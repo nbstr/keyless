@@ -430,6 +430,22 @@ ASSIGN_FALSE_POSITIVES = [
     # later assignments, which is a fact about the shell and not an act to judge.
     "set -x",
     "set -euo pipefail",
+    # The counter-half of the qualified-`*_KEY` keywords. `secret_key`,
+    # `signing_key` and `encryption_key` are keywords; a credential word followed
+    # by any OTHER identifier is not, because such a name refers to a credential
+    # instead of holding one. Measured over 86,125 real commands: admitting a
+    # bounded suffix generally adds `AWS_ACCESS_KEY_ID` (30 — the public half of
+    # the pair), `apiKeyConnectionId` (22), `secretRef` (11) and `secretsManager`.
+    # These are the shapes that decide it, so they must stay silent.
+    "export CACHE_KEY=%s" % DECOY["generic"],
+    "export IDEMPOTENCY_KEY=%s" % DECOY["generic"],
+    "export SECRET_NAME=%s" % DECOY["generic"],
+    "export SECRET_ARN=%s" % DECOY["generic"],
+    "export AWS_ACCESS_KEY_ID=%s" % DECOY["generic"],
+    "export KEY=%s" % DECOY["generic"],
+    # Bare `key=` is 121 assignments in the same corpus and none of them is a
+    # credential, which is why `key` is not a keyword on its own.
+    "export SORT_KEY=%s" % DECOY["generic"],
 ]
 
 # The same literal in ARGUMENT position. Each of these carries a value that
@@ -450,6 +466,18 @@ ASSIGN_TRUE_POSITIVES = [
     "declare -x SLACK_TOKEN=%s" % DECOY["slack"],
     "export FOO=%s" % DECOY["github_pat"],
     "export DATABASE_URL=postgres://admin:%s@db.example.com/prod" % DECOY["generic"],
+    # Name-keyed only. DECOY["generic"] is deliberately not a vendor shape, so
+    # each of these is denied by the keyword or by nothing — which is what the
+    # first version of this suite could not tell apart: it spelled the case as
+    # `STRIPE_SECRET_KEY=<a Stripe key>`, where the vendor pattern fires and the
+    # keyword never has to.
+    "export SECRET_KEY=%s" % DECOY["generic"],
+    "export DJANGO_SECRET_KEY=%s" % DECOY["generic"],
+    "export SESSION_SIGNING_KEY=%s" % DECOY["generic"],
+    "export CREDENTIAL_ENCRYPTION_KEY=%s" % DECOY["generic"],
+    # libpq's own variable, and the one name where the left-hand lookbehind costs
+    # real coverage: `password` is glued to `pg`, so no separator precedes it.
+    "PGPASSWORD=%s psql -h db.example.com -U app" % DECOY["generic"],
 ]
 
 # ── the two controls, and they prove OPPOSITE things ────────────────────────
@@ -460,6 +488,11 @@ ASSIGN_TRUE_POSITIVES = [
 #
 # VALUE: the walk reaches the assignment, and `fingerprint` clears the value.
 # Every one is credential-NAMED, so a name-keyed gate refuses all four.
+#
+# The first row only started proving that once `secret_key` became a keyword.
+# Before it did, `SECRET_KEY` matched no keyword at all, so the row was silent
+# whether or not expansion-blanking worked — a control that could not fail,
+# sitting inside the suite whose job is to make silence explain itself.
 ASSIGN_VALUE_CONTROL = [
     ('export SECRET_KEY="$SECRET_KEY"', "SECRET_KEY"),
     ('export GITHUB_TOKEN="$GITHUB_TOKEN"', "GITHUB_TOKEN"),

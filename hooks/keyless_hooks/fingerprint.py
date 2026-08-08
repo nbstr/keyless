@@ -60,7 +60,16 @@ _VENDOR = re.compile(
 
 # A credential inside a URL's userinfo. The password class excludes `/` and `@`
 # so it cannot run past the host, and both quantifiers sit over disjoint classes.
-_URL_AUTH = re.compile(r"[a-zA-Z][a-zA-Z0-9+.-]{1,15}://[^\s/:@]{1,64}:([^\s/@\"']{6,128})@")
+#
+# 8 is the floor, and this is the only pattern in the module that can reach it:
+# every other generic rule already requires 12 or 16. Writing a smaller number
+# here changes nothing, because `_too_plain` needs 8 DISTINCT characters and no
+# value shorter than 8 characters has them — so the two floors have to be read
+# together, and a relaxation that moves one alone is a no-op.
+#
+# Below 8 the shapes are `postgres` against a dev database (23 in the corpus)
+# and `([^:]+):([^@]+)@` — a regex fragment, not a URL (7 more).
+_URL_AUTH = re.compile(r"[a-zA-Z][a-zA-Z0-9+.-]{1,15}://[^\s/:@]{1,64}:([^\s/@\"']{8,128})@")
 
 # `Authorization: Bearer …` and its siblings, in a header, a curl flag, or a
 # config file.
@@ -76,10 +85,28 @@ _FLAG = re.compile(
 # directly with a lookbehind rather than by scanning a wildcard prefix, because
 # `[A-Za-z0-9_-]*(?:token|secret)` is exactly the two-adjacent-quantifiers shape
 # that goes quadratic on a long non-matching identifier.
+#
+# The keyword must END the identifier — `["']?\s*[:=]` follows it immediately —
+# and that is a precision rule, not an oversight. A credential word with more
+# identifier after it usually NAMES a credential rather than holding one:
+# measured over 86,125 real agent commands, letting any bounded suffix through
+# admits `AWS_ACCESS_KEY_ID` (30, the public half of the pair), `apiKeyConnectionId`
+# (22), `secretRef` (11), `secretsManager`, `secretName`, `credentialsFullUri` and
+# `TOKEN_DOCS` (a URL) — 142 new findings, almost none of them a secret.
+#
+# So the tail is ENUMERATED instead. `key` alone is far too generic to be a
+# keyword — `cacheKey`, `sortKey`, `objectKey`, `partitionKey`, and 121 bare
+# `key=` assignments in the same corpus — but a `key` qualified as secret,
+# signing or encryption is a credential every time it appears. `pgpassword` is
+# listed whole because the lookbehind blocks a keyword glued to a preceding word,
+# and libpq's variable is the one name where that costs real coverage: 33
+# occurrences in the corpus, against 51 for every other glued spelling combined
+# (`nextPageToken`, `isPersonalToken`, `attributeKey`) — all of them code.
 _ASSIGN = re.compile(
     r"(?i)(?<![A-Za-z0-9])"
-    r"(?P<kw>token|secret|password|passwd|apikey|api_key|api-key|access_key|"
-    r"access-key|private_key|private-key|credentials?|auth_token|auth-token)"
+    r"(?P<kw>token|secret_key|secret-key|secret|pgpassword|password|passwd|apikey|"
+    r"api_key|api-key|access_key|access-key|private_key|private-key|signing_key|"
+    r"signing-key|encryption_key|encryption-key|credentials?|auth_token|auth-token)"
     r"[\"']?\s*[:=]\s*"
     r"(?:\"([^\"\n]{12,256})\"|'([^'\n]{12,256})'|([A-Za-z0-9+/_.=~-]{12,256}))")
 
