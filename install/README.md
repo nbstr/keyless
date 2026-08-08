@@ -1,0 +1,199 @@
+# Installing the daemon
+
+Two files to read before you run anything: [`install.sh`](install.sh) and
+[`sh.keyless.keylessd.plist`](sh.keyless.keylessd.plist).
+
+**The installer is dry-run by default.** It prints every command it would run,
+in order, and changes nothing. `--commit` is the only thing that makes it act.
+
+```console
+$ cargo build --release             # the installer copies from target/release
+$ ./install/install.sh              # prints the plan
+$ sudo ./install/install.sh --commit
+```
+
+It needs `sudo` exactly once, to create a user. Nothing afterwards does.
+
+[`uninstall.sh`](uninstall.sh) reverses all of it — the launchd job, the
+files, and the user account the install created. It is dry-run by default
+too, and takes the same `--commit`.
+
+---
+
+## What the one `sudo` buys
+
+A uid you are not.
+
+That is the entire mechanism. Everything else in `keyless` is a good habit
+around a store your own uid can read — and **anything readable by your uid is
+readable by every session and every subagent one spawns.** No file mode, no
+deny rule and no wrapper changes that. A second uid does, because the kernel
+enforces it and there is nothing to bypass.
+
+| path | mode | owner | what it means for you |
+|---|---|---|---|
+| `/usr/local/var/lib/keyless/secrets.json` | `0600` | `_keyless:keyless` | you cannot read it |
+| `/usr/local/var/log/keyless/audit.jsonl` | `0640` | `_keyless:keyless` | you read it, you cannot write it |
+| `/usr/local/var/run/keyless/keylessd.sock` | `0660` | `_keyless:keyless` | you connect to it |
+| `/usr/local/var/run/keyless/` | `0755` | `_keyless:keyless` | you cannot replace the socket |
+| `/usr/local/etc/keyless/keylessd.json` | `0644` | `root:wheel` | you read the policy |
+
+The socket is `0660` and not `0640` because **connecting to a unix socket needs
+write permission**, not read. A socket a group can only read is a socket that
+group cannot use.
+
+The audit log's mode is the whole unforgeability claim. Each row carries
+`sha256(previous_hash || row)`, which detects an edit only if the editor cannot
+also recompute every hash after it. A writer with write access can, in about
+four lines. `0640` is what makes your sessions not that writer.
+
+---
+
+## The step the installer will not do for you
+
+**Installing this daemon next to a login keychain that still holds your secrets
+closes nothing.**
+
+`security find-generic-password -s <service> -w` returns plaintext, with no
+prompt and exit 0, to every process running as you. Standing up a daemon does
+not change that. The items are still there and still readable.
+
+The step that shuts the hole is a migration, and it has two halves:
+
+1. Put the secret where only `_keyless` can read it.
+2. **Delete it from your login keychain.**
+
+Half two is the one that matters, and it is the one that feels optional. Until
+it happens you have two doors and have locked one.
+
+```console
+$ sudo -u _keyless tee /usr/local/var/lib/keyless/secrets.json >/dev/null <<'EOF'
+{ "GITHUB_TOKEN": "...", "DATABASE_URL": "..." }
+EOF
+$ sudo chmod 0600 /usr/local/var/lib/keyless/secrets.json
+
+$ security delete-generic-password -s keyless -a GITHUB_TOKEN
+```
+
+The installer does not do this, and should not: it cannot know which of your
+keychain items are meant to stay reachable by hand, and a script that deletes
+credentials it guessed at is worse than the problem it is solving.
+
+Verify the delete rather than assuming it. The check is that the *old* path
+stops working:
+
+```console
+$ security find-generic-password -s keyless -a GITHUB_TOKEN -w
+security: SecKeychainSearchCopyNext: The specified item could not be found.
+```
+
+---
+
+## Then point your sessions at it
+
+`~/.config/keyless/config.json`:
+
+```json
+{ "stores": { "daemon": { "enabled": true } } }
+```
+
+Enabling the daemon **disables the local keychain backend**, whatever that
+backend's own `enabled` flag says. That is enforced in `store::build`, not
+documented as a convention, because a local fallback would re-open the hole the
+moment the daemon stopped — and anyone who can stop a process could choose
+that. Killing `keylessd` must get you fewer secrets, never more.
+
+**Log out and back in.** Group membership is established at login; until then
+your shell is not in the `keyless` group and the kernel refuses the connection
+before the daemon ever sees it. The symptom is every name degrading, which
+looks exactly like a broken daemon.
+
+---
+
+## Checking it
+
+```console
+$ keyless doctor
+$ keylessd check  --config /usr/local/etc/keyless/keylessd.json
+$ keylessd verify --config /usr/local/etc/keyless/keylessd.json
+```
+
+`keyless doctor` also reports the case worth catching: a socket that is
+listening while your config does not mention it. That means the daemon is
+installed and every session is still reading the keychain directly — and
+nothing else in the tool would ever say so, because from `run`'s point of view
+everything is working.
+
+---
+
+## Re-pinning after an upgrade
+
+The allowlist holds the **code hash** of the `keyless` binary. Rebuilding it
+changes that hash, so an upgrade that replaces the binary without updating the
+config produces a daemon that refuses its own client:
+
+```console
+$ sudo cp target/release/keyless /usr/local/bin/keyless
+$ keylessd pin --path /usr/local/bin/keyless
+# put the new hash in peer.allow_images, then:
+$ sudo launchctl kickstart -k system/sh.keyless.keylessd
+```
+
+`keylessd pin` refuses to pin an interpreter, and so does the daemon at request
+time. Pinning `node` or `python3` would authorise every program that
+interpreter will ever run — see the README's section on why that costs you
+nothing.
+
+---
+
+## Linux
+
+Not shipped, because it is not tested. What changes, so nobody has to work it
+out twice:
+
+**The attestation does not port.** `csops(CS_OPS_CDHASH)`, the audit token and
+`proc_pidinfo` are XNU. The Linux equivalents are:
+
+| macOS | Linux |
+|---|---|
+| `getpeereid` / `LOCAL_PEERCRED` | `SO_PEERCRED` (`struct ucred`) |
+| `LOCAL_PEERTOKEN` pid generation | no equivalent — use `pidfd_open(2)`, which *is* the race-free handle |
+| `csops(CS_OPS_CDHASH)` on the live image | no code signature at all; hash `/proc/<pid>/exe` **opened via the pidfd**, never re-opened by path |
+| `proc_pidinfo` uniq identifier | the pidfd, or `/proc/<pid>/stat` field 22 (start time) |
+
+`pidfd_open` is strictly better than what macOS offers: it is a handle to a
+*process*, so pid reuse is not merely detectable, it is impossible. Open the
+pidfd first, then read everything through it.
+
+**The trap to avoid is the one this design was measured against.**
+`readlink("/proc/<pid>/exe")` and then opening the resulting path is the
+vulnerable pattern — that is a path, and paths can be replaced. Open
+`/proc/<pid>/exe` **directly** as a file descriptor and hash the descriptor. On
+Linux it is the race-free primitive and it is easier than the racy one.
+
+**systemd** replaces launchd, and `DynamicUser=yes` replaces creating a user by
+hand:
+
+```ini
+[Service]
+DynamicUser=yes
+ExecStart=/usr/local/bin/keylessd run --config /etc/keyless/keylessd.json
+LoadCredential=store:/etc/keyless/secrets.json
+RuntimeDirectory=keyless
+RuntimeDirectoryMode=0750
+StateDirectory=keyless
+LimitCORE=0
+ProtectSystem=strict
+PrivateTmp=yes
+NoNewPrivileges=yes
+```
+
+`LoadCredential=` is the better half of the deal: systemd reads the file as
+root and hands the daemon a descriptor under `$CREDENTIALS_DIRECTORY`, so the
+store never has to be readable by the daemon's own (dynamic, unstable) uid at
+all. `RuntimeDirectoryMode=0750` plus a `SupplementaryGroups=` entry replaces
+the group dance in `install.sh`.
+
+`LimitCORE=0` matters as much there as the `HardResourceLimits` block does in
+the plist: a core dump of this process contains every cached plaintext, on
+disk, outside every guarantee the rest of the design makes.

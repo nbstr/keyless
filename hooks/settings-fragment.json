@@ -1,0 +1,68 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 __KEYLESS_HOOKS_DIR__/keyless_hook.py",
+            "timeout": 10,
+            "statusMessage": "keyless"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 __KEYLESS_HOOKS_DIR__/keyless_hook.py",
+            "timeout": 10,
+            "statusMessage": "keyless"
+          }
+        ]
+      }
+    ]
+  },
+  "permissions": {
+    "deny": [
+      "Read(**/.ssh/id_*)",
+      "Read(**/.aws/credentials)",
+      "Read(**/.claude.json)",
+      "Read(**/.cckeys.json)",
+      "Read(**/.infisical/.token)",
+      "Read(**/.config/gh/hosts.yml)",
+      "Read(**/.docker/config.json)",
+      "Read(**/.gnupg/*.key)"
+    ]
+  },
+  "_keylessComment": [
+    "The deny list above holds only OPAQUE credential stores \u2014 files whose names",
+    "are worthless to an agent and whose content is never legitimately needed.",
+    "For those a hard permission gate is strictly better than the hook: it",
+    "survives a broken hook, bypassPermissions, and the subagent boundary.",
+    "",
+    "`.env` and friends are deliberately ABSENT, and that is a measured decision.",
+    "A permission deny PRE-EMPTS the hook's rewrite. Driven live: with",
+    "Read(**/.env) in this list the session was told only 'denied by permission",
+    "settings' \u2014 no names, no alternative. With it removed, the same session was",
+    "told which three names the file declares and offered",
+    "`keyless run -s <NAME> -- <cmd>`. The hook is the better layer for a file",
+    "worth inventorying; the deny rule is the better layer for a file that is",
+    "nothing but key material.",
+    "",
+    "`_keylessHardDeny` adds the wider list for anyone who wants the hard gate",
+    "anyway: `./install.sh --hard-deny`. It costs the names view.",
+    "",
+    "install.py copies `hooks` and `permissions.deny` into your settings file and",
+    "nothing else. Neither comment key is ever written there."
+  ],
+  "_keylessHardDeny": [
+    "Read(**/.env)",
+    "Read(**/.npmrc)",
+    "Read(**/.netrc)",
+    "Read(**/.pgpass)",
+    "Read(**/*.pem)"
+  ]
+}

@@ -1,0 +1,69 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>sh.keyless.keylessd</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/local/bin/keylessd</string>
+    <string>run</string>
+    <string>--config</string>
+    <string>/usr/local/etc/keyless/keylessd.json</string>
+  </array>
+
+  <!-- The whole point. Everything the daemon owns belongs to this uid, and
+       the sessions run as somebody else. -->
+  <key>UserName</key>
+  <string>_keyless</string>
+
+  <!-- The group the socket is created in, and the group the human is in.
+       Connecting to a unix socket needs WRITE permission on it, so the mode
+       is 0660 and this group is what carries the access. -->
+  <key>GroupName</key>
+  <string>keyless</string>
+
+  <key>RunAtLoad</key>
+  <true/>
+
+  <!-- A daemon that stays down degrades every session until somebody
+       notices. Degrading is safe — the child still runs — but it is silent,
+       so the daemon should come back on its own. -->
+  <key>KeepAlive</key>
+  <true/>
+
+  <key>ProcessType</key>
+  <string>Background</string>
+
+  <!-- stderr only. The daemon writes warnings and refusals here and never a
+       value; the audit log is the record, this is the console. -->
+  <key>StandardErrorPath</key>
+  <string>/usr/local/var/log/keyless/keylessd.err</string>
+  <key>StandardOutPath</key>
+  <string>/dev/null</string>
+
+  <!-- No core dumps. A core file of this process would contain every cached
+       plaintext, written to disk, readable by root, outside every guarantee
+       the rest of the design makes. -->
+  <key>HardResourceLimits</key>
+  <dict>
+    <key>Core</key>
+    <integer>0</integer>
+  </dict>
+  <key>SoftResourceLimits</key>
+  <dict>
+    <key>Core</key>
+    <integer>0</integer>
+    <key>NumberOfFiles</key>
+    <integer>1024</integer>
+  </dict>
+
+  <!-- Deny the daemon a controlling terminal and a session it does not need. -->
+  <key>SessionCreate</key>
+  <false/>
+
+  <key>WorkingDirectory</key>
+  <string>/</string>
+</dict>
+</plist>

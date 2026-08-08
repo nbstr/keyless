@@ -1,0 +1,55 @@
+[package]
+name = "keyless"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+license = "MIT"
+description = "Use a secret without ever holding one: name it, and it reaches the child process and nothing else."
+repository = "https://github.com/nbstr/keyless"
+readme = "README.md"
+keywords = ["secrets", "credentials", "agent", "keychain", "masking"]
+categories = ["command-line-utilities", "authentication"]
+
+[dependencies]
+# Argument parsing. `derive` keeps the CLI surface declarative, which matters
+# because the verb set is a security property: a reader must be able to see at
+# a glance that no verb prints a value.
+clap = { version = "4", default-features = false, features = [
+    "std",
+    "help",
+    "usage",
+    "error-context",
+    "derive",
+] }
+# Config parsing and audit-row serialization. JSON is the only serialization
+# format in the tool, so this is one dependency doing both jobs.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Best-effort scrubbing of plaintext buffers on drop. Hand-rolled zeroing is
+# not reliable: the optimizer is allowed to delete a write to memory that is
+# never read again. This crate exists to make that write non-elidable.
+zeroize = "1"
+# The POSIX syscalls a pseudo-terminal needs: openpty, termios, the winsize
+# ioctls, setsid/TIOCSCTTY, and sigwait. Hand-rolled FFI for those is not the
+# good kind of minimalism — a wrong `ioctl` request constant compiles, links,
+# and corrupts memory at runtime.
+#
+# Feature-gated down to the five modules actually used. `default-features =
+# false` is not spelled here because nix's default feature set is already
+# empty; the list below is additive, not a subtraction.
+nix = { version = "0.31", features = [
+    "term",    # openpty, Termios, cfmakeraw, tcgetattr/tcsetattr
+    "signal",  # SigSet::wait (sigwait), killpg — no signal handler exists
+    "process", # Pid, setsid
+    "ioctl",   # TIOCGWINSZ / TIOCSWINSZ / TIOCSCTTY
+    "poll",    # waking the stdin relay so it can be joined rather than leaked
+    "pthread", # pthread_kill: the shutdown wake must reach ONE thread
+] }
+
+[dev-dependencies]
+
+[profile.release]
+strip = true
+lto = true
+codegen-units = 1
+panic = "abort"

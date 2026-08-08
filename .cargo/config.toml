@@ -1,0 +1,15 @@
+# Pin the Apple linker to its absolute path.
+#
+# `rustc` invokes whatever `cc` resolves to on PATH. On a machine where an
+# unrelated tool installs its own `cc` earlier in PATH — /usr/local/bin/cc, say
+# — every link fails with `unknown option '-lSystem'`, which reads as a broken
+# toolchain rather than as a shadowed binary. /usr/bin/cc is Apple clang on
+# every macOS install, so naming it is both safe and specific.
+#
+# Scoped to the Apple targets, so it changes nothing when building elsewhere.
+
+[target.aarch64-apple-darwin]
+linker = "/usr/bin/cc"
+
+[target.x86_64-apple-darwin]
+linker = "/usr/bin/cc"

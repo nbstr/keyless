@@ -1,0 +1,237 @@
+//! Talking to the daemon, with a deadline that cannot be missed.
+//!
+//! # Why the whole exchange runs on a thread
+//!
+//! `UnixStream` can be given a read and a write timeout. It cannot be given a
+//! **connect** timeout — `std` has no `connect_timeout` for the unix domain —
+//! and a connect to a socket whose listener is wedged with a full backlog
+//! blocks indefinitely. A tool that must never stop a command from running
+//! cannot contain an unbounded wait.
+//!
+//! So the connect, the write and the read all happen on a worker thread, and
+//! the caller waits on a channel with a deadline. When the deadline passes the
+//! caller gives up and reports the daemon unavailable; the worker finishes
+//! whenever the kernel lets it and drops everything it holds. One orphan thread
+//! per timed-out name, each of which ends on its own — the alternative is a
+//! non-blocking connect written in `unsafe`, and this boundary already carries
+//! all the `unsafe` it needs.
+//!
+//! # Scrubbing
+//!
+//! The reply frame holds a plaintext value. It is read into a buffer this
+//! module owns and zeroizes, rather than into a `BufReader` whose internal
+//! buffer is private and would keep a copy for the life of the read. What
+//! cannot be scrubbed is the copy the kernel held in the socket buffer, which
+//! belongs to the kernel.
+
+use std::io::{self, BufRead, Read};
+use std::os::unix::net::UnixStream;
+use std::path::{Path, PathBuf};
+use std::sync::mpsc;
+use std::thread;
+use std::time::Duration;
+
+use zeroize::Zeroize;
+
+use crate::ipc::protocol::{ProtocolError, Reply, Request, read_frame, write_frame};
+
+/// A configured route to a daemon.
+#[derive(Debug, Clone)]
+pub struct Client {
+    socket: PathBuf,
+    timeout: Duration,
+}
+
+/// Why a request did not produce a reply.
+///
+/// Every variant means the same thing to `run`: no value, so degrade. They are
+/// kept apart because `doctor` and the audit log should be able to say whether
+/// the daemon is absent, slow, or answering nonsense.
+#[derive(Debug)]
+pub enum ClientError {
+    /// The socket could not be reached: absent, not a socket, wrong
+    /// permissions, or nothing listening.
+    Unreachable(io::Error),
+    /// The deadline passed with no reply.
+    Timeout(Duration),
+    /// The connection failed mid-exchange.
+    Transport(io::Error),
+    /// The daemon answered something this build does not understand.
+    Protocol(ProtocolError),
+}
+
+impl std::fmt::Display for ClientError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ClientError::Unreachable(source) => write!(f, "cannot reach the daemon: {source}"),
+            ClientError::Timeout(after) => {
+                write!(f, "the daemon did not answer within {after:?}")
+            }
+            ClientError::Transport(source) => write!(f, "the connection failed: {source}"),
+            ClientError::Protocol(source) => write!(f, "{source}"),
+        }
+    }
+}
+
+impl std::error::Error for ClientError {}
+
+impl Client {
+    /// Point at a socket, with a deadline for the whole exchange.
+    #[must_use]
+    pub fn new(socket: PathBuf, timeout: Duration) -> Self {
+        Client { socket, timeout }
+    }
+
+    /// The socket this client talks to.
+    #[must_use]
+    pub fn socket(&self) -> &Path {
+        &self.socket
+    }
+
+    /// Send one request and wait for one reply, or give up.
+    pub fn request(&self, request: &Request) -> Result<Reply, ClientError> {
+        let frame = request.encode().map_err(ClientError::Transport)?;
+        let socket = self.socket.clone();
+        let timeout = self.timeout;
+        let (sender, receiver) = mpsc::channel();
+
+        thread::Builder::new()
+            .name(format!("{}-ipc", crate::NAME))
+            .spawn(move || {
+                // A send failure means the caller already gave up; the reply is
+                // dropped, which zeroizes the value it carried.
+                let _ = sender.send(exchange(&socket, &frame, timeout));
+            })
+            .map_err(ClientError::Transport)?;
+
+        match receiver.recv_timeout(timeout) {
+            Ok(result) => result,
+            Err(mpsc::RecvTimeoutError::Timeout) => Err(ClientError::Timeout(timeout)),
+            Err(mpsc::RecvTimeoutError::Disconnected) => Err(ClientError::Transport(
+                io::Error::other("the request thread ended without answering"),
+            )),
+        }
+    }
+}
+
+fn exchange(socket: &Path, frame: &[u8], timeout: Duration) -> Result<Reply, ClientError> {
+    let stream = UnixStream::connect(socket).map_err(ClientError::Unreachable)?;
+    stream
+        .set_read_timeout(Some(timeout))
+        .map_err(ClientError::Transport)?;
+    stream
+        .set_write_timeout(Some(timeout))
+        .map_err(ClientError::Transport)?;
+
+    write_frame(&mut &stream, frame).map_err(ClientError::Transport)?;
+
+    let mut reader = ScrubbedReader::new(&stream);
+    let raw = read_frame(&mut reader).map_err(ClientError::Protocol)?;
+    let Some(mut raw) = raw else {
+        return Err(ClientError::Transport(io::Error::other(
+            "the daemon closed the connection without answering",
+        )));
+    };
+    let reply = Reply::decode(&raw).map_err(ClientError::Protocol);
+    raw.zeroize();
+    reply
+}
+
+/// A `BufRead` whose buffer is scrubbed when it is dropped.
+///
+/// `std::io::BufReader` would do the buffering, and would also keep the
+/// plaintext in a `Vec` this crate cannot reach. Forty lines is a small price
+/// for the difference between "the value is gone" and "the value is somewhere
+/// on the heap until the allocator reuses the page".
+struct ScrubbedReader<R: Read> {
+    inner: R,
+    buf: Vec<u8>,
+    start: usize,
+    end: usize,
+}
+
+impl<R: Read> ScrubbedReader<R> {
+    fn new(inner: R) -> Self {
+        ScrubbedReader {
+            inner,
+            buf: vec![0; 8 * 1024],
+            start: 0,
+            end: 0,
+        }
+    }
+}
+
+impl<R: Read> Read for ScrubbedReader<R> {
+    fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+        let available = self.fill_buf()?;
+        let taken = available.len().min(out.len());
+        out[..taken].copy_from_slice(&available[..taken]);
+        self.consume(taken);
+        Ok(taken)
+    }
+}
+
+impl<R: Read> BufRead for ScrubbedReader<R> {
+    fn fill_buf(&mut self) -> io::Result<&[u8]> {
+        if self.start == self.end {
+            self.start = 0;
+            self.end = self.inner.read(&mut self.buf)?;
+        }
+        Ok(&self.buf[self.start..self.end])
+    }
+
+    fn consume(&mut self, amount: usize) {
+        self.start = (self.start + amount).min(self.end);
+    }
+}
+
+impl<R: Read> Drop for ScrubbedReader<R> {
+    fn drop(&mut self) {
+        self.buf.zeroize();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Client, ClientError, ScrubbedReader};
+    use crate::ipc::protocol::Request;
+    use std::io::BufRead;
+    use std::time::Duration;
+
+    #[test]
+    fn an_absent_socket_is_unreachable_rather_than_a_hang() {
+        let client = Client::new(
+            std::env::temp_dir().join("keyless-no-such-daemon.sock"),
+            Duration::from_millis(200),
+        );
+        let error = client
+            .request(&Request::ping())
+            .expect_err("there is no daemon there");
+        assert!(matches!(error, ClientError::Unreachable(_)));
+    }
+
+    #[test]
+    fn a_path_that_is_a_regular_file_is_unreachable_rather_than_a_panic() {
+        let path =
+            std::env::temp_dir().join(format!("keyless-not-a-socket-{}", std::process::id()));
+        std::fs::write(&path, b"not a socket").expect("write");
+        let client = Client::new(path.clone(), Duration::from_millis(200));
+        assert!(matches!(
+            client.request(&Request::ping()),
+            Err(ClientError::Unreachable(_))
+        ));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn the_scrubbed_reader_frames_exactly_like_a_bufreader() {
+        let data: &[u8] = b"alpha\nbeta\n";
+        let mut reader = ScrubbedReader::new(data);
+        let mut line = String::new();
+        reader.read_line(&mut line).expect("read");
+        assert_eq!(line, "alpha\n");
+        line.clear();
+        reader.read_line(&mut line).expect("read");
+        assert_eq!(line, "beta\n");
+    }
+}

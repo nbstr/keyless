@@ -1,0 +1,10 @@
+/target
+**/*.rs.bk
+.DS_Store
+
+# Python bytecode from the hook pack. Committed by accident once: the hooks
+# are stdlib-only scripts, so a .pyc is pure build output and a stale one
+# shadows a source edit in a copied tree, which is how a mutation run reports a
+# green suite against code it did not actually run.
+__pycache__/
+*.py[cod]

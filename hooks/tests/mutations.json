@@ -1,0 +1,233 @@
+[
+  {
+    "id": "M1-cat-is-a-non-reader",
+    "why": "KL-FILE's whole gate is the non-reader allowlist sitting on the closed side. Admitting `cat` to it opens every plain read.",
+    "file": "keyless_hooks/config.py",
+    "find": "    \"ls\", \"stat\", \"test\", \"[\", \"[[\", \"touch\", \"mkdir\", \"rm\", \"rmdir\",",
+    "replace": "    \"cat\", \"head\", \"awk\", \"test\", \"[\", \"[[\", \"touch\", \"mkdir\", \"rm\", \"rmdir\","
+  },
+  {
+    "id": "M2-no-substitution-flattening",
+    "why": "Removes the view that catches `cat $(echo .env)`, where the path lives in a statement headed by a command that cannot read.",
+    "file": "keyless_hooks/checks/file_read.py",
+    "find": "flatten_substitutions(base)]\n    texts.extend(substitution_payloads(base))",
+    "replace": "]"
+  },
+  {
+    "id": "M3-no-quote-collapse",
+    "why": "Removes the token-level quote collapse, which is the only thing that sees `.en''v` as `.env`.",
+    "file": "keyless_hooks/shellview.py",
+    "find": "            if collapsed and not any(c.isspace() for c in collapsed):\n                out.extend(candidate_operands(collapsed))",
+    "replace": "            pass"
+  },
+  {
+    "id": "M4-vault-subcommand-never-matches",
+    "why": "KL-VAULT reads the subcommand. Anchoring the pattern on a string no CLI emits makes every print verb pass while the table still looks populated.",
+    "file": "keyless_hooks/config.py",
+    "find": "    [\"op\", r\"^(read|inject)\\b\", \"op run -- <cmd>\", None],",
+    "replace": "    [\"op\", r\"^zzz-never-matches\\b\", \"op run -- <cmd>\", None],"
+  },
+  {
+    "id": "M5-env-dump-never-bare",
+    "why": "`bare` is the discrimination between `set` (a dump) and `set -e` (every script). Forcing it false disables KL-ENV without touching its trigger.",
+    "file": "keyless_hooks/checks/env_dump.py",
+    "find": "    return verb, bare, redirect",
+    "replace": "    return verb, False, redirect"
+  },
+  {
+    "id": "M6-no-secret-name-segments",
+    "why": "KL-ENVVAR's advisory rests entirely on the segment list. An empty one is a check that runs and can never fire.",
+    "file": "keyless_hooks/config.py",
+    "find": "DEFAULT_SECRET_SEGMENTS = [\n    \"token\", \"secret\", \"password\", \"passwd\", \"apikey\", \"credential\",",
+    "replace": "DEFAULT_SECRET_SEGMENTS = [\n    \"zzz-never\", \"passwd\", \"apikey\", \"credential\","
+  },
+  {
+    "id": "M7-redact-is-a-no-op",
+    "why": "The class-4 rewrite. Returning the text unchanged is the failure that looks most like success: the write proceeds and the secret is in it.",
+    "file": "keyless_hooks/fingerprint.py",
+    "find": "    findings = scan(text)\n    if not findings:\n        return text, []",
+    "replace": "    findings = scan(text)\n    return text, []"
+  },
+  {
+    "id": "M8-everything-is-a-placeholder",
+    "why": "The placeholder filter is the scanner's precision. Making it total silences every shape at once while the patterns still compile.",
+    "file": "keyless_hooks/fingerprint.py",
+    "find": "def _is_placeholder(value):\n    v = value.strip()",
+    "replace": "def _is_placeholder(value):\n    return True\n    v = value.strip()"
+  },
+  {
+    "id": "M9-nothing-is-protected",
+    "why": "The path matcher. Returning None for everything disables KL-FILE entirely, on every tool, in one line.",
+    "file": "keyless_hooks/secretpaths.py",
+    "find": "    forms = expansions(candidate, cwd, expand_globs)\n    if not forms:\n        return None",
+    "replace": "    forms = expansions(candidate, cwd, expand_globs)\n    return None"
+  },
+  {
+    "id": "M10-deny-is-downgraded-to-silence",
+    "why": "The engine's deny path. Dropping the reason turns every block in the pack into a no-op that still writes a decision row saying it blocked.",
+    "file": "keyless_hooks/engine.py",
+    "find": "            return message, None, advisories",
+    "replace": "            return None, None, advisories"
+  },
+  {
+    "id": "M11-payload-coercion-removed",
+    "why": "The fail-open boundary. Returning a wrongly-typed field raw is exactly the defect that crashed 8 of 9 scripts in one estate on VALID JSON.",
+    "file": "keyless_hooks/payload.py",
+    "find": "    v = obj.get(key)\n    return v if isinstance(v, str) else default",
+    "replace": "    return obj.get(key, default)"
+  },
+  {
+    "id": "M12-names-view-copies-lines",
+    "why": "The one place bytes from a secret file reach output. Copying the whole line instead of the validated key turns the protective view into the leak it exists to prevent.",
+    "file": "keyless_hooks/checks/file_read.py",
+    "find": "        body = [\"%s=[keyless:redacted]\" % n for n in names]",
+    "replace": "        body = [\"%s=%s\" % (n, open(path).read().strip()) for n in names]"
+  },
+  {
+    "id": "M13-wrappers-not-absorbed",
+    "why": "`sudo`, `env` and `timeout` in front of a reader. Not absorbing them makes the head the wrapper, and one prefix word walks past every gate.",
+    "file": "keyless_hooks/shellview.py",
+    "find": "        if name in _WRAPPERS:\n            last_wrapper = (name, end)\n            continue\n        return name, end, last_wrapper",
+    "replace": "        return name, end, last_wrapper"
+  },
+  {
+    "id": "M14-keywords-are-not-command-positions",
+    "why": "`for f in *; do cat .env; done` puts the verb after `do`. Dropping the keyword positions is the classic enumeration gap.",
+    "file": "keyless_hooks/shellview.py",
+    "find": "    for m in re.finditer(r\"(?:^|[\\s;&|(){}\\n])(%s)(?=[\\s\\n])\" % \"|\".join(_KEYWORDS), view):\n        pos.append(m.end(1))",
+    "replace": "    pass"
+  },
+  {
+    "id": "M15-symlinks-not-resolved",
+    "why": "5 real files behind 179 symlinks is a normal estate. Matching only the requested path leaves every link open.",
+    "file": "keyless_hooks/secretpaths.py",
+    "find": "            real = os.path.realpath(absolute)\n            if real not in out:\n                out.append(real)\n        elif _GLOB_CHARS.search(cand) and expand_globs:",
+    "replace": "            pass\n        elif _GLOB_CHARS.search(cand) and expand_globs:"
+  },
+  {
+    "id": "M16-verb-path-is-the-raw-arguments",
+    "why": "Restores prefix matching: the row is tested against `secrets folders get --env=prod` instead of the verb path. This is the exact defect that refused `infisical secrets folders get` twice in one session.",
+    "file": "keyless_hooks/checks/vault_cli.py",
+    "find": "            path = verb_path(rest)",
+    "replace": "            path = rest"
+  },
+  {
+    "id": "M17-flags-never-truncate-the-path",
+    "why": "A bare `-f` may consume the next word. Skipping it instead of ending the path lets a flag VALUE be read as a subcommand, so `infisical secrets --env prod get X` collapses to a path no row matches and the bare-secrets row goes silent on a full dump.",
+    "file": "keyless_hooks/checks/vault_cli.py",
+    "find": "        if tok.startswith(\"-\"):\n            if \"=\" in tok:\n                continue\n            break",
+    "replace": "        if tok.startswith(\"-\"):\n            continue"
+  },
+  {
+    "id": "M18-help-is-never-detected",
+    "why": "The help exemption is the only thing that lets `infisical secrets --help` through, because that spelling truncates the verb path back onto the bare-secrets row. Inverting it turns every documentation read in the table into a refusal.",
+    "file": "keyless_hooks/checks/vault_cli.py",
+    "find": "    toks = _tokens(rest)\n    for tok in toks:\n        if tok in _HELP_FLAGS:\n            return True",
+    "replace": "    toks = _tokens(rest)\n    for tok in toks:\n        if tok in _HELP_FLAGS:\n            return False"
+  },
+  {
+    "id": "M19-help-exemption-swallows-everything",
+    "why": "The opposite direction of M18, and the more dangerous one: an exemption that always fires disables all fourteen stores at once while the table still looks populated and every row still compiles.",
+    "file": "keyless_hooks/checks/vault_cli.py",
+    "find": "            if is_help(rest):",
+    "replace": "            if True or is_help(rest):"
+  },
+  {
+    "id": "M20-refusal-echoes-the-arguments",
+    "why": "`pass-cli totp generate <base32-seed>` carries the secret as a positional argument. Echoing the raw arguments puts that credential in the refusal message, so the hook leaks the value it exists to protect.",
+    "file": "keyless_hooks/checks/vault_cli.py",
+    "find": "    shown = \" \".join(path.split()[:2])",
+    "replace": "    shown = path"
+  },
+  {
+    "id": "M21-bare-pass-is-a-print-verb",
+    "why": "`pass` and `gopass` are the one negation left in the table, so an empty verb path matches it. Dropping the trailing `\\S` refuses bare `pass`, which prints the store's tree of NAMES and no value.",
+    "file": "keyless_hooks/config.py",
+    "find": "             r\"grep|help|version|--)\\b)\\S\", \"pass ls lists names\", None],",
+    "replace": "             r\"grep|help|version|--)\\b)\", \"pass ls lists names\", None],"
+  },
+  {
+    "id": "M22-kubectl-name-format-backtracks",
+    "why": "An optional `[= ]?` group lets the regex backtrack around the `name` exclusion, so `--output=name` matches by consuming nothing. The safe format becomes a block — a false positive introduced while closing the `-ojson` false negative.",
+    "file": "keyless_hooks/config.py",
+    "find": "     r\"(?:^|\\s)(?:--output|-o)(?:[= ]\\s*|(?=[a-z]))(?!name\\b)\"],",
+    "replace": "     r\"(?:^|\\s)(?:--output|-o)(?:[= ]\\s*)?(?!name\\b)\"],"
+  },
+  {
+    "id": "M23-keychain-flag-must-end-the-cluster",
+    "why": "`security` clusters short flags: `-ws NAME` parses as `-w -s NAME` and was measured searching the keychain. Requiring `w` to END the cluster makes the password flag invisible in the spelling most likely to be typed.",
+    "file": "keyless_hooks/config.py",
+    "find": "     r\"(?:^|\\s)-[A-Za-z]*[wg][A-Za-z]*(?=\\s|$)\"],",
+    "replace": "     r\"(?:^|\\s)-[A-Za-z]*[wg](?:\\s|$)\"],"
+  },
+  {
+    "id": "M24-pattern-arguments-are-paths",
+    "why": "Restores filesystem expansion of a regex handed to grep. This is the measured defect: `.*` expanded against a real directory matched every dotfile there, 9 of 38 organic KL-FILE denies on its own.",
+    "file": "keyless_hooks/checks/file_read.py",
+    "find": "        skip_glob = first_positional(stmt) if head in cfg.pattern_tools else \"\"",
+    "replace": "        skip_glob = \"\""
+  },
+  {
+    "id": "M25-the-exemption-covers-every-operand",
+    "why": "The exemption belongs to the pattern ARGUMENT alone. Widening it to the whole statement makes `grep TOKEN prod.*` a read nothing notices, which is a leak introduced while closing a false positive.",
+    "file": "keyless_hooks/checks/file_read.py",
+    "find": "                                   expand_globs=(not in_code and cand != skip_glob))",
+    "replace": "                                   expand_globs=(not in_code and not skip_glob))"
+  },
+  {
+    "id": "M24b-interpreter-code-is-glob-expanded",
+    "why": "`python3 -c \"re.findall('.*', s)\"` hands the interpreter that string verbatim; no shell expanded it. Expanding it against the real directory refuses a regex as a read of every dotfile, and the code arrives as a flag value so the positional rule cannot reach it.",
+    "file": "keyless_hooks/checks/file_read.py",
+    "find": "        in_code = head in cfg.interpreters",
+    "replace": "        in_code = False"
+  },
+  {
+    "id": "M25b-a-flag-supplied-pattern-still-skips",
+    "why": "`grep -f patterns.txt prod.env` reads BOTH files. Ignoring the flag that supplies the pattern makes the first positional look like a regex and drops a real read.",
+    "file": "keyless_hooks/shellview.py",
+    "find": "    if not rest or _PATTERN_FROM_FLAG.search(rest):\n        return \"\"",
+    "replace": "    if not rest:\n        return \"\""
+  },
+  {
+    "id": "M26-jq-filters-are-paths",
+    "why": "`==` is what separates a jq filter ending in `.env` from a filename. Removing the test refuses a filter as a credential file.",
+    "file": "keyless_hooks/secretpaths.py",
+    "find": "    if any(mark in cand for mark in _NOT_A_PATH):\n        return []",
+    "replace": "    if False:\n        return []"
+  },
+  {
+    "id": "M27-trailing-slash-is-a-file",
+    "why": "`.env/` names a directory and cannot open the file `.env` — the kernel answers ENOTDIR. Treating it as that file refuses a read that never existed.",
+    "file": "keyless_hooks/secretpaths.py",
+    "find": "    if cand.endswith(\"/\"):",
+    "replace": "    if False and cand.endswith(\"/\"):"
+  },
+  {
+    "id": "M28-language-idioms-are-paths",
+    "why": "`*.env` matches any word ending in `.env`, so the JS idiom `process.env` reads as a credential file and `grep -rn 'process.env' src/` is refused. The exclusion is the whole fix, and it must not be reachable past a broader protected glob.",
+    "file": "keyless_hooks/config.py",
+    "find": "    \"process.env\",\n    \"import.meta.env\",",
+    "replace": "    \"never-matches-anything.example\","
+  },
+  {
+    "id": "M29-comparisons-split-like-flags",
+    "why": "The flag-attached operand split exists for `dd if=.env`. Applied to `==` it carves `staging.env` out of a jq comparison and refuses the filter as a credential file — a second route to the same false positive, reached even when the whole token is correctly rejected.",
+    "file": "keyless_hooks/shellview.py",
+    "find": "        if past_head and \"=\" in collapsed and \"==\" not in collapsed:",
+    "replace": "        if past_head and \"=\" in collapsed:"
+  },
+  {
+    "id": "M30-heredoc-bodies-are-commands",
+    "why": "A heredoc body is blanked for act detection. Scanning the RAW command for operands reads the body as statements, because strip_heredocs leaves the newlines and statements() then cuts at every prose line. A commit message quoting `.env` becomes a refused read.",
+    "file": "keyless_hooks/checks/file_read.py",
+    "find": "    base = strip_heredocs(cmd)\n    texts = [base, expand_local_assignments(base), flatten_substitutions(base)]\n    texts.extend(substitution_payloads(base))",
+    "replace": "    texts = [cmd, expand_local_assignments(cmd), flatten_substitutions(cmd)]\n    texts.extend(substitution_payloads(cmd))"
+  },
+  {
+    "id": "M30-lower-case-names-are-credentials",
+    "why": "6 of 9 organic KL-ENVVAR warns fired on a lower-case `pat` in a session doing 167 `re.*` calls — a PATTERN variable. Dropping the case test brings that whole class back.",
+    "file": "keyless_hooks/checks/env_dump.py",
+    "find": "    if name != name.upper():\n        return False",
+    "replace": "    if False:\n        return False"
+  }
+]
