@@ -101,6 +101,32 @@ pub fn doctor(
                 }
             }
         }
+    } else if !load.config.secrets.is_empty() {
+        // Say what was NOT checked, and say what it costs, in the one place
+        // somebody is looking when something is broken.
+        //
+        // The flag has existed all along and the README documents it; this
+        // report never mentioned it, so it was reached by people who had
+        // already read the manual for a different reason. A capability nothing
+        // points at is one nobody runs.
+        //
+        // The cost is stated because it is the answer to "why is this not the
+        // default": `--probe` resolves each name, and resolving a name READS
+        // that credential out of the store — for Proton, one vendor `run` per
+        // name and one permanent off-machine audit entry per item. A health
+        // command that reads every credential you own on every invocation is a
+        // worse default than one that checks less. Whether each STORE is alive
+        // is checked above either way, and that costs no credential at all.
+        writeln!(
+            out,
+            "names    {} declared, not probed",
+            load.config.secrets.len()
+        )?;
+        writeln!(
+            out,
+            "         `{} doctor --probe` asks each one; it READS each credential to do so",
+            crate::NAME
+        )?;
     }
 
     writeln!(
@@ -194,6 +220,38 @@ mod tests {
             "doctor leaked a value"
         );
         assert_eq!(code, 0);
+    }
+
+    #[test]
+    fn an_unprobed_report_says_so_and_names_the_flag_and_its_cost() {
+        // The gap this closes is not a missing capability. `--probe` has always
+        // existed and the README has always documented it; nothing in the
+        // report a person actually reads ever mentioned it, so it was found
+        // only by people who had already gone looking elsewhere.
+        let paths = Paths::under(Path::new("/nonexistent/keyless-doctor"));
+        let mut load = Config::load(&paths.config);
+        load.config = serde_json::from_str(r#"{"secrets":{"DECOY":{}}}"#).expect("valid");
+        load.loaded = true;
+        let registry = Registry::new(vec![Box::new(Healthy)]);
+        let audit = AuditLog::new(PathBuf::from("/nonexistent/keyless-doctor/audit.jsonl"));
+
+        let mut out: Vec<u8> = Vec::new();
+        doctor(&paths, &load, &registry, &audit, &[], false, &mut out).expect("write");
+        let unprobed = String::from_utf8(out).expect("utf-8");
+        assert!(unprobed.contains("not probed"), "{unprobed}");
+        assert!(unprobed.contains("--probe"), "{unprobed}");
+        // The cost, so the reader can tell why it is not the default rather than
+        // concluding the default is simply lazy.
+        assert!(unprobed.contains("READS each credential"), "{unprobed}");
+
+        // And the line is absent when the names WERE probed, so it can never
+        // describe a report that does not match it. Without this the assertions
+        // above pass on an implementation that prints the line unconditionally.
+        let mut out: Vec<u8> = Vec::new();
+        doctor(&paths, &load, &registry, &audit, &[], true, &mut out).expect("write");
+        let probed = String::from_utf8(out).expect("utf-8");
+        assert!(!probed.contains("not probed"), "{probed}");
+        assert!(probed.contains("name     DECOY ok"), "{probed}");
     }
 
     #[test]

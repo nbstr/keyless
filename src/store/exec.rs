@@ -485,12 +485,24 @@ pub fn first_line(stderr: &[u8]) -> String {
 /// punctuation, not information, once the lines are joined), and applies the same
 /// cap as [`first_line`].
 ///
+/// # Colour is removed, because this string stops being terminal output
+///
+/// A vendor writing to a pipe may still colour its diagnostics — `pass-cli` 2.2.5
+/// does, measured 2026-08-08 — and the escape sequences survive into whatever
+/// this string is put into. That string is an error message that gets embedded in
+/// a longer sentence, printed in the middle of a `doctor` report, and written to
+/// the audit log as JSON. Escape codes belong to none of those: in the log they
+/// are noise stored forever, and in a report they colour text the report did not
+/// choose to colour, in the middle of a line it did not choose to interrupt.
+/// They are also the only part of the vendor's stderr that carries no meaning at
+/// all, so removing them loses nothing.
+///
 /// **stderr only, exactly like [`first_line`].** Reading more of it is safe
 /// precisely because nothing in this crate lets a value reach stderr; the same
 /// change applied to stdout would be a disclosure.
 #[must_use]
 pub fn summarise(stderr: &[u8]) -> String {
-    let text = String::from_utf8_lossy(stderr);
+    let text = strip_ansi(&String::from_utf8_lossy(stderr));
     let joined = text
         .lines()
         .map(str::trim)
@@ -508,6 +520,38 @@ pub fn summarise(stderr: &[u8]) -> String {
         cut -= 1;
     }
     format!("{}…", &joined[..cut])
+}
+
+/// Remove ANSI escape sequences, keeping every printable byte.
+///
+/// Handles the two forms a CLI actually emits: a CSI sequence (`ESC [` … final
+/// byte in `@`–`~`), which is what colour and cursor movement use, and a bare
+/// two-character escape. An `ESC` that begins a sequence with no terminator —
+/// truncated output, since the capture is bounded — consumes the rest rather
+/// than leaking a half-sequence.
+///
+/// Written here rather than taken as a dependency: it is a dozen lines, and the
+/// alternative is another crate in the trusted path of a secrets tool. The same
+/// reasoning as [`crate::store::proton::resolve_executable`].
+fn strip_ansi(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars();
+    while let Some(c) = chars.next() {
+        if c != '\x1b' {
+            out.push(c);
+            continue;
+        }
+        // A CSI sequence runs until a byte in `@`–`~`. Any other two-character
+        // escape drops both characters, which `chars.next()` has already done.
+        if chars.next() == Some('[') {
+            for c in chars.by_ref() {
+                if ('@'..='~').contains(&c) {
+                    break;
+                }
+            }
+        }
+    }
+    out
 }
 
 /// Strip the single trailing newline a line-oriented helper adds.
@@ -658,6 +702,37 @@ mod tests {
         // above could pass on a `first_line` that had quietly started reading
         // more, and the new function would be protecting nothing.
         assert!(!first_line(stderr).contains("NotAllowed"));
+    }
+
+    #[test]
+    fn a_summary_carries_no_terminal_escape_codes() {
+        // Measured 2026-08-08: `pass-cli` 2.2.5 colours its diagnostics even
+        // when stderr is a pipe, so this is what a dead session actually looks
+        // like from inside a capture. The summary is embedded in a longer
+        // sentence, printed mid-report by `doctor`, and stored in the audit log
+        // as JSON — none of which is terminal output.
+        let stderr = b"\x1b[2m2000-01-01T00:00:00Z\x1b[0m \x1b[31mERROR\x1b[0m no session\n\
+                       Error: This operation requires an authenticated client\n";
+        let summary = super::summarise(stderr);
+
+        assert!(
+            !summary.contains('\x1b'),
+            "an escape sequence survived: {summary:?}"
+        );
+        // Every printable byte is kept, including the parts that sat between
+        // two escapes. A strip that ate the words would be worse than one that
+        // ate nothing.
+        assert!(summary.contains("ERROR"), "{summary}");
+        assert!(summary.contains("2000-01-01T00:00:00Z"), "{summary}");
+        assert!(summary.contains("authenticated client"), "{summary}");
+
+        // The negative control: the raw bytes DO carry escapes, so the
+        // assertion above is testing the strip and not the fixture.
+        assert!(String::from_utf8_lossy(stderr).contains('\x1b'));
+
+        // A truncated sequence — the capture is bounded, so stderr can stop
+        // mid-escape — must not leak its tail either.
+        assert!(!super::summarise(b"live\x1b[3").contains('\x1b'));
     }
 
     #[test]
