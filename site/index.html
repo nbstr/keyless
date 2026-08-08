@@ -1,0 +1,1141 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>keyless — name a secret, never hold one</title>
+<meta name="description" content="A secrets broker for AI coding agents. The value reaches one child process and nothing else. There is no verb that prints it.">
+<style>
+/* ------------------------------------------------------------------ reset */
+*,*::before,*::after{box-sizing:border-box}
+html,body,h1,h2,h3,p,ul,ol,li,figure,pre,table{margin:0;padding:0}
+ul,ol{list-style:none}
+button{font:inherit;color:inherit;background:none;border:0;cursor:pointer}
+a{color:inherit;text-decoration:none}
+table{border-collapse:collapse;width:100%}
+img,svg{display:block;max-width:100%}
+
+/* -------------------------------------------------------------- variables */
+:root{
+  --bg:#090A0B;
+  --card:#0E0F10;
+  --cell-a:#070807;
+  --cell-b:#080908;
+  --well:#050505;
+  --text:#F6F7F9;
+  --hair:#23262A;
+  --panel:rgba(255,255,255,.09);
+  --green:#5FD39A;
+  --violet:#9D9BEA;
+  --btn:#1C1E21;
+  --code-bg:rgba(255,255,255,.06);
+  --sans:ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
+  --mono:ui-monospace,SFMono-Regular,Menlo,Monaco,"Liberation Mono",monospace;
+  --ease-reveal:cubic-bezier(.16,1,.3,1);
+  --ease-hover:cubic-bezier(.4,0,.2,1);
+  --ease-out:cubic-bezier(0,0,.2,1);
+}
+
+/* ------------------------------------------------------------------- base */
+body{
+  background:var(--bg);
+  color:var(--text);
+  font-family:var(--sans);
+  font-size:16px;
+  line-height:24px;
+  -webkit-font-smoothing:antialiased;
+  text-rendering:optimizeLegibility;
+}
+::selection{background:rgba(95,211,154,.22)}
+
+/* ------------------------------------------------------------ type system */
+h1{
+  font-size:clamp(2.5rem,min(7.6vw,9.2vh),6.5rem);
+  font-weight:600;line-height:.95;letter-spacing:-.03em;color:#fff;
+}
+h2{
+  font-size:clamp(2.7rem,5.4vw,5.2rem);
+  font-weight:600;line-height:.88;letter-spacing:-.055em;color:#fff;
+}
+h3{font-size:24.8px;font-weight:600;line-height:1;letter-spacing:-.035em;color:var(--text)}
+h3.compact{font-size:18.4px;line-height:23px;letter-spacing:-.03em}
+.dim{color:rgba(255,255,255,.55)}
+
+.mono{font-family:var(--mono)}
+.lbl{ /* the standard 11px label */
+  font-family:var(--mono);font-size:11px;line-height:14px;font-weight:500;
+  letter-spacing:.16em;text-transform:uppercase;color:rgba(255,255,255,.4);
+}
+.lbl-dim{color:rgba(255,255,255,.3)}
+.micro{
+  font-family:var(--mono);font-size:9px;line-height:14px;letter-spacing:.15em;
+  text-transform:uppercase;color:rgba(255,255,255,.35);
+}
+.eyebrow-txt{
+  font-family:var(--mono);font-size:10px;line-height:15px;letter-spacing:.20em;
+  text-transform:uppercase;color:rgba(255,255,255,.35);
+}
+.deck{font-size:16px;line-height:24px;color:rgba(255,255,255,.55)}
+code{
+  font-family:var(--mono);font-size:.875em;
+  background:var(--code-bg);border-radius:4px;padding:.12em .38em;
+  color:rgba(255,255,255,.8);
+}
+pre{
+  font-family:var(--mono);font-size:11px;line-height:1.75;letter-spacing:.22px;
+  background:transparent;color:rgba(255,255,255,.7);
+  overflow-x:auto;white-space:pre;
+}
+pre .c{color:rgba(255,255,255,.3)}
+pre .k{color:rgba(255,255,255,.95)}
+pre .g{color:var(--green)}
+.g{color:var(--green)}
+.v{color:var(--violet)}
+
+/* ----------------------------------------------------------------- layout */
+.col{max-width:1152px;margin:0 auto;padding:0 24px}
+/* Full-bleed escape. --sbw is the scrollbar width, measured in JS: 100vw
+   INCLUDES the scrollbar, so without subtracting it the slab is wider than the
+   visible area and the whole page scrolls sideways. */
+.slab{
+  position:relative;left:50%;
+  width:calc(100vw - var(--sbw,0px) - 3rem);
+  max-width:90rem;
+  transform:translateX(-50%);
+}
+@media(max-width:640px){.slab{width:calc(100vw - var(--sbw,0px) - 2rem)}}
+section.band{padding:112px 0}
+@media(min-width:640px){section.band{padding:160px 0}}
+.rule{border-top:1px solid var(--panel);padding-top:24px;margin-bottom:48px}
+@media(min-width:640px){.rule{padding-top:32px;margin-bottom:64px}}
+.eyebrow{display:flex;align-items:center;gap:12px}
+.eyebrow .idx{font-family:var(--mono);font-size:10px;letter-spacing:.20em;color:var(--green)}
+.eyebrow .dash{width:40px;height:1px;background:var(--green);flex:none}
+.head{
+  display:grid;grid-template-columns:minmax(0,1fr) minmax(240px,.42fr);
+  align-items:end;gap:32px;margin-top:32px;
+}
+@media(max-width:900px){.head{grid-template-columns:1fr;align-items:start;gap:20px}}
+.caveat{
+  margin-top:32px;font-family:var(--mono);font-size:9px;line-height:16px;
+  letter-spacing:.16em;text-transform:uppercase;color:rgba(255,255,255,.3);
+  max-width:70ch;
+}
+.caveat b{font-weight:500;color:rgba(255,255,255,.5)}
+
+/* the hairline grid: the wrapper's background IS every divider */
+.grid{
+  display:grid;gap:1px;background:var(--panel);
+  border:1px solid var(--panel);
+}
+.grid > *{background:var(--cell-a)}
+.grid > *:nth-child(even){background:var(--cell-b)}
+/* Column counts live in classes, never inline: an inline grid-template-columns
+   cannot be overridden by a media query, so a slab set inline stays multi-column
+   at 390px and its cells get clipped. */
+.g1{grid-template-columns:minmax(0,1fr)}
+.g2{grid-template-columns:repeat(2,minmax(0,1fr))}
+.g3{grid-template-columns:repeat(3,minmax(0,1fr))}
+.g4{grid-template-columns:repeat(4,minmax(0,1fr))}
+.g2w{grid-template-columns:minmax(0,1.3fr) minmax(0,1fr)}
+@media(max-width:1024px){
+  .g2,.g2w{grid-template-columns:minmax(0,1fr)}
+  .g3,.g4{grid-template-columns:repeat(2,minmax(0,1fr))}
+}
+@media(max-width:640px){
+  .g3,.g4{grid-template-columns:minmax(0,1fr)}
+}
+.pad{padding:24px}
+@media(min-width:640px){.pad{padding:28px 32px}}
+
+/* ------------------------------------------------------------------- nav */
+nav{
+  position:fixed;top:0;left:0;right:0;height:65px;z-index:50;
+  background:rgba(9,10,11,.85);backdrop-filter:blur(12px);
+  -webkit-backdrop-filter:blur(12px);
+  border-bottom:1px solid rgba(255,255,255,.08);
+}
+nav .inner{
+  max-width:1152px;margin:0 auto;padding:0 24px;height:100%;
+  display:flex;align-items:center;justify-content:space-between;gap:24px;
+}
+.wordmark{display:flex;align-items:baseline;gap:10px}
+.wordmark .name{font-size:16px;font-weight:600;letter-spacing:-.03em;color:#fff}
+nav ul{display:flex;align-items:center;gap:22px}
+nav a.navlink{transition:color .15s var(--ease-hover)}
+nav a.navlink:hover{color:rgba(255,255,255,.9)}
+.chip{
+  font-family:var(--mono);font-size:10px;letter-spacing:.16em;text-transform:uppercase;
+  color:rgba(255,255,255,.45);border:1px solid var(--hair);border-radius:8px;
+  padding:5px 9px;transition:color .15s var(--ease-hover),border-color .15s var(--ease-hover);
+}
+a.chip:hover{color:rgba(255,255,255,.85);border-color:rgba(255,255,255,.24)}
+@media(max-width:860px){nav ul{display:none}}
+
+/* ------------------------------------------------------------------ hero */
+header.hero{padding:140px 0 96px}
+@media(min-width:640px){header.hero{padding:180px 0 120px}}
+.hero-eyebrow{
+  font-family:var(--mono);font-size:14px;line-height:20px;font-weight:500;
+  letter-spacing:.30em;text-transform:uppercase;color:rgba(255,255,255,.45);
+}
+.hero h1{margin-top:28px;max-width:18ch}
+.hero .sub{
+  margin-top:24px;max-width:62ch;font-size:15px;line-height:1.5;
+  color:rgba(255,255,255,.5);
+}
+@media(min-width:640px){.hero .sub{font-size:16px}}
+.cta-row{margin-top:40px;display:flex;flex-wrap:wrap;align-items:center;gap:20px}
+.cta{
+  display:inline-flex;align-items:center;justify-content:center;gap:10px;
+  height:52px;width:400px;max-width:100%;border-radius:9999px;
+  background:var(--btn);border:1px solid var(--hair);color:#fff;
+  font-size:15px;font-weight:500;letter-spacing:-.01em;
+  transition:background .15s var(--ease-hover),border-color .15s var(--ease-hover);
+}
+.cta:hover{background:#24272B;border-color:rgba(255,255,255,.2)}
+.cta .arw{transition:transform .2s var(--ease-out)}
+.cta:hover .arw{transform:translateX(4px)}
+@media(max-width:640px){.cta{width:100%}}
+.cta-alt{
+  display:inline-flex;align-items:center;gap:8px;
+  font-family:var(--mono);font-size:11px;letter-spacing:.16em;text-transform:uppercase;
+  color:rgba(255,255,255,.45);transition:color .15s var(--ease-hover);
+}
+.cta-alt:hover{color:rgba(255,255,255,.85)}
+.cta-alt .arw{transition:transform .2s var(--ease-out)}
+.cta-alt:hover .arw{transform:translateX(4px)}
+
+.flow{margin-top:72px}
+.flow .row{
+  display:grid;grid-template-columns:150px minmax(0,1fr) 190px;
+  align-items:center;gap:20px;
+}
+@media(max-width:860px){
+  .flow .row{grid-template-columns:1fr;gap:8px;align-items:start}
+}
+.flow .row .what{font-family:var(--mono);font-size:12px;line-height:1.6;color:rgba(255,255,255,.8);word-break:break-word}
+.flow .verdict{text-align:right}
+@media(max-width:860px){.flow .verdict{text-align:left}}
+.legend{
+  display:grid;gap:1px;background:var(--panel);
+  grid-template-columns:repeat(5,minmax(0,1fr));
+}
+.legend > div{background:var(--well);padding:16px 20px}
+@media(max-width:860px){.legend{grid-template-columns:repeat(2,minmax(0,1fr))}}
+@media(max-width:480px){.legend{grid-template-columns:1fr}}
+.legend .val{margin-top:6px;font-family:var(--mono);font-size:12px;color:rgba(255,255,255,.7)}
+
+/* ------------------------------------------------------------------ stats */
+.stat .n{
+  font-size:clamp(2rem,4.4vw,3.4rem);font-weight:600;letter-spacing:-.04em;
+  line-height:1;color:#fff;
+}
+.stat .l{margin-top:14px;max-width:34ch}
+.rail{height:1px;background:rgba(255,255,255,.1);margin-top:14px;position:relative;overflow:hidden}
+.rail i{
+  display:block;height:1px;width:0;background:rgba(255,255,255,.45);
+  transition:width .7s var(--ease-out);
+}
+.shape-row{display:grid;grid-template-columns:minmax(0,1fr) 64px;gap:16px;align-items:baseline;padding:14px 0}
+.shape-row + .shape-row{border-top:1px solid rgba(255,255,255,.06)}
+.shape-row .num{font-family:var(--mono);font-size:13px;color:rgba(255,255,255,.8);text-align:right}
+
+/* ------------------------------------------------------------- instrument */
+.seg{display:flex;flex-wrap:wrap;gap:8px}
+.seg button{
+  font-family:var(--mono);font-size:11px;letter-spacing:.16em;text-transform:uppercase;
+  padding:9px 14px;border-radius:8px;border:1px solid var(--hair);
+  color:rgba(255,255,255,.4);background:transparent;
+  transition:color .15s var(--ease-hover),background-color .15s var(--ease-hover),border-color .15s var(--ease-hover);
+}
+.seg button:hover{color:rgba(255,255,255,.75)}
+.seg button[aria-pressed="true"]{background:#fff;color:#0A0B0C;border-color:#fff}
+.readout{display:grid;gap:1px;background:var(--panel)}
+.readout > div{
+  background:var(--well);padding:13px 20px;display:grid;
+  grid-template-columns:minmax(0,1fr) auto;gap:16px;align-items:baseline;
+}
+.readout .rv{font-family:var(--mono);font-size:12px;color:rgba(255,255,255,.8);text-align:right}
+.termbar{
+  display:flex;align-items:center;gap:10px;padding:12px 20px;
+  border-bottom:1px solid var(--panel);
+}
+.pip{width:6px;height:6px;border-radius:50%;background:var(--green);animation:blink 1s steps(1) infinite}
+@keyframes blink{50%{opacity:.25}}
+.cmd{padding:24px 20px;min-height:120px;display:flex;align-items:center}
+@media(min-width:640px){.cmd{padding:32px}}
+.cmd pre{font-size:12px;white-space:pre-wrap;word-break:break-word;line-height:1.85}
+
+/* -------------------------------------------------------------- enc table */
+.enc{width:100%;font-family:var(--mono);font-size:11px;line-height:1.6}
+.enc th{
+  text-align:left;font-weight:500;letter-spacing:.16em;text-transform:uppercase;
+  font-size:9px;color:rgba(255,255,255,.35);padding:0 12px 12px 0;white-space:nowrap;
+}
+.enc td{padding:7px 12px 7px 0;vertical-align:top;border-top:1px solid rgba(255,255,255,.06)}
+.enc td.i{color:rgba(255,255,255,.25);width:24px}
+.enc td.nm{color:rgba(255,255,255,.7);white-space:nowrap}
+.enc td.gl{color:rgba(255,255,255,.35);white-space:nowrap}
+.enc td.out{color:rgba(255,255,255,.85);word-break:break-all;min-width:200px}
+.enc tr.dup td.out{color:rgba(255,255,255,.25)}
+.enc tr.dup td.nm{color:rgba(255,255,255,.3)}
+.enc td.dupflag{color:rgba(255,255,255,.25);white-space:nowrap;text-align:right}
+.tbl-scroll{overflow-x:auto}
+
+/* ------------------------------------------------------------------ boxes */
+.box{border:1px solid rgba(255,255,255,.16);padding:24px}
+@media(min-width:640px){.box{padding:32px}}
+.box .big{font-size:20px;line-height:1.35;letter-spacing:-.02em;color:#fff;max-width:44ch}
+.verdict-list li{
+  display:grid;grid-template-columns:minmax(0,1fr) auto;gap:16px;align-items:baseline;
+  padding:14px 0;
+}
+.verdict-list li + li{border-top:1px solid rgba(255,255,255,.06)}
+.verdict-list .k{font-family:var(--mono);font-size:12px;color:rgba(255,255,255,.8)}
+/* a grid child with no min-width refuses to shrink below its content, which is
+   how a long code chip pushes a two-column row wider than the screen */
+.verdict-list li > *,.readout > div > *,.shape-row > *{min-width:0;overflow-wrap:anywhere}
+@media(max-width:640px){
+  .verdict-list li,.readout > div{grid-template-columns:minmax(0,1fr);gap:6px}
+  .verdict-list li .lbl,.readout .rv{text-align:left}
+  .flow .verdict{text-align:left}
+}
+.notes li{padding:16px 0;color:rgba(255,255,255,.7);font-size:15px;line-height:1.6}
+.notes li + li{border-top:1px solid rgba(255,255,255,.06)}
+.notes b{color:#fff;font-weight:600}
+
+/* ----------------------------------------------------------------- footer */
+footer{border-top:1px solid var(--panel);padding:64px 0 80px}
+footer .cols{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:32px;align-items:start}
+@media(max-width:640px){footer .cols{grid-template-columns:1fr}}
+
+/* ----------------------------------------------------------------- motion */
+/* Gated on .js: without scripting the reveal never resolves, and an ungated
+   rule would leave the whole page at opacity 0 — blank, with no way back. */
+.js .reveal{opacity:0;transform:translateY(14px);
+  transition:opacity .45s var(--ease-reveal),transform .45s var(--ease-reveal)}
+.js .reveal.in{opacity:1;transform:none}
+/* a .slab is centred BY a transform, so a reveal on the same element must
+   carry that centring through both states or the panel jumps off-axis */
+.js .slab.reveal{transform:translateX(-50%) translateY(14px)}
+.js .slab.reveal.in{transform:translateX(-50%)}
+.cascade{opacity:0;transform:translateY(14px);
+  animation:cascade .45s var(--ease-reveal) forwards}
+@keyframes cascade{to{opacity:1;transform:none}}
+@media(prefers-reduced-motion:reduce){
+  *,*::before,*::after{
+    animation-duration:.001ms!important;animation-iteration-count:1!important;
+    transition-duration:.001ms!important;scroll-behavior:auto!important}
+  .js .reveal{opacity:1;transform:none}
+  .js .slab.reveal,.js .slab.reveal.in{transform:translateX(-50%)}
+  .cascade{opacity:1;transform:none;animation:none}
+}
+html{scroll-behavior:smooth}
+@media(prefers-reduced-motion:reduce){html{scroll-behavior:auto}}
+</style>
+</head>
+<body>
+<script>document.documentElement.className += " js";</script>
+
+<nav>
+  <div class="inner">
+    <div class="wordmark">
+      <span class="name">keyless</span>
+      <span class="lbl" style="letter-spacing:.16em">secrets broker</span>
+    </div>
+    <ul class="lbl">
+      <li><a class="navlink" href="#measure">measurement</a></li>
+      <li><a class="navlink" href="#spellings">spellings</a></li>
+      <li><a class="navlink" href="#masking">masking</a></li>
+      <li><a class="navlink" href="#limits">limits</a></li>
+      <li><a class="navlink" href="#hooks">hooks</a></li>
+    </ul>
+    <a class="chip" href="#install">install</a>
+  </div>
+</nav>
+
+<!-- =============================================================== HERO -->
+<header class="hero">
+  <div class="col">
+    <p class="hero-eyebrow cascade" style="animation-delay:40ms">Secrets broker for coding agents</p>
+    <h1 class="cascade" style="animation-delay:80ms">Seven verbs. <span class="dim">Not one of them prints a secret.</span></h1>
+    <p class="sub cascade" style="animation-delay:140ms">
+      <code>keyless</code> puts a secret into one child process's environment and nowhere else — not stdout,
+      not scrollback, not the transcript. There is deliberately no verb that prints a value, and there never
+      will be. That absence is the whole product.
+    </p>
+    <div class="cta-row cascade" style="animation-delay:200ms">
+      <a class="cta" href="#install">Install it <span class="arw">&rarr;</span></a>
+      <a class="cta-alt" href="#limits">Read what it does not catch <span class="arw">&rarr;</span></a>
+    </div>
+
+    <div class="flow slab">
+      <div class="grid g1">
+        <div class="pad cascade" style="animation-delay:250ms">
+          <div class="row">
+            <span class="lbl">01 &nbsp;you type</span>
+            <span class="what">keyless run -s STRIPE_KEY -- sh -c 'curl -H "$STRIPE_KEY" https://api.example.com'</span>
+            <span class="lbl verdict">the name only</span>
+          </div>
+        </div>
+        <div class="pad cascade" style="animation-delay:400ms">
+          <div class="row">
+            <span class="lbl">02 &nbsp;keyless</span>
+            <span class="what">resolves STRIPE_KEY from the store and spawns the child with it in the environment</span>
+            <span class="lbl verdict">never printed</span>
+          </div>
+        </div>
+        <div class="pad cascade" style="animation-delay:550ms">
+          <div class="row">
+            <span class="lbl">03 &nbsp;the child</span>
+            <span class="what">curl reads $STRIPE_KEY from its own environment and sends the header</span>
+            <span class="lbl verdict" style="color:var(--green)">injected &check;</span>
+          </div>
+        </div>
+      </div>
+      <div class="legend cascade" style="animation-delay:1250ms;margin-top:1px">
+        <div><div class="micro">stdout</div><div class="val">nothing</div></div>
+        <div><div class="micro">scrollback</div><div class="val">nothing</div></div>
+        <div><div class="micro">shell history</div><div class="val">nothing</div></div>
+        <div><div class="micro">the transcript</div><div class="val">nothing</div></div>
+        <div><div class="micro">the child's environ</div><div class="val" style="color:rgba(255,255,255,.9)">the value</div></div>
+      </div>
+    </div>
+
+    <p class="caveat cascade" style="animation-delay:1350ms">
+      Two states, no third — <b>INJECTED</b> or <b>DEGRADED</b>. A partial injection does not exist.
+      <b>keyless get</b> is not a typo you can make; it does not exist.
+      MIT licensed &middot; Rust &middot; five direct dependencies &middot; 24 packages in the lock file.
+    </p>
+  </div>
+</header>
+
+<!-- ======================================================== 01 MEASUREMENT -->
+<section class="band" id="measure">
+  <div class="col">
+    <div class="rule reveal">
+      <div class="eyebrow"><span class="idx">01</span><span class="dash"></span><span class="eyebrow-txt">measure your own</span></div>
+      <div class="head">
+        <h2>Your number,<br>not ours.</h2>
+        <p class="deck">A credential reaches a command in four shapes. This page will not tell you how often
+          it happens on someone else's laptop — count it on yours.</p>
+      </div>
+    </div>
+
+    <div class="slab reveal">
+      <div class="grid g2">
+        <div class="pad">
+          <h3 class="compact">The four shapes</h3>
+          <p class="deck" style="margin-top:12px;font-size:15px">Each one puts the value itself on the command
+            line, where the shell, the history file and the transcript all record it.</p>
+          <ul class="verdict-list" style="margin-top:16px">
+            <li><span class="k">url-embedded</span><span class="lbl"><code>https://user:VALUE@host</code></span></li>
+            <li><span class="k">env assignment</span><span class="lbl"><code>export TOKEN=VALUE</code></span></li>
+            <li><span class="k">cli flag</span><span class="lbl"><code>--token VALUE</code></span></li>
+            <li><span class="k">http header</span><span class="lbl"><code>Authorization: Bearer VALUE</code></span></li>
+          </ul>
+          <p class="micro" style="margin-top:20px;line-height:16px">
+            all four are one primitive wide &mdash; spawn a child with the secret in its environment
+          </p>
+        </div>
+        <div class="pad">
+          <h3 class="compact">Count them in your own history</h3>
+          <p class="deck" style="margin-top:12px;font-size:15px">Standard tools, nothing installed.
+            <span style="color:rgba(255,255,255,.85)">Each line prints a count and never prints a matching
+            line</span> — the same rule the tool follows.</p>
+<pre style="margin-top:20px"><span class="c"># swap in ~/.bash_history, or any transcript directory</span>
+<span class="k">H=~/.zsh_history</span>
+
+grep -acE 'https?://[^ /]*:[^ /@]*@' <span class="k">"$H"</span>          <span class="c"># url</span>
+grep -acE '[A-Z_]{4,}=[^ ]{12,}' <span class="k">"$H"</span>              <span class="c"># env</span>
+grep -acE '\-\-(token|key|secret|password)[= ][^ -][^ ]*' <span class="k">"$H"</span>   <span class="c"># flag</span>
+grep -acE '[Aa]uthorization: *(Bearer|Basic) [^ "]+' <span class="k">"$H"</span>       <span class="c"># header</span></pre>
+          <p class="micro" style="margin-top:18px;line-height:16px">
+            four counts. that is your number, and it is the only one that should persuade you
+          </p>
+        </div>
+      </div>
+    </div>
+
+    <p class="caveat reveal">
+      <b>The counts are lines, not secrets</b> &mdash; a shape is checkable without anyone reading a value,
+      which is why this page counts shapes and never values. &nbsp;&middot;&nbsp; A correctly wrapped
+      <b>keyless run</b> matches none of the four, so the recipe does not count the fix as the problem.
+      &nbsp;&middot;&nbsp; The CLI-flag shape is the documented reason <b>keyless put has no --value flag</b>.
+    </p>
+  </div>
+</section>
+
+<!-- ========================================================= 02 SPELLINGS -->
+<section class="band" id="spellings">
+  <div class="col">
+    <div class="rule reveal">
+      <div class="eyebrow"><span class="idx">02</span><span class="dash"></span><span class="eyebrow-txt">where a secret goes</span></div>
+      <div class="head">
+        <h2>Four spellings.<br>One works.</h2>
+        <p class="deck">The instrument is driven by the command, not by a secret. Nothing here asks you to
+          paste a credential — asking is the offence, whatever the client-side code does.</p>
+      </div>
+    </div>
+
+    <div class="slab reveal">
+      <div class="grid g2w" id="spellGrid">
+        <div>
+          <div class="termbar">
+            <span class="pip" id="pip"></span>
+            <span class="lbl" id="spellState">correct</span>
+            <span style="flex:1"></span>
+            <span class="micro">what the child actually receives</span>
+          </div>
+          <div style="padding:20px 20px 0">
+            <div class="seg" role="group" aria-label="command spelling">
+              <button type="button" data-spell="0" aria-pressed="false">no keyless</button>
+              <button type="button" data-spell="1" aria-pressed="false">naive</button>
+              <button type="button" data-spell="2" aria-pressed="false">quoted</button>
+              <button type="button" data-spell="3" aria-pressed="true">correct</button>
+            </div>
+          </div>
+          <div class="cmd"><pre id="spellCmd"></pre></div>
+          <div style="padding:0 20px 24px">
+            <p class="micro" id="spellNote" style="line-height:17px;max-width:64ch"></p>
+          </div>
+        </div>
+        <div style="background:var(--cell-b)">
+          <div class="readout" id="spellReadout"></div>
+        </div>
+      </div>
+    </div>
+
+    <p class="caveat reveal">
+      <b>The exit code is 0 in all four rows.</b> keyless never refuses: an unresolvable name warns on stderr,
+      runs the child with an untouched environment, and forwards its exit code. A missing credential is a 401
+      at exit 0 — read the DEGRADED banner, because the exit code cannot tell you.
+    </p>
+
+    <div class="slab reveal" style="margin-top:48px">
+      <div class="box">
+        <p class="big">Two of these four spellings inject correctly and still send nothing useful.</p>
+        <p class="deck" style="margin-top:16px;max-width:72ch">
+          The calling shell expands <code>"$TOKEN"</code> before <code>keyless</code> is ever executed, and
+          <code>keyless</code> does not expand its own arguments. Neither fault is visible to the broker —
+          by the time it runs, the argument is already empty or already literal. Single-quote the body and
+          keep it inside <code>sh -c</code>, and the rule holds for every command you will ever wrap.
+        </p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- =========================================================== 03 MASKING -->
+<section class="band" id="masking">
+  <div class="col">
+    <div class="rule reveal">
+      <div class="eyebrow"><span class="idx">03</span><span class="dash"></span><span class="eyebrow-txt">twenty encodings</span></div>
+      <div class="head">
+        <h2>Twenty shapes.<br>Ten needles.</h2>
+        <p class="deck">The masker generates twenty encodings of a secret, in a fixed order, and deduplicates.
+          For a plain alphanumeric value, half of them are the same string.</p>
+      </div>
+    </div>
+
+    <div class="slab reveal">
+      <div class="grid g1">
+        <div style="padding:20px 24px;display:flex;flex-wrap:wrap;gap:20px;align-items:center">
+          <div class="seg" role="group" aria-label="demo value">
+            <button type="button" data-val="0" aria-pressed="true">plain value</button>
+            <button type="button" data-val="1" aria-pressed="false">awkward value</button>
+          </div>
+          <div style="flex:1;min-width:220px">
+            <div class="micro">the value being masked</div>
+            <div class="mono" id="encValue" style="font-size:13px;color:rgba(255,255,255,.85);margin-top:6px;word-break:break-all"></div>
+          </div>
+          <div style="text-align:right">
+            <div class="micro">distinct needles</div>
+            <div class="mono" id="encCount" style="font-size:22px;letter-spacing:-.02em;margin-top:4px"></div>
+          </div>
+        </div>
+        <div style="padding:24px;overflow:hidden">
+          <div class="tbl-scroll">
+            <table class="enc">
+              <thead><tr><th></th><th>encoder</th><th>reads as</th><th>rendered</th><th></th></tr></thead>
+              <tbody id="encBody"></tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <p class="caveat reveal">
+      Rendered in your browser, by the same twenty encoders in the same order. <b>The repo's test table is an
+      independent oracle</b> — its literals are generated by Python's standard library, not by the code under
+      test. &nbsp;&middot;&nbsp; Split at every byte is still caught: the masker holds back bytes that could
+      <b>begin</b> a needle and releases them the instant they cannot. Observed live against <b>fold -w1</b>.
+      It is a prefix withhold, content-aware — not a suffix carry.
+    </p>
+  </div>
+</section>
+
+<!-- ============================================================ 04 LIMITS -->
+<section class="band" id="limits">
+  <div class="col">
+    <div class="rule reveal">
+      <div class="eyebrow"><span class="idx">04</span><span class="dash"></span><span class="eyebrow-txt">what it does not catch</span></div>
+      <div class="head">
+        <h2>A filter,<br>not a control.</h2>
+        <p class="deck">Three tokens defeat it: <code>sh -c 'echo $TOKEN &gt; /tmp/x'</code>. By design. The
+          threat model is a capable agent taking a shortcut, not an adversary.</p>
+      </div>
+    </div>
+
+    <div class="slab reveal">
+      <div class="grid g2">
+        <div class="pad">
+          <h3 class="compact">Six shapes, driven at the real binary</h3>
+          <ul class="verdict-list" style="margin-top:16px">
+            <li><span class="k">the raw value, echoed</span><span class="lbl" style="color:var(--green)">masked</span></li>
+            <li><span class="k">contiguous hex</span><span class="lbl" style="color:var(--green)">masked</span></li>
+            <li><span class="k">one byte per write &mdash; <code>fold -w1</code></span><span class="lbl" style="color:var(--green)">masked</span></li>
+            <li><span class="k">gzip</span><span class="lbl">not caught</span></li>
+            <li><span class="k"><code>xxd -p</code> wrapped at 60 columns</span><span class="lbl">not caught</span></li>
+            <li><span class="k">HTTP Basic &mdash; <code>user:pass</code> base64'd together</span><span class="lbl" style="color:rgba(255,255,255,.45)">length-dependent</span></li>
+          </ul>
+        </div>
+        <div class="pad">
+          <h3 class="compact">The Basic-auth limit, measured</h3>
+          <p class="deck" style="margin-top:12px;font-size:15px">The username is folded into the same base64
+            block, so whether the secret survives as a recognisable needle depends on how the bytes align.</p>
+          <ul class="verdict-list" style="margin-top:12px">
+            <li><span class="k">username <code>ab:</code> &mdash; 3 bytes</span><span class="lbl" style="color:var(--green)">caught</span></li>
+            <li><span class="k">username <code>abcde:</code> &mdash; 6 bytes</span><span class="lbl" style="color:var(--green)">caught</span></li>
+            <li><span class="k">username <code>apiuser:</code> &mdash; 8 bytes</span><span class="lbl">prints in the clear</span></li>
+          </ul>
+          <p class="micro" style="margin-top:18px;line-height:16px">one username length in three, proven &mdash;
+            <span style="color:rgba(255,255,255,.6)">not estimated</span></p>
+        </div>
+      </div>
+    </div>
+
+    <div class="slab reveal" style="margin-top:48px">
+      <div class="box">
+        <div class="lbl" style="color:rgba(255,255,255,.45);margin-bottom:16px">the number that hurts</div>
+        <p class="big"><code style="font-size:1em">keyless run</code> never refuses.</p>
+        <p class="deck" style="margin-top:14px;max-width:72ch">
+          An unresolvable name warns on stderr, runs the child with an untouched environment, and forwards the
+          child's exit code. <span style="color:rgba(255,255,255,.85)">So a missing credential is a 401 at exit
+          0.</span> Nothing in the exit status distinguishes a working secret from a missing one; only the
+          <span class="v">DEGRADED</span> banner does.
+        </p>
+      </div>
+    </div>
+
+    <div class="slab reveal" style="margin-top:48px">
+      <div class="grid g1">
+        <div class="pad">
+          <ul class="notes">
+            <li><b>The child gets the real value.</b> It can write it to a file, POST it anywhere, or print it.
+              Masking filters what comes back out through the pipe; it does not constrain the process.</li>
+            <li><b>Nothing here survives <code>sudo</code>.</b> If you are an admin on your own machine, this is
+              a boundary against your sessions — not against you.</li>
+            <li><b>One part is a control, not a habit.</b> The daemon's store is owned by a uid you are not:
+              <code>secrets.json</code> at mode <code>0600</code>, user <code>_keyless</code>. The install asks
+              for <code>sudo</code> exactly once, to create that user, and nothing afterwards does. The audit log
+              is readable by you and not writable by you, and each row is hashed as
+              <code>sha256(previous || row)</code>.</li>
+            <li><b>15 tests are <code>#[ignore]</code>d and never run in CI</b> — the entire live Proton Pass
+              suite, which needs a real account. CI asserts <code>ignored == 15</code> precisely so that stays
+              visible rather than quietly drifting.</li>
+            <li><b>macOS only for the daemon.</b> CI runs the Linux link and <em style="font-style:normal;color:#fff">requires it to fail</em>,
+              on exactly four named XNU symbols. Linux is unshipped because it is untested, and the build says so
+              out loud.</li>
+            <li><b>There is no "leaks prevented" counter on this page, and there never will be.</b> A security
+              product's success is a non-event. <code>keyless</code> cannot show you the leak that did not
+              happen, and a number nobody can audit is exactly the wrong thing to put on this page.</li>
+          </ul>
+        </div>
+      </div>
+    </div>
+
+    <p class="caveat reveal">
+      Every verdict above was driven at the real binary, not read from a document.
+      &nbsp;&middot;&nbsp; <b>Three of five masking limits carry a test.</b> The other two do not, and this page
+      will not claim otherwise.
+    </p>
+  </div>
+</section>
+
+<!-- ============================================================= 05 HOOKS -->
+<section class="band" id="hooks">
+  <div class="col">
+    <div class="rule reveal">
+      <div class="eyebrow"><span class="idx">05</span><span class="dash"></span><span class="eyebrow-txt">the hook pack</span></div>
+      <div class="head">
+        <h2>68 blocked.<br>3 get through.</h2>
+        <p class="deck">A Python hook pack rides alongside the binary and guards the paths an agent actually
+          takes. The three that get through are published in the repo, so the list cannot go stale.</p>
+      </div>
+    </div>
+
+    <div class="slab reveal">
+      <div class="grid g2">
+        <div class="pad stat" style="display:flex;flex-direction:column;justify-content:space-between;gap:24px">
+          <div>
+            <div class="n"><span class="g">68</span> <span style="color:rgba(255,255,255,.25)">/ 71</span></div>
+            <div class="lbl l">attacks driven at the pack &mdash; 68 blocked, <span class="v">3 get through</span></div>
+          </div>
+          <div class="rail" style="height:2px"><i data-fill="96" style="height:2px;background:var(--green)"></i></div>
+        </div>
+        <div class="pad stat">
+          <div class="n">~ +6 ms</div>
+          <div class="lbl l">added per tool call &mdash; stated as about, never to one decimal</div>
+        </div>
+      </div>
+      <div class="grid g4" style="border-top:0">
+        <div class="pad"><div class="mono" style="font-size:22px;letter-spacing:-.02em">6</div><div class="lbl l" style="margin-top:10px">checks</div></div>
+        <div class="pad"><div class="mono" style="font-size:22px;letter-spacing:-.02em">16 / 36</div><div class="lbl l" style="margin-top:10px">vault CLIs, verb rows</div></div>
+        <div class="pad"><div class="mono" style="font-size:22px;letter-spacing:-.02em">20 + 4</div><div class="lbl l" style="margin-top:10px">vendor patterns, generic shapes</div></div>
+        <div class="pad"><div class="mono" style="font-size:22px;letter-spacing:-.02em">22</div><div class="lbl l" style="margin-top:10px">protected paths</div></div>
+      </div>
+    </div>
+
+    <p class="caveat reveal">
+      The pack also rewrites a credential-shaped literal into a <b>${NAME}</b> reference before a file write
+      reaches disk. It fired during the build of this page: of four literals in a probe write, <b>three were
+      rewritten</b> &mdash; a GitHub token, an AWS key id, a Slack token &mdash; and the fourth, the invented
+      demo value used above, matched nothing and was left alone. The pack replaces what it recognises and
+      names the shapes it matched. It does not guess.
+    </p>
+  </div>
+</section>
+
+<!-- =========================================================== 06 INSTALL -->
+<section class="band" id="install">
+  <div class="col">
+    <div class="rule reveal">
+      <div class="eyebrow"><span class="idx">06</span><span class="dash"></span><span class="eyebrow-txt">install &amp; proof</span></div>
+      <div class="head">
+        <h2>Dry-run<br>by default.</h2>
+        <p class="deck">The installer prints every command it would run, in order, and changes nothing.
+          <code>--commit</code> is the only thing that makes it act.</p>
+      </div>
+    </div>
+
+    <div class="slab reveal">
+      <div class="grid g2">
+        <div class="pad">
+          <div class="lbl" style="margin-bottom:16px">three lines</div>
+<pre style="font-size:12px"><span class="k">cargo build --release</span>            <span class="c"># the installer copies from target/release</span>
+<span class="k">./install/install.sh</span>             <span class="c"># prints the plan, changes nothing</span>
+<span class="k">sudo ./install/install.sh --commit</span></pre>
+          <p class="deck" style="margin-top:20px;font-size:15px">
+            It needs <code>sudo</code> exactly once, to create a user. Nothing afterwards does.
+            <code>uninstall.sh</code> reverses all of it — the launchd job, the files, and the account —
+            and is dry-run too.
+          </p>
+          <p class="micro" style="margin-top:20px;line-height:16px">
+            MIT licensed &middot; the repository is private today, so there is no clone line to copy yet
+          </p>
+        </div>
+        <div class="pad">
+          <div class="lbl" style="margin-bottom:16px">the seven verbs</div>
+          <p class="mono" style="font-size:13px;color:rgba(255,255,255,.85);line-height:2">
+            run &middot; ls &middot; items &middot; fields &middot; new &middot; put &middot; doctor
+          </p>
+          <div style="border-top:1px solid rgba(255,255,255,.08);margin:20px 0"></div>
+          <div class="lbl" style="margin-bottom:12px">and the two that do not exist</div>
+<pre style="font-size:11px"><span class="c">$</span> <span class="k">keyless get FOO</span>
+error: unrecognized subcommand 'get'
+
+<span class="c">$</span> <span class="k">keyless put FOO --value hunter2</span>
+error: unexpected argument '--value' found</pre>
+          <p class="micro" style="margin-top:16px;line-height:16px">both observed live &mdash; the absence is the design</p>
+        </div>
+      </div>
+      <div class="grid g3" style="border-top:0">
+        <div class="pad"><div class="mono" style="font-size:20px">24</div><div class="lbl l" style="margin-top:10px">packages in the lock file</div></div>
+        <div class="pad"><div class="mono" style="font-size:20px">433</div><div class="lbl l" style="margin-top:10px">tests, 0 failed, 15 ignored</div></div>
+        <div class="pad"><div class="mono" style="font-size:20px">0</div><div class="lbl l" style="margin-top:10px">values printed, ever</div></div>
+      </div>
+    </div>
+
+    <div class="slab reveal" style="margin-top:48px">
+      <div class="grid g1">
+        <div class="pad">
+          <div class="lbl" style="margin-bottom:8px">observed, not quoted</div>
+          <ul class="verdict-list">
+            <li><span class="k">cargo test</span><span class="lbl" style="color:var(--green)">exit 0 &mdash; 433 passed, 0 failed, 15 ignored</span></li>
+            <li><span class="k">cargo fmt --check</span><span class="lbl" style="color:var(--green)">exit 0 &mdash; zero bytes out</span></li>
+            <li><span class="k">python3 hooks/tests/run.py</span><span class="lbl" style="color:var(--green)">517 checks, all green</span></li>
+            <li><span class="k">python3 hooks/tests/mutate.py</span><span class="lbl" style="color:var(--green)">33 / 33 mutations caught</span></li>
+            <li><span class="k">CI at this sha</span><span class="lbl" style="color:var(--green)">6 jobs, 1m29s, clippy -D warnings on both runners</span></li>
+          </ul>
+        </div>
+      </div>
+    </div>
+
+    <p class="caveat reveal">
+      The README says 415 tests. <b>The real count is 433</b> &mdash; this page counts the suite, not the
+      document. There is no telemetry, and a test scans the binary for endpoint strings to keep it that way.
+    </p>
+  </div>
+</section>
+
+<footer>
+  <div class="col">
+    <div class="cols">
+      <div>
+        <div class="wordmark"><span class="name">keyless</span><span class="lbl" style="letter-spacing:.16em">use a secret without holding one</span></div>
+        <p class="deck" style="margin-top:16px;max-width:56ch;font-size:15px">
+          Name it, and it reaches the child process and nothing else. Rust, MIT, macOS.
+        </p>
+      </div>
+      <ul class="lbl" style="display:grid;gap:10px;text-align:right">
+        <li><a class="navlink" href="#measure">the measurement</a></li>
+        <li><a class="navlink" href="#spellings">the three spellings</a></li>
+        <li><a class="navlink" href="#masking">twenty encodings</a></li>
+        <li><a class="navlink" href="#limits">what it does not catch</a></li>
+        <li><a class="navlink" href="#install">install</a></li>
+      </ul>
+    </div>
+    <p class="micro" style="margin-top:48px;line-height:16px;max-width:78ch">
+      Every number on this page has an artifact behind it in the repository. The ones that did not are not
+      here.
+    </p>
+  </div>
+</footer>
+
+<script>
+(function(){
+"use strict";
+
+/* 100vw includes the scrollbar; the layout must not. Measure it and expose it,
+   or every full-bleed slab is wider than the visible area and the page scrolls
+   sideways at exactly the scrollbar's width. */
+function measureScrollbar(){
+  var sbw = window.innerWidth - document.documentElement.clientWidth;
+  document.documentElement.style.setProperty("--sbw", (sbw > 0 ? sbw : 0) + "px");
+}
+measureScrollbar();
+window.addEventListener("resize", measureScrollbar);
+window.addEventListener("load", measureScrollbar);
+
+/* ------------------------------------------------------------------ reveal */
+var reduce = window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+
+function fillRails(root){
+  var rails = root.querySelectorAll(".rail i[data-fill]");
+  for (var i=0;i<rails.length;i++){
+    (function(el){
+      var w = el.getAttribute("data-fill") + "%";
+      if (reduce) { el.style.width = w; }
+      else { window.requestAnimationFrame(function(){ el.style.width = w; }); }
+    })(rails[i]);
+  }
+}
+
+var targets = document.querySelectorAll(".reveal");
+if (reduce || !("IntersectionObserver" in window)) {
+  for (var i=0;i<targets.length;i++) targets[i].classList.add("in");
+  fillRails(document);
+} else {
+  var io = new IntersectionObserver(function(entries){
+    entries.forEach(function(e){
+      if (!e.isIntersecting) return;
+      e.target.classList.add("in");
+      fillRails(e.target);
+      io.unobserve(e.target);
+    });
+  }, {rootMargin:"0px 0px -12% 0px", threshold:0.08});
+  for (var j=0;j<targets.length;j++) io.observe(targets[j]);
+}
+
+/* Segmented control state.
+   The CSS rule on [aria-pressed="true"] is the no-JS fallback; the active look is
+   ALSO written inline here so the rendered state never depends on a selector
+   re-match, and so it can be asserted directly from the element. */
+function setSegment(buttons, activeIndex){
+  for (var i=0;i<buttons.length;i++){
+    var on = (i === activeIndex);
+    buttons[i].setAttribute("aria-pressed", on ? "true" : "false");
+    buttons[i].style.background  = on ? "#ffffff" : "transparent";
+    buttons[i].style.color       = on ? "#0A0B0C" : "rgba(255,255,255,.4)";
+    buttons[i].style.borderColor = on ? "#ffffff" : "#23262A";
+  }
+}
+
+/* ------------------------------------------------- instrument 1: spellings */
+/* An invented value, not a real credential shape. Verified against the keyless
+   hook pack during this build: it matches none of the 20 vendor patterns, so it
+   survives a file write unrewritten. Every table below is computed from it. */
+var DEMO = "sk-live-4f2a9c1d";
+
+var SPELLINGS = [
+  {
+    id:"no keyless",
+    state:"unbrokered",
+    cmd:[
+      {c:"# the shell holds the value, and so does everything downstream"},
+      {k:'export TOKEN=' + DEMO},
+      {k:'curl -H "Authorization: Bearer $TOKEN" https://api.example.com'}
+    ],
+    note:"The value is now a string in your shell. Every process you start inherits it, and every surface that recorded the command recorded the secret.",
+    rows:[
+      ["the argument carries","the value"],
+      ["in scrollback","the value"],
+      ["in shell history","the value"],
+      ["in the transcript","the value"],
+      ["in the child environ","the value"],
+      ["exit code","0"],
+      ["exposed in","4 places"],
+      ["basis","how a shell works"]
+    ],
+    verdict:["verdict","leaks"], verdictTone:"plain"
+  },
+  {
+    id:"naive",
+    state:"injected",
+    cmd:[
+      {c:"# the CALLING shell expands $TOKEN before keyless is executed"},
+      {k:'keyless run -s TOKEN -- curl -H "$TOKEN" https://api.example.com'}
+    ],
+    note:"TOKEN is unset in your shell, so the argument arrives empty. keyless injected correctly and cannot see that the argument was already destroyed.",
+    rows:[
+      ["the argument carries","(empty)"],
+      ["in scrollback","nothing"],
+      ["in shell history","nothing"],
+      ["in the transcript","nothing"],
+      ["in the child environ","the value"],
+      ["exit code","0"],
+      ["exposed in","1 place"],
+      ["basis","documented behaviour"]
+    ],
+    verdict:["verdict","silently empty"], verdictTone:"plain"
+  },
+  {
+    id:"quoted",
+    state:"injected",
+    cmd:[
+      {c:"# single quotes survive the shell, and keyless does not expand arguments"},
+      {k:"keyless run -s TOKEN -- curl -H '$TOKEN' https://api.example.com"}
+    ],
+    note:"The argument reaches curl as the seven literal characters $TOKEN. keyless passes arguments through untouched — expanding them would be a second place a value could appear.",
+    rows:[
+      ["the argument carries","the literal $TOKEN"],
+      ["in scrollback","nothing"],
+      ["in shell history","nothing"],
+      ["in the transcript","nothing"],
+      ["in the child environ","the value"],
+      ["exit code","0"],
+      ["exposed in","1 place"],
+      ["basis","documented behaviour"]
+    ],
+    verdict:["verdict","silently literal"], verdictTone:"plain"
+  },
+  {
+    id:"correct",
+    state:"injected",
+    cmd:[
+      {c:"# single-quote the body, and keep it inside sh -c"},
+      {k:'keyless run -s TOKEN -- sh -c \'curl -H "$TOKEN" https://api.example.com\''}
+    ],
+    note:"Only the INNER shell expands, and it expands from the environment keyless just handed it. This is the one spelling where the value reaches the request.",
+    rows:[
+      ["the argument carries","the value"],
+      ["in scrollback","nothing"],
+      ["in shell history","nothing"],
+      ["in the transcript","nothing"],
+      ["in the child environ","the value"],
+      ["exit code","0"],
+      ["exposed in","1 place"],
+      ["basis","documented behaviour"]
+    ],
+    verdict:["verdict","correct"], verdictTone:"green"
+  }
+];
+
+var spellCmd = document.getElementById("spellCmd");
+var spellReadout = document.getElementById("spellReadout");
+var spellNote = document.getElementById("spellNote");
+var spellState = document.getElementById("spellState");
+var pip = document.getElementById("pip");
+var spellButtons = document.querySelectorAll("[data-spell]");
+
+function renderSpelling(n){
+  var s = SPELLINGS[n];
+
+  spellCmd.textContent = "";
+  s.cmd.forEach(function(line, idx){
+    var span = document.createElement("span");
+    span.className = line.c ? "c" : "k";
+    span.textContent = (line.c || line.k);
+    spellCmd.appendChild(span);
+    if (idx < s.cmd.length - 1) spellCmd.appendChild(document.createTextNode("\n"));
+  });
+
+  spellReadout.textContent = "";
+  s.rows.concat([s.verdict]).forEach(function(r, idx){
+    var row = document.createElement("div");
+    var k = document.createElement("span");
+    k.className = "lbl"; k.textContent = r[0];
+    var v = document.createElement("span");
+    v.className = "rv"; v.textContent = r[1];
+    var last = (idx === s.rows.length);
+    if (last){
+      v.className = "lbl";
+      v.style.letterSpacing = ".16em";
+      v.style.color = (s.verdictTone === "green") ? "#5FD39A" : "rgba(255,255,255,.8)";
+    }
+    if (r[0] === "exit code" || r[0] === "exposed in") v.style.color = "rgba(255,255,255,.95)";
+    row.appendChild(k); row.appendChild(v);
+    spellReadout.appendChild(row);
+  });
+
+  spellNote.textContent = s.note;
+  spellState.textContent = s.state;
+  spellState.style.color = (s.state === "injected") ? "#5FD39A" : "rgba(255,255,255,.4)";
+  pip.style.background = (s.state === "injected") ? "#5FD39A" : "rgba(255,255,255,.35)";
+
+  setSegment(spellButtons, n);
+}
+for (var b=0;b<spellButtons.length;b++){
+  spellButtons[b].addEventListener("click", function(){
+    renderSpelling(Number(this.getAttribute("data-spell")));
+  });
+}
+renderSpelling(3);
+
+/* --------------------------------------------- instrument 2: 20 encodings */
+var B32A = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+
+function utf8(s){
+  var out = [], i, c;
+  for (i=0;i<s.length;i++){
+    c = s.codePointAt(i);
+    if (c > 0xFFFF) i++;
+    if (c < 0x80) out.push(c);
+    else if (c < 0x800){ out.push(0xC0|(c>>6), 0x80|(c&63)); }
+    else if (c < 0x10000){ out.push(0xE0|(c>>12), 0x80|((c>>6)&63), 0x80|(c&63)); }
+    else { out.push(0xF0|(c>>18), 0x80|((c>>12)&63), 0x80|((c>>6)&63), 0x80|(c&63)); }
+  }
+  return out;
+}
+function b64(bytes){
+  var bin = "";
+  for (var i=0;i<bytes.length;i++) bin += String.fromCharCode(bytes[i]);
+  return btoa(bin);
+}
+function b32(bytes){
+  var out = "", bits = 0, val = 0, i;
+  for (i=0;i<bytes.length;i++){
+    val = (val << 8) | bytes[i]; bits += 8;
+    while (bits >= 5){ out += B32A[(val >>> (bits-5)) & 31]; bits -= 5; }
+  }
+  if (bits > 0) out += B32A[(val << (5-bits)) & 31];
+  while (out.length % 8 !== 0) out += "=";
+  return out;
+}
+function hex(bytes){
+  var out = "";
+  for (var i=0;i<bytes.length;i++) out += (bytes[i] < 16 ? "0" : "") + bytes[i].toString(16);
+  return out;
+}
+function jsonBody(v){ return JSON.stringify(v).slice(1,-1); }
+function jsonAscii(v){
+  return jsonBody(v).replace(/[\u0080-\uFFFF]/g, function(ch){
+    return "\\u" + ("000" + ch.charCodeAt(0).toString(16)).slice(-4);
+  });
+}
+
+function variants(v){
+  var by = utf8(v);
+  var s = b64(by);
+  var u = s.replace(/\+/g,"-").replace(/\//g,"_");
+  var t = b32(by);
+  var h = hex(by);
+  var p = encodeURIComponent(v);
+  var strict = p.replace(/[!'()*]/g, function(c){
+    return "%" + c.charCodeAt(0).toString(16).toUpperCase();
+  });
+  var jm = jsonBody(v);
+  return [
+    ["raw",              "as stored",           v],
+    ["lowercase",        "case-folded",         v.toLowerCase()],
+    ["uppercase",        "case-folded",         v.toUpperCase()],
+    ["base64-std",       "the usual base64",    s],
+    ["base64-std-nopad", "Go writes this",      s.replace(/=+$/,"")],
+    ["base64-url",       "url-safe alphabet",   u],
+    ["base64-url-nopad", "a JWT segment",       u.replace(/=+$/,"")],
+    ["base32",           "a TOTP seed",         t],
+    ["base32-nopad",     "unpadded base32",     t.replace(/=+$/,"")],
+    ["hex-lower",        "hexdump",             h],
+    ["hex-upper",        "hexdump, shouting",   h.toUpperCase()],
+    ["hex-0x-lower",     "a literal in code",   "0x"+h],
+    ["hex-0x-upper",     "a literal in code",   "0x"+h.toUpperCase()],
+    ["url-query",        "space becomes +",     p.replace(/%20/g,"+")],
+    ["url-path",         "space becomes %20",   p],
+    ["url-strict",       "RFC 3986",            strict],
+    ["json-minimal",     "JSON.stringify",      jm],
+    ["json-html",        "Go escapes & < >",    jm.replace(/&/g,"\\u0026").replace(/</g,"\\u003c").replace(/>/g,"\\u003e")],
+    ["json-slash",       "PHP escapes /",       jm.replace(/\//g,"\\/")],
+    ["json-ascii-only",  "Python escapes é",    jsonAscii(v)]
+  ];
+}
+
+var VALUES = [DEMO, "Kx7 <a&b>\"/c!D\u00e99zQ"];
+var encBody  = document.getElementById("encBody");
+var encValue = document.getElementById("encValue");
+var encCount = document.getElementById("encCount");
+var valButtons = document.querySelectorAll("[data-val]");
+
+function renderEnc(n){
+  var v = VALUES[n];
+  var rows = variants(v);
+  var seen = {}, distinct = 0;
+
+  encBody.textContent = "";
+  rows.forEach(function(r, i){
+    var first = !Object.prototype.hasOwnProperty.call(seen, r[2]);
+    if (first){ seen[r[2]] = r[0]; distinct++; }
+
+    var tr = document.createElement("tr");
+    if (!first) tr.className = "dup";
+
+    var cells = [
+      ["i",  String(i+1).padStart(2,"0")],
+      ["nm", r[0]],
+      ["gl", r[1]],
+      ["out", r[2]],
+      ["dupflag", first ? "" : "= " + seen[r[2]]]
+    ];
+    cells.forEach(function(c){
+      var td = document.createElement("td");
+      td.className = c[0];
+      td.textContent = c[1];
+      tr.appendChild(td);
+    });
+    encBody.appendChild(tr);
+  });
+
+  encValue.textContent = v;
+  encCount.textContent = "";
+  var strong = document.createElement("span");
+  strong.textContent = String(distinct);
+  strong.style.color = "#fff";
+  var rest = document.createElement("span");
+  rest.textContent = " / 20";
+  rest.style.color = "rgba(255,255,255,.25)";
+  encCount.appendChild(strong); encCount.appendChild(rest);
+
+  setSegment(valButtons, n);
+}
+for (var c2=0;c2<valButtons.length;c2++){
+  valButtons[c2].addEventListener("click", function(){
+    renderEnc(Number(this.getAttribute("data-val")));
+  });
+}
+renderEnc(0);
+
+})();
+</script>
+</body>
+</html>
