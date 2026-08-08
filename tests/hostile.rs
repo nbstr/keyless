@@ -209,11 +209,23 @@ fn a_keychain_binary_that_never_answers_still_spawns_the_child() {
 }
 
 #[test]
-fn a_keychain_binary_that_streams_forever_is_killed_at_the_deadline() {
+fn a_keychain_binary_that_streams_forever_is_bounded_in_memory_not_just_in_time() {
     // The same absent deadline, in its expensive form: a `security` that copies
     // `/dev/zero` to its stdout reached 2.7 GB resident in 12 s and was still
     // climbing at 40 s. `Command::output` reads to end of stream, and there is
-    // no end. The deadline is what bounds it.
+    // no end.
+    //
+    // **A deadline alone does not fix this, and the first version of this test
+    // proved it.** With the read still unbounded, a 500 ms deadline against
+    // `dd if=/dev/zero` allocated and scrubbed enough that this test
+    // intermittently blew past a THIRTY-SECOND wall clock on a loaded machine —
+    // a green suite that failed once in several runs, for the exact defect it
+    // was written to close. How long a flood runs and how much arrives in that
+    // time are two different bounds, and only the second one is about memory.
+    //
+    // So the read is capped, and the giveaway that the cap is what is working
+    // is the deadline below: **60 seconds**, far longer than the 500 ms lookup
+    // deadline. If this test ever fails on time again, the cap is gone.
     let dir = scratch("keychain-floods");
     let marker = dir.join("witness");
     let stub = hostile_security(
@@ -232,7 +244,7 @@ fn a_keychain_binary_that_streams_forever_is_killed_at_the_deadline() {
     let argv = witness(&marker, "DECOY", 7);
     let started = Instant::now();
     let (outcome, _) = within(
-        Duration::from_secs(30),
+        Duration::from_secs(60),
         "a flooding keychain lookup",
         move || run_with(&registry, &["DECOY"], &argv, &[]),
     );
@@ -241,9 +253,67 @@ fn a_keychain_binary_that_streams_forever_is_killed_at_the_deadline() {
     assert_eq!(outcome.exit_code, 7);
     assert_eq!(outcome.state, State::Degraded);
     assert!(
-        started.elapsed() < Duration::from_secs(20),
+        started.elapsed() < Duration::from_secs(30),
         "the flood was not bounded: {:?}",
         started.elapsed()
+    );
+}
+
+#[test]
+fn a_backend_that_produces_more_than_the_cap_is_an_error_not_a_truncated_value() {
+    // The cap must not hand back a PREFIX. A truncated credential is a silently
+    // wrong one: it injects, the child runs, and the remote end rejects it for
+    // a reason nothing on this machine can explain.
+    //
+    // 12 MB, over the 8 MiB cap, from a stub that EXITS — so nothing here is a
+    // timeout, and the error can only come from the cap itself.
+    let dir = scratch("cap-not-truncation");
+    let marker = dir.join("witness");
+    let stub = hostile_security(
+        &dir,
+        "security-oversized",
+        "case \"$1\" in\n\
+         \x20 find-generic-password) exec /bin/dd if=/dev/zero bs=1048576 count=12 ;;\n\
+         esac\n\
+         exit 1\n",
+    );
+
+    let registry = Registry::new(vec![Box::new(
+        KeychainStore::new(stub, "keyless".to_owned()).with_timeout(Duration::from_secs(30)),
+    )]);
+
+    let argv = witness(&marker, "DECOY", 5);
+    let (outcome, notes) = within(
+        Duration::from_secs(60),
+        "an oversized keychain value",
+        move || run_with(&registry, &["DECOY"], &argv, &[]),
+    );
+
+    assert_eq!(witnessed(&marker), "<unset>", "nothing may be injected");
+    assert_eq!(outcome.exit_code, 5, "the child's exit code must come back");
+    assert_eq!(outcome.state, State::Degraded);
+    assert!(
+        notes.contains("more than"),
+        "the reason must name the cap rather than a timeout: {notes}"
+    );
+
+    // The negative control: a value just UNDER the cap still resolves, so the
+    // assertion above is about the cap and not about `dd` output being rejected
+    // on some other ground.
+    let under = hostile_security(
+        &dir,
+        "security-large-but-legal",
+        "case \"$1\" in\n\
+         \x20 find-generic-password) exec /usr/bin/head -c 1048576 /dev/zero ;;\n\
+         esac\n\
+         exit 1\n",
+    );
+    let store =
+        KeychainStore::new(under, "keyless".to_owned()).with_timeout(Duration::from_secs(30));
+    // NUL bytes are valid UTF-8, so a megabyte of them is a legal `Secret`.
+    assert!(
+        store.resolve("DECOY").is_ok(),
+        "a 1 MB value is under the cap and must still resolve"
     );
 }
 

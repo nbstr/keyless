@@ -36,7 +36,7 @@
 
 use std::io;
 use std::io::Write as _;
-use std::process::{Command, Output, Stdio};
+use std::process::{Command, Stdio};
 
 use crate::error::StoreError;
 use std::sync::mpsc::{self, RecvTimeoutError};
@@ -153,6 +153,14 @@ pub enum CaptureError {
     /// Proton paths goes through here, which puts that abort **before** the
     /// spawn `keyless run` promises always to reach.
     Threads(io::Error),
+    /// The backend produced more than [`MAX_CAPTURE_BYTES`] on one stream.
+    ///
+    /// A separate variant rather than a truncated success, because the bytes are
+    /// a PREFIX of what a backend produced — which is exactly the shape a
+    /// truncated credential has, and handing one to a caller would inject a
+    /// silently wrong secret. No real value is anywhere near this size, so this
+    /// is a statement about the backend and nothing else.
+    TooLarge(usize),
 }
 
 impl std::fmt::Display for CaptureError {
@@ -165,6 +173,9 @@ impl std::fmt::Display for CaptureError {
             CaptureError::Collect(source) => write!(f, "cannot read its output: {source}"),
             CaptureError::Threads(source) => {
                 write!(f, "cannot start a thread to read its output: {source}")
+            }
+            CaptureError::TooLarge(cap) => {
+                write!(f, "it produced more than {cap} bytes")
             }
         }
     }
@@ -254,20 +265,96 @@ pub fn capture_with_input(
     captured
 }
 
+/// The most this will hold from one of a backend's streams.
+///
+/// # Why a deadline is not enough on its own
+///
+/// The deadline bounds how LONG a flooding backend runs. It does not bound how
+/// much arrives in that time, and the two are not the same failure. `Command::
+/// output` and `wait_with_output` both read to end of stream into a growing
+/// `Vec`, so a `security` copying `/dev/zero` reached 2.7 GB resident in twelve
+/// seconds and ended as an out-of-memory kill.
+///
+/// Adding a ten-second deadline did not fix that, it only capped the exponent —
+/// measured in this crate's own suite, a **500 ms** deadline against
+/// `dd if=/dev/zero` still allocated and scrubbed enough to blow past a
+/// thirty-second wall clock on a loaded machine, intermittently. Memory has to
+/// be bounded directly.
+///
+/// Eight mebibytes is four orders of magnitude above any credential and above
+/// every real backend's stderr. Reading past it is a fact about the backend, not
+/// about the value, so it becomes [`CaptureError::TooLarge`] rather than a
+/// truncated secret.
+const MAX_CAPTURE_BYTES: usize = 8 * 1024 * 1024;
+
+/// Read to end of stream, keeping at most [`MAX_CAPTURE_BYTES`].
+///
+/// Draining past the cap rather than stopping at it is deliberate: a reader that
+/// stops leaves the child blocked on a full pipe, which turns a bounded overflow
+/// into a wait for the deadline. Discarding costs a `memcpy` and lets the child
+/// finish saying whatever it was going to say.
+///
+/// The scratch buffer is scrubbed: a backend's stdout is where a plaintext value
+/// arrives, so the bytes that pass through here are as sensitive as the ones
+/// that are kept.
+fn read_capped<R: io::Read>(mut source: R) -> (Vec<u8>, bool) {
+    let mut kept: Vec<u8> = Vec::new();
+    let mut scratch = [0u8; 64 * 1024];
+    let mut overflowed = false;
+    loop {
+        match source.read(&mut scratch) {
+            Ok(0) => break,
+            Ok(read) => {
+                let room = MAX_CAPTURE_BYTES.saturating_sub(kept.len());
+                if read > room {
+                    overflowed = true;
+                }
+                kept.extend_from_slice(&scratch[..read.min(room)]);
+            }
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(_) => break,
+        }
+    }
+    scratch.zeroize();
+    (kept, overflowed)
+}
+
 /// Wait for `child` with a deadline, killing it when the deadline expires.
-fn collect(child: std::process::Child, timeout: Duration) -> Result<Captured, CaptureError> {
+fn collect(mut child: std::process::Child, timeout: Duration) -> Result<Captured, CaptureError> {
     // Captured before the child moves into the collector thread, because that
     // thread owns it from then on and killing needs the id.
     let pid = Pid::from_raw(child.id().cast_signed());
 
-    // `wait_with_output` reads both pipes to EOF and only then reaps, which is
-    // the one shape that cannot deadlock on a child that fills a pipe buffer.
-    // It also has no timeout, hence the thread: the wait is what we bound.
-    let (finished, done) = mpsc::channel::<io::Result<Output>>();
+    // Both pipes are read CONCURRENTLY, which is the one shape that cannot
+    // deadlock on a child that fills one of them while writing to the other.
+    // `wait_with_output` gave that for free and is not usable here, because it
+    // reads without a bound — see [`MAX_CAPTURE_BYTES`].
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+
+    let (errors_read, errors) = mpsc::channel::<(Vec<u8>, bool)>();
+    if let Some(pipe) = stderr
+        && let Err(source) = thread::Builder::new()
+            .name("keyless-store-stderr".to_owned())
+            .spawn(move || {
+                let _ = errors_read.send(read_capped(pipe));
+            })
+    {
+        let _ = kill(pid, Signal::SIGKILL);
+        return Err(CaptureError::Threads(source));
+    }
+
+    let (finished, done) = mpsc::channel::<io::Result<(std::process::ExitStatus, Vec<u8>, bool)>>();
     if let Err(source) = thread::Builder::new()
         .name("keyless-store-output".to_owned())
         .spawn(move || {
-            let _ = finished.send(child.wait_with_output());
+            // Drained before the wait: a child cannot exit while blocked on a
+            // pipe nobody is reading.
+            let (bytes, overflowed) = match stdout {
+                Some(pipe) => read_capped(pipe),
+                None => (Vec::new(), false),
+            };
+            let _ = finished.send(child.wait().map(|status| (status, bytes, overflowed)));
         })
     {
         // The closure was dropped with the `Child` inside it, and dropping a
@@ -279,11 +366,31 @@ fn collect(child: std::process::Child, timeout: Duration) -> Result<Captured, Ca
     }
 
     match done.recv_timeout(timeout) {
-        Ok(Ok(output)) => Ok(Captured {
-            status: output.status,
-            stdout: output.stdout,
-            stderr: output.stderr,
-        }),
+        Ok(Ok((status, mut bytes, overflowed))) => {
+            if overflowed {
+                // Scrubbed rather than returned. The bytes are a prefix of
+                // something a backend produced, which is exactly the shape a
+                // truncated credential has, and no caller has any use for one.
+                bytes.zeroize();
+                return Err(CaptureError::TooLarge(MAX_CAPTURE_BYTES));
+            }
+            // A flooded stderr is dropped on the floor rather than waited for:
+            // stdout is what a lookup is about, and the whole point of arriving
+            // here is not to wait for a stream that will not end.
+            let stderr = match errors.recv_timeout(REAP_GRACE) {
+                Ok((bytes, false)) => bytes,
+                Ok((mut bytes, true)) => {
+                    bytes.zeroize();
+                    b"<stderr too large to quote>".to_vec()
+                }
+                Err(_) => Vec::new(),
+            };
+            Ok(Captured {
+                status,
+                stdout: bytes,
+                stderr,
+            })
+        }
         Ok(Err(source)) => Err(CaptureError::Collect(source)),
         Err(RecvTimeoutError::Timeout) => {
             // The collector thread still holds the `Child`, so the pid has not
@@ -292,8 +399,8 @@ fn collect(child: std::process::Child, timeout: Duration) -> Result<Captured, Ca
             let _ = kill(pid, Signal::SIGKILL);
             // Collect whatever it managed to read, only to scrub it: a partial
             // value is as sensitive as a whole one.
-            if let Ok(Ok(mut output)) = done.recv_timeout(REAP_GRACE) {
-                output.stdout.zeroize();
+            if let Ok(Ok((_, mut bytes, _))) = done.recv_timeout(REAP_GRACE) {
+                bytes.zeroize();
             }
             Err(CaptureError::TimedOut(timeout))
         }
@@ -320,9 +427,10 @@ fn collect(child: std::process::Child, timeout: Duration) -> Result<Captured, Ca
 pub fn unavailable(store: &str, binary: &std::path::Path, error: &CaptureError) -> StoreError {
     let detail = match error {
         CaptureError::Spawn(_) => format!("{} {error}", binary.display()),
-        CaptureError::TimedOut(_) | CaptureError::Collect(_) | CaptureError::Threads(_) => {
-            error.to_string()
-        }
+        CaptureError::TimedOut(_)
+        | CaptureError::Collect(_)
+        | CaptureError::Threads(_)
+        | CaptureError::TooLarge(_) => error.to_string(),
     };
     StoreError::Unavailable {
         store: store.to_owned(),
