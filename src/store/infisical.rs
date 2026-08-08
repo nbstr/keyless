@@ -324,7 +324,7 @@ impl InfisicalStore {
             routing: Routing::from_config(config, invocation_env),
             project_id: settings.project_id.clone(),
             config_dir: settings.config_dir.clone(),
-            timeout: Duration::from_millis(settings.timeout_ms),
+            timeout: crate::config::bounded_timeout(settings.timeout_ms),
         }
     }
 

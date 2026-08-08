@@ -24,7 +24,7 @@ use crate::config::{Config, SecretRoute};
 use crate::error::StoreError;
 use crate::secret::Secret;
 use crate::store::Store;
-use crate::store::exec::{capture_with_input, first_line, strip_one_newline};
+use crate::store::exec::{capture, capture_with_input, first_line, strip_one_newline, unavailable};
 use crate::store::manage::{Manage, ManageError, Stored};
 
 /// `errSecItemNotFound`. `security` exits with this when the item is simply
@@ -39,6 +39,8 @@ pub struct KeychainStore {
     keychain: Option<PathBuf>,
     /// name -> (service, account) overrides taken from config.
     routes: std::collections::BTreeMap<String, (String, String)>,
+    /// How long one lookup gets. See [`crate::store::exec::capture`].
+    timeout: std::time::Duration,
 }
 
 impl KeychainStore {
@@ -50,7 +52,15 @@ impl KeychainStore {
             default_service,
             keychain: None,
             routes: std::collections::BTreeMap::new(),
+            timeout: crate::config::bounded_timeout(crate::config::DEFAULT_TIMEOUT_MS),
         }
+    }
+
+    /// Use a different deadline than the default.
+    #[must_use]
+    pub fn with_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.timeout = timeout;
+        self
     }
 
     /// Search one specific keychain file rather than the caller's default list.
@@ -87,6 +97,7 @@ impl KeychainStore {
             default_service: keychain.service.clone(),
             keychain: None,
             routes,
+            timeout: crate::config::bounded_timeout(keychain.timeout_ms),
         }
     }
 
@@ -134,9 +145,14 @@ impl Store for KeychainStore {
         if let Some(keychain) = &self.keychain {
             command.arg(keychain);
         }
-        let output = command.output().map_err(|source| {
-            self.unavailable(format!("cannot run {}: {source}", self.binary.display()))
-        })?;
+        // Through `capture` rather than `Command::output`, which waits forever
+        // and reads without a bound. Both matter here and neither is theory: a
+        // `security` that never answers wedges the terminal with no child and no
+        // message, and a `security` that streams `/dev/zero` grows this process
+        // until the kernel ends it. `binary` is a config field, so neither
+        // requires a compromised system tool.
+        let mut output = capture(command, self.timeout)
+            .map_err(|error| unavailable(self.id(), &self.binary, &error))?;
 
         if !output.status.success() {
             if output.status.code() == Some(EXIT_ITEM_NOT_FOUND) {
@@ -147,7 +163,10 @@ impl Store for KeychainStore {
             return Err(self.backend(first_line(&output.stderr)));
         }
 
-        let mut bytes = output.stdout;
+        // Moved out rather than borrowed: `Captured::drop` zeroizes whatever is
+        // still there, and the value is about to become a `Secret` that owns the
+        // same duty.
+        let mut bytes = std::mem::take(&mut output.stdout);
         strip_one_newline(&mut bytes);
 
         if bytes.is_empty() {
@@ -162,13 +181,13 @@ impl Store for KeychainStore {
     }
 
     fn health(&self) -> Result<(), StoreError> {
-        // Read-only, prompts for nothing, and touches no item.
-        let output = Command::new(&self.binary)
-            .arg("list-keychains")
-            .output()
-            .map_err(|source| {
-                self.unavailable(format!("cannot run {}: {source}", self.binary.display()))
-            })?;
+        // Read-only, prompts for nothing, and touches no item. Under the same
+        // deadline as a lookup: `doctor` is the verb people run when something
+        // is already wrong, so it is the last place that may hang.
+        let mut command = Command::new(&self.binary);
+        command.arg("list-keychains");
+        let output = capture(command, self.timeout)
+            .map_err(|error| unavailable(self.id(), &self.binary, &error))?;
 
         if output.status.success() {
             Ok(())

@@ -37,7 +37,10 @@ pub enum Encoding {
     Lowercase,
     /// ASCII-uppercased, same reason.
     Uppercase,
-    /// RFC 4648 base64 with padding — HTTP Basic auth, most SDK encoders.
+    /// RFC 4648 base64 with padding — Kubernetes `data:` values, most SDK
+    /// encoders. **Not HTTP Basic**, which encodes `user:password` as one
+    /// string: base64 is 3-byte aligned, so the encoding of the password alone
+    /// is a substring of that only when `user:` is a multiple of three bytes.
     Base64Std,
     /// RFC 4648 base64 without padding — JWT segments, many Go encoders.
     Base64StdNoPad,
@@ -49,9 +52,14 @@ pub enum Encoding {
     Base32,
     /// RFC 4648 §6 base32 without padding.
     Base32NoPad,
-    /// Lowercase hex — digests, `xxd`, most Rust and Python formatting.
+    /// Lowercase hex — Python `bytes.hex()`, Rust `{:x}`, Node
+    /// `toString("hex")`.
+    ///
+    /// **Not a hex dump.** `xxd` separates two-byte columns with spaces and
+    /// `xxd -p` wraps at 60 characters, so neither leaves a contiguous image of
+    /// a value longer than 30 bytes for a substring match to find.
     HexLower,
-    /// Uppercase hex — `openssl`, some Java formatting.
+    /// Uppercase hex — some Java formatting, `openssl` with `-upper`.
     HexUpper,
     /// `0x`-prefixed lowercase hex — Ethereum tooling, C-style dumps.
     HexPrefixedLower,

@@ -5,14 +5,24 @@
 //! needs the same three things: spawn, wait with a bound, and turn a failure
 //! into a sentence that cannot contain a value.
 //!
-//! # Why the deadline is not optional
+//! # Why the deadline is not optional, for every store
 //!
-//! `Command::output` waits forever. A local `security` call cannot realistically
-//! do that, but a network-backed store can: a black-holed TCP connection, a
-//! captive portal that accepts the SYN and answers nothing, an auth server
-//! rewriting a token. Without a bound, `keyless run` stops being a wrapper and
-//! becomes the reason the terminal is hung — and a tool that hangs gets removed,
-//! which is the failure this whole project exists to avoid.
+//! `Command::output` waits forever and reads without a bound. A network-backed
+//! store hits that first — a black-holed TCP connection, a captive portal that
+//! accepts the SYN and answers nothing, an auth server rewriting a token — but
+//! **a local store is not exempt, and assuming it was is how the keychain
+//! adapter spent its whole life without a deadline.**
+//!
+//! The binary a store runs is a path in a config file, not a system guarantee.
+//! Measured 2026-08-08 against a `security` stand-in: one that sleeps hangs
+//! `keyless run` indefinitely with no child and no message, and one that copies
+//! `/dev/zero` to its stdout reaches 2.7 GB resident in twelve seconds and ends
+//! as an out-of-memory kill. Neither needs a compromised system tool and neither
+//! is slower to arrange than the network case.
+//!
+//! Without a bound, `keyless run` stops being a wrapper and becomes the reason
+//! the terminal is hung — and a tool that hangs gets removed, which is the
+//! failure this whole project exists to avoid.
 //!
 //! So a lookup that runs out of time is **degraded, never fatal**: the caller
 //! gets an error describing the timeout, the resolver records the name as
@@ -40,6 +50,42 @@ use zeroize::Zeroize;
 /// How much of a backend's stderr is quoted in an error. Enough to diagnose,
 /// short enough not to paste a wall of text into an agent's transcript.
 pub const MAX_DETAIL: usize = 200;
+
+/// Serialises the act of creating a child, and nothing else.
+///
+/// # The race this closes, measured rather than assumed
+///
+/// A `Command` with piped stdio creates its pipes and execs inside one call.
+/// Two threads doing that at the same time can have one child inherit the other
+/// child's pipe **write** end before it is closed — and a pipe reaches
+/// end-of-file only when the last writer closes it. The reader then waits for an
+/// end that never comes.
+///
+/// It is a deadlock, not a slowdown. Measured 2026-08-08 in this crate's own
+/// test binary: eleven keychain tests take **0.97 s** with `--test-threads=1`
+/// and **hit every deadline** with `--test-threads=4` — five of them, at ten and
+/// thirty seconds, on stubs that do nothing but `printf` and exit.
+///
+/// This became `keyless run`'s problem the moment a run started resolving its
+/// names concurrently (see [`crate::cmd::run::resolve_all`]). One thread per
+/// name, each spawning a vendor CLI, is exactly the shape above.
+///
+/// The lock is held across `spawn` and released before the wait, so lookups
+/// still overlap — what is serialised is the microsecond in which a child's
+/// descriptors are visible to another `fork`, never the seconds spent waiting
+/// for an answer.
+static SPAWNING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Create the child with [`SPAWNING`] held.
+///
+/// A poisoned lock is ignored: the mutex guards no data, only an interval, so a
+/// panic elsewhere has left nothing inconsistent to protect.
+pub fn spawn_serialised(command: &mut Command) -> io::Result<std::process::Child> {
+    let _guard = SPAWNING
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    command.spawn()
+}
 
 /// How long to wait for a killed child to be reaped before giving up on it.
 ///
@@ -97,6 +143,16 @@ pub enum CaptureError {
     TimedOut(Duration),
     /// The child started but its output could not be collected.
     Collect(io::Error),
+    /// The operating system refused a thread.
+    ///
+    /// A separate variant rather than a `panic`, and that is the whole reason it
+    /// exists. `thread::spawn` panics when the OS says no — a process limit, a
+    /// thread limit, exhausted address space — and this crate's release profile
+    /// sets `panic = "abort"`, so a panic here is an immediate abort with no
+    /// child, no exit code and no message. Every lookup on the Infisical and
+    /// Proton paths goes through here, which puts that abort **before** the
+    /// spawn `keyless run` promises always to reach.
+    Threads(io::Error),
 }
 
 impl std::fmt::Display for CaptureError {
@@ -107,6 +163,9 @@ impl std::fmt::Display for CaptureError {
                 write!(f, "no answer within {} ms", after.as_millis())
             }
             CaptureError::Collect(source) => write!(f, "cannot read its output: {source}"),
+            CaptureError::Threads(source) => {
+                write!(f, "cannot start a thread to read its output: {source}")
+            }
         }
     }
 }
@@ -129,7 +188,7 @@ pub fn capture(mut command: Command, timeout: Duration) -> Result<Captured, Capt
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
-    let child = command.spawn().map_err(CaptureError::Spawn)?;
+    let child = spawn_serialised(&mut command).map_err(CaptureError::Spawn)?;
     collect(child, timeout)
 }
 
@@ -171,19 +230,22 @@ pub fn capture_with_input(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
-    let mut child = command.spawn().map_err(CaptureError::Spawn)?;
+    let mut child = spawn_serialised(&mut command).map_err(CaptureError::Spawn)?;
     // Taken before the child moves into the collector, which owns it afterwards.
     let stdin = child.stdin.take();
     let mut payload = input.to_vec();
-    let writer = thread::spawn(move || {
-        if let Some(mut pipe) = stdin {
-            let _ = pipe.write_all(&payload);
-            let _ = pipe.flush();
-            // Dropping the pipe here closes it, which is what tells a child
-            // reading to end of input that there is no more.
-        }
-        payload.zeroize();
-    });
+    let writer = thread::Builder::new()
+        .name("keyless-store-stdin".to_owned())
+        .spawn(move || {
+            if let Some(mut pipe) = stdin {
+                let _ = pipe.write_all(&payload);
+                let _ = pipe.flush();
+                // Dropping the pipe here closes it, which is what tells a child
+                // reading to end of input that there is no more.
+            }
+            payload.zeroize();
+        })
+        .map_err(CaptureError::Threads)?;
 
     let captured = collect(child, timeout);
     // Joined rather than detached so the scrub above is known to have happened
@@ -202,9 +264,19 @@ fn collect(child: std::process::Child, timeout: Duration) -> Result<Captured, Ca
     // the one shape that cannot deadlock on a child that fills a pipe buffer.
     // It also has no timeout, hence the thread: the wait is what we bound.
     let (finished, done) = mpsc::channel::<io::Result<Output>>();
-    thread::spawn(move || {
-        let _ = finished.send(child.wait_with_output());
-    });
+    if let Err(source) = thread::Builder::new()
+        .name("keyless-store-output".to_owned())
+        .spawn(move || {
+            let _ = finished.send(child.wait_with_output());
+        })
+    {
+        // The closure was dropped with the `Child` inside it, and dropping a
+        // `Child` neither kills nor reaps. The process is therefore still
+        // running and still ours, so its pid cannot have been reused and
+        // signalling it is safe rather than a race.
+        let _ = kill(pid, Signal::SIGKILL);
+        return Err(CaptureError::Threads(source));
+    }
 
     match done.recv_timeout(timeout) {
         Ok(Ok(output)) => Ok(Captured {
@@ -248,7 +320,9 @@ fn collect(child: std::process::Child, timeout: Duration) -> Result<Captured, Ca
 pub fn unavailable(store: &str, binary: &std::path::Path, error: &CaptureError) -> StoreError {
     let detail = match error {
         CaptureError::Spawn(_) => format!("{} {error}", binary.display()),
-        CaptureError::TimedOut(_) | CaptureError::Collect(_) => error.to_string(),
+        CaptureError::TimedOut(_) | CaptureError::Collect(_) | CaptureError::Threads(_) => {
+            error.to_string()
+        }
     };
     StoreError::Unavailable {
         store: store.to_owned(),
