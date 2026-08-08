@@ -246,6 +246,20 @@ pub fn stub_pass_cli_listing(dir: &Path, behaviour: &Backend, listing: &Listing)
     let session_log = dir.join("pass-cli.session");
     let body = format!(
         "#!/bin/sh\n\
+         # Parse like the vendor up to `--`: both spellings of an option value,\n\
+         # and a refusal for anything the vendor reads as a short-flag cluster.\n\
+         # Ahead of every verb, because clap parses before it dispatches.\n\
+         env_file=''\n\
+         for arg in \"$@\"; do\n\
+         \x20 if [ \"$arg\" = '--' ]; then break; fi\n\
+         \x20 case \"$arg\" in\n\
+         \x20   --env-file=*) env_file=\"${{arg#--env-file=}}\" ;;\n\
+         \x20   --*|-) ;;\n\
+         \x20   -*) echo \"error: unexpected argument '$arg' found\" >&2; exit 2 ;;\n\
+         \x20 esac\n\
+         \x20 if [ \"$prev\" = '--env-file' ]; then env_file=\"$arg\"; fi\n\
+         \x20 prev=\"$arg\"\n\
+         done\n\
          if [ \"$1\" = 'item' ] && [ \"$2\" = 'list' ]; then\n\
          \x20 printf '%s\\n' \"$@\" > '{list_argv}'\n\
          \x20 printf '%s' \"$PROTON_PASS_AGENT_REASON\" > '{reason}'\n\
@@ -257,11 +271,6 @@ pub fn stub_pass_cli_listing(dir: &Path, behaviour: &Backend, listing: &Listing)
          printf '%s' \"$PROTON_PASS_AGENT_REASON\" > '{reason}'\n\
          printf '%s' \"${{PROTON_PASS_SESSION_DIR-<unset>}}\" > '{session}'\n\
          # Resolve the reference the way the real CLI would: out of the env file.\n\
-         env_file=''\n\
-         for arg in \"$@\"; do\n\
-         \x20 if [ \"$prev\" = '--env-file' ]; then env_file=\"$arg\"; fi\n\
-         \x20 prev=\"$arg\"\n\
-         done\n\
          if [ -n \"$env_file\" ]; then\n\
          \x20 sed -e 's/^[^=]*=//' \"$env_file\" > '{reference}'\n\
          fi\n\
@@ -292,6 +301,30 @@ pub fn stub_pass_cli_listing(dir: &Path, behaviour: &Backend, listing: &Listing)
 /// at each call site so a fixture can hold a value in every value position, which
 /// is what makes "no value reached the field list" a real assertion rather than a
 /// restatement of the parser.
+///
+/// # It parses arguments the way the vendor does, and refuses the same ones
+///
+/// A stub that answers on `$1` and `$2` and ignores the rest cannot fail on a
+/// malformed invocation, so every test using it is blind to the one thing an
+/// argument vector can get wrong. The real binary parses with clap, which reads
+/// ANY standalone argument beginning with a single `-` as a short-flag cluster —
+/// whatever option came before it. Measured against `pass-cli` 2.2.5 on
+/// 2026-08-08:
+///
+/// ```text
+/// $ pass-cli item list --vault-name -dashvault --output json
+/// error: unexpected argument '-d' found
+/// exit 2
+/// ```
+///
+/// Proton ids are base64url, so about one in 64 begins with `-`. That is not a
+/// hypothetical: it was found on a real item, whose leading `-` meant `keyless
+/// fields` could not inspect it at all. The check below reproduces the refusal — exit 2, the vendor's
+/// wording — so an adapter that hands a bare `-…` to this fixture fails here
+/// rather than passing and failing in front of a user.
+///
+/// A lone `-` is left alone: it is the vendor's own spelling for stdin, and clap
+/// treats it as a value rather than as flags.
 pub fn stub_pass_cli_discovery(dir: &Path, vaults: &str, listing: &str, view: &str) -> PathBuf {
     let vaults_file = dir.join("vaults.json");
     let listing_file = dir.join("listing.json");
@@ -310,6 +343,12 @@ pub fn stub_pass_cli_discovery(dir: &Path, vaults: &str, listing: &str, view: &s
          printf '%s\\n' \"$@\" > '{argv}'\n\
          printf '%s' \"$PROTON_PASS_AGENT_REASON\" > '{reason}'\n\
          printf '%s' \"${{PROTON_PASS_SESSION_DIR-<unset>}}\" > '{session}'\n\
+         for arg in \"$@\"; do\n\
+         \x20 case \"$arg\" in\n\
+         \x20   --*|-) ;;\n\
+         \x20   -*) echo \"error: unexpected argument '$arg' found\" >&2; exit 2 ;;\n\
+         \x20 esac\n\
+         done\n\
          if [ \"$1\" = 'vault' ] && [ \"$2\" = 'list' ]; then cat '{vaults}'; exit 0; fi\n\
          if [ \"$1\" = 'item' ] && [ \"$2\" = 'list' ]; then cat '{listing}'; exit 0; fi\n\
          if [ \"$1\" = 'item' ] && [ \"$2\" = 'view' ]; then cat '{view}'; exit 0; fi\n\
@@ -323,6 +362,29 @@ pub fn stub_pass_cli_discovery(dir: &Path, vaults: &str, listing: &str, view: &s
         view = view_file.display(),
     );
     write_stub(dir, "pass-cli-discovery-stub", &body)
+}
+
+/// A `pass-cli` stand-in whose session is dead: every verb is refused.
+///
+/// The two stderr lines are the vendor's own, measured against `pass-cli` 2.2.5
+/// on 2026-08-08 by pointing `PROTON_PASS_SESSION_DIR` at an empty scratch
+/// directory. Quoted rather than invented, because the adapter's health message
+/// is built from them and an approximation would let the wording drift.
+///
+/// This is what an expired agent token looks like from the outside: the binary is
+/// on `PATH`, the session directory exists, and nothing at all can be read. Both
+/// local preconditions pass, which is why a health check that stops at them
+/// reports `ok`.
+pub fn stub_pass_cli_dead_session(dir: &Path) -> PathBuf {
+    let body = format!(
+        "#!/bin/sh\n\
+         printf '%s\\n' \"$@\" > '{argv}'\n\
+         echo 'ERROR pass-cli/src/main.rs:332: Command is not logout there is no session' >&2\n\
+         echo 'Error: This operation requires an authenticated client' >&2\n\
+         exit 1\n",
+        argv = dir.join("pass-cli.argv").display(),
+    );
+    write_stub(dir, "pass-cli-dead-session-stub", &body)
 }
 
 /// How many times the stub's `item list` ran. Zero when it never did.

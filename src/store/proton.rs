@@ -232,6 +232,53 @@ where
     }
 }
 
+/// Attach `--flag=value` as ONE argument, because a value may begin with `-`.
+///
+/// # The failure this exists to stop
+///
+/// `pass-cli` parses with clap, and clap reads any standalone argument starting
+/// with a single `-` as a short-flag cluster — whatever option preceded it.
+/// Measured against `pass-cli` 2.2.5 on 2026-08-08:
+///
+/// ```text
+/// $ pass-cli item list --vault-name -dashvault --output json
+/// error: unexpected argument '-d' found
+///   tip: to pass '-d' as a value, use '-- -d'
+/// exit 2
+/// ```
+///
+/// That is not a corner case here. Proton item and share ids are **base64url**,
+/// whose alphabet includes `-`, so roughly one id in 64 begins with one. This
+/// was found on a real item, not reasoned about: an id beginning `-` meant
+/// `keyless fields` could not inspect that item at all.
+///
+/// # Why the `=` form and not the alternatives
+///
+/// - **A `--` separator** ends option parsing, so it protects a POSITIONAL. Every
+///   coordinate here is an option VALUE, which is on the wrong side of that
+///   separator. It fixes nothing.
+/// - **The vendor's by-name flags** (`--item-title`, `--vault-name`) address by
+///   title, which is exactly what this adapter refuses to do: the ids come from a
+///   listing it just read, so `fields` and `run` see the same item even when two
+///   share a title.
+/// - **Shell quoting** does not enter into it — [`Command`] passes an argument
+///   vector to `execvp` and no shell is involved. The receiving parser is what
+///   rejects the value, so the fix has to be in the argument it receives.
+///
+/// `--flag=value` is accepted by clap for every long option, verified against the
+/// same binary and the same value that fails above. It carries no ambiguity: clap
+/// splits on the FIRST `=`, so a value containing one arrives whole.
+///
+/// This is the only way this adapter and [`crate::store::proton_manager`] pass a
+/// value that a vault, an item, a share or a path decides. There is deliberately
+/// no second idiom.
+pub(crate) fn flag_value(command: &mut Command, flag: &str, value: impl AsRef<std::ffi::OsStr>) {
+    let mut joined = std::ffi::OsString::from(flag);
+    joined.push("=");
+    joined.push(value);
+    command.arg(joined);
+}
+
 /// The justification recorded, end-to-end encrypted, against every read.
 ///
 /// # Why this is not the command line
@@ -943,8 +990,10 @@ impl ProtonStore {
     {
         let mut command = Command::new(&self.binary);
         command.arg("run");
-        command.arg("--env-file");
-        command.arg(env_file);
+        // `--flag=value`, like every other value this adapter passes: `TMPDIR`
+        // decides this path and nothing here may assume it does not start with
+        // `-`. See `flag_value`.
+        flag_value(&mut command, "--env-file", env_file);
         // Required: the vendor's masking would otherwise replace the value in
         // the probe's own output, and this adapter would inject the mask token.
         command.arg("--no-masking");
@@ -989,10 +1038,12 @@ impl ProtonStore {
         let mut command = Command::new(&self.binary);
         command.arg("item");
         command.arg("list");
-        // `--vault-name` rather than the positional argument: a vault whose name
-        // starts with `-` would otherwise be read as a flag.
-        command.arg("--vault-name");
-        command.arg(vault);
+        // `--vault-name=<vault>` as one argument. Naming the flag is what stops
+        // the vault being taken as the wrong positional; joining the value with
+        // `=` is what stops a vault whose name starts with `-` being read as a
+        // flag. Passing them as two arguments does only the first, and the
+        // vendor refuses it — see `flag_value`.
+        flag_value(&mut command, "--vault-name", vault);
         command.arg("--output");
         command.arg("json");
         remove_ambient_references(&mut command, ambient);
@@ -1156,6 +1207,11 @@ impl ProtonStore {
     /// Addressed by `--item-id` rather than by title: the id comes from a listing
     /// this adapter just read, so `fields` and `run` are looking at the same item
     /// even if two share a title.
+    ///
+    /// Both ids are joined to their flags with `=`. Item and share ids are
+    /// base64url, so about one in 64 begins with `-`, and passed as a separate
+    /// argument the vendor's parser reads it as a short-flag cluster and refuses
+    /// the whole command. See [`flag_value`].
     fn view_command<I>(&self, session_dir: &Path, item: &ItemRecord, ambient: I) -> Command
     where
         I: IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
@@ -1163,10 +1219,8 @@ impl ProtonStore {
         let mut command = Command::new(&self.binary);
         command.arg("item");
         command.arg("view");
-        command.arg("--share-id");
-        command.arg(&item.share_id);
-        command.arg("--item-id");
-        command.arg(&item.id);
+        flag_value(&mut command, "--share-id", &item.share_id);
+        flag_value(&mut command, "--item-id", &item.id);
         command.arg("--output");
         command.arg("json");
         remove_ambient_references(&mut command, ambient);
@@ -1285,23 +1339,77 @@ impl Store for ProtonStore {
             .ok_or_else(|| self.backend(format!("`{reference}` is not valid UTF-8")))
     }
 
+    /// Local preconditions, then one round trip that proves the session is alive.
+    ///
+    /// # Why this asks the vendor something
+    ///
+    /// It used to check the session DIRECTORY and the binary and stop, on the
+    /// reasoning that reachability and authentication "can be observed for free
+    /// at the first real lookup, which degrades". Measured on 2026-08-08, that
+    /// reasoning produces the exact failure this whole tool exists to kill:
+    /// with the agent session expired, `doctor` printed `store proton ok` and
+    /// `0 problem(s)` while EVERY Proton name was degrading, and the child ran
+    /// with an empty bearer and came back HTTP 400 at exit 0.
+    ///
+    /// The premise was wrong in one word: **free**. A degraded lookup is only
+    /// observable to somebody already reading stderr of a run that is failing
+    /// for a reason they do not yet know. `doctor` is the command they are told
+    /// to run to find that reason out, and `keyless run` never refuses, so a
+    /// dead session has no other alarm anywhere on the machine. A health check
+    /// that cannot see the single most common way this backend dies is not a
+    /// cheaper check, it is a check of something else.
+    ///
+    /// One directory away, [`crate::store::infisical`] already pays this cost
+    /// and documents why. This is that idiom, not a second one.
+    ///
+    /// # What the round trip costs, and what bounds it
+    ///
+    /// `vault list` prints vault names, ids and counts — no item content of any
+    /// kind — so no credential is read and no item's audit trail gains an entry
+    /// for a read nobody asked for. It is the same verb `keyless items` already
+    /// spends when no vault is named.
+    ///
+    /// It cannot hang and it cannot prompt: [`capture`] gives the child
+    /// `/dev/null` on stdin, so a vendor that decided to ask for a password gets
+    /// end-of-file instead, and the configured timeout plus the output cap bound
+    /// it either way.
+    ///
+    /// # Why a failure is a PROBLEM and not a third state
+    ///
+    /// Because it is one. A session this call cannot use is a session no lookup
+    /// can use, so every Proton name in the config will degrade. Saying so is
+    /// `doctor`'s whole job, and it stays inside `doctor`'s contract: a problem
+    /// here degrades a run, it never blocks one. Nothing in `run` consults this.
     fn health(&self) -> Result<(), StoreError> {
-        // Presence, plus the one precondition that is knowable without asking
-        // the vendor anything.
-        //
-        // A deeper check would need a network round trip and a remote audit
-        // entry for a read nobody requested, so reachability and authentication
-        // stay where they can be observed for free: at the first real lookup,
-        // which degrades. The session directory is different — it is a fact
-        // about the local config, and `doctor` can say it before a run does.
-        self.session_dir()?;
+        // Local facts first, so the message names the closest cause. Both are
+        // preconditions of the round trip below: with no session directory there
+        // is no identity to ask as, and with no binary there is nothing to ask.
+        let session_dir = self.session_dir()?;
 
-        match resolve_executable(&self.binary) {
-            Some(_) => Ok(()),
-            None => Err(self.unavailable(format!(
+        if resolve_executable(&self.binary).is_none() {
+            return Err(self.unavailable(format!(
                 "`{}` is not on PATH or is not executable",
                 self.binary.display()
-            ))),
+            )));
+        }
+
+        let captured = capture(
+            self.vault_list_command(session_dir, std::env::vars_os()),
+            self.timeout,
+        )
+        .map_err(|error| self.unreachable(&error))?;
+
+        if captured.status.success() {
+            Ok(())
+        } else {
+            // stderr only, as everywhere else in this adapter, and with the fix
+            // attached: the vendor says what is wrong, not what to do about it.
+            Err(self.unavailable(format!(
+                "the session at {} cannot be used: {}; re-mint it with `pass-cli login` \
+                 (or re-issue the agent token) and check `stores.proton.session_dir`",
+                session_dir.display(),
+                summarise(&captured.stderr)
+            )))
         }
     }
 }
@@ -1865,12 +1973,17 @@ mod tests {
         assert_eq!(argv.get(2).map(String::as_str), Some("list"));
         assert!(argv.iter().any(|arg| arg == "--output"));
         assert!(argv.iter().any(|arg| arg == "json"));
-        // Passed as a flag value rather than positionally, so a vault whose
-        // name starts with `-` is not read as an option.
-        let vault = argv.iter().position(|arg| arg == "--vault-name");
-        assert_eq!(
-            vault.and_then(|at| argv.get(at + 1)).map(String::as_str),
-            Some("personal")
+        // Named AND joined. Naming the flag stops the vault being taken as a
+        // positional; joining it with `=` stops a vault whose name starts with
+        // `-` being read as a short-flag cluster. Two separate arguments do only
+        // the first, and the vendor refuses that outright.
+        assert!(
+            argv.iter().any(|arg| arg == "--vault-name=personal"),
+            "{argv:?}"
+        );
+        assert!(
+            !argv.iter().any(|arg| arg == "--vault-name"),
+            "the flag and its value were passed as two arguments: {argv:?}"
         );
         for forbidden in ["--show-secrets", "view", "--field", "run"] {
             assert!(
@@ -2169,12 +2282,18 @@ mod tests {
         assert_eq!(argv.get(2).map(String::as_str), Some("view"));
         // By id, not by title: the id came from a listing this adapter just read,
         // so `fields` and `run` are looking at the same item even if two share a
-        // title.
-        let at = argv.iter().position(|arg| arg == "--item-id");
-        assert_eq!(
-            at.and_then(|at| argv.get(at + 1)).map(String::as_str),
-            Some("ITEM1")
+        // title. Joined to its flag, because an id may begin with `-`.
+        assert!(argv.iter().any(|arg| arg == "--item-id=ITEM1"), "{argv:?}");
+        assert!(
+            argv.iter().any(|arg| arg == "--share-id=SHARE1"),
+            "{argv:?}"
         );
+        for split in ["--item-id", "--share-id"] {
+            assert!(
+                !argv.iter().any(|arg| arg == split),
+                "`{split}` and its value were passed as two arguments: {argv:?}"
+            );
+        }
         assert!(argv.iter().any(|arg| arg == "json"));
 
         // Same two variables as every other Proton call.
@@ -2207,6 +2326,79 @@ mod tests {
             .map(|(key, _)| key.to_string_lossy().into_owned())
             .collect();
         assert!(removed.contains(&"A_REFERENCE".to_owned()), "{removed:?}");
+    }
+
+    #[test]
+    fn no_coordinate_ever_arrives_as_a_short_flag_cluster() {
+        // The rule is the vendor's parser's, stated once and applied to every
+        // invocation this adapter builds: clap reads a standalone argument that
+        // begins with ONE `-` as a cluster of short flags, whatever option came
+        // before it, and refuses the command with exit 2.
+        //
+        // Written as a property over the whole argument vector rather than as a
+        // list of the flags this file happens to pass. A list would be the same
+        // list twice — add a flag and it leaves the test in the same stroke.
+        //
+        // The values below are the shape that actually broke: Proton ids are
+        // base64url, whose alphabet includes `-`, so an id can begin with one.
+        // They are invented — the property under test is the leading `-`, and
+        // nothing here needs a coordinate from anybody's real vault.
+        fn no_cluster(argv: &[String], what: &str) {
+            for arg in &argv[1..] {
+                // A lone `-` is exempt: it is the vendor's own spelling for
+                // stdin, and clap reads it as a value rather than as flags.
+                let cluster = arg.starts_with('-') && !arg.starts_with("--") && arg != "-";
+                assert!(
+                    !cluster,
+                    "{what} passed `{arg}`, which the vendor reads as short flags: {argv:?}"
+                );
+            }
+        }
+
+        let store = store_from("{}");
+
+        let listing = list_argv(&store, "-dashvault");
+        assert!(
+            listing.iter().any(|arg| arg == "--vault-name=-dashvault"),
+            "{listing:?}"
+        );
+        no_cluster(&listing, "`item list`");
+
+        let record = ItemRecord {
+            id: "-Kx7Qm2Za".to_owned(),
+            share_id: "-Sh4r3".to_owned(),
+            state: "Active".to_owned(),
+            title: "demo.service".to_owned(),
+            item_type: "custom".to_owned(),
+        };
+        let command = store.view_command(Path::new(SCOPED), &record, ambient());
+        let view: Vec<String> = std::iter::once(command.get_program())
+            .chain(command.get_args())
+            .map(OsStr::to_string_lossy)
+            .map(std::borrow::Cow::into_owned)
+            .collect();
+        assert!(
+            view.iter().any(|arg| arg == "--item-id=-Kx7Qm2Za"),
+            "{view:?}"
+        );
+        assert!(
+            view.iter().any(|arg| arg == "--share-id=-Sh4r3"),
+            "{view:?}"
+        );
+        no_cluster(&view, "`item view`");
+
+        // The negative control for the helper itself: it has to be able to fail.
+        // Without this, `no_cluster` could be vacuous — a loop that never trips
+        // reads exactly like a loop that cannot.
+        let broken = vec![
+            "pass-cli".to_owned(),
+            "--item-id".to_owned(),
+            "-Kx7Qm2Za".to_owned(),
+        ];
+        assert!(
+            std::panic::catch_unwind(|| no_cluster(&broken, "the control")).is_err(),
+            "the check passed an argument vector the vendor refuses"
+        );
     }
 
     #[test]

@@ -56,8 +56,8 @@ use crate::secret::Secret;
 use crate::store::exec::{self, CaptureError, capture, capture_with_input, summarise};
 use crate::store::manage::{MINT_A_MANAGER_TOKEN, Manage, ManageError, Stored};
 use crate::store::proton::{
-    ItemListing, Matched, REASON_VAR, REFERENCE_SCHEME, Reason, SESSION_DIR_VAR, match_title,
-    remove_ambient_references, resolve_executable, scrub,
+    ItemListing, Matched, REASON_VAR, REFERENCE_SCHEME, Reason, SESSION_DIR_VAR, flag_value,
+    match_title, remove_ambient_references, resolve_executable, scrub,
 };
 
 /// The fields a `login` item has of its own.
@@ -225,8 +225,10 @@ impl ProtonManager {
         let mut command = Command::new(&self.binary);
         command.arg("item");
         command.arg("list");
-        command.arg("--vault-name");
-        command.arg(vault);
+        // Joined with `=`: a vault whose name starts with `-` is read as a
+        // short-flag cluster when it arrives as its own argument. See
+        // [`flag_value`].
+        flag_value(&mut command, "--vault-name", vault);
         command.arg("--output");
         command.arg("json");
         remove_ambient_references(&mut command, ambient);
@@ -247,8 +249,7 @@ impl ProtonManager {
         command.arg("item");
         command.arg("create");
         command.arg(kind);
-        command.arg("--vault-name");
-        command.arg(&address.vault);
+        flag_value(&mut command, "--vault-name", &address.vault);
         command.arg("--from-template");
         command.arg("-");
         remove_ambient_references(&mut command, ambient);

@@ -45,6 +45,17 @@ use support::{
     stub_pass_cli_discovery, stub_pass_cli_listing, witness, witnessed,
 };
 
+/// Whether `argv` carries `flag`, in either of the two spellings clap accepts.
+///
+/// Written once because the adapter now joins every option to its value with
+/// `=`. A check for the bare string would silently stop biting on the joined
+/// form — a forbidden flag would slip through a test that still reads as a
+/// guard, which is the exact failure shape these tests exist to catch.
+fn mentions(argv: &[String], flag: &str) -> bool {
+    argv.iter()
+        .any(|arg| arg == flag || arg.starts_with(&format!("{flag}=")))
+}
+
 /// Build a registry from a JSON config, as `main` does.
 fn registry_from(json: &str, reason: &Reason) -> Registry {
     let config: Config = serde_json::from_str(json).expect("the test config must be valid");
@@ -340,12 +351,14 @@ fn a_proton_value_reaches_the_child_and_nothing_else() {
         "the lookup inherited the ambient Proton session"
     );
 
+    // `--env-file=<path>`, one argument. Every value this adapter passes is
+    // joined to its flag, because the vendor's parser reads a value that begins
+    // with `-` as a cluster of short flags, and `TMPDIR` decides this one.
     let argv = recorded_lines(&dir.join("pass-cli.argv"));
-    let at = argv
+    let env_file = argv
         .iter()
-        .position(|arg| arg == "--env-file")
+        .find_map(|arg| arg.strip_prefix("--env-file="))
         .expect("the reference must travel in an env file");
-    let env_file = argv.get(at + 1).expect("--env-file takes a path");
     assert!(
         !Path::new(env_file).exists(),
         "the probe env file outlived the lookup: {env_file}"
@@ -720,7 +733,7 @@ fn a_named_item_is_addressed_by_the_ids_this_session_minted() {
     // that could print content.
     let list_argv = recorded_lines(&dir.join("pass-cli.list.argv"));
     assert!(
-        list_argv.iter().any(|arg| arg == "personal"),
+        list_argv.iter().any(|arg| arg == "--vault-name=personal"),
         "{list_argv:?}"
     );
     assert!(
@@ -1241,7 +1254,7 @@ fn discovery_never_reaches_the_verb_that_resolves_a_value() {
     assert_eq!(argv.first().map(String::as_str), Some("item"));
     for forbidden in ["run", "--env-file", "--no-masking", "--show-secrets"] {
         assert!(
-            !argv.iter().any(|arg| arg == forbidden),
+            !mentions(&argv, forbidden),
             "`{forbidden}` appeared in a discovery invocation: {argv:?}"
         );
     }
@@ -1251,4 +1264,207 @@ fn discovery_never_reaches_the_verb_that_resolves_a_value() {
     // off-machine like any other.
     assert_eq!(recorded(&dir.join("pass-cli.session")), SCOPED_SESSION_DIR);
     assert!(!recorded(&dir.join("pass-cli.reason")).trim().is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// A coordinate that begins with `-`.
+//
+// Proton ids are base64url, whose alphabet includes `-`, so about one id in 64
+// begins with one. `pass-cli` parses with clap, which reads a standalone
+// argument beginning with a single `-` as a cluster of short flags — whatever
+// option preceded it — and refuses the command with exit 2. Found on a real
+// item on 2026-08-08, not reasoned about: an id beginning `-` meant `keyless
+// fields` could not inspect that item at all.
+//
+// Every coordinate below is invented. The property under test is the leading
+// `-`, which any base64url-shaped decoy carries — see `no_real_vault_coordinates`
+// in this file, which is what keeps it that way.
+//
+// The stub refuses exactly what the vendor refuses, so this is a test of the
+// invocation reaching a parser, not of a copy of the adapter's flag list.
+// ---------------------------------------------------------------------------
+
+/// The same shape as `LIVE_AND_TRASHED`, with ids that begin with `-`.
+const DASH_LEADING_IDS: &str = r#"{"items":[
+    {"id":"-Kx7Qm2Za","share_id":"-Sh4r3","vault_id":"V","state":"Active","flags":[],
+     "create_time":"2000-01-01T00:00:00","modify_time":"2000-01-01T00:00:01",
+     "title":"demo.service","item_type":"custom"}]}"#;
+
+fn dash_id_view() -> String {
+    format!(
+        r#"{{"item":{{"id":"-Kx7Qm2Za","share_id":"-Sh4r3","state":"Active","revision":2,
+            "content":{{"item_uuid":"UU1D","title":"demo.service","note":"{VIEW_LEAK}",
+              "extra_fields":[
+                {{"name":"API Token","content":{{"Hidden":"{VIEW_LEAK}"}}}}
+              ]}}}}}}"#
+    )
+}
+
+#[test]
+fn fields_inspects_an_item_whose_id_begins_with_a_dash() {
+    let dir = scratch("discover-dash-id");
+    let stub = stub_pass_cli_discovery(&dir, ONE_VAULT, DASH_LEADING_IDS, &dash_id_view());
+    let fields = discoverer_for(&stub)
+        .fields(Some("personal"), "demo.service")
+        .expect("an item whose id begins with `-` must still be inspectable");
+
+    let names: Vec<&str> = fields.iter().map(|field| field.name.as_str()).collect();
+    assert!(names.contains(&"API Token"), "{names:?}");
+
+    // And the id reached the vendor joined to its flag, in one argument. The
+    // assertion above cannot distinguish "addressed correctly" from "addressed
+    // by title and got lucky", and addressing by title is the wrong fix here.
+    let argv = recorded_lines(&dir.join("pass-cli.argv"));
+    assert!(
+        argv.iter().any(|arg| arg == "--item-id=-Kx7Qm2Za"),
+        "{argv:?}"
+    );
+    assert!(
+        !argv.iter().any(|arg| arg == "--item-title"),
+        "the item was addressed by title, which two items can share: {argv:?}"
+    );
+}
+
+#[test]
+fn a_vault_whose_name_begins_with_a_dash_is_still_enumerable() {
+    // The same defect one verb earlier. `--vault-name` was already named rather
+    // than positional, and that alone never fixed it: the vendor refuses the
+    // value whichever option it followed.
+    let dir = scratch("discover-dash-vault");
+    let stub = stub_pass_cli_discovery(&dir, ONE_VAULT, DASH_LEADING_IDS, "{}");
+    let items = discoverer_for(&stub)
+        .items(Some("-dashvault"))
+        .expect("a vault whose name begins with `-` must still be enumerable");
+    assert_eq!(items.len(), 1);
+
+    let argv = recorded_lines(&dir.join("pass-cli.argv"));
+    assert!(
+        argv.iter().any(|arg| arg == "--vault-name=-dashvault"),
+        "{argv:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// `doctor` and a dead session.
+//
+// Measured on 2026-08-08: with the agent session expired, `keyless doctor`
+// printed `store proton ok` and `0 problem(s)` while every Proton name was
+// degrading — the child ran with an empty bearer and the resulting HTTP 400
+// came back at exit 0. `doctor` is the command a session is told to run to find
+// that out, and `keyless run` never refuses, so nothing else on the machine
+// could have said it.
+// ---------------------------------------------------------------------------
+
+/// `doctor`'s report and its exit code, against a registry built from `config`.
+fn doctor_report(dir: &Path, config: &str) -> (String, i32) {
+    let paths = keyless::paths::Paths::under(dir);
+    let mut load = keyless::config::Config::load(&paths.config);
+    load.config = serde_json::from_str(config).expect("the test config must be valid");
+    load.loaded = true;
+    let registry = store::build(
+        &load.config,
+        &Invocation {
+            reason: Reason::for_verb("doctor"),
+            infisical_env: None,
+        },
+    )
+    .registry;
+    let audit = keyless::audit::AuditLog::new(paths.audit.clone());
+
+    let mut out: Vec<u8> = Vec::new();
+    let code = keyless::cmd::doctor::doctor(&paths, &load, &registry, &audit, &[], false, &mut out)
+        .expect("the report must be writable");
+    (String::from_utf8(out).expect("utf-8"), code)
+}
+
+#[test]
+fn doctor_reports_an_expired_proton_session_as_a_problem() {
+    let dir = scratch("doctor-dead-session");
+    let stub = support::stub_pass_cli_dead_session(&dir);
+    let (report, code) = doctor_report(&dir, &proton_config(&stub, r#""timeout_ms":5000"#));
+
+    assert!(
+        report.contains("store    proton PROBLEM"),
+        "a dead session was not reported as a problem:\n{report}"
+    );
+    // The vendor's own words, so the reader knows which of the many ways this
+    // backend fails they are looking at.
+    assert!(
+        report.contains("authenticated client"),
+        "the report did not say what the vendor said:\n{report}"
+    );
+    // And the fix, because "requires an authenticated client" does not tell
+    // anybody which session directory to re-mint.
+    assert!(report.contains("pass-cli login"), "{report}");
+    assert!(report.contains(SCOPED_SESSION_DIR), "{report}");
+    assert_eq!(code, 1, "{report}");
+    assert!(!report.contains("0 problem(s)"), "{report}");
+
+    // The check reached the vendor rather than concluding from the config, and
+    // it asked for the one verb that reads no item content.
+    let argv = recorded_lines(&dir.join("pass-cli.argv"));
+    assert_eq!(argv.first().map(String::as_str), Some("vault"));
+    assert_eq!(argv.get(1).map(String::as_str), Some("list"));
+    for forbidden in ["run", "view", "--show-secrets", "--env-file"] {
+        assert!(
+            !mentions(&argv, forbidden),
+            "a health check asked for `{forbidden}`: {argv:?}"
+        );
+    }
+}
+
+#[test]
+fn doctor_reports_a_live_proton_session_as_ok() {
+    // The negative control for the test above. Without it, that one passes on an
+    // implementation that reports every Proton store as broken, which would be a
+    // false RED — the same defect wearing the other colour, and the one that
+    // gets a health check deleted.
+    let dir = scratch("doctor-live-session");
+    let stub = stub_pass_cli_discovery(&dir, ONE_VAULT, LIVE_AND_TRASHED, "{}");
+    let (report, code) = doctor_report(&dir, &proton_config(&stub, r#""timeout_ms":5000"#));
+
+    assert!(report.contains("store    proton ok"), "{report}");
+    assert_eq!(code, 0, "{report}");
+    assert!(report.contains("0 problem(s)"), "{report}");
+
+    // `ok` here is a claim about a live session, and the default report is
+    // still allowed to make it because it MEASURED it — for the price of one
+    // spawn that reads no item content. The last thing the vendor was asked
+    // is the proof: `vault list`, never `run`.
+    let argv = recorded_lines(&dir.join("pass-cli.argv"));
+    assert_eq!(argv.first().map(String::as_str), Some("vault"));
+    assert!(!mentions(&argv, "run"), "{argv:?}");
+
+    // And the report says which question it did NOT ask. `--probe` resolves
+    // every name, which READS every credential; that is why it is opt-in, and
+    // why the report has to name it rather than leave the reader believing
+    // `store proton ok` covers their names too.
+    assert!(report.contains("not probed"), "{report}");
+    assert!(report.contains("--probe"), "{report}");
+}
+
+#[test]
+fn a_proton_store_with_no_session_directory_is_unhealthy_without_spawning_anything() {
+    // The local preconditions still come first, and they still short-circuit.
+    // A health check that spawned the vendor before noticing there is no
+    // identity to ask as would report the wrong cause, and — measured
+    // 2026-08-08 — `pass-cli` REINITIALISES the session database at whatever
+    // path it is pointed at, so "spawn first, ask later" is not a cosmetic
+    // mistake here.
+    let dir = scratch("doctor-no-session");
+    let stub = stub_pass_cli_discovery(&dir, ONE_VAULT, LIVE_AND_TRASHED, "{}");
+    let config = format!(
+        r#"{{"stores":{{"keychain":{{"enabled":false}},
+             "proton":{{"enabled":true,"binary":"{}","timeout_ms":5000}}}}}}"#,
+        stub.display()
+    );
+    let (report, code) = doctor_report(&dir, &config);
+
+    assert!(report.contains("store    proton PROBLEM"), "{report}");
+    assert!(report.contains("session_dir"), "{report}");
+    assert_eq!(code, 1, "{report}");
+    assert!(
+        !dir.join("pass-cli.argv").exists(),
+        "the vendor was spawned with no session directory configured"
+    );
 }
