@@ -33,6 +33,7 @@ use serde::{Deserialize, Serialize};
 use crate::attest::{Policy, is_interpreter};
 use crate::error::ConfigError;
 use crate::ipc::peer::decode_hex;
+use crate::paths::ConfigPath;
 use crate::store::file::FileStore;
 use crate::store::keychain::KeychainStore;
 use crate::store::{Registry, Store};
@@ -42,11 +43,11 @@ use crate::store::{Registry, Store};
 pub struct DaemonConfig {
     /// Where to listen.
     #[serde(default = "default_socket")]
-    pub socket: PathBuf,
+    pub socket: ConfigPath,
     /// Where to append the audit log. Must be a path the calling user cannot
     /// write; the installer is what makes that true.
     #[serde(default = "default_audit")]
-    pub audit: PathBuf,
+    pub audit: ConfigPath,
     /// How long a resolved value may be reused from memory.
     #[serde(default = "default_ttl_seconds")]
     pub cache_ttl_seconds: u64,
@@ -112,7 +113,7 @@ pub struct FileStoreConfig {
     pub enabled: bool,
     /// Path to the `{"NAME":"value"}` file.
     #[serde(default = "default_secrets_file")]
-    pub path: PathBuf,
+    pub path: ConfigPath,
 }
 
 impl Default for FileStoreConfig {
@@ -140,7 +141,7 @@ pub struct DaemonKeychainConfig {
     pub service: String,
     /// Path to the `security` binary.
     #[serde(default = "default_security_binary")]
-    pub binary: PathBuf,
+    pub binary: ConfigPath,
     /// The keychain file to search.
     ///
     /// **Required in practice.** A daemon has no login keychain, so leaving
@@ -148,7 +149,7 @@ pub struct DaemonKeychainConfig {
     /// no GUI session, which finds nothing. The installer creates a keychain
     /// owned by the daemon's uid and names it here.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub keychain: Option<PathBuf>,
+    pub keychain: Option<ConfigPath>,
 }
 
 impl Default for DaemonKeychainConfig {
@@ -162,20 +163,24 @@ impl Default for DaemonKeychainConfig {
     }
 }
 
-fn default_socket() -> PathBuf {
-    crate::ipc::default_socket_path()
+fn default_socket() -> ConfigPath {
+    ConfigPath::from(crate::ipc::default_socket_path())
 }
 
-fn default_audit() -> PathBuf {
-    PathBuf::from("/usr/local/var/log")
-        .join(crate::NAME)
-        .join("audit.jsonl")
+fn default_audit() -> ConfigPath {
+    ConfigPath::from(
+        PathBuf::from("/usr/local/var/log")
+            .join(crate::NAME)
+            .join("audit.jsonl"),
+    )
 }
 
-fn default_secrets_file() -> PathBuf {
-    PathBuf::from("/usr/local/var/lib")
-        .join(crate::NAME)
-        .join("secrets.json")
+fn default_secrets_file() -> ConfigPath {
+    ConfigPath::from(
+        PathBuf::from("/usr/local/var/lib")
+            .join(crate::NAME)
+            .join("secrets.json"),
+    )
 }
 
 const fn default_ttl_seconds() -> u64 {
@@ -190,8 +195,8 @@ fn default_service() -> String {
     crate::NAME.to_owned()
 }
 
-fn default_security_binary() -> PathBuf {
-    PathBuf::from("/usr/bin/security")
+fn default_security_binary() -> ConfigPath {
+    ConfigPath::from("/usr/bin/security")
 }
 
 impl DaemonConfig {
@@ -257,15 +262,23 @@ impl DaemonConfig {
     pub fn registry(&self) -> Registry {
         let mut stores: Vec<Box<dyn Store>> = Vec::new();
         if self.stores.file.enabled {
-            stores.push(Box::new(FileStore::new(self.stores.file.path.clone())));
+            stores.push(Box::new(FileStore::new(
+                self.stores.file.path.to_path_buf(),
+            )));
         }
         if self.stores.keychain.enabled {
             stores.push(Box::new(
                 KeychainStore::new(
-                    self.stores.keychain.binary.clone(),
+                    self.stores.keychain.binary.to_path_buf(),
                     self.stores.keychain.service.clone(),
                 )
-                .in_keychain(self.stores.keychain.keychain.clone()),
+                .in_keychain(
+                    self.stores
+                        .keychain
+                        .keychain
+                        .as_deref()
+                        .map(|path| path.to_path_buf()),
+                ),
             ));
         }
         Registry::new(stores)

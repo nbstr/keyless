@@ -121,7 +121,7 @@ fn twenty_sessions_asking_at_once_make_one_upstream_call() {
     // A slow backend makes the window real and the assertion exact.
     config.stores.file.enabled = false;
     config.stores.keychain.enabled = true;
-    config.stores.keychain.binary = support::slow_store_stub(&dir, DECOY_VALUE, 200);
+    config.stores.keychain.binary = support::slow_store_stub(&dir, DECOY_VALUE, 200).into();
     let running = start_daemon(&config, policy_allowing_self());
     let socket = running.socket().to_path_buf();
 
@@ -200,7 +200,7 @@ fn the_cache_serves_a_repeat_without_touching_the_store() {
         .flatten()
     {
         let path = entry.path();
-        if path == config.stores.file.path {
+        if path == config.stores.file.path.as_path() {
             continue;
         }
         let contents = std::fs::read(&path).unwrap_or_default();
@@ -257,7 +257,7 @@ fn the_daemons_audit_log_chains_across_concurrent_sessions() {
     });
     drop(running);
 
-    let log = AuditLog::new(config.audit.clone());
+    let log = AuditLog::new(config.audit.to_path_buf());
     let rows = log.verify().expect("the chain must hold under concurrency");
     assert_eq!(rows, 60, "expected one row per request, got {rows}");
 

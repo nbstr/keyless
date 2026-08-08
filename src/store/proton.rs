@@ -429,7 +429,45 @@ impl Drop for TempEnvFile {
 const NO_SESSION_DIR: &str = "`stores.proton.session_dir` is not set, so which Proton \
      identity answers would be whatever `pass-cli` was last logged into — on a machine with a \
      full-account login that is every vault, not the scoped one. Set it to the session \
-     directory of the agent token you minted, e.g. \"session_dir\": \"~/.keyless-pass-session\"";
+     directory of the agent token you minted, e.g. \"session_dir\": \"~/.keyless-pass-session\" \
+     — a leading `~` is expanded against your home directory";
+
+/// What to tell an operator whose session directory is a RELATIVE path.
+///
+/// # Why this is checked here rather than at parse time
+///
+/// [`crate::paths::ConfigPath`] refuses a `~` it cannot resolve, so a path
+/// reaching this point is exactly what the file said. It cannot go further and
+/// refuse every relative path, because most path fields in the same config are
+/// legitimately relative: `binary` is `pass-cli`, `probe_binary` resolves
+/// through `PATH`. Relative is wrong for a session DIRECTORY specifically, so
+/// the rule belongs to the field, not to the type.
+///
+/// # Why a degraded name rather than a refused command
+///
+/// This is the same defect the tilde bug was — one config, a different session
+/// per working directory — and it is just as invisible, so it must not be
+/// silent. It must also not block: `keyless run` never refuses, and a config
+/// typo is a poor place to acquire the first exception. So a lookup fails as
+/// [`StoreError::Unavailable`], `run` names the name it could not resolve and
+/// still spawns the child, and `doctor` — which calls the same function from
+/// [`ProtonStore::health`] — reports `store proton PROBLEM …` instead of `ok`.
+/// `doctor` has no power to block anything and its own report says so, so
+/// "refuse it in `doctor`" can only mean "never call it ok", which is what this
+/// does.
+///
+/// The write verbs are the documented exception and refuse outright; see
+/// [`crate::store::manage`] and [`crate::store::proton_manager`].
+pub(crate) fn relative_session_dir(field: &str, dir: &Path) -> String {
+    format!(
+        "`{field}` is `{}`, which is a relative path. `pass-cli` resolves it against the \
+         working directory, so one config would mint a FRESH, EMPTY session in every directory \
+         a command is run from — and every one of them resolves nothing while looking \
+         configured. Write an absolute path, or `~/…`, which is expanded against your home \
+         directory",
+        dir.display()
+    )
+}
 
 /// Where one name lives, in the stable form: vault name, item title, field.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -921,9 +959,12 @@ impl ProtonStore {
             .collect();
 
         ProtonStore {
-            binary: settings.binary.clone(),
-            probe_binary: settings.probe_binary.clone(),
-            session_dir: settings.session_dir.clone(),
+            binary: settings.binary.to_path_buf(),
+            probe_binary: settings.probe_binary.to_path_buf(),
+            session_dir: settings
+                .session_dir
+                .as_deref()
+                .map(|path| path.to_path_buf()),
             timeout: crate::config::bounded_timeout(settings.timeout_ms),
             reason,
             addresses,
@@ -965,9 +1006,17 @@ impl ProtonStore {
     /// name it could not resolve and spawns the child anyway. The never-block
     /// invariant has no exception here and does not acquire one.
     fn session_dir(&self) -> Result<&Path, StoreError> {
-        self.session_dir
+        let dir = self
+            .session_dir
             .as_deref()
-            .ok_or_else(|| self.unavailable(NO_SESSION_DIR))
+            .ok_or_else(|| self.unavailable(NO_SESSION_DIR))?;
+        if !dir.is_absolute() {
+            // A relative session directory is the tilde defect wearing different
+            // clothes — see `relative_session_dir` for why it degrades here and
+            // refuses in the write verbs.
+            return Err(self.unavailable(relative_session_dir("stores.proton.session_dir", dir)));
+        }
+        Ok(dir)
     }
 
     /// Build one `pass-cli run --env-file … -- printenv KEYLESS_PROBE` invocation.

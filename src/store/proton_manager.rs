@@ -57,7 +57,7 @@ use crate::store::exec::{self, CaptureError, capture, capture_with_input, summar
 use crate::store::manage::{MINT_A_MANAGER_TOKEN, Manage, ManageError, Stored};
 use crate::store::proton::{
     ItemListing, Matched, REASON_VAR, REFERENCE_SCHEME, Reason, SESSION_DIR_VAR, flag_value,
-    match_title, remove_ambient_references, resolve_executable, scrub,
+    match_title, relative_session_dir, remove_ambient_references, resolve_executable, scrub,
 };
 
 /// The fields a `login` item has of its own.
@@ -134,12 +134,20 @@ impl ProtonManager {
     /// legible "mint an editor token" into the vendor's `NotAllowed` — and if the
     /// reader token were ever granted write access, the fallback would silently
     /// undo the whole split.
+    ///
+    /// The same variant when that directory is RELATIVE. A read degrades on this
+    /// and still runs the command; a write refuses, which is the asymmetry
+    /// [`crate::store::manage`] documents — a write that "degraded" would report
+    /// success with nothing stored, and here it would store into a session
+    /// directory that depends on where the operator was standing.
     pub fn from_config(config: &Config, reason: Reason) -> Result<Self, ManageError> {
         let settings = &config.stores.proton;
-        let manager = settings
-            .manager
-            .as_ref()
-            .and_then(|manager| manager.session_dir.clone().map(|dir| (manager, dir)));
+        let manager = settings.manager.as_ref().and_then(|manager| {
+            manager
+                .session_dir
+                .as_deref()
+                .map(|dir| (manager, dir.to_path_buf()))
+        });
 
         let Some((manager, session_dir)) = manager else {
             return Err(ManageError::NoIdentity {
@@ -148,8 +156,18 @@ impl ProtonManager {
             });
         };
 
+        if !session_dir.is_absolute() {
+            return Err(ManageError::NoIdentity {
+                store: "proton".to_owned(),
+                detail: relative_session_dir(
+                    "stores.proton.manager.session_dir",
+                    session_dir.as_path(),
+                ),
+            });
+        }
+
         Ok(ProtonManager {
-            binary: settings.binary.clone(),
+            binary: settings.binary.to_path_buf(),
             session_dir,
             timeout: crate::config::bounded_timeout(manager.timeout_ms),
             reason,

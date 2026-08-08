@@ -156,7 +156,7 @@ fn corrupt_config_still_spawns_the_child() {
         // The defaulted config, with the backend pointed at a stub so no real
         // keychain is ever consulted by this suite.
         let mut config = load.config.clone();
-        config.stores.keychain.binary = stub_security(&dir, &Stub::NotFound);
+        config.stores.keychain.binary = stub_security(&dir, &Stub::NotFound).into();
         let registry = store::build(&config, &Invocation::default()).registry;
 
         let warnings = vec![problem.to_string()];

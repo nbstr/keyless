@@ -282,7 +282,7 @@ fn verify(args: &VerifyArgs) -> ExitCode {
     let path = match &args.audit {
         Some(path) => path.clone(),
         None => match DaemonConfig::load(&args.config) {
-            Ok(config) => config.audit,
+            Ok(config) => config.audit.to_path_buf(),
             Err(error) => return fail(&error.to_string()),
         },
     };

@@ -93,7 +93,7 @@ impl KeychainStore {
             })
             .collect();
         KeychainStore {
-            binary: keychain.binary.clone(),
+            binary: keychain.binary.to_path_buf(),
             default_service: keychain.service.clone(),
             keychain: None,
             routes,
@@ -235,7 +235,7 @@ impl KeychainManager {
     #[must_use]
     pub fn from_config(config: &Config) -> Self {
         KeychainManager {
-            binary: config.stores.keychain.binary.clone(),
+            binary: config.stores.keychain.binary.to_path_buf(),
             default_service: config.stores.keychain.service.clone(),
             keychain: None,
             timeout: std::time::Duration::from_secs(30),
