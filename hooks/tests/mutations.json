@@ -285,5 +285,33 @@
     "file": "keyless_hooks/checks/env_dump.py",
     "find": "    if name != name.upper():\n        return False",
     "replace": "    if False:\n        return False"
+  },
+  {
+    "id": "M39-a-qualified-key-is-not-a-credential",
+    "why": "`SECRET_KEY` is Django's and Flask's own credential and the name-keyed rule could not see it: the keyword has to be followed immediately by `=`, and `SECRET` is followed by `_KEY`. Removing the qualified spellings restores that blindness while every vendor pattern still matches, so `STRIPE_SECRET_KEY=<a Stripe key>` stays green and only a value with no vendor shape goes red.",
+    "file": "keyless_hooks/fingerprint.py",
+    "find": "    r\"(?P<kw>token|secret_key|secret-key|secret|pgpassword|password|passwd|apikey|\"\n    r\"api_key|api-key|access_key|access-key|private_key|private-key|signing_key|\"\n    r\"signing-key|encryption_key|encryption-key|credentials?|auth_token|auth-token)\"",
+    "replace": "    r\"(?P<kw>token|secret|pgpassword|password|passwd|apikey|\"\n    r\"api_key|api-key|access_key|access-key|private_key|private-key|\"\n    r\"credentials?|auth_token|auth-token)\""
+  },
+  {
+    "id": "M40-pgpassword-is-two-words",
+    "why": "The lookbehind refuses a keyword glued to a preceding word, which is right for `nextPageToken` and `attributeKey` and wrong for exactly one name: libpq's PGPASSWORD, 33 occurrences in the corpus against 51 for every other glued spelling combined. Dropping the literal reopens it, and nothing else in the pack covers `PGPASSWORD=<literal> psql`.",
+    "file": "keyless_hooks/fingerprint.py",
+    "find": "    r\"(?P<kw>token|secret_key|secret-key|secret|pgpassword|password|passwd|apikey|\"",
+    "replace": "    r\"(?P<kw>token|secret_key|secret-key|secret|password|passwd|apikey|\""
+  },
+  {
+    "id": "M41-any-suffix-is-still-a-credential",
+    "why": "The mutation that widens instead of narrowing, and the false-positive layer is the only thing that can catch it. Letting any bounded identifier follow the keyword is the obvious way to reach SECRET_KEY, and over 86,125 real commands it also admits AWS_ACCESS_KEY_ID (30, the public half of the pair), apiKeyConnectionId (22), secretRef (11) and secretsManager: 142 new findings, almost none a secret. A gate that denies those gets uninstalled, so silence on them has to be an assertion and not an accident.",
+    "file": "keyless_hooks/fingerprint.py",
+    "find": "    r\"[\\\"']?\\s*[:=]\\s*\"\n    r\"(?:\\\"([^\\\"\\n]{12,256})\\\"",
+    "replace": "    r\"[A-Za-z0-9_-]{0,32}[\\\"']?\\s*[:=]\\s*\"\n    r\"(?:\\\"([^\\\"\\n]{12,256})\\\""
+  },
+  {
+    "id": "M42-key-alone-is-a-credential-word",
+    "why": "The other way to reach SECRET_KEY without enumerating a tail, and the cheaper-looking one: make `key` a keyword on its own. The corpus refuses it — 121 bare `key=` assignments carrying an opaque value, none of them a credential, plus cacheKey, sortKey, objectKey, partitionKey and idempotency keys. This is the mutation the silence fixtures for those names exist to catch; without it they assert nothing.",
+    "file": "keyless_hooks/fingerprint.py",
+    "find": "    r\"(?P<kw>token|secret_key|",
+    "replace": "    r\"(?P<kw>token|key|secret_key|"
   }
 ]

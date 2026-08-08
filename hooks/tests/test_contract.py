@@ -301,6 +301,46 @@ def run():
         s.check("rewrite keeps the file's key: %s" % want,
                 want in fingerprint.redact(text)[0], True)
 
+    # ── the name-keyed rule, where the keyword is not the whole identifier ──
+    #
+    # Every case below uses DECOY["generic"] — deliberately NOT a vendor shape.
+    # The three cases above pass through a vendor pattern, so they stayed green
+    # while `STRIPE_SECRET_KEY=<an opaque value>` matched nothing at all: the
+    # keyword has to be followed immediately by `=`, and `SECRET` is followed by
+    # `_KEY`. A decoy that two rules can catch cannot tell you which one did.
+    #
+    # The names are spelled out rather than read from `_ASSIGN` — a table driven
+    # by the pattern it is testing goes green the moment an entry is deleted from
+    # both at once.
+    for name in ("SECRET_KEY", "DJANGO_SECRET_KEY", "STRIPE_SECRET_KEY",
+                 "SIGNING_KEY", "SESSION_SIGNING_KEY", "ENCRYPTION_KEY",
+                 "CREDENTIAL_ENCRYPTION_KEY", "PGPASSWORD"):
+        found = fingerprint.scan("%s=%s" % (name, DECOY["generic"]))
+        s.check("name-keyed catches %s" % name,
+                [f.kind for f in found], ["named_credential"])
+        # The reference has to resolve. Reading only as far as the KEYWORD is the
+        # bug that turned GITHUB_TOKEN into ${GITHUB}; a qualified tail puts the
+        # other half of the same name at risk.
+        s.check("name-keyed names %s in full" % name,
+                "${%s}" % name in fingerprint.redact("%s=%s"
+                                                     % (name, DECOY["generic"]))[0], True)
+
+    # The counter-half, and it is what keeps the rule above narrow. A credential
+    # word with MORE identifier after it names a credential rather than holding
+    # one, so these must stay silent — `AWS_ACCESS_KEY_ID` is the public half of
+    # the pair and `SECRET_ARN` is an address.
+    #
+    # Each name goes red under a mutation, and two different ones: the first
+    # group under M42 (`key` promoted to a keyword on its own), the second under
+    # M41 (any bounded suffix allowed after a keyword). A silence assertion that
+    # no mutation can break is a comment with a `check` call around it.
+    for name in ("CACHE_KEY", "SORT_KEY", "OBJECT_KEY", "PARTITION_KEY",
+                 "IDEMPOTENCY_KEY", "KEY", "ROW_KEY",
+                 "SECRET_NAME", "SECRET_REF", "SECRET_ARN",
+                 "AWS_ACCESS_KEY_ID", "TOKEN_DOCS_URL", "SECRETS_MANAGER_ARN"):
+        s.check("name-keyed leaves %s alone" % name,
+                fingerprint.scan("%s=%s" % (name, DECOY["generic"])), [])
+
     # ── the never-allow invariant ───────────────────────────────────────────
     for payload in (bash("cat .env"), bash("env"), read(os.path.join(root, ".env")),
                     write(os.path.join(root, "o.env"), "T=%s" % DECOY["github_pat"]),
