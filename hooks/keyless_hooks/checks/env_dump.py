@@ -41,7 +41,6 @@ _DUMP = {
 }
 
 _REDIRECT = re.compile(r"^\d*(?:>>|>&|>\||&>>|&>|>|<<<|<<|<&|<)")
-_ASSIGN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 
 # Whole-environment expressions inside an interpreter's argument. Each excludes
 # the single-key form: `process.env.FOO` is one variable and is the same act as

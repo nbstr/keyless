@@ -27,7 +27,7 @@ def _table():
     # Imported inside the function so a broken check module cannot stop the
     # engine from loading the others: the import cost is paid once per process
     # either way, and the failure mode differs.
-    from .checks import env_dump, file_read, literal_write, vault_cli
+    from .checks import env_dump, file_read, literal_write, shell_assign, vault_cli
 
     return [
         # id                event          tier      handler
@@ -35,6 +35,13 @@ def _table():
         ("KL-VAULT",  "PreToolUse", BLOCK,   vault_cli.run),
         ("KL-ENV",    "PreToolUse", BLOCK,   env_dump.run),
         ("KL-ENVVAR", "PreToolUse", WARN,    env_dump.run_named_var),
+        # BLOCK rather than OBSERVE, against this file's own rollout rung. The
+        # rung exists to gather rows when a predicate is unproven; this one is
+        # `fingerprint` — already deployed under KL-WRITE, and narrowed further
+        # here to literal values in assignment position. Measured before it was
+        # registered: 0 denials across 86,117 agent Bash calls and 1,791
+        # interactive shell commands that were not a real credential assignment.
+        ("KL-ASSIGN", "PreToolUse", BLOCK,   shell_assign.run),
         ("KL-WRITE",  "PreToolUse", REWRITE, literal_write.run),
         ("KL-SEEN",   "PostToolUse", WARN,   literal_write.run_post),
     ]

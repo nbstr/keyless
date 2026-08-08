@@ -224,6 +224,62 @@
     "replace": "    texts = [cmd, expand_local_assignments(cmd), flatten_substitutions(cmd)]\n    texts.extend(substitution_payloads(cmd))"
   },
   {
+    "id": "M31-arguments-count-as-assignments",
+    "why": "KL-ASSIGN's precision IS the position rule: the same word is a shell assignment before the statement's head and an argument after it. Dropping the test makes `make BUILD=<key>` and `--token=<key>` denials, which is a false positive on the tool sessions use most.",
+    "file": "keyless_hooks/checks/shell_assign.py",
+    "find": "        if pair is not None:\n            if decl or not past_head:\n                out.append(pair)\n            continue",
+    "replace": "        if pair is not None:\n            out.append(pair)\n            continue"
+  },
+  {
+    "id": "M32-expansions-are-literals",
+    "why": "A value built at run time was never typed and cannot be in the transcript. Scanning it verbatim refuses `export AUTH_TOKEN=\"$(cat ~/.token)\"` — a command that leaks nothing and is the very shape the pack asks people to move toward.",
+    "file": "keyless_hooks/checks/shell_assign.py",
+    "find": "    spelled = _EXPANSION.sub(\" \", raw_value)",
+    "replace": "    spelled = raw_value"
+  },
+  {
+    "id": "M33-quote-and-backslash-splicing-survives",
+    "why": "`gh''p_<literal>` and `gh\\p_<literal>` are one word to the shell and several fragments to any tokenizer. The shell removes both marks before the value exists, so leaving them in place makes the value invisible and the bypass six characters long.",
+    "file": "keyless_hooks/checks/shell_assign.py",
+    "find": "    return spelled.replace(\"'\", \"\").replace('\"', \"\").replace(\"\\\\\", \"\")",
+    "replace": "    return spelled"
+  },
+  {
+    "id": "M34-prose-is-a-credential",
+    "why": "The generic NAME=<opaque> rule is name-keyed, and `password:` followed by twelve word characters satisfies it inside an ordinary sentence. Without the whitespace test the check denies `export BANNER=\"db password: ...\"`, and a gate that refuses a sentence is a gate that gets uninstalled.",
+    "file": "keyless_hooks/checks/shell_assign.py",
+    "find": "    if any(c.isspace() for c in literal.strip()):\n        return [f for f in found if f.kind not in _NAME_KEYED]",
+    "replace": "    if False:\n        return [f for f in found if f.kind not in _NAME_KEYED]"
+  },
+  {
+    "id": "M35-declaration-verbs-are-heads",
+    "why": "`export` and `declare` are not commands taking arguments, they are the words after which everything is an assignment. Reading `export` as the head puts every assignment past it and silences the check on its single most common spelling.",
+    "file": "keyless_hooks/checks/shell_assign.py",
+    "find": "        if not past_head and word in _DECLARE:\n            decl = True\n            continue",
+    "replace": "        if False:\n            decl = True\n            continue"
+  },
+  {
+    "id": "M36-wrappers-end-the-assignment-prefix",
+    "why": "`env FOO=<key> cmd` puts the assignment AFTER the wrapper. Treating `env` as the head reads the assignment as its argument, and one prefix word walks past the gate — the same defect `head_of` already absorbs wrappers to prevent.",
+    "file": "keyless_hooks/checks/shell_assign.py",
+    "find": "        if not past_head and is_wrapper(word):",
+    "replace": "        if False and is_wrapper(word):"
+  },
+  {
+    "id": "M37-remediation-teaches-a-broken-form",
+    "why": "`keyless run -s NAME -- cmd \"$NAME\"` is expanded by the CALLING shell where the name is unset, so it sends an EMPTY credential and the failure is a 401 at exit 0. A refusal that hands back that spelling is worse than one that hands back nothing, because it looks like it worked.",
+    "file": "keyless_hooks/checks/shell_assign.py",
+    "find": "        \"    keyless run -s %s -- sh -c '<the command you were going to run>'\\n\\n\"",
+    "replace": "        \"    keyless run -s %s -- <the command you were going to run>\\n\\n\""
+  },
+  {
+    "id": "M38-the-refusal-echoes-the-command",
+    "why": "The command being refused CONTAINS the credential — that is the whole reason it is refused. Quoting it back puts the value in the block message, so the hook publishes the secret it exists to protect. Same shape as M20, on the check where the value is guaranteed to be present.",
+    "file": "keyless_hooks/checks/shell_assign.py",
+    "find": "    return (\"deny\", _message(names, shapes),",
+    "replace": "    return (\"deny\", cmd + \"\\n\" + _message(names, shapes),"
+  },
+  {
     "id": "M30-lower-case-names-are-credentials",
     "why": "6 of 9 organic KL-ENVVAR warns fired on a lower-case `pat` in a session doing 167 `re.*` calls — a PATTERN variable. Dropping the case test brings that whole class back.",
     "file": "keyless_hooks/checks/env_dump.py",

@@ -27,6 +27,18 @@ to. It is not kept as history; it is an executable control. Every safe command
 is replayed against it through the real config file, and the run asserts that it
 refuses a named set of them. If that control ever comes back clean, the case list
 has drifted somewhere harmless and none of the assertions above mean anything.
+
+Four controls now, and each pins a different way this file could go vacuous:
+
+    PREFIX_RULES             the vault TABLE shape that refused safe verbs
+    HELP_CONTROL             the row still matches; `is_help` is why it is silent
+    ASSIGN_VALUE_CONTROL     the walk reaches the assignment; the VALUE clears it
+    ASSIGN_POSITION_CONTROL  the value WOULD fire; the POSITION is why it does not
+
+The last two are a pair on purpose. A KL-ASSIGN whose walk silently stopped
+finding assignments would keep every allow-case in this file green while
+protecting nothing at all, and no assertion of the form "it is silent" can tell
+those two apart.
 """
 
 import json
@@ -335,6 +347,132 @@ ENVVAR_TRUE_POSITIVES = [
     "printenv GITHUB_TOKEN",
 ]
 
+# ── KL-ASSIGN ───────────────────────────────────────────────────────────────
+#
+# This check denies on `Bash`, which is the most-used tool there is, so its
+# false-positive floor decides whether the pack survives at all. Measured before
+# it was registered, over commands that were really run rather than invented:
+# 86,117 agent `Bash` calls from the local transcript corpus and 1,791
+# interactive shell commands. 50,638 of them contain an `=`. 326 denied, and
+# every one was a real credential assignment — 201 connection-string passwords,
+# 114 credential-named opaque values, 9 JWTs, 2 AWS access keys. Zero denials on
+# anything else.
+#
+# The cases below are the shapes that corpus is MADE of. Re-derive the numbers
+# rather than trusting this paragraph; the corpus grows every day.
+
+# Two fixtures spelled in halves, because this pack's own KL-WRITE rewrites the
+# file it is being written into. `TOKEN="<12+ opaque characters>"` is exactly the
+# shape it substitutes, and both of these arrived on disk as `${AUTH_TOKEN}` and
+# `${PASSWORD}` the first time — fixtures asserting the OPPOSITE of what they
+# were written to assert, with the suite still green. harness.py splits its
+# decoys for the same reason. Read the file back after writing it.
+ASSIGN_RUNTIME_FETCH = "export AUTH_TOKEN=" + '"$(cat ~/.token)"'
+ASSIGN_PROSE = 'export BANNER="db password: ' + 'correct-horse-battery-staple"'
+
+# The case that PROVES expansion-blanking is load-bearing. It took a mutation to
+# find, and two earlier candidates were vacuous — worth recording, because the
+# obvious spellings are all covered by something else and a test built on one
+# passes whether the blanking is there or not:
+#
+#   $VAR / ${VAR}   `_is_placeholder` returns True for any value containing `${`,
+#                   and separately for a value that IS a `$VAR`. Covered.
+#   value opens $   `_ASSIGN`'s value class excludes `$`, so `NAME=$(…)` never
+#                   reaches a finding at all. Covered.
+#   $( … )          never reaches the scan in one piece: `statement_spans` cuts
+#                   at `(` and `)`, so the assignment word is already truncated
+#                   to `postgres://app:$` before this check reads it.
+#
+# A BACKTICK substitution is caught by none of those, and `_URL_AUTH` reads it as
+# an eleven-character password. That is the one class where blanking decides the
+# verdict — which is also why the other alternatives in `_EXPANSION` stay: they
+# keep this check's reasoning its own, rather than resting on another module's
+# placeholder list continuing to cover them.
+ASSIGN_SUBST_IN_URL = ("export DATABASE_URL=postgres://app:`get-"
+                       + "db-pw`@db.internal/app")
+
+ASSIGN_FALSE_POSITIVES = [
+    # ordinary configuration — the bulk of every `=` in the corpus
+    "export NODE_ENV=production",
+    "export PORT=3000",
+    "export RUST_LOG=debug",
+    "export CI=true",
+    "export EDITOR=vim",
+    "export TZ=Europe/Brussels",
+    "export LANG=en_US.UTF-8",
+    "export HOMEBREW_NO_AUTO_UPDATE=1",
+    "export PYTHONPATH=./src:./tests",
+    "export CONFIG_PATH=/etc/app/config.yaml",
+    "export npm_config_registry=https://registry.npmjs.org/",
+    "declare -x NODE_ENV=production",
+    "VERSION=3.11.4 make install",
+    "export GIT_AUTHOR_NAME='Some Person'",
+    # a value that is a REFERENCE. This is the correct usage the pack asks for,
+    # and a check keyed on the variable NAME refuses every one of them.
+    'export PATH="$HOME/.local/bin:$PATH"',
+    'export DATABASE_URL="$DATABASE_URL"',
+    'export TOKEN="$TOKEN"',
+    "export SECRET_KEY=${SECRET_KEY}",
+    "export FOO=$(some-command)",
+    # A value fetched at run time. Credential-NAMED, and the substitution is
+    # opaque enough to satisfy every filter in `fingerprint` — so blanking the
+    # expansion is the only thing that keeps this silent.
+    ASSIGN_RUNTIME_FETCH,
+    ASSIGN_SUBST_IN_URL,
+    # Prose. `password:` followed by twelve-plus word characters satisfies the
+    # generic NAME=<opaque> rule exactly, and only the whitespace test withholds
+    # it. A gate that denies a sentence is a gate that gets uninstalled.
+    ASSIGN_PROSE,
+    # high-entropy values that are not credentials
+    "export COMMIT_SHA=e3b0c44298fc1c149afbf4c8996fb92427ae41e4",
+    "export BUILD_ID=550e8400-e29b-41d4-a716-446655440000",
+    # `set -x` is tracing, not an assignment. It AMPLIFIES this leak by echoing
+    # later assignments, which is a fact about the shell and not an act to judge.
+    "set -x",
+    "set -euo pipefail",
+]
+
+# The same literal in ARGUMENT position. Each of these carries a value that
+# `fingerprint` recognises; they are silent only because the word is past the
+# statement's head, where an `=` belongs to the program and not to the shell.
+ASSIGN_FALSE_POSITIVES_ARGV = [
+    "make BUILD=%s" % DECOY["github_pat"],
+    "./configure --with-token=%s" % DECOY["github_pat"],
+    'git commit -m "set GITHUB_TOKEN=%s in CI"' % DECOY["github_pat"],
+    "dd if=/dev/zero of=/tmp/x bs=1M count=1",
+]
+
+ASSIGN_TRUE_POSITIVES = [
+    "export GITHUB_TOKEN=%s" % DECOY["github_pat"],
+    "STRIPE_SECRET_KEY=%s ./deploy.sh" % DECOY["stripe"],
+    "AWS_ACCESS_KEY_ID=%s" % DECOY["aws_key"],
+    "env NPM_TOKEN=%s npm publish" % DECOY["npm"],
+    "declare -x SLACK_TOKEN=%s" % DECOY["slack"],
+    "export FOO=%s" % DECOY["github_pat"],
+    "export DATABASE_URL=postgres://admin:%s@db.example.com/prod" % DECOY["generic"],
+]
+
+# ── the two controls, and they prove OPPOSITE things ────────────────────────
+#
+# Asserting only "it is silent" is worth nothing: a walk that stopped finding
+# assignments at all would keep every case above green while the check protected
+# nothing. Each pair below names WHICH half is responsible.
+#
+# VALUE: the walk reaches the assignment, and `fingerprint` clears the value.
+# Every one is credential-NAMED, so a name-keyed gate refuses all four.
+ASSIGN_VALUE_CONTROL = [
+    ('export SECRET_KEY="$SECRET_KEY"', "SECRET_KEY"),
+    ('export GITHUB_TOKEN="$GITHUB_TOKEN"', "GITHUB_TOKEN"),
+    (ASSIGN_RUNTIME_FETCH, "AUTH_TOKEN"),
+    ("export AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}", "AWS_SECRET_ACCESS_KEY"),
+]
+
+# POSITION: the value WOULD fire, and the walk deliberately never offers it.
+ASSIGN_POSITION_CONTROL = [
+    ("make BUILD=%s" % DECOY["github_pat"], "BUILD", DECOY["github_pat"]),
+    ("npm run build -- --token=%s" % DECOY["npm"], "token", DECOY["npm"]),
+]
+
 # len(SAFE) allow-assertions + len(PREFIX_REFUSES) table-control assertions
 # + 1 table-control-total + 3 per HELP_CONTROL case + 2 per ARGV_SECRET case
 # + the count check itself.
@@ -342,7 +480,21 @@ EXPECTED_CHECKS = (len(SAFE) + len(PREFIX_REFUSES) + 1 + 3 * len(HELP_CONTROL)
                    + 2 * len(ARGV_SECRET)
                    + len(FILE_FALSE_POSITIVES_REGEX_CWD)
                    + len(FILE_FALSE_POSITIVES) + len(FILE_TRUE_POSITIVES)
-                   + len(ENVVAR_FALSE_POSITIVES) + len(ENVVAR_TRUE_POSITIVES) + 1)
+                   + len(ENVVAR_FALSE_POSITIVES) + len(ENVVAR_TRUE_POSITIVES)
+                   + len(ASSIGN_FALSE_POSITIVES) + len(ASSIGN_FALSE_POSITIVES_ARGV)
+                   + len(ASSIGN_TRUE_POSITIVES)
+                   + 2 * len(ASSIGN_VALUE_CONTROL) + 2 * len(ASSIGN_POSITION_CONTROL)
+                   + 1)
+
+
+def _assignments_in(cmd):
+    """The (name, raw_value) pairs KL-ASSIGN's walk would offer to the scanner."""
+    from keyless_hooks.checks.shell_assign import assignments
+    from keyless_hooks.shellview import statements, strip_heredocs
+    out = []
+    for stmt in statements(strip_heredocs(cmd)):
+        out.extend(assignments(stmt))
+    return out
 
 
 def _config(rows):
@@ -411,6 +563,32 @@ def run():
         s.check("KL-ENVVAR allows: %s" % cmd[:40], drive(bash(cmd)).kind, "silent")
     for cmd in ENVVAR_TRUE_POSITIVES:
         s.check("KL-ENVVAR still warns: %s" % cmd[:40], drive(bash(cmd)).kind, "warn")
+
+    # ── KL-ASSIGN: configuration and references are not credentials ──────────
+    from keyless_hooks.checks.shell_assign import credential_findings
+    for cmd in ASSIGN_FALSE_POSITIVES:
+        s.check("KL-ASSIGN allows: %s" % cmd[:48], drive(bash(cmd)).kind, "silent")
+    for cmd in ASSIGN_FALSE_POSITIVES_ARGV:
+        s.check("KL-ASSIGN allows (argv): %s" % cmd[:44],
+                drive(bash(cmd)).kind, "silent")
+    for cmd in ASSIGN_TRUE_POSITIVES:
+        s.check("KL-ASSIGN still denies: %s" % cmd[:44], drive(bash(cmd)).kind, "deny")
+
+    # control 3: silence is the VALUE's doing, not a walk that stopped walking.
+    for cmd, name in ASSIGN_VALUE_CONTROL:
+        values = [v for n, v in _assignments_in(cmd) if n == name]
+        s.check("assign control: the walk reaches %s" % name, bool(values), True)
+        s.check("assign control: the value clears %s" % name,
+                credential_findings(name, values[0]) if values else ["<not reached>"],
+                [])
+
+    # control 4: and the position rule is load-bearing — these values DO fire,
+    # and are silent only because the word is an argument.
+    for cmd, name, value in ASSIGN_POSITION_CONTROL:
+        s.check("assign control: the walk skips %s" % name,
+                [n for n, _v in _assignments_in(cmd) if n == name], [])
+        s.check("assign control: but that value would fire: %s" % name,
+                bool(credential_findings(name, value)), True)
 
     # ── the count itself ─────────────────────────────────────────────────────
     # A suite that runs nothing exits 0. Asserted last so it counts itself.

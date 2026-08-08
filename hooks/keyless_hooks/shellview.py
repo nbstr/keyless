@@ -25,6 +25,7 @@ __all__ = [
     "candidate_operands", "file_operands", "expand_local_assignments",
     "interpreter_payloads", "rest_after_head", "first_positional",
     "flatten_substitutions", "substitution_payloads",
+    "assignment_split", "is_wrapper",
 ]
 
 # Wrapper words that TAKE a command as their argument. The head of
@@ -240,6 +241,38 @@ def _unquote(tok):
     if len(tok) >= 2 and tok[0] == tok[-1] and tok[0] in ("'", '"'):
         return tok[1:-1]
     return tok
+
+
+def assignment_split(token):
+    """`(name, raw_value)` for a shell assignment word, or None.
+
+    The value is returned EXACTLY as written — quotes, expansions and all —
+    because the caller's whole question is whether it is a literal, and
+    unquoting here would delete the evidence.
+
+    Built on `_ASSIGN_PREFIX`, the same regex `_walk_head` and `file_operands`
+    use to decide that a leading word is an assignment rather than a command.
+    A second copy of that pattern in a check module drifts the first time this
+    one is corrected, and the two would then disagree about where a statement's
+    assignment prefix ends.
+    """
+    if not token:
+        return None
+    m = _ASSIGN_PREFIX.match(token)
+    if not m:
+        return None
+    return token[:m.end() - 1], token[m.end():]
+
+
+def is_wrapper(name):
+    """True when `name` TAKES a command as its argument — `env`, `sudo`, `timeout`.
+
+    Public because a check that needs to know where a statement's assignment
+    PREFIX ends walks the same list `head_of` does: in `env FOO=1 cmd` the
+    assignment sits AFTER `env` and before the real head, so a walk that treats
+    `env` as the command reads `FOO=1` as an argument and stops looking.
+    """
+    return name in _WRAPPERS
 
 
 # A wrapper's own positional argument: `timeout 5 cmd`, `nice 10 cmd`,
