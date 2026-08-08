@@ -17,6 +17,28 @@
 //! The reason is not politeness. A tool that occasionally blocks the work gets
 //! removed, and what comes back is the plaintext literal on the command line.
 //! Degrading loses the protection for one command; failing loses it for good.
+//!
+//! # What "the command does not exist" now excludes
+//!
+//! [`RunError::SpawnFailed`] used to absorb failures that were about the
+//! ENVIRONMENT rather than the command, and report them against the program: a
+//! stored value containing a NUL byte produced `cannot execute /bin/sh: nul byte
+//! found`, exit 127, no child. The kernel gets a second say now —
+//! [`caused_by_the_environment`] — and its refusal drops the injection and
+//! spawns again, degraded. A refusal that says the machine is momentarily out of
+//! process slots is retried rather than reported; see [`spawn_persistently`].
+//!
+//! So `SpawnFailed` means what it says: nothing this tool did to the environment
+//! is left in the explanation.
+//!
+//! # Three things here are bounded on purpose
+//!
+//! Each was an unbounded wait that ended with the child either never running or
+//! never being reported: [`resolve_all`] (N deadlines became one),
+//! [`PUMP_DRAIN_GRACE`] (a grandchild holding the pipes), and
+//! [`crate::store::exec::spawn_serialised`] (two concurrent spawns deadlocking on
+//! an inherited descriptor). Read those three before changing the shape of this
+//! function.
 
 use std::ffi::OsString;
 use std::io::{self, Write};

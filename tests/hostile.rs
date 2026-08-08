@@ -540,10 +540,25 @@ fn a_backgrounded_grandchild_does_not_hold_the_process_open() {
 
 #[test]
 fn the_output_of_a_child_that_exits_normally_is_not_truncated() {
-    // The negative control for the bounded drain. A drain that gave up
-    // immediately would pass the test above and silently eat every run's
-    // output. 4000 lines is more than a pipe buffer, so it can only all arrive
-    // if the filters were genuinely waited for.
+    // That the bounded drain does not eat ordinary output — 100,000 lines,
+    // ~1.2 MB, through the masking filters and out the other side intact.
+    //
+    // **This is NOT a control on the grace length, and saying so is the point.**
+    // It was written as one, and the mutation refuted it: cutting
+    // `PUMP_DRAIN_GRACE` from two seconds to one NANOSECOND leaves this test
+    // green, at 4,000 lines and at 100,000 alike. Raising the volume cannot fix
+    // that, because volume is not what is at stake.
+    //
+    // A pipe holds one buffer. A child writing more than that BLOCKS until the
+    // filter drains it, so by the time the child exits — which is the only
+    // thing `child.wait()` is waiting for — at most one buffer is still in
+    // flight, whatever the total. The filters flush that in far less time than
+    // `run` spends writing an audit row and returning.
+    //
+    // So the two-second grace is generous rather than load-bearing: what
+    // protects a normal run's output is backpressure, and the grace exists only
+    // for the abnormal case where a grandchild holds the pipe open forever.
+    // Both facts are worth knowing, and neither is what a green tick here says.
     // Through the real binary, because a library-level test writes to this
     // process's own stdout and cannot count what arrived.
     let dir = scratch("drain-keeps-output");
@@ -572,7 +587,7 @@ fn the_output_of_a_child_that_exits_normally_is_not_truncated() {
         .args([
             "/bin/sh",
             "-c",
-            "i=0; while [ $i -lt 4000 ]; do echo line-$i; i=$((i+1)); done",
+            "i=0; while [ $i -lt 100000 ]; do echo line-$i; i=$((i+1)); done",
         ])
         .stdout(std::process::Stdio::from(out))
         .status()
@@ -583,7 +598,7 @@ fn the_output_of_a_child_that_exits_normally_is_not_truncated() {
         .expect("read the sink")
         .lines()
         .count();
-    assert_eq!(lines, 4000, "output was truncated by the drain");
+    assert_eq!(lines, 100_000, "output was truncated by the drain");
 }
 
 #[test]
