@@ -850,8 +850,15 @@ pub struct ProtonStore {
     /// In memory and nowhere else. A cache on disk that the client can read is
     /// a `get` verb with extra steps, which is the one thing this tool does not
     /// offer.
-    listings: Mutex<BTreeMap<String, Arc<Vec<ItemRecord>>>>,
+    listings: Mutex<BTreeMap<String, VaultSlot>>,
 }
+
+/// One vault's cache entry, and the gate that makes it fill exactly once.
+///
+/// The inner `Mutex` is the whole point: it is held across the vendor CLI spawn,
+/// so several names resolving from one vault at the same time produce one
+/// listing rather than one each. See [`ProtonStore::cached_items`].
+type VaultSlot = Arc<Mutex<Option<Arc<Vec<ItemRecord>>>>>;
 
 impl ProtonStore {
     /// Construct from a parsed config and the reason reads will be recorded under.
@@ -870,7 +877,7 @@ impl ProtonStore {
             binary: settings.binary.clone(),
             probe_binary: settings.probe_binary.clone(),
             session_dir: settings.session_dir.clone(),
-            timeout: Duration::from_millis(settings.timeout_ms),
+            timeout: crate::config::bounded_timeout(settings.timeout_ms),
             reason,
             addresses,
             listings: Mutex::new(BTreeMap::new()),
@@ -996,20 +1003,35 @@ impl ProtonStore {
 
     /// One vault's items, from the cache or from the CLI.
     ///
-    /// A race between two lookups of the same vault costs one extra listing and
-    /// nothing else, so the CLI runs outside the lock rather than holding it
-    /// across a process spawn.
+    /// # Two locks, and why neither one is the other
+    ///
+    /// A run resolves its names CONCURRENTLY — see [`crate::cmd::run`], where
+    /// doing it in turn made N unresolvable names cost N deadlines. So "check,
+    /// then fetch, then insert" is a race that costs one vendor CLI spawn per
+    /// racing name, which is precisely the cost this cache exists to remove.
+    ///
+    /// The **map** lock is therefore held only long enough to hand out a vault's
+    /// slot, so a lookup in a different vault is never serialised behind this
+    /// one. The **slot** lock is held across the spawn on purpose: it is the
+    /// thing that makes "one listing per vault per run" true rather than
+    /// probable, and every thread waiting on it wants the answer that spawn is
+    /// about to produce.
+    ///
+    /// A failed fetch leaves the slot empty, so a later name retries rather than
+    /// inheriting a failure it did not cause.
     fn cached_items(
         &self,
         session_dir: &Path,
         vault: &str,
         name: &str,
     ) -> Result<Arc<Vec<ItemRecord>>, StoreError> {
-        if let Some(cached) = self.cache().get(vault) {
+        let slot = Arc::clone(self.cache().entry(vault.to_owned()).or_default());
+        let mut slot = slot.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(cached) = slot.as_ref() {
             return Ok(Arc::clone(cached));
         }
         let fetched = Arc::new(self.fetch_items(session_dir, vault, name)?);
-        self.cache().insert(vault.to_owned(), Arc::clone(&fetched));
+        *slot = Some(Arc::clone(&fetched));
         Ok(fetched)
     }
 
@@ -1019,7 +1041,7 @@ impl ProtonStore {
     /// vendor said about a vault, with no invariant spanning two entries — so
     /// refusing to serve from it after an unrelated panic would degrade a run
     /// for no safety gain.
-    fn cache(&self) -> std::sync::MutexGuard<'_, BTreeMap<String, Arc<Vec<ItemRecord>>>> {
+    fn cache(&self) -> std::sync::MutexGuard<'_, BTreeMap<String, VaultSlot>> {
         self.listings.lock().unwrap_or_else(PoisonError::into_inner)
     }
 

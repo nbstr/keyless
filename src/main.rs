@@ -143,8 +143,15 @@ struct PutArgs {
 #[derive(Args)]
 struct RunArgs {
     /// A secret to inject, as NAME or ENV=NAME. Repeatable.
+    ///
+    /// `OsString` rather than `String`, and that is a never-block fix rather
+    /// than a nicety. clap rejects a non-UTF-8 value for a `String` argument
+    /// **before `dispatch` is ever called**, and exits 2 — a third way out with
+    /// no child, reached while a perfectly runnable command sat after the `--`.
+    /// Taken as bytes, the same input becomes one unresolvable name: the run
+    /// warns, degrades, and still runs the command.
     #[arg(short = 's', long = "secret", value_name = "[ENV=]NAME")]
-    secret: Vec<String>,
+    secret: Vec<OsString>,
 
     /// Infisical environment for names in this run that declare none.
     ///
@@ -218,11 +225,18 @@ fn dispatch() -> i32 {
             let mut bindings = Vec::new();
             let mut unusable = Vec::new();
             for spec in &args.secret {
-                match Binding::parse(spec) {
-                    Ok(binding) => bindings.push(binding),
-                    Err(reason) => {
+                let printable = spec.to_string_lossy().into_owned();
+                match spec.to_str().map(Binding::parse) {
+                    Some(Ok(binding)) => bindings.push(binding),
+                    Some(Err(reason)) => {
                         warnings.push(reason);
-                        unusable.push(spec.clone());
+                        unusable.push(printable);
+                    }
+                    None => {
+                        warnings.push(format!(
+                            "`{printable}` is not valid UTF-8, so it names no secret"
+                        ));
+                        unusable.push(printable);
                     }
                 }
             }

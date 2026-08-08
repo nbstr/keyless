@@ -151,7 +151,7 @@ impl ProtonManager {
         Ok(ProtonManager {
             binary: settings.binary.clone(),
             session_dir,
-            timeout: Duration::from_millis(manager.timeout_ms),
+            timeout: crate::config::bounded_timeout(manager.timeout_ms),
             reason,
         })
     }

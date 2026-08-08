@@ -147,10 +147,10 @@ impl DaemonClientConfig {
             .unwrap_or_else(crate::ipc::default_socket_path)
     }
 
-    /// The exchange deadline.
+    /// The exchange deadline, clamped to [`MAX_TIMEOUT_MS`].
     #[must_use]
     pub const fn timeout(&self) -> std::time::Duration {
-        std::time::Duration::from_millis(self.timeout_ms)
+        bounded_timeout(self.timeout_ms)
     }
 }
 
@@ -176,6 +176,16 @@ pub struct KeychainConfig {
     /// works.
     #[serde(default = "default_security_binary")]
     pub binary: PathBuf,
+    /// How long one lookup may take before it degrades the run.
+    ///
+    /// This backend is local and it is the one enabled by default, which is
+    /// exactly why it needs the deadline the other two always had: `security`
+    /// is a path in a config file, so "a local call cannot hang" is a statement
+    /// about a binary nobody has checked. It is also the pathological case for
+    /// an unbounded read — a `security` that writes `/dev/zero` to its stdout
+    /// grows this process by gigabytes for as long as it is allowed to run.
+    #[serde(default = "default_timeout_ms")]
+    pub timeout_ms: u64,
     /// Set false to take the backend out of the search order without deleting
     /// its settings.
     #[serde(default = "default_true")]
@@ -187,6 +197,7 @@ impl Default for KeychainConfig {
         KeychainConfig {
             service: default_service(),
             binary: default_security_binary(),
+            timeout_ms: default_timeout_ms(),
             enabled: true,
         }
     }
@@ -493,8 +504,11 @@ fn default_proton_binary() -> PathBuf {
 /// until the user reaches for Ctrl-C — and the expiry is a degraded path, so
 /// the command still runs when it fires.
 fn default_timeout_ms() -> u64 {
-    10_000
+    DEFAULT_TIMEOUT_MS
 }
+
+/// Ten seconds, as a constant a store can reach without a config.
+pub const DEFAULT_TIMEOUT_MS: u64 = 10_000;
 
 /// `printenv NAME` writes one variable's value to stdout and nothing else. It
 /// is not a shell, so the name is an argument rather than something interpolated
@@ -521,6 +535,119 @@ pub struct ConfigLoad {
     pub loaded: bool,
 }
 
+/// The longest any single lookup may be allowed to take, whatever the config says.
+///
+/// A `timeout_ms` is the knob that says how long a backend gets. Without a
+/// ceiling it is also the knob that says how long `keyless run` may hang: a
+/// `"timeout_ms": 86400000` is a wedged terminal expressed as a number, and a
+/// config is not a trusted input — it can be handed in with `--config` or
+/// `KEYLESS_CONFIG` by whatever wrote the file.
+///
+/// Sixty seconds is far above every real backend measured here (a cold vendor
+/// CLI, a TLS handshake and a token refresh together fit inside ten) and far
+/// below the point where a person concludes the tool is broken.
+pub const MAX_TIMEOUT_MS: u64 = 60_000;
+
+/// A configured `timeout_ms` as a duration, clamped to [`MAX_TIMEOUT_MS`].
+///
+/// One function rather than a clamp at each of the five call sites: five copies
+/// would eventually disagree, and the one that forgot the clamp would be the one
+/// that hangs.
+#[must_use]
+pub const fn bounded_timeout(milliseconds: u64) -> std::time::Duration {
+    let bounded = if milliseconds > MAX_TIMEOUT_MS {
+        MAX_TIMEOUT_MS
+    } else {
+        milliseconds
+    };
+    std::time::Duration::from_millis(bounded)
+}
+
+/// The largest config file that will be read.
+///
+/// A config holds names, store kinds, paths and timeouts — a thousand declared
+/// secrets fit in well under a hundred kilobytes. One mebibyte is therefore
+/// generous by three orders of magnitude while still being a bound, and a bound
+/// is what stops a regular file the size of a disk from being read into memory
+/// before anyone notices there is no child process yet.
+const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
+
+/// Read the config file, or say why it will not be read.
+///
+/// `Ok(None)` means the file is absent, which is not a problem.
+///
+/// # Why this is not `fs::read_to_string`
+///
+/// `read_to_string` has no bound in either dimension, and a path is not
+/// necessarily a file. Both failures are **hangs rather than errors**, and both
+/// were reachable through `KEYLESS_CONFIG`:
+///
+/// - A FIFO with no writer. `open` blocks until a writer appears, so the process
+///   never reaches the read, never reaches the spawn, and shows nothing.
+/// - A character device such as `/dev/zero`. It reads successfully and forever;
+///   memory climbs until the kernel or the operator ends it.
+///
+/// Neither exits, so neither is a failure the never-block invariant could
+/// classify. They simply never spawn the child.
+///
+/// The two guards below are ordered against a swap between them. `O_NONBLOCK`
+/// comes first: it makes `open` on a writerless FIFO return immediately instead
+/// of blocking, so the file type can be checked from the **descriptor** rather
+/// than from a `stat` that a rename could invalidate before the `open`. Regular
+/// files ignore the flag for reads, so it costs the ordinary path nothing.
+fn read_config_file(path: &Path) -> Result<Option<String>, ConfigError> {
+    use std::io::Read as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    let file = match fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::libc::O_NONBLOCK)
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(source) => {
+            return Err(ConfigError::Read {
+                path: path.to_path_buf(),
+                source,
+            });
+        }
+    };
+
+    let metadata = file.metadata().map_err(|source| ConfigError::Read {
+        path: path.to_path_buf(),
+        source,
+    })?;
+
+    if !metadata.is_file() {
+        return Err(ConfigError::Unusable {
+            path: path.to_path_buf(),
+            detail: "not a regular file, so reading it could never end".to_owned(),
+        });
+    }
+    if metadata.len() > MAX_CONFIG_BYTES {
+        return Err(ConfigError::Unusable {
+            path: path.to_path_buf(),
+            detail: format!(
+                "{} bytes, over the {MAX_CONFIG_BYTES} byte cap",
+                metadata.len()
+            ),
+        });
+    }
+
+    // `take` as well as the length check above: the length came from the
+    // descriptor, but a file being appended to between the two would otherwise
+    // grow past the cap while being read.
+    let mut raw = String::new();
+    file.take(MAX_CONFIG_BYTES)
+        .read_to_string(&mut raw)
+        .map_err(|source| ConfigError::Read {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    Ok(Some(raw))
+}
+
 impl Config {
     /// Read `path`, falling back to defaults on any problem.
     ///
@@ -528,22 +655,20 @@ impl Config {
     /// has declared a name.
     #[must_use]
     pub fn load(path: &Path) -> ConfigLoad {
-        let raw = match fs::read_to_string(path) {
-            Ok(raw) => raw,
-            Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+        let raw = match read_config_file(path) {
+            Ok(Some(raw)) => raw,
+            // Absent, which is the normal state before anyone declares a name.
+            Ok(None) => {
                 return ConfigLoad {
                     config: Config::default(),
                     problem: None,
                     loaded: false,
                 };
             }
-            Err(source) => {
+            Err(problem) => {
                 return ConfigLoad {
                     config: Config::default(),
-                    problem: Some(ConfigError::Read {
-                        path: path.to_path_buf(),
-                        source,
-                    }),
+                    problem: Some(problem),
                     loaded: false,
                 };
             }

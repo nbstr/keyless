@@ -91,6 +91,14 @@ pub enum ConfigError {
     Read { path: PathBuf, source: io::Error },
     /// The file was read but is not valid config.
     Parse { path: PathBuf, detail: String },
+    /// The path exists but is not something a config file can be read from:
+    /// a FIFO, a device, a socket, or a regular file larger than the cap.
+    ///
+    /// Separate from [`ConfigError::Read`] because the failure is decided
+    /// **without reading**, which is the whole point: reading a FIFO with no
+    /// writer blocks forever and reading `/dev/zero` never ends. Both are hangs
+    /// rather than errors, and a hang is the one failure this tool may not have.
+    Unusable { path: PathBuf, detail: String },
 }
 
 impl fmt::Display for ConfigError {
@@ -102,6 +110,9 @@ impl fmt::Display for ConfigError {
             ConfigError::Parse { path, detail } => {
                 write!(f, "cannot parse config at {}: {detail}", path.display())
             }
+            ConfigError::Unusable { path, detail } => {
+                write!(f, "ignoring config at {}: {detail}", path.display())
+            }
         }
     }
 }
@@ -110,7 +121,7 @@ impl std::error::Error for ConfigError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             ConfigError::Read { source, .. } => Some(source),
-            ConfigError::Parse { .. } => None,
+            ConfigError::Parse { .. } | ConfigError::Unusable { .. } => None,
         }
     }
 }
