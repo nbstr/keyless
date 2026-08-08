@@ -12,8 +12,8 @@
 //! Measured on 2026-08-08: a Proton item of type `custom` was created, the
 //! configured `field` did not match the item's real field name, `keyless`
 //! degraded, and **the field name could not be found** — the only vendor verb
-//! that reveals it also prints the value, and the harness gate on this machine
-//! correctly refused it. `items` and `fields` close that.
+//! that reveals it also prints the value, so any policy that forbids printing a
+//! value also forbids finding the field name. `items` and `fields` close that.
 //!
 //! # The line this seam draws
 //!

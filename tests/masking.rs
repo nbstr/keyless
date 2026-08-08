@@ -192,8 +192,9 @@ fn the_generated_set_and_the_table_describe_the_same_encodings() {
 
 #[test]
 fn a_credential_embedded_in_a_url_is_caught() {
-    // 714 of the measured plaintext sites were URL-embedded credentials, the
-    // single largest category.
+    // The URL-embedded shape, one of the four the README's *Why this exists*
+    // names. It is the one that needs its own test, because the credential sits
+    // between a `:` and an `@` rather than at a word boundary.
     let secret = Secret::new("s3cr3t-decoy-password-9999".to_owned());
     let masker = Arc::new(Masker::from_secrets([("DB_PASSWORD", &secret)]));
     let line = "postgres://app:s3cr3t-decoy-password-9999@db.internal:5432/prod";
