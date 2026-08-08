@@ -21,7 +21,7 @@ backup: ~/.claude/settings.json.keyless-backup-20260806T212412
 
 ## What it does
 
-Six checks, one process per event. Each names the working alternative in the
+Seven checks, one process per event. Each names the working alternative in the
 same breath as the refusal, so the agent's next action is the right one rather
 than a retry or a question.
 
@@ -31,13 +31,20 @@ than a retry or a question.
 | `KL-VAULT` | a vault CLI verb that prints plaintext, across 16 stores | **deny** |
 | `KL-ENV` | an environment dump — `env`, `printenv`, `set`, `export -p`, `process.env`, `os.environ` | **rewrite** when bare, **deny** when it captures |
 | `KL-ENVVAR` | a credential-named variable being echoed | **warn** |
+| `KL-ASSIGN` | a credential literal typed into a shell assignment — `export X=…`, `X=… cmd` | **deny** |
 | `KL-WRITE` | a credential literal in a `Write` or `Edit` | **rewrite** |
 | `KL-SEEN` | a credential shape in tool output | **warn** |
 
 ### It prefers rewriting to refusing
 
 A block costs a turn and teaches nothing; the second attempt writes the same
-literal into a different file. Three of the six checks substitute instead.
+literal into a different file. Three of the seven checks substitute instead.
+
+`KL-ASSIGN` is the deliberate exception, and the reason is worth stating: the
+substitution that is right for a file is dangerous for a command. Rewriting
+`STRIPE_SECRET_KEY=<literal> ./deploy.sh` into `${STRIPE_SECRET_KEY}` runs the
+deploy against production with an EMPTY credential, immediately, with nobody
+looking. A file is read before it is used; a command is not.
 
 **A `Read` of a protected file is redirected to a names-only view.** The agent
 gets what it was actually after:
@@ -278,9 +285,9 @@ Reproduce: `python3 tests/test_latency.py`.
 ## Proving it
 
 ```console
-$ python3 tests/run.py        # 517 checks: contract, false-positive,
+$ python3 tests/run.py        # 613 checks: contract, false-positive,
                               #   fail-open, adversarial, install, latency
-$ python3 tests/mutate.py     # 33 deliberate breakages; every one must be caught
+$ python3 tests/mutate.py     # 41 deliberate breakages; every one must be caught
 ```
 
 Four kinds of proof, because a green contract suite is a hypothesis:
@@ -288,7 +295,7 @@ Four kinds of proof, because a green contract suite is a hypothesis:
 - **contract** — every gate × {fires, silent, look-alike}, plus all 20 vendor
   patterns asserted by *kind* against a decoy of the real length.
 - **fail-open** — every malformed, hostile and broken input allows.
-- **adversarial** — 71 attacks on the block list, printed as a table with an
+- **adversarial** — 87 attacks on the block list, printed as a table with an
   honest survivor row.
 - **mutation** — each check broken on purpose, with the patched file diffed to
   prove the mutation *landed*, and a baseline control in the same copied tree so

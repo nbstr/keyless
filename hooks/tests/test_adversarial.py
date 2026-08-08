@@ -14,7 +14,7 @@ is aimed at a real credential.
 import os
 
 import harness
-from harness import Suite, bash, drive, fixtures, read
+from harness import DECOY, Suite, bash, drive, fixtures, read
 
 # ── the attack corpus ───────────────────────────────────────────────────────
 # (id, command, what the attack exploits)
@@ -93,11 +93,44 @@ ATTACKS = [
     ("k8s_columns",      "kubectl get secret db -o custom-columns=K:.data",
                          "a .data map through a format nobody enumerates"),
     ("k8s_wide",         "kubectl get secret -A -o wide",  "a .data map through a wide table"),
-    # Two rows that are EXPECTED to get through. They are here so the published
+    # ── a credential literal typed into a shell assignment ──────────────────
+    ("assign_export",    "export GITHUB_TOKEN=%s" % DECOY["github_pat"],
+                         "the obvious spelling"),
+    ("assign_prefix",    "STRIPE_SECRET_KEY=%s ./deploy.sh" % DECOY["stripe"],
+                         "the command-prefix form, no `export`"),
+    ("assign_bare",      "AWS_ACCESS_KEY_ID=%s" % DECOY["aws_key"],
+                         "an assignment standing alone"),
+    ("assign_env",       "env NPM_TOKEN=%s npm publish" % DECOY["npm"],
+                         "the assignment behind a wrapper"),
+    ("assign_sudo_env",  "sudo env GITHUB_TOKEN=%s ./x.sh" % DECOY["github_pat"],
+                         "two wrappers before the assignment"),
+    ("assign_declare",   "declare -x SLACK_TOKEN=%s" % DECOY["slack"],
+                         "a declaration builtin instead of `export`"),
+    ("assign_local",     "local GOOGLE_API_KEY=%s" % DECOY["google"],
+                         "a function-scoped declaration"),
+    ("assign_bash_c",    'bash -c "export GITHUB_TOKEN=%s"' % DECOY["github_pat"],
+                         "the assignment inside an opaque word"),
+    ("assign_splice",    "export GH_TOKEN=gh''p_" + DECOY["github_pat"][4:],
+                         "quote splicing inside the value"),
+    ("assign_backslash", "export GH_TOKEN=gh\\p_" + DECOY["github_pat"][4:],
+                         "backslash splicing inside the value"),
+    ("assign_do",        "for i in 1 2; do export JWT=%s; done" % DECOY["jwt"],
+                         "a loop body"),
+    ("assign_then",      "if true; then export GITHUB_TOKEN=%s; fi" % DECOY["github_pat"],
+                         "a shell keyword before the assignment"),
+    ("assign_second",    "export TZ=UTC GITHUB_TOKEN=%s" % DECOY["github_pat"],
+                         "the second of two assignments in one word list"),
+    ("assign_url",       "export DATABASE_URL=postgres://admin:%s@db.example.com/prod"
+                         % DECOY["generic"], "a password inside a connection string"),
+    ("assign_unnamed",   "export FOO=%s" % DECOY["github_pat"],
+                         "a variable whose NAME gives nothing away"),
+    # Rows that are EXPECTED to get through. They are here so the published
     # limit set is driven rather than asserted in prose, and so a future change
     # that closes one is visible instead of silently improving the claim.
     ("outer_var",        "cat $ENVFILE",                   "a path set by an EARLIER call"),
     ("script_then_run",  "printf 'cat .env' > s.sh; bash s.sh", "writing a reader, then running it"),
+    ("assign_heredoc",   "cat > deploy.sh <<'EOF'\nexport GITHUB_TOKEN=%s\nEOF"
+                         % DECOY["github_pat"], "the literal inside a heredoc BODY"),
 ]
 
 # Rows that are NOT blocked, with the reason each is structurally out of reach.
@@ -114,6 +147,13 @@ SURVIVORS = {
                        "process the harness never shows a hook. A content gate on "
                        "the WRITE could catch the common spelling and would be "
                        "trivially rephrased around; it is not attempted.",
+    "assign_heredoc": "the literal is in a heredoc BODY, which every check in this "
+                      "pack blanks because a body is text ABOUT commands — the rule "
+                      "that stops a runbook quoting `cat .env` being read as one. "
+                      "Authoring a `.env` through `cat > … <<EOF` is the KL-WRITE "
+                      "act performed on Bash, a real and separate surface with its "
+                      "own remediation; it is left whole rather than half-covered "
+                      "by a refusal that talks about `export`.",
 }
 
 

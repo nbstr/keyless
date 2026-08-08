@@ -180,6 +180,62 @@ def run():
     s.check("KL-ENVVAR silent on PWD", drive(bash("echo $PWD")).kind, "silent")
     s.check("KL-ENVVAR silent on non-printer", drive(bash("test -n $API_TOKEN")).kind, "silent")
 
+    # ── KL-ASSIGN: a credential literal typed into a shell assignment ────────
+    for label, cmd in (
+            ("export", "export GITHUB_TOKEN=%s" % DECOY["github_pat"]),
+            ("quoted value", 'export GITHUB_TOKEN="%s"' % DECOY["github_pat"]),
+            ("command prefix", "STRIPE_SECRET_KEY=%s ./deploy.sh" % DECOY["stripe"]),
+            ("bare statement", "AWS_ACCESS_KEY_ID=%s" % DECOY["aws_key"]),
+            ("env wrapper", "env NPM_TOKEN=%s npm publish" % DECOY["npm"]),
+            ("two wrappers", "sudo env GITHUB_TOKEN=%s ./x.sh" % DECOY["github_pat"]),
+            ("declare -x", "declare -x SLACK_TOKEN=%s" % DECOY["slack"]),
+            ("local", "local GOOGLE_API_KEY=%s" % DECOY["google"]),
+            ("readonly", "readonly OPENAI_KEY=%s" % DECOY["openai"]),
+            ("inside sh -c", 'bash -c "export GITHUB_TOKEN=%s"' % DECOY["github_pat"]),
+            ("loop body", "for i in 1 2; do export JWT=%s; done" % DECOY["jwt"]),
+            ("after a keyword", "if true; then export GITHUB_TOKEN=%s; fi"
+                                % DECOY["github_pat"]),
+            ("second of two", "export TZ=UTC GITHUB_TOKEN=%s" % DECOY["github_pat"]),
+            ("url password", "export DATABASE_URL=postgres://admin:%s@db.example.com/prod"
+                             % DECOY["generic"]),
+            # The name says nothing and the value says everything. A check keyed
+            # on the variable's name is silent here, which is the whole argument
+            # for keying on the value instead.
+            ("uninformative name", "export FOO=%s" % DECOY["github_pat"])):
+        s.check("KL-ASSIGN fires: %s" % label, drive(bash(cmd)).kind, "deny")
+
+    # silent when the value is a REFERENCE — the usage this pack asks for
+    for cmd in ("export NODE_ENV=production",
+                "export PORT=3000",
+                "export RUST_LOG=debug",
+                'export PATH="$HOME/.local/bin:$PATH"',
+                'export DATABASE_URL="$DATABASE_URL"',
+                "export FOO=$(some-command)",
+                'export TOKEN="$TOKEN"',
+                "export SECRET_KEY=${SECRET_KEY}",
+                "declare -x NODE_ENV=production",
+                "set -x"):
+        s.check("KL-ASSIGN silent: %s" % cmd[:34], drive(bash(cmd)).kind, "silent")
+
+    # look-alikes: an `=` that is an ARGUMENT, not a shell assignment
+    for label, cmd in (
+            ("make variable", "make BUILD=%s" % DECOY["github_pat"]),
+            ("a configure flag", "./configure --with-token=%s" % DECOY["github_pat"]),
+            ("a commit message", 'git commit -m "set GITHUB_TOKEN=%s in CI"'
+                                 % DECOY["github_pat"])):
+        s.check("KL-ASSIGN look-alike: %s" % label, drive(bash(cmd)).kind, "silent")
+
+    # the refusal has to leave the reader with a WORKING command
+    v = drive(bash("export GITHUB_TOKEN=%s" % DECOY["github_pat"]))
+    s.check("KL-ASSIGN names the variable", "GITHUB_TOKEN" in v.message, True)
+    # `-- cmd "$NAME"` is expanded by the calling shell where the name is unset,
+    # and `-- cmd '$NAME'` arrives as a literal. Only a single-quoted `sh -c`
+    # body works, so a remediation string missing it teaches an empty credential.
+    s.check_in("KL-ASSIGN teaches the working spelling",
+               "keyless run -s GITHUB_TOKEN -- sh -c '", v.message)
+    s.check("KL-ASSIGN never echoes the value",
+            DECOY["github_pat"] in v.message, False)
+
     # ── KL-WRITE: rewrite, never refuse ─────────────────────────────────────
     for label, literal in (("github", DECOY["github_pat"]), ("aws", DECOY["aws_key"]),
                            ("stripe", DECOY["stripe"]), ("openai", DECOY["openai"]),
@@ -270,6 +326,8 @@ def run():
     leaky = []
     for payload in (bash("cat .env"), read(os.path.join(root, ".env")),
                     bash("cat %s/.env" % root),
+                    bash("export GITHUB_TOKEN=%s" % DECOY["github_pat"]),
+                    bash("DB=postgres://a:%s@h/d ./run.sh" % DECOY["generic"]),
                     write(os.path.join(root, "o.env"), "T=%s" % DECOY["stripe"])):
         v = drive(payload)
         for value in DECOY.values():
