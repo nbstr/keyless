@@ -128,11 +128,12 @@ impl Daemon {
 
         Ok(Daemon {
             listener,
-            socket: config.socket.clone(),
+            socket: config.socket.to_path_buf(),
             policy: Arc::new(policy),
             resolver: Arc::new(Resolver::new(config.registry(), config.ttl())),
             audit: Arc::new(
-                AuditLog::new(config.audit.clone()).with_mode(crate::audit::MODE_GROUP_READABLE),
+                AuditLog::new(config.audit.to_path_buf())
+                    .with_mode(crate::audit::MODE_GROUP_READABLE),
             ),
             names: Arc::new(config.names.clone()),
             idle: config.idle_timeout(),
@@ -512,8 +513,8 @@ mod tests {
         // would let any user on the machine talk to the daemon.
         let dir = scratch("mode");
         let config = DaemonConfig {
-            socket: dir.join("d.sock"),
-            audit: dir.join("audit.jsonl"),
+            socket: dir.join("d.sock").into(),
+            audit: dir.join("audit.jsonl").into(),
             ..DaemonConfig::default()
         };
         let daemon = Daemon::bind(&config, Policy::new()).expect("bind");
@@ -532,8 +533,8 @@ mod tests {
     fn a_stale_socket_is_replaced() {
         let dir = scratch("stale");
         let config = DaemonConfig {
-            socket: dir.join("d.sock"),
-            audit: dir.join("audit.jsonl"),
+            socket: dir.join("d.sock").into(),
+            audit: dir.join("audit.jsonl").into(),
             ..DaemonConfig::default()
         };
         let first = Daemon::bind(&config, Policy::new()).expect("first bind");

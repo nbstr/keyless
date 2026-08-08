@@ -588,15 +588,15 @@ pub fn short_socket_path(dir: &Path) -> PathBuf {
 /// A daemon config rooted in `dir`, backed by a file store.
 pub fn daemon_config(dir: &Path) -> DaemonConfig {
     DaemonConfig {
-        socket: short_socket_path(dir),
-        audit: dir.join("audit.jsonl"),
+        socket: short_socket_path(dir).into(),
+        audit: dir.join("audit.jsonl").into(),
         cache_ttl_seconds: 60,
         idle_timeout_seconds: 5,
         peer: PeerConfig::default(),
         stores: DaemonStores {
             file: FileStoreConfig {
                 enabled: true,
-                path: dir.join("secrets.json"),
+                path: dir.join("secrets.json").into(),
             },
             ..DaemonStores::default()
         },

@@ -477,7 +477,7 @@ fn rewriting_a_row_breaks_the_chain() {
     }
     drop(running);
 
-    let log = AuditLog::new(config.audit.clone());
+    let log = AuditLog::new(config.audit.to_path_buf());
     let rows = log.verify().expect("a fresh log must verify");
     assert!(rows >= 3, "expected the daemon's rows, got {rows}");
 

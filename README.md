@@ -384,11 +384,19 @@ other half of the same fix, for a project you would rather locate by its
 `.infisical.json`:
 
 ```json
-"infisical": { "enabled": true, "config_dir": "/Users/you/work/api" }
+"infisical": { "enabled": true, "config_dir": "~/work/api" }
 ```
 
 Working-directory discovery remains the fallback when neither is set, so nothing
 changes for a config that never needed this.
+
+**A leading `~` is expanded against `$HOME` in every path field of this file**,
+so the line above needs no editing to say whose machine it is on. Three forms
+are refused at parse time rather than taken literally, because taken literally
+each one creates a directory of that name beside whatever the caller was
+standing in: `~user/…` (this build does not read the passwd database), `$VAR/…`
+(a config file is not a shell), and a `~` when `HOME` is unset. A refusal names
+the line, and the command still runs.
 
 ### Proton Pass — verified against `pass-cli` 2.2.5
 

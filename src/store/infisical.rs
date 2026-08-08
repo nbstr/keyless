@@ -319,11 +319,14 @@ impl InfisicalStore {
     pub fn from_config(config: &Config, invocation_env: Option<&str>) -> Self {
         let settings = &config.stores.infisical;
         InfisicalStore {
-            binary: settings.binary.clone(),
-            probe_binary: settings.probe_binary.clone(),
+            binary: settings.binary.to_path_buf(),
+            probe_binary: settings.probe_binary.to_path_buf(),
             routing: Routing::from_config(config, invocation_env),
             project_id: settings.project_id.clone(),
-            config_dir: settings.config_dir.clone(),
+            config_dir: settings
+                .config_dir
+                .as_deref()
+                .map(|path| path.to_path_buf()),
             timeout: crate::config::bounded_timeout(settings.timeout_ms),
         }
     }

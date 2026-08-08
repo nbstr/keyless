@@ -186,7 +186,8 @@ impl std::error::Error for ManageError {}
 ///   normal one rather than an unusual one.
 /// - A viewer-role token returns `NotAllowed` from `item create` and from
 ///   `item trash`.
-pub const MINT_A_MANAGER_TOKEN: &str = "add \"manager\": {\"session_dir\": \"~/.keyless-pass-manager\"} to stores.proton, then put a \
+pub const MINT_A_MANAGER_TOKEN: &str = "add \"manager\": {\"session_dir\": \"~/.keyless-pass-manager\"} to stores.proton — a leading \
+     `~` is expanded against your home directory, and the path must not be relative — then put a \
      SECOND agent token in that directory with the editor role: `pass-cli agent create <name> \
      --expiration 3m --vault <VAULT>`, then `pass-cli agent access grant <name> --vault-name \
      <VAULT> --role editor` — `--role` defaults to `viewer`, which is exactly why a write fails \

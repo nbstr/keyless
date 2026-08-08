@@ -37,6 +37,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::NAME;
 use crate::error::ConfigError;
+use crate::paths::ConfigPath;
 
 /// The whole config file.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -118,7 +119,7 @@ pub struct DaemonClientConfig {
     /// Socket path. Absent means the built-in default, which honours
     /// `KEYLESS_SOCKET`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub socket: Option<PathBuf>,
+    pub socket: Option<ConfigPath>,
     /// Deadline for the whole exchange, in milliseconds.
     ///
     /// This is a ceiling on how long `keyless run` can be delayed by a daemon
@@ -143,7 +144,8 @@ impl DaemonClientConfig {
     #[must_use]
     pub fn socket_path(&self) -> PathBuf {
         self.socket
-            .clone()
+            .as_deref()
+            .map(Path::to_path_buf)
             .unwrap_or_else(crate::ipc::default_socket_path)
     }
 
@@ -175,7 +177,7 @@ pub struct KeychainConfig {
     /// without ever touching a real keychain, and so an unusual install still
     /// works.
     #[serde(default = "default_security_binary")]
-    pub binary: PathBuf,
+    pub binary: ConfigPath,
     /// How long one lookup may take before it degrades the run.
     ///
     /// This backend is local and it is the one enabled by default, which is
@@ -212,7 +214,7 @@ impl Default for KeychainConfig {
 pub struct InfisicalConfig {
     /// Path to, or name of, the `infisical` binary.
     #[serde(default = "default_infisical_binary")]
-    pub binary: PathBuf,
+    pub binary: ConfigPath,
     /// **Read by nothing. Kept only so a config that still sets it is told so.**
     ///
     /// Infisical requires an environment on every call — its own CLI makes
@@ -262,7 +264,7 @@ pub struct InfisicalConfig {
     /// by walking up from the working directory. Without this, the same config
     /// resolves in one checkout and degrades in another.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub config_dir: Option<PathBuf>,
+    pub config_dir: Option<ConfigPath>,
     /// How long one lookup may take before it degrades the run.
     #[serde(default = "default_timeout_ms")]
     pub timeout_ms: u64,
@@ -271,7 +273,7 @@ pub struct InfisicalConfig {
     /// Configurable for the same two reasons as the keychain binary: an unusual
     /// install still works, and the adapter is exercisable against a stub.
     #[serde(default = "default_probe_binary")]
-    pub probe_binary: PathBuf,
+    pub probe_binary: ConfigPath,
     /// Set false to take the backend out of the search order.
     #[serde(default)]
     pub enabled: bool,
@@ -304,7 +306,7 @@ impl Default for InfisicalConfig {
 pub struct ProtonConfig {
     /// Path to, or name of, the `pass-cli` binary.
     #[serde(default = "default_proton_binary")]
-    pub binary: PathBuf,
+    pub binary: ConfigPath,
     /// The session directory every lookup runs under, as
     /// `PROTON_PASS_SESSION_DIR`.
     ///
@@ -326,7 +328,7 @@ pub struct ProtonConfig {
     /// Absent means the Proton backend degrades every lookup rather than
     /// guessing which identity was meant. See [`crate::store::proton`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub session_dir: Option<PathBuf>,
+    pub session_dir: Option<ConfigPath>,
     /// The SECOND identity: an editor-role token, used by the write verbs only.
     ///
     /// [`ProtonConfig::session_dir`] above is the **reader**. It is the default
@@ -344,7 +346,7 @@ pub struct ProtonConfig {
     pub timeout_ms: u64,
     /// The helper that reads one variable out of the child environment.
     #[serde(default = "default_probe_binary")]
-    pub probe_binary: PathBuf,
+    pub probe_binary: ConfigPath,
     /// Set false to take the backend out of the search order.
     #[serde(default)]
     pub enabled: bool,
@@ -396,7 +398,7 @@ pub struct ProtonManagerConfig {
     /// failing the whole config parse — a parse failure would fall back to
     /// defaults and take `run` down with it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub session_dir: Option<PathBuf>,
+    pub session_dir: Option<ConfigPath>,
     /// How long one write may take before it fails.
     #[serde(default = "default_timeout_ms")]
     pub timeout_ms: u64,
@@ -480,20 +482,20 @@ fn default_service() -> String {
     NAME.to_owned()
 }
 
-fn default_security_binary() -> PathBuf {
-    PathBuf::from("/usr/bin/security")
+fn default_security_binary() -> ConfigPath {
+    ConfigPath::from("/usr/bin/security")
 }
 
-fn default_infisical_binary() -> PathBuf {
-    PathBuf::from("infisical")
+fn default_infisical_binary() -> ConfigPath {
+    ConfigPath::from("infisical")
 }
 
 fn default_infisical_path() -> String {
     "/".to_owned()
 }
 
-fn default_proton_binary() -> PathBuf {
-    PathBuf::from("pass-cli")
+fn default_proton_binary() -> ConfigPath {
+    ConfigPath::from("pass-cli")
 }
 
 /// Ten seconds per lookup.
@@ -513,8 +515,8 @@ pub const DEFAULT_TIMEOUT_MS: u64 = 10_000;
 /// `printenv NAME` writes one variable's value to stdout and nothing else. It
 /// is not a shell, so the name is an argument rather than something interpolated
 /// into a command line.
-fn default_probe_binary() -> PathBuf {
-    PathBuf::from("/usr/bin/printenv")
+fn default_probe_binary() -> ConfigPath {
+    ConfigPath::from("/usr/bin/printenv")
 }
 
 fn default_true() -> bool {
