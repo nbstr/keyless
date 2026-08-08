@@ -6,7 +6,7 @@
 //! `infisical secrets get NAME` and `infisical export` — and **all three write
 //! plaintext to stdout**. In an agent session stdout is the transcript, so all
 //! three are exactly the disclosure `keyless` exists to prevent, and all three
-//! are denied at the harness level on this machine.
+//! are the right thing for an agent harness to deny outright.
 //!
 //! The fourth verb, `infisical run --env=<env> --path=<path> -- <cmd>`, prints
 //! nothing. It fetches the secrets, adds them to a child process's environment,
@@ -24,8 +24,8 @@
 //!   Infisical has no masking of its own. Every Infisical-backed secret would
 //!   lose the one protection this tool's own README leads with.
 //! - **The child gets everything.** `infisical run` injects every secret at the
-//!   path, not the ones that were asked for. On this machine that is 405 names
-//!   reaching a child that asked for one.
+//!   path, not the ones that were asked for, which in a real project is
+//!   hundreds of names reaching a child that asked for one.
 //! - **`INJECTED` becomes a lie.** Measured 2026-08-06 with CLI 0.43.114: a
 //!   `run` against an environment and path that hold nothing at all exits **0**
 //!   and reports `Injecting 0 Infisical secrets`. Under nesting `keyless` sees

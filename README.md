@@ -43,7 +43,14 @@ A credential reaches a command in **four shapes**. Each one puts the value
 itself on the command line, where the shell, the history file and an agent's
 transcript all record it:
 
-One primitive covers 77% of those sites: *spawn a child with the secret in its
+| Shape | What it looks like |
+|---|---|
+| Embedded in a URL | `https://user:VALUE@host` |
+| An environment assignment | `export TOKEN=VALUE`, `VAR=VALUE cmd` |
+| A CLI flag | `--token VALUE` |
+| An HTTP header | `Authorization: Bearer VALUE` |
+
+All four are **one primitive wide** — *spawn a child with the secret in its
 environment*. So `run` is the product and everything else is support.
 
 ### Your number, not ours
@@ -264,7 +271,8 @@ plaintext never enters `keyless` at all, which sounds safer. What it costs:
   Infisical masks nothing. Every Infisical-backed secret loses the protection
   this README leads with.
 - **Your command gets everything.** `infisical run` injects every secret at the
-  path, not the ones you asked for — 405 names reaching a child that wanted one.
+  path, not the ones you asked for, which in a real project is hundreds of names
+  reaching a child that wanted one.
 - **`INJECTED` becomes a lie.** Measured: a `run` against an environment and path
   holding nothing exits **0** and reports `Injecting 0 Infisical secrets`. Under
   nesting `keyless` sees a clean exit, reports `INJECTED`, and your command has
@@ -1278,10 +1286,10 @@ for debugging".
 
 A single verb that writes a plaintext value to stdout voids the entire design,
 because a caller takes the shortest path and that verb is always the shortest
-path. This is measured, not theorised: one CLI already read its key from the
-environment at 18 call sites, and agents still typed that key as a literal flag
-41 times. Availability of the safe path does not win. Only being the shortest
-path wins.
+path. This is behavioural, not theoretical: a CLI that already reads its key
+from the environment still gets that key typed at it as a literal flag, because
+the flag is one line and setting up the environment is more than one.
+Availability of the safe path does not win. Only being the shortest path wins.
 
 The rule holds across the whole verb set, and each verb has to earn it
 separately:
@@ -1478,14 +1486,20 @@ There are no `TODO` comments in the source. Work is either done or listed here.
 ## Development
 
 ```console
-cargo test                              # 415 pass, 15 ignored (the live Proton suite)
+cargo test                              # 464 pass, 15 ignored (the live Proton suite)
 cargo clippy --all-targets -- -D warnings
 cargo fmt --check
 ```
 
-The hook pack has its own suite: `python3 hooks/tests/run.py` runs 517 checks
-and `python3 hooks/tests/mutate.py` breaks each check on purpose and requires
-every breakage to be caught.
+The 15 ignored are the entire live Proton Pass suite, which needs a real
+account. CI asserts `ignored == 15`, so that stays visible rather than quietly
+drifting.
+
+The hook pack has its own suite: `python3 hooks/tests/run.py` runs every check
+against fixed inputs, and `python3 hooks/tests/mutate.py` breaks each check on
+purpose and requires every breakage to be caught. Both print their own counts —
+this document deliberately does not restate one, because a count copied into
+prose goes stale the next time a check is added.
 
 No test reads a real credential, and no test reaches a real vault. All three
 backends are exercised against shell stubs — `security find-generic-password` is

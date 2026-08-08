@@ -97,7 +97,7 @@ impl SignalGate {
     ///
     /// `SIGWINCH` is precisely that case. Its default action is to ignore, and
     /// this relay blocks it. **macOS resolves the unspecified case by
-    /// discarding**, measured with a C probe on this machine:
+    /// discarding**, measured with a C probe:
     ///
     /// | disposition while blocked | `sigwait` |
     /// |---|---|

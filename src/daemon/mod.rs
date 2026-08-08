@@ -23,7 +23,7 @@
 //!   attested `keyless run -s TOKEN -- sh -c 'echo $TOKEN'` is an attested
 //!   client running an arbitrary command, and no attestation scheme detects
 //!   that. Attestation says *which program is asking*, never *what it intends*.
-//! - **It does not survive `sudo`.** The calling user on this machine is an
+//! - **It does not survive `sudo`.** The calling user is typically an
 //!   admin. Everything below is a boundary against that user acting as
 //!   themselves, which is what an agent session is; it is not a boundary
 //!   against a person who types their password.
