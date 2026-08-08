@@ -246,20 +246,26 @@ The number that decides whether this stays installed. Measured interleaved
 against `python3 -c pass` in the same loop, 25 rounds, so the figure is the
 pack's and not the machine's:
 
-| case | median | over a bare interpreter |
-|---|---:|---:|
-| bare `python3 -c pass` | 16.6 ms | — |
-| unmatched `Bash` call | 21.8 ms | **+5.2 ms** |
-| unmatched `Write` (4 KB) | 21.8 ms | +5.2 ms |
-| a firing `Bash` deny | 21.8 ms | +5.2 ms |
-| a `Read` rewrite (reads the file, writes the view) | 23.5 ms | +6.9 ms |
-| a 100 KB `Write` scan | 48.9 ms | +32.3 ms |
+| case | median | p90 | over a bare interpreter |
+|---|---:|---:|---:|
+| bare `python3 -c pass` | 17.2 ms | 25.1 ms | — |
+| unmatched `Bash` call | 23.5 ms | 24.9 ms | **+6.3 ms** |
+| unmatched `Write` (4 KB) | 22.9 ms | 32.0 ms | +5.7 ms |
+| a firing `Bash` deny | 23.1 ms | 27.8 ms | +5.9 ms |
+| a `Read` rewrite (reads the file, writes the view) | 24.6 ms | 30.7 ms | +7.4 ms |
+| a 100 KB `Write` scan | 49.7 ms | 58.0 ms | +32.5 ms |
 
-**+5.2 ms is what a session pays on every tool call.** It was +16.3 ms until
-`-X importtime` showed `traceback` pulling `_colorize → dataclasses → inspect`
-at module scope: 8.1 ms on every call in every session, for a path reachable
-only when a check is already broken. It and `hashlib` are imported at their use
-sites now.
+**About +6 ms is what a session pays on every tool call.** Measured 2026-08-08
+on a busy machine; the same rig read +5.2 ms on a quiet one. The *absolute*
+column moves with load and is worth nothing on its own — the delta is the
+number, because it is measured against a bare interpreter interleaved in the
+same loop. Quote the range, or re-run the rig; do not quote one figure to one
+decimal place as though it were a constant.
+
+It was +16.3 ms until `-X importtime` showed `traceback` pulling
+`_colorize → dataclasses → inspect` at module scope: 8.1 ms on every call in
+every session, for a path reachable only when a check is already broken. It and
+`hashlib` are imported at their use sites now.
 
 The scanner is a small number of compiled alternations in-process — no
 subprocess, no `gitleaks`, no `trufflehog`. A separate binary would add a
