@@ -97,11 +97,12 @@ security: SecKeychainSearchCopyNext: The specified item could not be found.
 { "stores": { "daemon": { "enabled": true } } }
 ```
 
-Enabling the daemon **disables the local keychain backend**, whatever that
-backend's own `enabled` flag says. That is enforced in `store::build`, not
-documented as a convention, because a local fallback would re-open the hole the
-moment the daemon stopped — and anyone who can stop a process could choose
-that. Killing `keylessd` must get you fewer secrets, never more.
+Enabling the daemon **disables every local backend** — keychain, Infisical and
+Proton Pass alike — whatever each one's own `enabled` flag says. That is
+enforced in `store::build`, not documented as a convention, because a local
+fallback would re-open the hole the moment the daemon stopped — and anyone who
+can stop a process could choose that. Killing `keylessd` must get you fewer
+secrets, never more.
 
 **Log out and back in.** Group membership is established at login; until then
 your shell is not in the `keyless` group and the kernel refuses the connection
