@@ -266,16 +266,12 @@ jobs:
   # through 3.13 are green at 514 checks; 3.6 fails one fail-open case under a
   # broken locale (it degrades to `silent` where every later version denies).
   #
-  # CI pins 3.9 as its low end rather than 3.7, because GitHub's hosted runners
-  # no longer provide 3.7 — 3.9 is the oldest interpreter this matrix can
-  # actually install, and it is already older than every supported Python.
-  #
-  # Both versions run on both runners. That is checked, not assumed: GitHub's
-  # `python-versions` manifest carries arm64 macOS builds for 3.9 (3.9.12 and
-  # 3.9.13) as well as for 3.13, so `macos-latest` can serve the low end. Ask
-  # for a version a runner has no build of and the job dies on the setup step,
-  # for a reason that has nothing to do with this pack — so check the manifest
-  # before moving either number.
+  # CI's low end is 3.9, not the 3.7 floor, and that gap is a property of the
+  # runners rather than of the pack. Counted in GitHub's `python-versions`
+  # manifest on 2026-08-08: 3.7 has ZERO builds for `ubuntu-24.04` and zero for
+  # arm64 macOS, while 3.9 has 14 and 2. Ask for a version a runner has no build
+  # of and the job dies on the setup step, for a reason that has nothing to do
+  # with this pack — so count the manifest before moving either number.
   hooks:
     name: hooks (${{ matrix.os }}, py${{ matrix.python }})
     runs-on: ${{ matrix.os }}
