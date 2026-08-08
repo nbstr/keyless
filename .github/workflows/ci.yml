@@ -1,0 +1,345 @@
+# CI for keyless.
+#
+# The point of this file is that a stranger can see the green rather than read a
+# claim about it. So every step below asserts a NUMBER or a NAMED FACT, never
+# just "the command exited 0" — a filtered test run that matched nothing exits 0,
+# a suite whose layers collapsed to zero checks exits 0, and a build that made no
+# artifact can exit 0 too.
+#
+# ---------------------------------------------------------------------------
+# The platform split, which is the whole reason this file has two shapes
+# ---------------------------------------------------------------------------
+#
+# `keylessd`'s attestation is XNU. It calls `getpeereid`, `csops`,
+# `proc_pidinfo` and `proc_pidpath`, all exported by libSystem and none of them
+# present on Linux. `install/README.md` says the daemon is macOS-only and lists
+# the Linux equivalents; this file is the mechanical half of that sentence.
+#
+# Measured on Linux (rust 1.89.0, aarch64-unknown-linux-gnu) on 2026-08-08:
+#
+#   cargo fmt --check                        exit 0
+#   cargo clippy --all-targets -- -D warnings exit 0   <- compiles EVERY line of
+#                                                         the daemon, links none
+#   cargo build --bin keyless                exit 0    (debug and release)
+#   cargo build --bin keylessd               exit 101  4 undefined references
+#   cargo build            (all targets)     exit 101  same 4
+#   cargo test                               exit 101  same 4 — the LIB TEST
+#                                                      binary links them too, so
+#                                                      not one Rust test runs
+#
+# Two traps live in those numbers and this file avoids both.
+#
+# 1. `cargo build` on Linux condemns a binary that is fine. A cold
+#    `cargo build --release` was run six times — five in parallel, once with
+#    `-j1` — and `target/release/keyless` was linked and on disk every time,
+#    while the exit code said 101. So the exit code and the artifact disagree,
+#    and checking either one alone gives a wrong answer: the code condemns a
+#    working client, and the artifact absolves a failed build.
+#
+#    That is a measurement, not a guarantee. Cargo does not promise to finish a
+#    unit before another unit's failure ends the build, so it could stop being
+#    true. Naming `--bin keyless` is what makes this file not depend on it.
+#
+# 2. Skipping the daemon on Linux would be the false green in the other
+#    direction — a job that never mentions `keylessd` is a job that will not
+#    notice the day someone breaks it. So Linux does two things instead of
+#    skipping: `clippy --all-targets` type-checks and lints every line of the
+#    daemon (only the final link is macOS-only), and the "platform boundary"
+#    step below runs the link, REQUIRES it to fail, and requires it to fail on
+#    exactly those four symbols. A fifth unportable symbol turns CI red. A
+#    successful link turns CI red. Either way somebody has to come back here and
+#    to `install/README.md`.
+#
+# ---------------------------------------------------------------------------
+# What is deliberately NOT here
+# ---------------------------------------------------------------------------
+#
+# * `cargo test` on Linux. It cannot run: every test binary links the lib, and
+#   the lib references the four symbols. Step 2 above is what keeps that fact
+#   honest instead of silent.
+# * The hook pack's latency layer. It asserts `floor < 2.5 x a bare interpreter`
+#   — a RATIO against interpreter start time, which is a property of the machine.
+#   On macOS a bare `python3 -c pass` costs ~19 ms and the pack's ~7 ms of
+#   imports hide inside it (1.35x, passes). On Linux the interpreter starts in
+#   ~4.6 ms and the same ~18 ms of imports read as 5.0x (fails). It is a
+#   benchmark, and a benchmark on shared CI hardware measures the neighbours. It
+#   runs on a developer machine; `--fast` is how CI says so out loud rather than
+#   by omission, and the check-count assertion below is what stops anything
+#   ELSE going quiet.
+# * `secrets:` of any kind, and the 15 `#[ignore]` Proton tests that would need
+#   one. Nothing here passes `--ignored`, and the macOS job asserts that exactly
+#   15 tests were ignored and 0 of them ran.
+#
+# Third-party actions: none. `actions/checkout`, `actions/cache` and
+# `actions/setup-python` are GitHub's own and are pinned by commit sha, because
+# a tool whose subject is credential handling should not ask a stranger to trust
+# a floating tag in its own build.
+
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # A backtrace costs nothing until something fails, and a CI failure with no
+  # backtrace costs a whole round trip.
+  RUST_BACKTRACE: 1
+  # The declared `rust-version` in Cargo.toml. Pinned rather than `stable`
+  # because `clippy -D warnings` on a moving toolchain goes red on a release
+  # nobody made — and a gate that fails for reasons unrelated to the change is
+  # a gate that gets switched off.
+  RUST_TOOLCHAIN: 1.89.0
+
+jobs:
+  # ---------------------------------------------------------------------------
+  rust:
+    name: rust (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Install the pinned toolchain
+        run: |
+          set -euo pipefail
+          rustup toolchain install "$RUST_TOOLCHAIN" \
+            --profile minimal --component rustfmt --component clippy
+          rustup default "$RUST_TOOLCHAIN"
+          rustc --version
+          cargo --version
+          cargo clippy --version
+
+      # `target/` is deliberately NOT cached, and that is a measurement rather
+      # than an omission. Timed on 2026-08-08.
+      #
+      # Linux, 4 CPUs, everything in this job except the tests:
+      #
+      #   cold  (no registry, no target)     29s     target/ ends at 373 MB
+      #   warm  (registry AND target)        17s
+      #   registry only (target discarded)   28s
+      #
+      # macOS, the whole job including `cargo test`:
+      #
+      #   cold                               42s     target/ ends at 471 MB
+      #   warm                               33s
+      #
+      # So `target/` buys about ten seconds and weighs several hundred megabytes.
+      # Restoring and saving that much on a runner costs roughly what it saves,
+      # and every push writes a fresh entry — a repository's cache budget is
+      # 10 GB, so a few dozen pushes evict everything, including the entries that
+      # were paying off. The registry is 25 MB, restores in about a second, and
+      # is the half that cannot thrash.
+      #
+      # Re-measure before changing this. These numbers are small because the
+      # dependency list is 23 crates; the day that stops being true, so does the
+      # conclusion.
+      - name: Cache the cargo registry
+        uses: actions/cache@1bd1e32a3bdc45362d1e726936510720a7c30a57 # v4.2.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-registry-
+
+      - name: Format
+        run: cargo fmt --check
+
+      # `--all-targets` reaches the tests, the examples and BOTH binaries, so on
+      # Linux this is the step that actually reads the daemon. It runs `cargo
+      # check` underneath and never links, which is exactly why it is portable
+      # and exactly why it is not proof that the daemon builds. The next two
+      # steps are that proof, one per platform.
+      - name: Clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+      # Named, not `cargo build`. On Linux a bare `cargo build` exits 101 for
+      # the daemon while this binary is already linked and on disk.
+      - name: Build the client (debug and release)
+        run: |
+          set -euo pipefail
+          cargo build --locked --bin keyless
+          cargo build --locked --release --bin keyless
+          ./target/release/keyless --version
+
+      # ---- macOS: the daemon links, and the whole suite runs ----------------
+
+      - name: Build the daemon (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          set -euo pipefail
+          cargo build --locked --bin keylessd
+          cargo build --locked --release --bin keylessd
+          ./target/release/keylessd --version
+
+      # The exit code is judged on its own line. Never `cargo test | tail`: a
+      # pipeline reports its LAST stage's status and `tail` always succeeds, so
+      # a failing suite reads as green and the evidence is truncated as well.
+      #
+      # Then the counts, because exit 0 is not evidence that anything ran. A
+      # filtered run that matches zero tests exits 0. The floor is set below the
+      # 415 measured on 2026-08-08 so it catches a suite that collapsed, not a
+      # suite that lost a case.
+      #
+      # `15 ignored` is the Proton live suite. Asserting it EQUALS 15 pins both
+      # halves of the claim: the live tests still exist, and CI ran none of them.
+      # Nothing here passes `--ignored`, and if anyone ever adds it this line is
+      # what turns red.
+      - name: Test (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          set -uo pipefail
+          cargo test --locked > test.log 2>&1
+          code=$?
+          cat test.log
+          if [ "$code" -ne 0 ]; then
+            echo "::error::cargo test exited $code"
+            exit "$code"
+          fi
+          count() {
+            awk -v want="$1" '/^test result:/ {
+                                for (i = 1; i <= NF; i++)
+                                  if ($(i+1) == want) n += $i
+                              }
+                              END { print n + 0 }' test.log
+          }
+          passed=$(count 'passed;')
+          ignored=$(count 'ignored;')
+          failed=$(count 'failed;')
+          echo "passed=$passed ignored=$ignored failed=$failed"
+          if [ "$passed" -lt 380 ]; then
+            echo "::error::only $passed tests ran; the floor is 380. A suite that"
+            echo "::error::exercised nothing exits 0 and reads exactly like a pass."
+            exit 1
+          fi
+          if [ "$ignored" -ne 15 ]; then
+            echo "::error::expected exactly 15 ignored tests (the Proton live suite,"
+            echo "::error::which needs a real account and must never run here); saw $ignored."
+            exit 1
+          fi
+          if [ "$failed" -ne 0 ]; then
+            echo "::error::$failed tests failed"
+            exit 1
+          fi
+
+      # ---- Linux: the boundary, pinned rather than skipped ------------------
+
+      - name: The daemon does not link on Linux, and this says exactly why
+        if: runner.os == 'Linux'
+        run: |
+          set -uo pipefail
+          if cargo build --locked --bin keylessd > keylessd-link.log 2>&1; then
+            cat keylessd-link.log
+            echo "::error::keylessd LINKED on Linux. That is good news and this"
+            echo "::error::file is now wrong: give Linux a real daemon job, and"
+            echo "::error::update the porting table in install/README.md."
+            exit 1
+          fi
+          cat keylessd-link.log
+          sed -nE "s/.*undefined reference to \`([A-Za-z0-9_]+)'.*/\1/p" \
+            keylessd-link.log | sort -u > got.txt
+          printf '%s\n' csops getpeereid proc_pidinfo proc_pidpath > want.txt
+          if ! diff -u want.txt got.txt; then
+            echo "::error::the daemon's unportable surface changed. It is meant to"
+            echo "::error::be exactly the four XNU calls in src/ipc/ffi.rs. A new"
+            echo "::error::name in this list is a new macOS-only dependency, and it"
+            echo "::error::belongs in the porting table in install/README.md."
+            exit 1
+          fi
+          echo "keylessd is macOS-only on exactly the four documented XNU symbols."
+
+  # ---------------------------------------------------------------------------
+  # The hook pack. Stdlib-only, so the only variable worth testing is the
+  # interpreter.
+  #
+  # Floor measured on 2026-08-08 by running the suite, not by reading it: 3.7
+  # through 3.13 are green at 514 checks; 3.6 fails one fail-open case under a
+  # broken locale (it degrades to `silent` where every later version denies).
+  #
+  # CI pins 3.9 as its low end rather than 3.7, because GitHub's hosted runners
+  # no longer provide 3.7 — 3.9 is the oldest interpreter this matrix can
+  # actually install, and it is already older than every supported Python.
+  #
+  # Both versions run on both runners. That is checked, not assumed: GitHub's
+  # `python-versions` manifest carries arm64 macOS builds for 3.9 (3.9.12 and
+  # 3.9.13) as well as for 3.13, so `macos-latest` can serve the low end. Ask
+  # for a version a runner has no build of and the job dies on the setup step,
+  # for a reason that has nothing to do with this pack — so check the manifest
+  # before moving either number.
+  hooks:
+    name: hooks (${{ matrix.os }}, py${{ matrix.python }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        python: ['3.9', '3.13']
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Install Python ${{ matrix.python }}
+        uses: actions/setup-python@42375524e23c412d93fb67b49958b491fce71c38 # v5.4.0
+        with:
+          python-version: ${{ matrix.python }}
+
+      # No `pip install`. The pack is stdlib-only and a dependency appearing
+      # here would be the first sign that stopped being true.
+      - name: No third-party imports
+        run: |
+          set -euo pipefail
+          python3 -c 'import sys; print(sys.version)'
+          test ! -e hooks/requirements.txt
+          test ! -e hooks/pyproject.toml
+          test ! -e hooks/setup.py
+
+      # `--fast` drops the latency layer only. See the header for why a ratio
+      # against interpreter start time cannot be a gate on shared hardware.
+      #
+      # run.py already refuses a layer that ran fewer checks than its own floor,
+      # which is the real guard. The total below is the cheap second one: it
+      # catches a whole LAYER going missing from the runner's own list.
+      - name: Hook pack suite
+        run: |
+          set -uo pipefail
+          python3 hooks/tests/run.py --fast > hooks.log 2>&1
+          code=$?
+          cat hooks.log
+          if [ "$code" -ne 0 ]; then
+            echo "::error::the hook suite exited $code"
+            exit "$code"
+          fi
+          checks=$(awk '/^[0-9]+ checks\./ { print $1 }' hooks.log)
+          echo "checks=$checks"
+          if [ "${checks:-0}" -lt 500 ]; then
+            echo "::error::only ${checks:-0} checks ran; the floor is 500. A suite"
+            echo "::error::that ran nothing prints ALL GREEN and exits 0."
+            exit 1
+          fi
+
+      # The suites are meant to stand up their own stubs rather than depend on a
+      # vendor CLI being installed, and a runner is where that is provable: it
+      # has neither. If either name ever appears on a runner's PATH, this stops
+      # being a proof and starts being a coincidence, so the job says so.
+      - name: No vendor CLI is present, so nothing can quietly depend on one
+        run: |
+          set -euo pipefail
+          for cli in infisical pass-cli; do
+            if command -v "$cli" > /dev/null 2>&1; then
+              echo "::error::$cli is on PATH on this runner. The suites are"
+              echo "::error::supposed to prove themselves against stubs; with the"
+              echo "::error::real binary here, a green run no longer proves that."
+              exit 1
+            fi
+          done
+          echo "neither infisical nor pass-cli is installed, as intended."
