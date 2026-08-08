@@ -34,7 +34,7 @@ zeroize = "1"
 # good kind of minimalism — a wrong `ioctl` request constant compiles, links,
 # and corrupts memory at runtime.
 #
-# Feature-gated down to the five modules actually used. `default-features =
+# Feature-gated down to the six modules actually used. `default-features =
 # false` is not spelled here because nix's default feature set is already
 # empty; the list below is additive, not a subtraction.
 nix = { version = "0.31", features = [

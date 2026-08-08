@@ -13,12 +13,27 @@ $ keyless run -s STRIPE_KEY=stripe-live -- ./deploy.sh
 ```
 
 The secret is read from a store, placed in the child process's environment, and
-scrubbed out of the child's stdout and stderr on the way back.
+scrubbed out of the child's stdout and stderr on the way back. `-s NAME` injects
+the secret `NAME` as `$NAME`. `-s ENV=NAME` injects the secret `NAME` under a
+different variable, so what a store calls something and what a program expects
+never have to agree.
+
+Two rules shape everything else, and both are structural rather than advisory:
+
+- **[`keyless run` never refuses to run your
+  command.](#rule-1-it-never-refuses-to-run-your-command)** A missing name, a
+  broken config or an unreachable store warns on stderr and runs your command
+  anyway, with an unmodified environment.
+- **[No verb prints a value.](#rule-2-there-is-no-verb-that-prints-a-value)**
+  There is no `get`, no `--reveal`, no debug flag. If a command needs a
+  credential, run the command under `keyless run`.
 
 On its own that is a good habit around a store your own uid can read. Add
-[`keylessd`](#keylessd--what-turns-a-habit-into-a-gate) and it becomes a
-boundary: the store moves behind a second uid, your sessions ask over a socket,
-and the socket carries names and results but never the store credential.
+[`keylessd`](#keylessd--the-uid-boundary) and it becomes a boundary: the store
+moves behind a second uid, your sessions ask over a socket, and the socket
+carries names and results but never the store credential.
+
+macOS today. MIT licensed.
 
 ---
 
@@ -58,76 +73,6 @@ flag](#storing-a-secret).
 
 ---
 
-## The two rules that shape everything
-
-### 1. It never refuses to run your command
-
-There is no code path in which `keyless run` exits without spawning the child.
-Not on a missing store, not on an unknown name, not on a corrupt config, not on
-a store that errors. It warns on stderr and runs the command anyway with an
-unmodified environment.
-
-```console
-$ keyless run -s DATABASE_URL -s GITHUB_TOKEN -- ./migrate.sh
-keyless: DEGRADED — 2 names unresolved: DATABASE_URL, GITHUB_TOKEN
-keyless:   DATABASE_URL: not found in any store
-...your command runs, and its exit code is yours...
-```
-
-There are two states and no third:
-
-- **INJECTED** — every requested name resolved, was injected, and is masked.
-- **DEGRADED** — anything else. The environment is untouched.
-
-A partial injection would be a third state, so it does not exist: if one name of
-three is missing, none of the three is injected. Fewer secrets, never more.
-
-This is not politeness. A tool that occasionally blocks the work gets
-uninstalled, and what comes back is the plaintext literal on the command line.
-Degrading loses the protection for one command; failing loses it for good.
-
-*Degraded runs still mask.* Whatever did resolve is still compiled into the
-output filter even though nothing is injected — so a value you typed by hand
-stays out of the audit log and out of the echoed output. Injection is withheld
-when degraded; redaction is not.
-
-The only two ways out without a child are "you gave me no command" (exit 64) and
-"that command does not exist" (exit 127). Neither is `keyless` declining to run
-something it could have run.
-
-### 2. There is no verb that prints a value
-
-No `get`. No `read`, `export`, `show`, `cat`, `--reveal`, `--print`,
-`--no-masking`. Not behind a flag, not behind an environment variable, not "just
-for debugging".
-
-A single verb that writes a plaintext value to stdout voids the entire design,
-because a caller takes the shortest path and that verb is always the shortest
-path. This is measured, not theorised: one CLI already read its key from the
-environment at 18 call sites, and agents still typed that key as a literal flag
-41 times. Availability of the safe path does not win. Only being the shortest
-path wins.
-
-If a command needs a credential, run the command under `keyless run`.
-
-The rule holds across the whole verb set, and each verb has to earn it
-separately:
-
-| Verb | What it prints |
-|---|---|
-| `run` | your command's output, with injected values replaced by `[keyless:NAME]` |
-| `ls` | the names you declared, and which environment each one points at |
-| `items` | vault, state, type, title |
-| `fields` | field names, kinds, types, paths — never a value, never a length |
-| `new` | that it stored something, and where |
-| `put` | the same, and it echoes nothing it read |
-| `doctor` | `ok` / `missing` / a store's own error |
-
-`new` is the interesting one: it generates a credential and then does not show it
-to you. There is no flag that does.
-
----
-
 ## Install
 
 ```console
@@ -142,30 +87,39 @@ toolchain. `cargo install` writes to `~/.cargo/bin`, which has to be on your
 `PATH`; the `--version` line is there so you find that out now rather than
 three commands later.
 
-macOS today; the store trait is portable and the
-rest of the tool has no platform-specific behaviour beyond POSIX process
-handling. The daemon's caller attestation is the exception — it is XNU-specific,
-and [`install/README.md`](install/README.md) records what replaces each piece on
-Linux.
+The store trait is portable and the rest of the tool has no platform-specific
+behaviour beyond POSIX process handling. The daemon's caller attestation is the
+exception — it is XNU-specific, and [`install/README.md`](install/README.md)
+records what replaces each piece on Linux.
 
 That installs the client only, and the client alone reads your keychain
-directly. For the uid boundary, see
-[`install/README.md`](install/README.md) — one `sudo`, and the installer is
-dry-run until you pass `--commit`.
+directly. For the uid boundary, see [`install/README.md`](install/README.md) —
+one `sudo`, and the installer is dry-run until you pass `--commit`.
 
 ---
 
-## Setup
+## Your first command
 
 Put a secret in your keychain — or let `keyless` generate one and put it there,
 which is the flow in which no plaintext exists outside the store:
 
 ```console
 $ security add-generic-password -s keyless -a DATABASE_URL -w
-$ keyless new DATABASE_URL          # generates it; see Writes below
+$ keyless new DATABASE_URL          # generates it; see Storing a secret below
 ```
 
-Declare it, in `~/.config/keyless/config.json`:
+Then use it:
+
+```console
+$ keyless run -s DATABASE_URL -- psql
+```
+
+That already works with no config file at all: an undeclared name is looked up
+as its own account under the default keychain service. **Declaring names is what
+makes them enumerable**, which is what `ls` lists — and what lets one name point
+somewhere other than the default.
+
+`~/.config/keyless/config.json`:
 
 ```json
 {
@@ -176,8 +130,6 @@ Declare it, in `~/.config/keyless/config.json`:
   }
 }
 ```
-
-Then:
 
 ```console
 $ keyless ls
@@ -196,18 +148,14 @@ store    keychain ok
 
 `doctor --probe` additionally asks each name whether it resolves, printing `ok`
 or `missing` — never a value, and never a length, because a length is still
-information about a secret.
+information about a secret. It may trigger a keychain access prompt, which a
+plain `doctor` does not.
 
-The config is entirely optional. An undeclared name still resolves: it is looked
-up as its own account under the default service. Declaring names is what makes
-them enumerable, which is what `ls` lists.
-
-`ls` lists what you declared, as four tab-separated fields — name, store,
-location, note — with `-` wherever there is nothing to say, so a parser never
-has to count them. The **location** column answers "which tenant does this name
-point at?", and only Infisical has an answer worth printing there: its
-environment decides *which real value* comes back. See
-[Infisical](#infisical--a-verb-that-hands-back-a-process-not-a-value).
+`ls` prints four tab-separated fields — name, store, location, note — with `-`
+wherever there is nothing to say, so a parser never has to count them. The
+**location** column answers "which tenant does this name point at?", and only
+Infisical has an answer worth printing there: its environment decides *which
+real value* comes back.
 
 ```console
 $ keyless ls
@@ -220,137 +168,141 @@ GITHUB_TOKEN	keychain 	-               	-
 environment. A keychain account is not printed: it picks an item, not a tenant,
 and a lookup detail in a listing is noise.
 
-To find out what a store actually holds — item titles, and the field names a
-config entry needs — use
-[`items` and `fields`](#discovery--write-a-config-entry-without-reading-a-value).
-Neither prints a value.
-
-Unknown fields in the config are ignored rather than rejected, so a config
-written for a newer build with more backends degrades to "I cannot serve those
-names" instead of refusing to parse and therefore serving none.
-
 **Nothing in the config file is ever a secret value.** It holds names,
 references, store kinds, paths and timeouts. There is no field a value fits in,
 which is why it needs no special permissions and can be committed.
 
+Unknown fields are ignored rather than rejected, so a config written for a newer
+build with more backends degrades to "I cannot serve those names" instead of
+refusing to parse and therefore serving none.
+
 ---
 
-## Discovery — write a config entry without reading a value
+## Stores
 
-`keyless ls` lists what you have already declared. It reads the config file and
-nothing else, which leaves an obvious hole: **to declare a name you have to know
-what the store calls the item and the field, and finding that out used to mean
-printing the value.**
+Three, and the first is the only one on by default.
 
-That is not hypothetical. On 2026-08-08 a Proton item of type `custom` was
-created, the `field` in the config did not match the item's real field name,
-`keyless` degraded — and the real field name could not be found. The only
-`pass-cli` verb that reveals it also prints the value, so the local harness gate
-refused it, correctly. Setting the tool up required doing the exact thing the
-tool exists to prevent.
+| Store | `enabled` default | Reached by | Live path verified |
+|---|---|---|---|
+| `keychain` | **on** | `security find-generic-password -w` | yes |
+| `infisical` | off | `infisical run … -- printenv KEY` | yes — CLI 0.43.114, 2026-08-06 |
+| `proton` | off | `pass-cli run --env-file … -- printenv` | yes — CLI 2.2.5, 2026-08-08 |
 
-Two verbs close that.
-
-```console
-$ keyless items --store proton --vault personal
-personal	Trashed	login	keyless-decoy-alpha
-personal	Active	custom	demo api key
-
-$ keyless fields --store proton --vault personal --item "demo api key"
-API Key	    custom	Hidden	    item.content.extra_fields[0]
-Secret	    custom	Hidden	    item.content.extra_fields[1]
-Expiry Date	custom	Timestamp	item.content.extra_fields[2]
-Permissions	custom	Text	    item.content.extra_fields[3]
-note	    builtin	-	        item.content
-title	    builtin	-	        item.content
-```
-
-Tab-separated columns, like `ls`, because this output is read by agents at least
-as often as by people. `items` gives vault, state, type, title. `fields` gives
-name, kind, type, path — and the `name` column is what goes in a config entry's
-`field`:
+The two network-backed ones are off unless asked for: a keychain-only setup must
+not start paying a process spawn and a network round trip per lookup because a
+newer build knows how to talk to a vault.
 
 ```json
-"DEMO_KEY": { "store": "proton", "vault": "personal",
-              "item": "demo api key", "field": "API Key" }
+{
+  "stores": {
+    "keychain": { "service": "keyless" },
+    "infisical": { "enabled": true, "path": "/backend" },
+    "proton": { "enabled": true, "session_dir": "/Users/you/.keyless-pass-session" },
+    "default": "keychain"
+  },
+  "secrets": {
+    "DATABASE_URL": { "store": "infisical", "env": "staging", "path": "/api",
+                      "key": "DB_URL" },
+    "GITHUB_TOKEN": { "store": "keychain", "account": "demo-token" },
+    "HOME_WIFI":    { "store": "proton", "vault": "Personal", "item": "Router",
+                      "field": "password" }
+  }
+}
 ```
 
-**Neither prints a value. Neither prints a value's length either** — a length is
-information about a secret, and `doctor --probe` has always refused to print one.
+### One name, several stores
 
-### A trashed item is shown, and `fields` on one is refused
+With a company vault and a personal vault both configured, `DATABASE_URL` could
+mean either. "Ask each backend in turn and take the first hit" answers that with
+configuration order — silently, and wrongly half the time. A personal database
+URL handed to a deploy script is not a convenience feature misfiring; it is one
+tenant's credential crossing into another's work, and nothing in the output would
+say so.
 
-Both halves are deliberate. Hiding a trashed item leaves you hunting for
-something that is in the bin; listing it *unmarked* is worse, because you would
-then write a config entry against a title that can never resolve — the resolver
-refuses a trashed item on purpose. So `items` reports the state verbatim and
-`fields` says why it will not go further:
+So the default is **explicit**. Exactly one backend is eligible for a name, and
+which one is never inferred from ordering:
+
+| The name declares | Backends configured | Outcome |
+|---|---|---|
+| `"store": "infisical"` | any | that backend, and only it |
+| nothing, `stores.default` set | any | the default backend, and only it |
+| nothing | exactly one | that one |
+| nothing | two or more | **ambiguous** — the run degrades and names the candidates |
 
 ```console
-$ keyless fields --store proton --vault personal --item keyless-decoy-alpha
-keyless: store `proton` failed: the only item titled `keyless-decoy-alpha` in
-vault `personal` is in the trash, so no config entry can resolve against it;
-restore it first
+$ keyless run -s DATABASE_URL -- ./migrate.sh
+keyless: DEGRADED — 1 names unresolved: DATABASE_URL
+keyless:   DATABASE_URL: 2 stores could answer (infisical, proton) and none is
+                         pinned; add "store" to this name, or set "stores.default"
+...your command runs anyway...
 ```
 
-### How the Proton path keeps the value out of the output
+Ambiguity is resolved by **refusing to guess**, not by picking — and the
+candidates are not queried to see which of them happens to have it. That would
+read a value out of a store you never meant to touch, and against Proton Pass it
+would write a remote audit entry for a read that was only ever a guess.
 
-`pass-cli item view` is the only verb that reveals an item's field names, and it
-prints the values too. There is no vendor flag that stops it. So the plaintext
-enters the process whether anyone wants it or not, and everything between arrival
-and the first byte of output is the mechanism:
+A single-store setup needs no pin. `stores.policy` set to `"ordered"` restores
+first-hit-wins for anyone whose backends all hold secrets of the same trust
+level. It is opt-in because the failure it enables is silent.
 
-- the bytes land in a capture buffer that zeroizes on drop;
-- they are parsed into a guard type with no `Display`, no `Serialize`, a `Debug`
-  that prints `ItemView(<redacted>)`, and a `Drop` that zeroizes **every string
-  in the JSON tree** — which covers the early-return and panic paths as well;
-- exactly two rules produce output, and there is no third. An array element
-  carrying a label key beside a value key contributes its **label**; anything
-  else contributes a **key**. Nothing recurses into a value container, so
-  `content` and `value` are read as structure and never as data;
-- the type column (`Hidden`, `Timestamp`) is the *key* of the object wrapping the
-  value, so reporting it never goes near the value;
-- every error message on the path is built from stderr only, as everywhere else
-  in this tool, because stdout is where the value is.
+### Infisical — a verb that hands back a process, not a value
 
-Requiring a field descriptor to be an **array element** is load-bearing rather
-than tidy. The vendor's own top-level `item` object carries a `content` key, so an
-`item` that ever gained a `name` would be read as one field descriptor and every
-real field would silently vanish from the listing. A shape that puts a descriptor
-outside an array falls back to emitting keys — a worse listing, never a leak.
+Three of the CLI's verbs yield a secret — `infisical secrets`, `infisical
+secrets get NAME`, `infisical export` — and **all three write plaintext to
+stdout**, which in an agent session is the transcript. So `keyless` uses the one
+verb that prints nothing: `infisical run --env=… --path=… -- <cmd>`, which
+fetches the secrets, puts them in a child's environment, and execs.
 
-Measured against `pass-cli` 2.2.5, and **the two shapes are not the same**:
+That verb gives you a *process*, not a value, and there are two ways to build on
+it.
 
-| Source | label | value |
-|---|---|---|
-| `item view --output json` | `item.content.extra_fields[N].name` | `…[N].content` |
-| `item create custom --get-template` | `sections[].fields[].field_name` | `…value` |
+**Nesting** — `keyless run` spawns `infisical run` spawns your command. The
+plaintext never enters `keyless` at all, which sounds safer. What it costs:
 
-The template's shape is the only one of the two you can read without printing a
-credential, so it is the tempting thing to build against — and it is wrong for a
-real item. Both are handled.
+- **Masking dies.** `keyless` cannot redact a value it has never seen, and
+  Infisical masks nothing. Every Infisical-backed secret loses the protection
+  this README leads with.
+- **Your command gets everything.** `infisical run` injects every secret at the
+  path, not the ones you asked for — 405 names reaching a child that wanted one.
+- **`INJECTED` becomes a lie.** Measured: a `run` against an environment and path
+  holding nothing exits **0** and reports `Injecting 0 Infisical secrets`. Under
+  nesting `keyless` sees a clean exit, reports `INJECTED`, and your command has
+  nothing. `DEGRADED` — the whole point of naming what did not resolve — becomes
+  unimplementable.
+- **A third process** between your terminal and your command, carrying the
+  signals, the window size and the exit code.
 
-### Two backends say why they cannot do this
+**Probing** — what `keyless` does. Run that same verb with the smallest possible
+child: `printenv KEY`, which writes one variable to stdout and exits. `keyless`
+captures it, wraps it in the same zeroizing type the keychain path uses, and
+injects exactly the names you asked for.
 
-A verb that works in one backend and leaks in another is worse than one that is
-plainly absent in the second, because you learn to trust it from the backend
-where it is safe. So:
+This is not a way around the policy; it is the policy's own mechanism. The denied
+verbs are denied because they print a value **into the session**. Here it goes
+into a pipe `keyless` owns and out again only into your command's environment,
+masked on the way back. `security -w` has exactly this shape and always has.
 
-| Backend | `items` / `fields` | Why |
-|---|---|---|
-| `proton` | yes | `item list` and `item view`, with the extraction above |
-| `keychain` | no | `security` has no verb listing one service's items without dumping the whole keychain file, and one extra flag on that dump prints values |
-| `infisical` | no | every verb that lists keys prints their values, and there is no keys-only flag |
-| `daemon` | no | a client that could enumerate the store could read what it never named — the hole the uid boundary closes |
+What probing costs, stated rather than implied:
 
-For Infisical the tempting workaround is unsafe rather than merely ugly: filter
-the vendor's output down to what is left of each `=`, and a value containing a
-newline produces a following line with no `=` in it, which the filter passes
-straight through.
+- **One `infisical run` per name** — a process spawn and a network round trip
+  each. Ten names is ten fetches, and the timeout below is per lookup.
+- **The plaintext enters `keyless`.** Nesting would have avoided that. It buys
+  masking, exact narrowing and an honest `DEGRADED`.
+- **`infisical` still loads every secret at the path into its own memory.**
+  Narrowing is about what reaches your command, not about what the vendor's CLI
+  fetches.
 
----
+Every invocation passes `--telemetry=false`. The CLI's telemetry defaults to
+**on**, so shelling out with default flags would make `keyless` the reason a
+report left your machine — see [No telemetry](#no-telemetry). It also pins
+`--log-destination=stderr`, because the CLI reads that from `LOG_DESTINATION`
+too and a value of `stdout` there would interleave log lines with the value
+being read.
 
-## Writes — put a secret in without a session seeing it
+`keyless` never opens `~/.infisical/.token`, `~/.infisical/.client-id`, or the
+encrypted cache beside them. The login belongs to the CLI and is inherited by
+spawning it; there is no config field a token fits in.
 
 #### An environment is required, and has no default
 
@@ -361,15 +313,12 @@ key names with different real values.
 `keyless` defaults it nowhere, and the reason is measured. With a machine-wide
 default of `prod`:
 
-- **Every name a caller invented resolved against production.** `META_APP_ID`,
-  declared in no config at all, came back with a real value — exit 0, nothing on
-  stderr.
+- **Every name a caller invented resolved against production.** A name declared
+  in no config at all came back with a real value — exit 0, nothing on stderr.
 - Asking for `DATABASE_URL` while meaning staging returned **production**, and
   the command succeeded.
 
-Neither is a bug in Infisical. `keyless` introduced the hazard, so `keyless`
-removed it. An environment now comes from exactly two places, most specific
-first:
+So an environment comes from exactly two places, most specific first:
 
 | Where | Covers |
 |---|---|
@@ -393,27 +342,24 @@ keyless:   DATABASE_URL: store `infisical` was not asked: `DATABASE_URL` has no
 ...your command runs anyway, with an unmodified environment...
 ```
 
-That is a degrade, never a refusal — [rule 1](#1-it-never-refuses-to-run-your-command)
-has no exception for this either.
+That is a degrade, never a refusal — [rule
+1](#rule-1-it-never-refuses-to-run-your-command) has no exception for this
+either.
 
 **A name's own `env` outranks `--env`.** The flag is a blanket aimed at the names
 that say nothing; a name that states where it lives is not repainted by it, so
 `--env staging` on a run that also touches a production-pinned name leaves that
 name in production.
 
-**If your config still sets `stores.infisical.env`, it is ignored and you are
-told so** on every run, by name, with the line to delete. Unknown keys are
-dropped silently by design, so removing the field outright would have made an
-existing `"env": "prod"` vanish without a word.
-
-```console
-keyless: warning: `stores.infisical.env` is set to `prod` and is IGNORED. …
-```
+A config that sets `stores.infisical.env` is told, on every run, that the key is
+ignored and which line to delete. Unknown keys are dropped silently by design,
+so removing the field outright would have made an existing `"env": "prod"`
+vanish without a word.
 
 `path` is deliberately **not** treated this way and still defaults to `/`. That
 is the vendor's own default, so `keyless` invents nothing; and the two fail
 differently — a wrong path can only miss a folder *inside the environment you
-named*, which degrades and says so, while a wrong environment returned a
+named*, which degrades and says so, while a wrong environment returns a
 plausible value from the other side of the boundary. `keyless ls` prints both
 coordinates for every Infisical name, so a folder that holds nothing is visible
 without a lookup.
@@ -495,10 +441,10 @@ entry is written for a read whose identity nobody chose.
 #### Address items by NAME — a share id is minted per session
 
 **A share id is not a coordinate you can store.** Measured 2026-08-08: the same
-vault `personal` answered with two different share ids to two live sessions of one
-account. A reference is therefore relative to the session that resolves it, and
-one written into a config file stops working the next time the token is renewed
-or a session recovers — as a **degraded run**, which is quiet.
+vault answered with two different share ids to two live sessions of one account.
+A reference is therefore relative to the session that resolves it, and one
+written into a config file stops working the next time the token is renewed or a
+session recovers — as a **degraded run**, which is quiet.
 
 So address an item the way a person does. Vault name, item title, field are
 stable; `keyless` resolves the volatile half at every lookup:
@@ -520,7 +466,7 @@ vault cost one listing — **in memory and never on disk**. A cache on disk that
 the client can read is a `get` verb with extra steps, and `keyless` does not
 offer one.
 
-Three rules, each of which degrades the name and never the command:
+Four rules, each of which degrades the name and never the command:
 
 | Situation | Outcome |
 |---|---|
@@ -639,14 +585,289 @@ lookup, not per run. `doctor` is where you find out why.
 
 ---
 
-## Masking
+## Finding what to put in the config
+
+`keyless ls` lists what you have already declared. It reads the config file and
+nothing else, which leaves an obvious hole: **to declare a name you have to know
+what the store calls the item and the field, and finding that out used to mean
+printing the value.** The only `pass-cli` verb that reveals a field name prints
+the values with it, so setting the tool up required doing the exact thing the
+tool exists to prevent.
+
+Two verbs close that.
+
+```console
+$ keyless items --store proton --vault personal
+personal	Trashed	login	keyless-decoy-alpha
+personal	Active	custom	demo api key
+
+$ keyless fields --store proton --vault personal --item "demo api key"
+API Key	    custom	Hidden	    item.content.extra_fields[0]
+Secret	    custom	Hidden	    item.content.extra_fields[1]
+Expiry Date	custom	Timestamp	item.content.extra_fields[2]
+Permissions	custom	Text	    item.content.extra_fields[3]
+note	    builtin	-	        item.content
+title	    builtin	-	        item.content
+```
+
+Tab-separated columns, like `ls`, because this output is read by agents at least
+as often as by people. `items` gives vault, state, type, title. `fields` gives
+name, kind, type, path — and the `name` column is what goes in a config entry's
+`field`:
+
+```json
+"DEMO_KEY": { "store": "proton", "vault": "personal",
+              "item": "demo api key", "field": "API Key" }
+```
+
+**Neither prints a value. Neither prints a value's length either** — a length is
+information about a secret, and `doctor --probe` has always refused to print one.
+
+### A trashed item is shown, and `fields` on one is refused
+
+Both halves are deliberate. Hiding a trashed item leaves you hunting for
+something that is in the bin; listing it *unmarked* is worse, because you would
+then write a config entry against a title that can never resolve — the resolver
+refuses a trashed item on purpose. So `items` reports the state verbatim and
+`fields` says why it will not go further:
+
+```console
+$ keyless fields --store proton --vault personal --item keyless-decoy-alpha
+keyless: store `proton` failed: the only item titled `keyless-decoy-alpha` in
+vault `personal` is in the trash, so no config entry can resolve against it;
+restore it first
+```
+
+### How the Proton path keeps the value out of the output
+
+`pass-cli item view` is the only verb that reveals an item's field names, and it
+prints the values too. There is no vendor flag that stops it. So the plaintext
+enters the process whether anyone wants it or not, and everything between arrival
+and the first byte of output is the mechanism:
+
+- the bytes land in a capture buffer that zeroizes on drop;
+- they are parsed into a guard type with no `Display`, no `Serialize`, a `Debug`
+  that prints `ItemView(<redacted>)`, and a `Drop` that zeroizes **every string
+  in the JSON tree** — which covers the early-return and panic paths as well;
+- exactly two rules produce output, and there is no third. An array element
+  carrying a label key beside a value key contributes its **label**; anything
+  else contributes a **key**. Nothing recurses into a value container, so
+  `content` and `value` are read as structure and never as data;
+- the type column (`Hidden`, `Timestamp`) is the *key* of the object wrapping the
+  value, so reporting it never goes near the value;
+- every error message on the path is built from stderr only, as everywhere else
+  in this tool, because stdout is where the value is.
+
+Requiring a field descriptor to be an **array element** is load-bearing rather
+than tidy. The vendor's own top-level `item` object carries a `content` key, so an
+`item` that ever gained a `name` would be read as one field descriptor and every
+real field would silently vanish from the listing. A shape that puts a descriptor
+outside an array falls back to emitting keys — a worse listing, never a leak.
+
+Measured against `pass-cli` 2.2.5, and **the two shapes are not the same**:
+
+| Source | label | value |
+|---|---|---|
+| `item view --output json` | `item.content.extra_fields[N].name` | `…[N].content` |
+| `item create custom --get-template` | `sections[].fields[].field_name` | `…value` |
+
+The template's shape is the only one of the two you can read without printing a
+credential, so it is the tempting thing to build against — and it is wrong for a
+real item. Both are handled.
+
+### Two backends say why they cannot do this
+
+A verb that works in one backend and leaks in another is worse than one that is
+plainly absent in the second, because you learn to trust it from the backend
+where it is safe. So:
+
+| Backend | `items` / `fields` | Why |
+|---|---|---|
+| `proton` | yes | `item list` and `item view`, with the extraction above |
+| `keychain` | no | `security` has no verb listing one service's items without dumping the whole keychain file, and one extra flag on that dump prints values |
+| `infisical` | no | every verb that lists keys prints their values, and there is no keys-only flag |
+| `daemon` | no | a client that could enumerate the store could read what it never named — the hole the uid boundary closes |
+
+For Infisical the tempting workaround is unsafe rather than merely ugly: filter
+the vendor's output down to what is left of each `=`, and a value containing a
+newline produces a following line with no `=` in it, which the filter passes
+straight through.
+
+---
+
+## Storing a secret
+
+```console
+$ keyless new DEMO_KEY --length 32
+stored	DEMO_KEY	pass://personal/demo api key/API Key (custom item)	proton (manager)
+
+$ printf '%s' "$value_from_the_provider" | keyless put DEMO_KEY
+stored	DEMO_KEY	keychain keyless/DEMO_KEY	keychain (this user, no separate manager exists)
+```
+
+`new` generates the value from the kernel's CSPRNG and **never shows it to
+anybody**. That is the point rather than an omission: it exists in the process and
+in the store, and nowhere else. There is no `--show`, no `--print`, and `put`
+echoes nothing.
+
+`put` takes the value on **stdin and nowhere else**. There is no `--value`, no
+`--secret`, and no positional value:
+
+```console
+$ keyless put DEMO_KEY --value hunter2
+error: unexpected argument '--value' found
+```
+
+An argument is readable from the process table for as long as the process lives
+— the CLI-flag shape, one of the four [above](#why-this-exists). A flag that
+exists gets used, so the flag does not exist — structurally, the same way `run`
+has no `--reveal`.
+
+At a terminal, `put` prompts with echo off. If echo cannot be switched off it
+does **not** prompt anyway; a prompt that echoes would print the credential.
+
+### These verbs may refuse. `run` may not
+
+`keyless run` never refuses, because blocking your work gets the tool uninstalled
+and then the plaintext comes back. That argument does not transfer to setup
+commands: `new` and `put` run once, with you watching, and nothing downstream is
+waiting on them. And a write that "degraded" would report success with nothing
+stored — which the next `run` would report as a missing name, for a reason nobody
+can find. So they exit non-zero and say what is missing:
+
+| Exit | Meaning |
+|---:|---|
+| 0 | stored |
+| 65 | the value is unusable — empty, not UTF-8, too large, a line break the backend cannot hold |
+| 71 | `/dev/urandom` could not be read |
+| 78 | nothing was attempted; a config file needs editing |
+| 1 | the backend refused or could not be reached |
+
+### The reader and the manager are two different identities
+
+`stores.proton.session_dir` is the **reader**: a viewer-role agent token, the
+default, and the only identity `run`, `ls`, `items` and `fields` can reach. It
+cannot create, move or trash anything, which is what you want every session on
+the machine to hold.
+
+`stores.proton.manager.session_dir` is a **second** token with the editor role,
+used by `new` and `put` and by nothing else:
+
+```json
+"proton": {
+  "enabled": true,
+  "session_dir": "~/.keyless-pass-session",
+  "manager": { "session_dir": "~/.keyless-pass-manager" }
+}
+```
+
+Minting it, measured against `pass-cli` 2.2.5:
+
+```console
+$ pass-cli agent create keyless-manager --expiration 3m --vault personal
+$ pass-cli agent access grant keyless-manager --vault-name personal --role editor
+```
+
+**`--role` defaults to `viewer`.** That is why an unexplained `NotAllowed` from a
+write is nearly always the token's role and not the vault's permissions, and why
+`keyless` attaches that fix to the failure instead of quoting the vendor and
+stopping:
+
+```console
+$ keyless new DEMO_KEY
+keyless: store `proton` refused the write: cannot create `demo api key` in
+vault `personal`: Error creating login item: Could not perform operation. Reason:
+NotAllowed. That is the token's ROLE, not the request ...
+```
+
+`pass-cli` puts the cause on a `Caused by:` line, so `keyless` quotes the whole
+of its stderr. The first line on its own says `Error creating login item` and
+names nothing you can act on.
+
+### What the split is, and what it is not
+
+Read this part rather than assuming the symmetry.
+
+**It buys:** two tokens, two audit trails at the vendor, two expiries, and a
+fleet of sessions that cannot write to the vault at all. That is real and worth
+having.
+
+**It is not a boundary.** Any process running as your uid can set
+`PROTON_PASS_SESSION_DIR` to the manager's directory and act as the manager. A
+file mode does not help, because the reader has to work in every session and is
+therefore readable by every session. **Locally the reader/manager split is
+advisory.**
+
+The only thing on this machine that can hold a credential your uid cannot reach
+is [`keylessd`](#keylessd--the-uid-boundary), behind a second uid. So the
+enforced version of this split is "the manager token lives on the daemon's
+side", and it is not built: `keylessd` carries a file store and a keychain store,
+no Proton adapter, and the protocol has no write operation.
+
+Given that, **`keyless` refuses every local write while the daemon is enabled**
+rather than reaching around it:
+
+```console
+$ keyless new DEMO_KEY
+keyless: `stores.daemon.enabled` is set, so the manager identity belongs on the
+daemon's side of the uid boundary and a local write would reach around it ...
+```
+
+The rule the whole daemon design rests on is that killing it must yield **fewer**
+powers, never more. A local write path that opens whenever the daemon is off is
+that hole, one verb over.
+
+For the keychain there is no second identity to have: the login keychain has one
+owner, and every process running as you can already read and write it with
+`security`. So keychain writes need no `manager` block, and the identity they
+report says so — claiming a manager there would be a claim about a boundary that
+is not present, and one false claim teaches you the other one is false too.
+
+### What each backend can write, and what it cannot
+
+| Backend | Write | Notes |
+|---|---|---|
+| `keychain` | `add-generic-password -U -w`, value on stdin | `-U` updates in place, so this rotates |
+| `proton` | `item create <type> --from-template -`, template on stdin | **creates only** |
+| `infisical` | no | `infisical secrets set` takes the value as a command-line argument, and the CLI offers no stdin form |
+
+Two measured details behind those:
+
+- **`security` asks for the password twice.** Fed one line, it reads end of input
+  for the retype, the two disagree, it re-prompts, accepts two empty answers and
+  **exits 0 having stored an empty value.** Exit status alone is therefore not
+  evidence that anything was written, so `keyless` writes the value twice and
+  treats a `passwords don't match` on stderr as a failure. A value containing a
+  line break is refused rather than stored as its first line.
+- **Proton writes create and never overwrite.** `item update` takes
+  `--field name=value` and offers no template on stdin, so updating would mean
+  putting the value in argv. A title that already exists is refused with the
+  reason, and that pre-flight listing is load-bearing: creating a second item with
+  one title makes the name form ambiguous, which is how a write verb silently
+  breaks a working `run`.
+
+### The audit row says which identity did it
+
+Every `run` row carries `"identities":["<store> (reader)"]`, and a write row says
+`proton (manager)`. A `Registry` cannot hold a writer and `ProtonStore` does not
+read the `manager` block, so a `run` row saying `(manager)` is unreachable — which
+makes "did a session ever act as the editor?" a question you answer from the log
+rather than from trust.
+
+---
+
+## What this protects you from, and what it does not
+
+Read this section before you rely on any of the rest.
+
+### Masking is a filter, not a control
 
 The child's stdout and stderr are scanned and any appearance of an injected
 value is replaced with `[keyless:NAME]`.
 
-**This is a filter, not a control.** It defends against accident — a tool that
-echoes its config, a stack trace carrying a connection string, `curl -v`
-printing a header. It does not defend against intent:
+It defends against **accident** — a tool that echoes its config, a stack trace
+carrying a connection string, `curl -v` printing a header. It does not defend
+against **intent**:
 
 ```console
 $ keyless run -s TOKEN -- sh -c 'echo $TOKEN > /tmp/x'
@@ -712,283 +933,7 @@ prompt, a progress bar or a line of log output reaches you whole and on time,
 and the withholding is confined to the handful of bytes that genuinely look like
 the beginning of a value.
 
----
-
-## Terminals
-
-Masking needs the child's output to pass through `keyless`, and that normally
-costs you the terminal: a program handed a pipe answers *no* to "am I on a
-terminal?", so `npm install` loses its progress bar, `git log` loses its pager
-and its colour, and prompts change shape. A tax on every invocation is how a
-tool gets uninstalled — which brings the plaintext literal straight back.
-
-So when you really are at a terminal, `keyless` allocates a pseudo-terminal and
-gives it to the child. The child sees a terminal because it **has** one. The
-bytes still cross the masker on the way out.
-
-|  | what the child gets |
-|---|---|
-| stdin, stdout and stderr are all terminals | a real pty — `isatty` true, colour, size, prompts |
-| anything redirected, a pipe, a CI job | pipes, exactly as before |
-| nothing to mask | your own stdio, inherited untouched |
-
-All three streams must be terminals before a pty is used, and each one is a
-separate reason:
-
-- **stdout** — with no terminal there is nothing to preserve, and writing escape
-  sequences into a pipe or a file corrupts it.
-- **stderr** — a pty carries ONE stream. Merging the child's stderr into it
-  would silently defeat a deliberate `2>errors.log`. That is data loss, not a
-  cosmetic difference.
-- **stdin** — a pty has no end-of-file to deliver. Relaying a pipe that ends into
-  a pty means synthesising an EOT, whose meaning depends on the child's line
-  discipline; getting it subtly wrong truncates input.
-
-What comes with the pty:
-
-- **The window size**, at start and on every resize. `SIGWINCH` reaches the
-  child, so a full-screen program reflows.
-- **Raw mode**, so Ctrl-C, arrow keys and paste reach the child untouched.
-- **Ctrl-C goes to the child, not to `keyless`.** Your terminal is raw, so it
-  raises no `SIGINT`; the `0x03` byte travels into the pty, and the child's own
-  line discipline raises `SIGINT` for the child. `SIGTERM`, `SIGHUP` and
-  `SIGQUIT` sent to `keyless` are forwarded rather than acted on, so the run
-  always leaves through the same exit path — with the terminal restored and the
-  child's exit code intact.
-- **Restoration on every exit path** — normal exit, a child killed by a signal,
-  and a panic (a hook covers the aborting kind, where destructors do not run).
-  `SIGKILL` and a hard `abort()` cannot be covered by anything; `stty sane`
-  repairs a terminal left raw by either.
-
-**A pty is a comfort, not a precondition.** If one cannot be allocated — no
-`/dev/ptmx`, no free descriptors, an unsupported platform — `keyless` prints one
-line, falls back to pipes, and runs your command with its secrets injected
-exactly as it would have. The never-block rule has no exception for terminals.
-
-There is no flag to force a pty on or off. The condition is observable and the
-fallback is automatic, so a switch would only be a way to get it wrong.
-
----
-
-## The audit log
-
-Append-only JSONL at `~/.local/state/keyless/audit.jsonl`, mode 0600.
-
-```json
-{"hash":"9f2c…","v":1,"ts":"2026-08-06T14:22:01.417Z","ts_ms":1786033321417,
- "verb":"run","state":"INJECTED","cwd":"/Users/you/src/app",
- "names":["DATABASE_URL"],"unresolved":[],
- "argv":["psql","--dbname=[keyless:DATABASE_URL]"],
- "argv_truncated":false,"exit_code":0,"prev":"4ab1…"}
-```
-
-**A value is never in here.** Not raw, not encoded, not hashed. The argv is
-redacted with the same masker that filters the child's output, so a value typed
-as a literal flag — the habit this tool replaces — is recorded as
-`[keyless:NAME]` rather than as itself.
-
-Rows are capped below `PIPE_BUF` (4096 on macOS) and appended under an exclusive
-advisory lock, because ~20 agent sessions can append concurrently. An oversized
-argv is truncated rather than allowed to interleave with another session's row.
-
-### The chain, and what it is worth
-
-Each row carries `sha256(previous_row_hash || this_row_bytes)`. The hash covers
-the payload and links to the previous *hash*, so editing or removing any row
-breaks every row after it. `keyless doctor` verifies it.
-
-**Its integrity is bounded by who can write the file.** A process that can append
-can also rewrite the file and recompute every hash — about four lines of work.
-So the chain detects accidental truncation, partial writes and tampering by
-anything that cannot rewrite the file, and detects nothing at all about a writer
-who can.
-
-**The chain is the detector. The file mode is the boundary.** They are different
-things and only one of them is cryptography:
-
-| | log written by | mode | can a session forge it? |
-|---|---|---|---:|
-| without the daemon | your own session | `0600` yours | **yes** |
-| with the daemon | `_keyless` | `0640` `_keyless:keyless` | no |
-
-Under the daemon your sessions can read the log and cannot write it, so a
-rewrite is refused by the kernel before the chain is ever consulted. Without the
-daemon the chain is worth exactly what it says above and no more.
-
-A test asserts *both* halves, including the uncomfortable one:
-`a_wholesale_rewrite_is_not_detected_by_the_chain_alone` rebuilds a log from
-scratch and confirms it verifies perfectly — so the limit stays a checked
-property rather than a caveat someone quietly drops.
-
-This is stated plainly because the tool this project was measured against
-shipped a "hash chain" that hashed the previous row's *id* rather than its hash
-and did not cover the payload. It was forgeable, and therefore decorative.
-
-Neither half survives `sudo`. If you are an admin on your own machine, this is a
-boundary against your sessions, not against you.
-
----
-
-## No telemetry
-
-`keyless` sends nothing anywhere, ever. No analytics, no version check, no crash
-reporting, no error upload. There is no opt-out because there is nothing to opt
-out of. It opens no socket at all: a test reads the built binary and fails if a
-URL scheme appears in it.
-
-**The promise extends through the subprocesses it spawns.** A network-backed
-store reaches the network — that is what you asked it for — but nothing else
-leaves with it. The Infisical CLI's own telemetry defaults to **on**, so
-`keyless` passes `--telemetry=false` on every invocation it makes. Without that,
-`keyless` would be the reason a report left your machine while this section
-claimed otherwise, which is precisely the failure that motivated writing it: the
-implementation this project was measured against posts the user's email to a
-hard-coded endpoint with no opt-out, while its docs claim it collects nothing.
-
-The binary test allows exactly one `telemetry` string — `--telemetry=false` — and
-fails both if any other appears and if that one ever goes missing.
-
-This says nothing about the `infisical` runs you make yourself.
-
----
-
-## `keylessd` — what turns a habit into a gate
-
-Everything above is a wrapper around a store **your own uid can read**. That is
-a good habit and it is not a boundary.
-
-`security find-generic-password -s <service> -w` returns a plaintext value with
-**no prompt and exit 0**. Anything readable by your uid is readable by every
-session you start and every subagent any of them spawns — every API token, every
-database URL, and the agent's own credentials alongside them. No file mode, no
-deny rule and no wrapper changes that.
-
-**A second uid does**, because the kernel enforces it and there is nothing to
-bypass.
-
-```
-your sessions (uid 501)          keylessd (uid _keyless)
-  keyless run -s TOKEN  ──socket──▶  reads the store
-        ▲                             writes the audit log
-        └──── the value ──────────────┘
-             names and results cross. the store credential never does.
-```
-
-See [`install/README.md`](install/README.md). It needs `sudo` exactly once, to
-create a user, and the installer prints its whole plan and changes nothing until
-you pass `--commit`.
-
-### Who is allowed to ask
-
-The daemon identifies the **running image** of whoever connects — not a path, and
-not anything the caller says about itself. Six kernel facts, cross-checked
-against each other:
-
-| fact | source |
-|---|---|
-| effective uid | `getpeereid`, cross-checked against `LOCAL_PEERCRED` and the audit token |
-| pid | `LOCAL_PEERPID`, cross-checked against the audit token |
-| pid **generation** | the audit token, stamped by the kernel at connect |
-| code hash of the live image | `csops(pid, CS_OPS_CDHASH)` |
-| live generation, twice | `proc_pidinfo`, read either side of the code hash |
-
-Two races close by construction rather than by timing:
-
-- **The binary is swapped after connecting.** The code hash comes from the
-  kernel's record of the *loaded image*. No path is resolved and no file is
-  opened, so there is no file to swap. The tool measured against this one
-  resolved the pid to a path and hashed the path; an unprivileged process
-  renamed a different binary over it and attested as the allowlisted hash.
-  There is a test that performs exactly that attack, and a twin that pins the
-  other binary so "refused" cannot be confused with "nothing worked".
-- **The pid is recycled.** The audit token carries the generation the kernel
-  assigned at connect; the live generation is read immediately before and after
-  the code hash. Three agreeing values mean the pid never left the process that
-  connected. `(pid, start_time)` — the usual advice — is *unavailable* here:
-  `proc_pidinfo(PROC_PIDTBSDINFO)`, where a start time lives, returns `EPERM` to
-  an unprivileged caller reading another user's process, which is precisely the
-  daemon's situation. Measured before the code was written.
-
-Attestation runs **per request, not per connection**, because a process can
-`exec` a different image without closing its sockets. There is a test that does
-that: connect as a pinned program, get served, `exec` an unpinned one, and ask
-again on the same connection. The second request is refused.
-
-### What happens when the caller is `node`
-
-This is the case the audited competitor fails silently, so it gets its own
-answer.
-
-**The code identity of a `node` process is node's.** It is identical for every
-program node will ever run. Allowlisting an AI agent would allowlist every Node
-program on the machine, including whatever `npx` last fetched. There is no way
-around it: the script's path comes from argv, which the process can rewrite, and
-hashing it means hashing a file at a path — the exact race above.
-
-So `keyless` **refuses interpreted callers outright**, and it costs nothing:
-
-- Claude Code is a Node program, and it is **never the peer on this socket**.
-- The peer is always `keyless run`, one compiled binary with one identity.
-- The agent gets a secret by *running* `keyless run`, which is the only
-  supported path and the one the whole tool is built around.
-
-A Node process connecting directly is not a user being inconvenienced; it is
-something that should not be there. It is refused by name, told to go through
-`keyless run`, and never silently attested as "the node binary".
-
-The check runs **before** the allowlist, so an operator cannot authorise an
-interpreter by pinning it — there is a test that pins `perl`'s real hash, drives
-a real `perl` client, and is still refused, plus a negative control proving the
-interpreter rule is what refused it. `keylessd pin` refuses to emit the pin in
-the first place, and there is no config key that turns any of this off.
-
-### What the boundary does *not* buy
-
-- **It does not stop an agent using a secret it is allowed to use.** An attested
-  `keyless run -s TOKEN -- sh -c 'echo $TOKEN'` is an attested client running an
-  arbitrary command. Attestation says *which program is asking*, never *what it
-  intends*. Caller attestation is the weakest of the three legs here; the uid
-  boundary on the store and the unforgeable audit log are the load-bearing ones.
-- **It does not survive `sudo`.**
-- **It does not migrate anything, and this is the one that actually matters.**
-  Standing the daemon up next to a login keychain that still holds your secrets
-  closes *nothing* — the items are still there and still readable by every
-  session. The step that shuts the hole is moving each secret somewhere only
-  `_keyless` can read and then **deleting it from the login keychain**. No script
-  should guess which of your items that applies to, so none of them does.
-
-### Twenty sessions at once
-
-**Single-flight per name.** Twenty sessions starting together and all wanting
-`GITHUB_TOKEN` produce **one** upstream call. Without it a store rate limit
-degrades the whole fleet at the same instant, which is indistinguishable from the
-daemon being down.
-
-**The in-memory TTL cache is not an offline cache.** The forbidden thing is a
-cache a *client* can decrypt without the daemon, because its key would have to
-live on the client's side of the boundary — a `get` verb with extra steps. This
-one never touches disk and dies with the daemon, so killing `keylessd` strictly
-reduces what is obtainable.
-
-**And there is no local fallback.** Enabling the daemon *disables* the keychain
-backend, whatever that backend's own flag says. It is enforced in
-`store::build`, not documented as a convention, because a fallback would
-re-open the hole the moment the daemon stopped — and anyone able to stop a
-process could choose that. Killing the daemon must get you fewer secrets, never
-more.
-
-### The rule still has no exception
-
-A daemon that is absent, stale, wedged, refusing, killed mid-request, speaking
-another protocol version, or answering nonsense is a `DEGRADED` like any other
-store failure: one line on stderr, and **your command runs** with an unmodified
-environment. There is one property test per failure mode — seventeen of them —
-and each asserts the child actually ran by reading a file the child wrote, which
-a process that never started cannot imitate.
-
----
-
-## Security properties, stated precisely
+### The properties, stated precisely
 
 What this gives you:
 
@@ -1037,10 +982,145 @@ What it does not give you, stated so nobody assumes otherwise:
 - **`new` trusts `/dev/urandom`.** It is the kernel's CSPRNG, seeded before
   userspace exists, and a short read is an error rather than a shorter password.
   If you do not trust it, generate the value in the provider's UI and `put` it.
-- **Masking is a filter, not a control.** See above.
-- **Ctrl-C reaches the child.** On a pty it arrives as a byte the child's own
-  line discipline turns into a signal; on the pipe path the child shares this
-  terminal's process group and receives it directly.
+- **Nothing here survives `sudo`.** If you are an admin on your own machine,
+  this is a boundary against your sessions, not against you.
+
+---
+
+## `keylessd` — the uid boundary
+
+Everything above is a wrapper around a store **your own uid can read**. That is
+a good habit and it is not a boundary.
+
+`security find-generic-password -s <service> -w` returns a plaintext value with
+**no prompt and exit 0**. Anything readable by your uid is readable by every
+session you start and every subagent any of them spawns — every API token, every
+database URL, and the agent's own credentials alongside them. No file mode, no
+deny rule and no wrapper changes that.
+
+**A second uid does**, because the kernel enforces it and there is nothing to
+bypass.
+
+```
+your sessions (uid 501)          keylessd (uid _keyless)
+  keyless run -s TOKEN  ──socket──▶  reads the store
+        ▲                             writes the audit log
+        └──── the value ──────────────┘
+             names and results cross. the store credential never does.
+```
+
+See [`install/README.md`](install/README.md). It needs `sudo` exactly once, to
+create a user, and the installer prints its whole plan and changes nothing until
+you pass `--commit`.
+
+### Who is allowed to ask
+
+The daemon identifies the **running image** of whoever connects — not a path, and
+not anything the caller says about itself. Six kernel facts, cross-checked
+against each other:
+
+| fact | source |
+|---|---|
+| effective uid | `getpeereid`, cross-checked against `LOCAL_PEERCRED` and the audit token |
+| pid | `LOCAL_PEERPID`, cross-checked against the audit token |
+| pid **generation** | the audit token, stamped by the kernel at connect |
+| code hash of the live image | `csops(pid, CS_OPS_CDHASH)` |
+| live generation, twice | `proc_pidinfo`, read either side of the code hash |
+
+Two races close by construction rather than by timing:
+
+- **The binary is swapped after connecting.** The code hash comes from the
+  kernel's record of the *loaded image*. No path is resolved and no file is
+  opened, so there is no file to swap. Resolving the pid to a path and hashing
+  that path is the obvious implementation and it is broken: an unprivileged
+  process can rename a different binary over the path and attest as the
+  allowlisted hash. There is a test that performs exactly that attack, and a
+  twin that pins the other binary so "refused" cannot be confused with "nothing
+  worked".
+- **The pid is recycled.** The audit token carries the generation the kernel
+  assigned at connect; the live generation is read immediately before and after
+  the code hash. Three agreeing values mean the pid never left the process that
+  connected. `(pid, start_time)` — the usual advice — is *unavailable* here:
+  `proc_pidinfo(PROC_PIDTBSDINFO)`, where a start time lives, returns `EPERM` to
+  an unprivileged caller reading another user's process, which is precisely the
+  daemon's situation. Measured before the code was written.
+
+Attestation runs **per request, not per connection**, because a process can
+`exec` a different image without closing its sockets. There is a test that does
+that: connect as a pinned program, get served, `exec` an unpinned one, and ask
+again on the same connection. The second request is refused.
+
+### What happens when the caller is `node`
+
+Interpreters need their own answer, because the obvious one is silently wrong.
+
+**The code identity of a `node` process is node's.** It is identical for every
+program node will ever run. Allowlisting an AI agent would allowlist every Node
+program on the machine, including whatever `npx` last fetched. There is no way
+around it: the script's path comes from argv, which the process can rewrite, and
+hashing it means hashing a file at a path — the exact race above.
+
+So `keyless` **refuses interpreted callers outright**, and it costs nothing:
+
+- An agent harness is typically a Node program, and it is **never the peer on
+  this socket**.
+- The peer is always `keyless run`, one compiled binary with one identity.
+- The agent gets a secret by *running* `keyless run`, which is the only
+  supported path and the one the whole tool is built around.
+
+A Node process connecting directly is not a user being inconvenienced; it is
+something that should not be there. It is refused by name, told to go through
+`keyless run`, and never silently attested as "the node binary".
+
+The check runs **before** the allowlist, so an operator cannot authorise an
+interpreter by pinning it — there is a test that pins `perl`'s real hash, drives
+a real `perl` client, and is still refused, plus a negative control proving the
+interpreter rule is what refused it. `keylessd pin` refuses to emit the pin in
+the first place, and there is no config key that turns any of this off.
+
+### What the boundary does *not* buy
+
+- **It does not stop an agent using a secret it is allowed to use.** An attested
+  `keyless run -s TOKEN -- sh -c 'echo $TOKEN'` is an attested client running an
+  arbitrary command. Attestation says *which program is asking*, never *what it
+  intends*. Caller attestation is the weakest of the three legs here; the uid
+  boundary on the store and the unforgeable audit log are the load-bearing ones.
+- **It does not survive `sudo`.**
+- **It does not migrate anything, and this is the one that actually matters.**
+  Standing the daemon up next to a login keychain that still holds your secrets
+  closes *nothing* — the items are still there and still readable by every
+  session. The step that shuts the hole is moving each secret somewhere only
+  `_keyless` can read and then **deleting it from the login keychain**. No script
+  should guess which of your items that applies to, so none of them does.
+
+### Many sessions at once
+
+**Single-flight per name.** Twenty sessions starting together and all wanting
+`GITHUB_TOKEN` produce **one** upstream call. Without it a store rate limit
+degrades the whole fleet at the same instant, which is indistinguishable from the
+daemon being down.
+
+**The in-memory TTL cache is not an offline cache.** The forbidden thing is a
+cache a *client* can decrypt without the daemon, because its key would have to
+live on the client's side of the boundary — a `get` verb with extra steps. This
+one never touches disk and dies with the daemon, so killing `keylessd` strictly
+reduces what is obtainable.
+
+**And there is no local fallback.** Enabling the daemon *disables* every local
+backend — keychain, Infisical and Proton Pass alike — whatever each one's own
+flag says. It is enforced in `store::build`, not documented as a convention,
+because a fallback would re-open the hole the moment the daemon stopped, and
+anyone able to stop a process could choose that. Killing the daemon must get you
+fewer secrets, never more.
+
+### The rule still has no exception
+
+A daemon that is absent, stale, wedged, refusing, killed mid-request, speaking
+another protocol version, or answering nonsense is a `DEGRADED` like any other
+store failure: one line on stderr, and **your command runs** with an unmodified
+environment. There is one property test per failure mode — seventeen of them —
+and each asserts the child actually ran by reading a file the child wrote, which
+a process that never started cannot imitate.
 
 ---
 
@@ -1068,16 +1148,21 @@ Same two rules as the binary. Every hook fails open — a crash, a timeout, an
 unparseable payload or a missing interpreter allows the call — and no hook
 prints a secret value into its own output, log or message.
 
+**A deny rule on a binary name is not a substitute.** Measured against the
+harness: five of ten bypass spellings walk straight past a `Bash(cat:*)` rule.
+Nothing in this pack matches on a binary name alone; the triggers read the FILE
+a command touches, or the subcommand that selects the mode.
+
 Measured overhead: **+5.2 ms per tool call.** Every mutation in its spec is
 caught, and the attacks that still get through are published rather than
 omitted — see [`hooks/README.md`](hooks/README.md).
 
-### The gate is why `fields` exists, and it has a false positive
+### Why `fields` exists, and where the gate still misfires
 
-`items` and `fields` were written because the gate did its job: an item's field
-name could not be found, because the only verb that reveals it prints the value
-and the pack refused it. The right answer was a verb that returns the names
-without the values, not a hole in the pack.
+`items` and `fields` exist because the gate did its job. An item's field name
+could not be found, because the only verb that reveals it prints the value and
+the pack refused it. The right answer was a verb that returns the names without
+the values, not a hole in the pack.
 
 One rough edge, measured 2026-08-08: the vault rule matches `pass-cli item view`
 **including `pass-cli item view --help`**, which prints a usage message and no
@@ -1086,6 +1171,201 @@ credential. Two other false positives are already recorded against
 the verb and not what the invocation would actually output. It is a nuisance
 rather than a risk, and the fix belongs in `vault_verbs`, not in a session
 routing around the gate.
+
+---
+
+## Reference
+
+### Rule 1: it never refuses to run your command
+
+There is no code path in which `keyless run` exits without spawning the child.
+Not on a missing store, not on an unknown name, not on a corrupt config, not on
+a store that errors. It warns on stderr and runs the command anyway with an
+unmodified environment.
+
+```console
+$ keyless run -s DATABASE_URL -s GITHUB_TOKEN -- ./migrate.sh
+keyless: DEGRADED — 2 names unresolved: DATABASE_URL, GITHUB_TOKEN
+keyless:   DATABASE_URL: not found in any store
+...your command runs, and its exit code is yours...
+```
+
+There are two states and no third:
+
+- **INJECTED** — every requested name resolved, was injected, and is masked.
+- **DEGRADED** — anything else. The environment is untouched.
+
+A partial injection would be a third state, so it does not exist: if one name of
+three is missing, none of the three is injected. Fewer secrets, never more.
+
+This is not politeness. A tool that occasionally blocks the work gets
+uninstalled, and what comes back is the plaintext literal on the command line.
+Degrading loses the protection for one command; failing loses it for good.
+
+*Degraded runs still mask.* Whatever did resolve is still compiled into the
+output filter even though nothing is injected — so a value you typed by hand
+stays out of the audit log and out of the echoed output. Injection is withheld
+when degraded; redaction is not.
+
+The only two ways out without a child are "you gave me no command" (exit 64) and
+"that command does not exist" (exit 127). Neither is `keyless` declining to run
+something it could have run.
+
+### Rule 2: there is no verb that prints a value
+
+No `get`. No `read`, `export`, `show`, `cat`, `--reveal`, `--print`,
+`--no-masking`. Not behind a flag, not behind an environment variable, not "just
+for debugging".
+
+A single verb that writes a plaintext value to stdout voids the entire design,
+because a caller takes the shortest path and that verb is always the shortest
+path. This is measured, not theorised: one CLI already read its key from the
+environment at 18 call sites, and agents still typed that key as a literal flag
+41 times. Availability of the safe path does not win. Only being the shortest
+path wins.
+
+The rule holds across the whole verb set, and each verb has to earn it
+separately:
+
+| Verb | What it prints |
+|---|---|
+| `run` | your command's output, with injected values replaced by `[keyless:NAME]` |
+| `ls` | the names you declared, and which environment each one points at |
+| `items` | vault, state, type, title |
+| `fields` | field names, kinds, types, paths — never a value, never a length |
+| `new` | that it stored something, and where |
+| `put` | the same, and it echoes nothing it read |
+| `doctor` | `ok` / `missing` / a store's own error |
+
+`new` is the interesting one: it generates a credential and then does not show it
+to you. There is no flag that does.
+
+### Terminals
+
+Masking needs the child's output to pass through `keyless`, and that normally
+costs you the terminal: a program handed a pipe answers *no* to "am I on a
+terminal?", so `npm install` loses its progress bar, `git log` loses its pager
+and its colour, and prompts change shape. A tax on every invocation is how a
+tool gets uninstalled — which brings the plaintext literal straight back.
+
+So when you really are at a terminal, `keyless` allocates a pseudo-terminal and
+gives it to the child. The child sees a terminal because it **has** one. The
+bytes still cross the masker on the way out.
+
+|  | what the child gets |
+|---|---|
+| stdin, stdout and stderr are all terminals | a real pty — `isatty` true, colour, size, prompts |
+| anything redirected, a pipe, a CI job | pipes, exactly as before |
+| nothing to mask | your own stdio, inherited untouched |
+
+All three streams must be terminals before a pty is used, and each one is a
+separate reason:
+
+- **stdout** — with no terminal there is nothing to preserve, and writing escape
+  sequences into a pipe or a file corrupts it.
+- **stderr** — a pty carries ONE stream. Merging the child's stderr into it
+  would silently defeat a deliberate `2>errors.log`. That is data loss, not a
+  cosmetic difference.
+- **stdin** — a pty has no end-of-file to deliver. Relaying a pipe that ends into
+  a pty means synthesising an EOT, whose meaning depends on the child's line
+  discipline; getting it subtly wrong truncates input.
+
+What comes with the pty:
+
+- **The window size**, at start and on every resize. `SIGWINCH` reaches the
+  child, so a full-screen program reflows.
+- **Raw mode**, so Ctrl-C, arrow keys and paste reach the child untouched.
+- **Ctrl-C goes to the child, not to `keyless`.** Your terminal is raw, so it
+  raises no `SIGINT`; the `0x03` byte travels into the pty, and the child's own
+  line discipline raises `SIGINT` for the child. `SIGTERM`, `SIGHUP` and
+  `SIGQUIT` sent to `keyless` are forwarded rather than acted on, so the run
+  always leaves through the same exit path — with the terminal restored and the
+  child's exit code intact. On the pipe path the child shares this terminal's
+  process group and receives Ctrl-C directly.
+- **Restoration on every exit path** — normal exit, a child killed by a signal,
+  and a panic (a hook covers the aborting kind, where destructors do not run).
+  `SIGKILL` and a hard `abort()` cannot be covered by anything; `stty sane`
+  repairs a terminal left raw by either.
+
+**A pty is a comfort, not a precondition.** If one cannot be allocated — no
+`/dev/ptmx`, no free descriptors, an unsupported platform — `keyless` prints one
+line, falls back to pipes, and runs your command with its secrets injected
+exactly as it would have. The never-block rule has no exception for terminals.
+
+There is no flag to force a pty on or off. The condition is observable and the
+fallback is automatic, so a switch would only be a way to get it wrong.
+
+### The audit log
+
+Append-only JSONL at `~/.local/state/keyless/audit.jsonl`, mode 0600.
+
+```json
+{"hash":"9f2c…","v":1,"ts":"2026-08-06T14:22:01.417Z","ts_ms":1786033321417,
+ "verb":"run","state":"INJECTED","cwd":"/Users/you/src/app",
+ "names":["DATABASE_URL"],"unresolved":[],
+ "argv":["psql","--dbname=[keyless:DATABASE_URL]"],
+ "argv_truncated":false,"exit_code":0,"prev":"4ab1…"}
+```
+
+**A value is never in here.** Not raw, not encoded, not hashed. The argv is
+redacted with the same masker that filters the child's output, so a value typed
+as a literal flag — the habit this tool replaces — is recorded as
+`[keyless:NAME]` rather than as itself.
+
+Rows are capped below `PIPE_BUF` (4096 on macOS) and appended under an exclusive
+advisory lock, because many agent sessions can append concurrently. An oversized
+argv is truncated rather than allowed to interleave with another session's row.
+
+#### The chain, and what it is worth
+
+Each row carries `sha256(previous_row_hash || this_row_bytes)`. The hash covers
+the payload and links to the previous *hash*, so editing or removing any row
+breaks every row after it. `keyless doctor` verifies it.
+
+**Its integrity is bounded by who can write the file.** A process that can append
+can also rewrite the file and recompute every hash — about four lines of work.
+So the chain detects accidental truncation, partial writes and tampering by
+anything that cannot rewrite the file, and detects nothing at all about a writer
+who can.
+
+**The chain is the detector. The file mode is the boundary.** They are different
+things and only one of them is cryptography:
+
+| | log written by | mode | can a session forge it? |
+|---|---|---|---:|
+| without the daemon | your own session | `0600` yours | **yes** |
+| with the daemon | `_keyless` | `0640` `_keyless:keyless` | no |
+
+Under the daemon your sessions can read the log and cannot write it, so a
+rewrite is refused by the kernel before the chain is ever consulted. Without the
+daemon the chain is worth exactly what it says above and no more.
+
+A test asserts *both* halves, including the uncomfortable one:
+`a_wholesale_rewrite_is_not_detected_by_the_chain_alone` rebuilds a log from
+scratch and confirms it verifies perfectly — so the limit stays a checked
+property rather than a caveat someone quietly drops.
+
+Neither half survives `sudo`.
+
+### No telemetry
+
+`keyless` sends nothing anywhere, ever. No analytics, no version check, no crash
+reporting, no error upload. There is no opt-out because there is nothing to opt
+out of. It opens no network socket of its own — the only socket it ever opens is
+the local Unix one to `keylessd` — and a test reads the built binary and fails if
+an endpoint or a known analytics vendor's name appears in it.
+
+**The promise extends through the subprocesses it spawns.** A network-backed
+store reaches the network — that is what you asked it for — but nothing else
+leaves with it. The Infisical CLI's own telemetry defaults to **on**, so
+`keyless` passes `--telemetry=false` on every invocation it makes. Without that,
+`keyless` would be the reason a report left your machine while this section
+claimed otherwise.
+
+The binary test allows exactly one `telemetry` string — `--telemetry=false` — and
+fails both if any other appears and if that one ever goes missing.
+
+This says nothing about the `infisical` runs you make yourself.
 
 ---
 
@@ -1098,11 +1378,11 @@ Deliberately out of scope, with the seams left clean:
   `run` never learns which backend answered, and neither does the daemon.
 - **Infisical and Proton Pass *behind* the daemon.** This is a gap with teeth,
   so it is stated rather than buried. Enabling the daemon suppresses every local
-  backend — that is the [rule](#keylessd--what-turns-a-habit-into-a-gate) that
-  keeps a fallback from re-opening the hole — but `keylessd`'s own store set is
-  the file store and the keychain. So a user who resolves names through Infisical
-  today and switches the daemon on will find those names **degrading**, loudly,
-  with a warning naming the suppressed backend.
+  backend — that is the [rule](#many-sessions-at-once) that keeps a fallback from
+  re-opening the hole — but `keylessd`'s own store set is the file store and the
+  keychain. So a user who resolves names through Infisical today and switches the
+  daemon on will find those names **degrading**, loudly, with a warning naming
+  the suppressed backend.
   Closing it means giving `keylessd` the same two adapters plus a decision about
   what reason it records, which is a change worth making on its own rather than
   inside a merge. It also needs an answer for `run --env`: the protocol carries a
@@ -1144,6 +1424,10 @@ cargo clippy --all-targets -- -D warnings
 cargo fmt --check
 ```
 
+The hook pack has its own suite: `python3 hooks/tests/run.py` runs 517 checks
+and `python3 hooks/tests/mutate.py` breaks each check on purpose and requires
+every breakage to be caught.
+
 No test reads a real credential, and no test reaches a real vault. All three
 backends are exercised against shell stubs — `security find-generic-password` is
 never invoked against a real service name, no keychain prompt is triggered,
@@ -1166,7 +1450,7 @@ parser.
 Both stubs take their fixtures from **files** rather than inlining JSON into the
 shell script. That is not style: the vendor's own wording includes
 `passwords don't match`, and an apostrophe inside a single-quoted shell string is
-a syntax error. Inlining one made a stub fail to parse, and the adapter reported
+a syntax error. Inline one and the stub fails to parse, and the adapter reports
 the shell's error as though it were the vendor's refusal — a fixture bug that
 reads as a real finding.
 
@@ -1177,9 +1461,9 @@ worthless: deleting an entry deletes it from both, and the suite stays green.
 
 **`cargo test --test <name>` does not rebuild `examples/`.** The attestation
 suite drives two real signed binaries from there, so filtering to one test file
-after editing a peer runs the *previous* binary — two correct fixes read as
-no-ops before this was noticed. The support helper now aborts the run when a peer
-is older than its source; `cargo test` with no filter is always safe.
+after editing a peer runs the *previous* binary, and a correct fix reads as a
+no-op. The support helper aborts the run when a peer is older than its source;
+`cargo test` with no filter is always safe.
 
 The security core is tested from three directions, and each catches a different
 class:
@@ -1234,14 +1518,14 @@ Five crates, in four rows, and each earns its place:
 | `clap` | argument parsing; the derive form keeps the verb set readable at a glance, which matters when the absence of a verb is a security property |
 | `serde` + `serde_json` | config parsing and audit rows — one format doing both jobs |
 | `zeroize` | the optimiser is permitted to delete a write to memory that is never read again, which is exactly what hand-rolled scrubbing is |
-| `nix` | the pty syscalls — `openpty`, `termios`, the three window/controlling-terminal `ioctl`s, `sigwait`, `pthread_kill`. Five of its 36 features are enabled |
+| `nix` | the pty syscalls — `openpty`, `termios`, the three window/controlling-terminal `ioctl`s, `sigwait`, `pthread_kill`. Six of its 35 features are enabled |
 
 `nix` is where hand-rolling stops being minimalism. A codec has a specification
 and published vectors, so owning one is cheap and checkable. An `ioctl` request
 constant does not: get it wrong and the code compiles, links, and then writes the
 wrong number of bytes through a pointer at runtime, differently on every
 platform. A terminal framework would have been far more than the job needs; the
-five enabled features are the job.
+six enabled features are the job.
 
 base64, base32, hex, SHA-256, percent-encoding, JSON escaping and the civil-date
 conversion are all written here rather than taken as dependencies. Each is short,
