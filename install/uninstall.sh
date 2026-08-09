@@ -4,8 +4,17 @@
 #
 # Dry run by default, like the installer. Pass --commit to apply.
 #
-# It removes the daemon, its account and its group. It does NOT remove the
-# audit log or the store, and that is deliberate:
+# THIS IS HALF THE UNINSTALL. It removes the daemon, its account and its group.
+# The config, the guards' registration in your agent's settings and the agent
+# instructions are the other half, and they belong to:
+#
+#   keyless uninstall
+#
+# The two do not overlap: that verb walks a receipt of what `keyless setup`
+# created and touches nothing under /usr/local; this script owns everything that
+# needed root to place.
+#
+# It does NOT remove the audit log or the store, and that is deliberate:
 #
 #   - The audit log is a record. Deleting the record as part of removing the
 #     thing that wrote it is exactly the shape of an incident nobody can
