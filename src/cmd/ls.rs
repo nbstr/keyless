@@ -17,6 +17,30 @@
 //! until they are given one. Backends whose coordinates pick an *item* rather
 //! than a *tenant* show `-`; printing a keychain account here would be a lookup
 //! detail, not a boundary.
+//!
+//! # Why the note column is labelled, and only for a person
+//!
+//! Three of the four columns are `keyless`'s own work: the name is a config key,
+//! the store is [`store::choose_store`]'s answer — the same rule a lookup applies
+//! — and the location is the route that lookup would take. **The fourth is a
+//! sentence somebody typed once and nothing has re-read since**, and all four
+//! render identically. A reader has no way to tell the computed columns from the
+//! remembered one, so a note reads with the authority of the row it sits in.
+//!
+//! That is not hypothetical. Measured 2026-08-09 by asking a provider to
+//! enumerate its own grant: two tokens written down as a two-permission pair
+//! each held **383 permission groups**, across three policies, including the
+//! right to mint further tokens and to change billing. Two sessions planned
+//! around a restriction that did not exist. The prose was wrong in the
+//! direction that costs most — **understating a credential stops you
+//! attempting a call that would have worked**, and nothing errors, because the
+//! call is never made.
+//!
+//! So the header names the columns and says which one nobody checked. It is
+//! written **only when stdout is a terminal**: the four tab-separated fields are
+//! read by agents at least as often as by people, and a header row handed to a
+//! parser is a fifth record that parses. A person gets the label; a pipe gets
+//! exactly the bytes it always got.
 
 use std::io::{self, Write};
 
@@ -27,13 +51,32 @@ use crate::store::{self, infisical};
 /// What the location column holds for a store whose coordinates name no tenant.
 const NO_LOCATION: &str = "-";
 
+/// Heading for the column [`store::choose_store`] decides.
+const STORE_HEADING: &str = "STORE";
+
+/// Heading for the column the resolver's own routing decides.
+const LOCATION_HEADING: &str = "LOCATION";
+
+/// Heading for the one column `keyless` does not compute, checked by nothing.
+///
+/// The parenthesis is the whole point of the header. Dropping it leaves four
+/// columns that look equally authoritative, which is the state that let a wrong
+/// scope claim travel — see this module's docs.
+const NOTE_HEADING: &str = "NOTE (yours, unchecked)";
+
 /// Write the declared names to `out`.
 ///
 /// Plain columns rather than a table renderer: the output is read by agents at
 /// least as often as by people. Exactly four tab-separated fields on every line
 /// — `name`, `store`, `location`, `note` — with `-` where there is nothing to
 /// say, so a parser never has to count them.
-pub fn ls(config: &Config, out: &mut dyn Write) -> io::Result<()> {
+///
+/// `interactive` says whether `out` is a terminal, and decides one thing only:
+/// whether the header is written. It is a parameter rather than a call to
+/// [`std::io::IsTerminal`] so a test drives both paths, and so the caller —
+/// which already knows — is the one that decides. Same seam, same reason, as
+/// [`crate::cmd::write::put`].
+pub fn ls(config: &Config, interactive: bool, out: &mut dyn Write) -> io::Result<()> {
     if config.secrets.is_empty() {
         return Ok(());
     }
@@ -45,6 +88,17 @@ pub fn ls(config: &Config, out: &mut dyn Write) -> io::Result<()> {
         .max()
         .unwrap_or(0)
         .max(4);
+
+    if interactive {
+        // `#` first, so the one reader that does get a header can drop it with
+        // the same rule every other comment-bearing format uses, and so no eye
+        // mistakes the row for a declared name.
+        writeln!(
+            out,
+            "{:<width$}\t{STORE_HEADING}\t{LOCATION_HEADING}\t{NOTE_HEADING}",
+            "#NAME"
+        )?;
+    }
 
     // Built once. `ls` describes the config, so it passes no invocation
     // environment: `--env` belongs to a `run`, and claiming it here would show
@@ -78,16 +132,59 @@ mod tests {
     use super::ls;
     use crate::config::Config;
 
+    /// The piped rendering — what a parser gets, and what every assertion below
+    /// about fields and ordering is written against.
     fn render(json: &str) -> String {
+        render_as(json, false)
+    }
+
+    fn render_as(json: &str, interactive: bool) -> String {
         let config: Config = serde_json::from_str(json).expect("valid config");
         let mut out: Vec<u8> = Vec::new();
-        ls(&config, &mut out).expect("writing to a Vec cannot fail");
+        ls(&config, interactive, &mut out).expect("writing to a Vec cannot fail");
         String::from_utf8(out).expect("utf-8")
     }
 
     #[test]
     fn an_empty_config_prints_nothing() {
         assert_eq!(render("{}"), "");
+        // Including the header: a heading over nothing is a row that describes
+        // an empty set, and `ls` on an empty config is the one case where a
+        // person is better served by silence than by furniture.
+        assert_eq!(render_as("{}", true), "");
+    }
+
+    #[test]
+    fn a_person_is_told_which_column_nobody_checked() {
+        // The measured defect: four columns render identically, three of them
+        // computed by this tool and one typed by a person, so a wrong scope
+        // claim in a note reads with the authority of the row around it.
+        let listed = render_as(
+            r#"{"secrets":{"TOKEN":{"note":"Zone:Read + DNS:Edit"}}}"#,
+            true,
+        );
+        let header = listed.lines().next().expect("a header");
+        assert!(header.starts_with('#'), "{listed}");
+        assert!(header.contains("NOTE (yours, unchecked)"), "{listed}");
+        assert!(
+            header.contains("STORE") && header.contains("LOCATION"),
+            "{listed}"
+        );
+        // And the header describes the same four fields as every other line,
+        // so the columns a person reads line up with the ones a parser gets.
+        assert_eq!(header.split('\t').count(), 4, "{listed}");
+    }
+
+    #[test]
+    fn a_pipe_gets_no_header_at_all() {
+        // A header handed to a parser is a fifth record that parses. This is
+        // the assertion that makes the header safe to add: without it, the
+        // test above passes just as happily on an implementation that prints
+        // the header unconditionally and breaks every consumer.
+        let piped = render(r#"{"secrets":{"TOKEN":{"note":"a note"}}}"#);
+        assert!(!piped.contains('#'), "{piped}");
+        assert!(!piped.contains("unchecked"), "{piped}");
+        assert_eq!(piped.lines().count(), 1, "{piped}");
     }
 
     #[test]
