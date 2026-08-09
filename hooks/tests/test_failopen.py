@@ -171,18 +171,58 @@ def run():
     s.check("a raising check is isolated", *_raising_check())
 
     # ── a broken environment ────────────────────────────────────────────────
+    #
+    # A missing HOME is spelled as a missing NAME INSIDE A DIRECTORY THAT
+    # EXISTS, and that is load-bearing rather than tidy. Spelled as a top-level
+    # path — "/nonexistent-home-for-keyless-tests" — this loop wrote an empty
+    # directory tree into the REPOSITORY ROOT and took a cargo-mutants baseline
+    # down twice.
+    #
+    # The mechanism is in CPython, not here.
+    # `importlib._bootstrap_external.SourceLoader.set_data` creates the parents
+    # of a bytecode cache with
+    #
+    #     while parent and not _path_isdir(parent):
+    #         parent, part = _path_split(parent)
+    #
+    # and `_path_split("/x")` returns `("", "x")` — the front is EMPTY, never
+    # "/". So when the whole absolute prefix is missing the loop runs off the
+    # top, exits with `parent == ""`, and rebuilds each level with
+    # `_path_join("", part)`, which is RELATIVE. `os.mkdir` then creates it
+    # under the current working directory. Give the path a parent that exists
+    # and the loop stops there, so every mkdir stays absolute.
+    #
+    # It needs Apple's /usr/bin/python3, whose `cache_from_source` redirects
+    # caches into `$HOME/Library/Caches/com.apple.python/`. A Homebrew
+    # interpreter writes `__pycache__` beside the source and never reads HOME,
+    # which is why this fired for some people and not others, and why it kept
+    # being misattributed.
+    #
+    # The tree holds directories and NO FILES, because the .pyc write goes to
+    # the absolute path and fails. Git tracks files, so git cannot see it at
+    # all — a .gitignore entry would not have helped.
+    missing_home = os.path.join(tempfile.gettempdir(), "keyless-tests-missing-home")
+    missing_tmpdir = os.path.join(tempfile.gettempdir(), "keyless-tests-missing-tmpdir")
+
     root = fixtures()
-    for label, env in (
-            ("HOME unset", {"HOME": ""}),
-            ("HOME missing dir", {"HOME": "/nonexistent-home-for-keyless-tests"}),
-            ("TMPDIR missing", {"TMPDIR": "/nonexistent-tmp-for-keyless-tests"}),
-            ("PATH unset", {"PATH": ""}),
-            ("broken locale", {"LC_ALL": "not-a-locale", "LANG": "not-a-locale"})):
-        v = drive(bash("cat .env", cwd=root), env=env)
-        s.check("broken env exits 0: %s" % label, v.exit_code, 0)
-        # The guard must still be a guard. A broken environment is not a reason
-        # to stop protecting; it is a reason to keep protecting without state.
-        s.check("broken env still denies: %s" % label, v.kind, "deny")
+    try:
+        for label, env in (
+                ("HOME unset", {"HOME": ""}),
+                ("HOME missing dir", {"HOME": missing_home}),
+                ("TMPDIR missing", {"TMPDIR": missing_tmpdir}),
+                ("PATH unset", {"PATH": ""}),
+                ("broken locale", {"LC_ALL": "not-a-locale", "LANG": "not-a-locale"})):
+            v = drive(bash("cat .env", cwd=root), env=env)
+            s.check("broken env exits 0: %s" % label, v.exit_code, 0)
+            # The guard must still be a guard. A broken environment is not a
+            # reason to stop protecting; it is a reason to keep protecting
+            # without state.
+            s.check("broken env still denies: %s" % label, v.kind, "deny")
+    finally:
+        # Whatever the interpreter decided to create under those two names is
+        # build output. It is now somewhere it can be removed.
+        shutil.rmtree(missing_home, ignore_errors=True)
+        shutil.rmtree(missing_tmpdir, ignore_errors=True)
 
     # ── an unwritable state directory ───────────────────────────────────────
     ro = tempfile.mkdtemp(prefix="keyless-ro-")
