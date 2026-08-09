@@ -28,10 +28,15 @@
 //!
 //! # Platform
 //!
-//! macOS. The whole crate is, and `cargo test` does not run at all on Linux —
-//! every test binary links the lib and the lib references four XNU symbols. The
-//! FIFO, `/dev/zero` and `ARG_MAX` properties below are POSIX rather than
-//! Darwin-specific, but they are only *measured* here.
+//! Both. Every property here is POSIX rather than Darwin-specific, and this
+//! file runs on macOS and Linux alike — the crate's four XNU calls are gated
+//! into the daemon, which nothing in this file touches.
+//!
+//! **Write each fixture so that it proves the same thing on both.** A case
+//! whose validity rests on a shell detail is not a test: property 8 below
+//! passed on macOS and hung on Linux for one reason — `/bin/sh -c` EXECs the
+//! command on macOS and dash FORKS it on Debian — and on the platform where it
+//! passed it was checking nothing at all.
 
 mod support;
 
@@ -45,6 +50,7 @@ use keyless::cmd::run::{Binding, TtyPolicy};
 use keyless::config::{Config, MAX_TIMEOUT_MS};
 use keyless::error::StoreError;
 use keyless::secret::Secret;
+use keyless::store::exec::{CaptureError, capture_with_input};
 use keyless::store::keychain::KeychainStore;
 use keyless::store::{Registry, Store};
 
@@ -726,4 +732,127 @@ fn a_daemon_timeout_from_config_is_clamped() {
     )
     .expect("valid config");
     assert_eq!(sane.stores.daemon.timeout(), Duration::from_millis(750));
+}
+
+// ---------------------------------------------------------------------------
+// 8. A backend that takes the value and never reads it.
+// ---------------------------------------------------------------------------
+
+/// How long the holder keeps the read end if nobody tells it to let go.
+///
+/// Long enough that the 5 s property assertion below cannot be satisfied by
+/// waiting the holder out — an unbounded write reports the elapsed time as this
+/// number, which is a red test with a sentence rather than a suite that never
+/// returns. Short enough that a crashed run leaves nothing lingering for long.
+const HOLDER_SECONDS: u64 = 25;
+
+#[test]
+fn a_backend_that_never_reads_its_stdin_is_bounded_by_the_deadline() {
+    // `capture_with_input` is how a credential reaches a backend that WRITES:
+    // `security add-generic-password -w` and `pass-cli item create
+    // --from-template -` both take theirs on stdin, because a value in argv is
+    // readable from the process table. So this is the one place in the crate
+    // where plaintext sits inside a syscall — and a pipe nobody empties fills
+    // at one buffer, after which a blocking write never returns.
+    //
+    // The fixture keeps the read end open in a process `keyless` never learns
+    // about. That is the whole test. Without it the kill at the deadline closes
+    // the pipe as a SIDE EFFECT, the write ends on its own, and the case passes
+    // against a completely unbounded write while proving nothing — which is
+    // what it did on macOS, where `/bin/sh -c` execs the command so the child
+    // is the only reader. Debian's dash forks, and the same case hung there
+    // instead. Neither behaviour is relied on below.
+    let dir = scratch("stdin-never-drained");
+    let holding = dir.join("holding");
+    let released = dir.join("released");
+    let stop = dir.join("stop");
+
+    // POSIX assigns /dev/null to an asynchronous list's stdin BEFORE its
+    // explicit redirections (XCU 2.9.4), so fd 3 is how the holder gets the
+    // real pipe rather than /dev/null. The shell then closes fd 3 and EXECs a
+    // sleep on /dev/null: the process `keyless` kills holds no end of the pipe
+    // at all, on either platform, and the holder is the only reader left.
+    let script = format!(
+        "exec 3<&0\n\
+         {{ : > '{holding}'\n\
+         i=0\n\
+         while [ ! -f '{stop}' ] && [ \"$i\" -lt {HOLDER_SECONDS} ]; do\n\
+           sleep 1\n\
+           i=$((i+1))\n\
+         done\n\
+         : > '{released}'\n\
+         }} <&3 &\n\
+         exec 3<&-\n\
+         exec sleep 45 < /dev/null\n",
+        holding = holding.display(),
+        stop = stop.display(),
+        released = released.display(),
+    );
+
+    // Larger than any pipe buffer, so the write cannot land in the buffer alone
+    // and has to wait for a reader that never comes.
+    let total = 512 * 1024;
+    let payload = vec![b'y'; total];
+
+    let started = Instant::now();
+    let outcome = within(
+        Duration::from_secs(60),
+        "capture_with_input against a backend that never reads its stdin",
+        move || {
+            let mut command = std::process::Command::new("/bin/sh");
+            command.args(["-c", &script]);
+            capture_with_input(command, Duration::from_millis(300), &payload)
+        },
+    );
+    let elapsed = started.elapsed();
+
+    // The fixture is checked before the property it enables. A holder that
+    // never started would make everything below pass against an unbounded
+    // write, which is exactly the failure this case exists to stop repeating.
+    assert!(
+        holding.exists(),
+        "the holder never took the read end, so nothing was holding the pipe \
+         open and this case proves nothing"
+    );
+
+    // The property. 300 ms is the deadline; five seconds is far outside every
+    // scheduling accident and far inside the holder's own lifetime, so a write
+    // that waits for the READER rather than for the DEADLINE lands here with a
+    // number rather than hanging the suite.
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "the deadline did not reach the write: a 300 ms bound took {elapsed:?}"
+    );
+
+    // The second half of the fixture check, and it is only meaningful once the
+    // assertion above has passed: at 300 ms the holder cannot have finished
+    // unless it never ran at all.
+    assert!(
+        !released.exists(),
+        "the holder let go before the deadline, so the pipe was closed by \
+         something other than the bound under test"
+    );
+
+    // And the mechanical proof that the pipe really was still open. These two
+    // outcomes are distinguishable and they say opposite things about the
+    // fixture: bytes still outstanding means the write stalled against a live
+    // reader that never read, while `TimedOut` would mean the pipe had broken
+    // and the write finished on its own — the vacuous shape.
+    let error = outcome.expect_err("a value nobody read must not read as a success");
+    match error {
+        CaptureError::InputNotRead { sent, total: asked } => {
+            assert_eq!(asked, total);
+            assert!(
+                sent > 0 && sent < asked,
+                "the write neither started nor stalled: {sent} of {asked} bytes"
+            );
+        }
+        other => panic!(
+            "expected the unread input to be named; a plain timeout here means \
+             the read end had closed and the fixture was vacuous: {other:?}"
+        ),
+    }
+
+    // Let the holder go rather than leaving it to age out.
+    let _ = std::fs::write(&stop, b"");
 }

@@ -36,13 +36,16 @@
 
 use std::io;
 use std::io::Write as _;
-use std::process::{Command, Stdio};
+use std::os::fd::AsFd as _;
+use std::process::{ChildStdin, Command, Stdio};
 
 use crate::error::StoreError;
-use std::sync::mpsc::{self, RecvTimeoutError};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
+use nix::fcntl::{FcntlArg, OFlag, fcntl};
+use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
 use nix::sys::signal::{Signal, kill};
 use nix::unistd::Pid;
 use zeroize::Zeroize;
@@ -161,6 +164,24 @@ pub enum CaptureError {
     /// silently wrong secret. No real value is anywhere near this size, so this
     /// is a statement about the backend and nothing else.
     TooLarge(usize),
+    /// The deadline expired with part of the value still unwritten, because
+    /// nothing drained the child's stdin.
+    ///
+    /// A separate variant rather than a [`CaptureError::TimedOut`] for the same
+    /// reason [`CaptureError::TooLarge`] is separate from a success: the child
+    /// received a PREFIX of a credential, which is the shape a silently wrong
+    /// secret has. It also names a different repair — "the backend never read
+    /// what it was given" sends a reader somewhere else than "the backend never
+    /// answered".
+    ///
+    /// The counts are lengths, which is metadata. No part of the value reaches
+    /// this variant or the sentence built from it.
+    InputNotRead {
+        /// How many bytes of the value reached the pipe.
+        sent: usize,
+        /// How many bytes the caller asked to send.
+        total: usize,
+    },
 }
 
 impl std::fmt::Display for CaptureError {
@@ -176,6 +197,9 @@ impl std::fmt::Display for CaptureError {
             }
             CaptureError::TooLarge(cap) => {
                 write!(f, "it produced more than {cap} bytes")
+            }
+            CaptureError::InputNotRead { sent, total } => {
+                write!(f, "it read {sent} of the {total} bytes it was given")
             }
         }
     }
@@ -199,8 +223,23 @@ pub fn capture(mut command: Command, timeout: Duration) -> Result<Captured, Capt
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
+    let deadline = deadline_for(timeout);
     let child = spawn_serialised(&mut command).map_err(CaptureError::Spawn)?;
-    collect(child, timeout)
+    Pending::start(child)?.finish(timeout, deadline)
+}
+
+/// The instant `timeout` expires, counted from now.
+///
+/// `Instant + Duration` PANICS on overflow, and this crate's release profile
+/// sets `panic = "abort"` — so a caller passing a duration the clock cannot
+/// hold would end the process with no child, no exit code and no message,
+/// which is the exact failure [`CaptureError::Threads`] exists to avoid.
+/// A timeout no clock can represent is not a timeout anyone meant, so it
+/// becomes one that has already expired: the child is killed and the caller
+/// gets a [`CaptureError::TimedOut`] it can read.
+fn deadline_for(timeout: Duration) -> Instant {
+    let now = Instant::now();
+    now.checked_add(timeout).unwrap_or(now)
 }
 
 /// Run `command` with `input` on its stdin, under the same deadline as
@@ -215,22 +254,44 @@ pub fn capture(mut command: Command, timeout: Duration) -> Result<Captured, Capt
 /// `security add-generic-password -w` with no argument — and this is the one
 /// function that feeds them.
 ///
-/// # What happens to the copy
+/// # The value is never copied, and never leaves this thread
 ///
-/// `input` stays the caller's; this function makes exactly one copy, hands it to
-/// the writer thread, and that thread zeroizes it whether the write succeeded,
-/// failed, or died on a closed pipe. The child's stdout is handled exactly as in
-/// [`capture`] — [`Captured`] scrubs it on drop.
+/// `input` stays the caller's and is written straight from the caller's buffer.
+/// There is no second copy of the plaintext anywhere in this function, no
+/// heap allocation holding it, and no other thread that can see it — so there
+/// is no buffer here to abandon, and nothing to scrub on the way out. The
+/// caller owns exactly one copy and scrubs exactly one copy. The child's
+/// stdout is handled as in [`capture`] — [`Captured`] scrubs it on drop.
 ///
-/// The write happens on its own thread because a child that reads all of its
-/// input before writing any output is indistinguishable, from here, from one
-/// that writes first: doing the write inline would deadlock on the second shape
-/// as soon as the value exceeds a pipe buffer.
+/// # Why the write is bounded rather than merely concurrent
+///
+/// A child that reads all of its input before writing any output is
+/// indistinguishable, from here, from one that writes first. So the child's
+/// stdout and stderr are drained on their own threads for the whole of this
+/// call, and the write proceeds against a pipe somebody is emptying — that is
+/// what stops the obvious deadlock at the first pipe buffer.
+///
+/// It is not enough on its own. **A blocking write to a pipe nobody reads waits
+/// forever, and no deadline held by another thread can end it**: nothing can
+/// safely close a descriptor a second thread is parked inside `write(2)` on,
+/// and abandoning that thread would leave a live thread holding a credential
+/// with no way to reach it again. Killing the child does not reliably help
+/// either — a grandchild that inherited the read end keeps the pipe open, and
+/// `/bin/sh -c` produces exactly that on Linux, where dash forks the command
+/// macOS's shell execs.
+///
+/// So the write is bounded **at the descriptor**: [`deliver`] sets `O_NONBLOCK`
+/// on the write end and waits in `poll` with the time that is left, which makes
+/// its runtime a property of `timeout` rather than of the child's behaviour.
+/// The whole call is then bounded by one deadline covering the write and the
+/// wait together, instead of the two of them serially.
 ///
 /// # Errors
 ///
-/// The same three as [`capture`]. A child killed at the deadline closes the pipe,
-/// so the writer thread ends with an error it discards rather than hanging.
+/// The same as [`capture`], plus [`CaptureError::InputNotRead`] when the
+/// deadline expires with part of the value still unwritten — a child that took
+/// a PREFIX of a credential and a child that took all of it must not be
+/// reported the same way.
 pub fn capture_with_input(
     mut command: Command,
     timeout: Duration,
@@ -241,28 +302,111 @@ pub fn capture_with_input(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
+    let deadline = deadline_for(timeout);
     let mut child = spawn_serialised(&mut command).map_err(CaptureError::Spawn)?;
     // Taken before the child moves into the collector, which owns it afterwards.
     let stdin = child.stdin.take();
-    let mut payload = input.to_vec();
-    let writer = thread::Builder::new()
-        .name("keyless-store-stdin".to_owned())
-        .spawn(move || {
-            if let Some(mut pipe) = stdin {
-                let _ = pipe.write_all(&payload);
-                let _ = pipe.flush();
-                // Dropping the pipe here closes it, which is what tells a child
-                // reading to end of input that there is no more.
-            }
-            payload.zeroize();
-        })
-        .map_err(CaptureError::Threads)?;
+    // The readers are started BEFORE the write, so the child is free to answer
+    // while it is still being fed.
+    let pending = Pending::start(child)?;
 
-    let captured = collect(child, timeout);
-    // Joined rather than detached so the scrub above is known to have happened
-    // before this function returns.
-    let _ = writer.join();
-    captured
+    let sent = match stdin {
+        Some(pipe) => deliver(pipe, input, deadline),
+        // Unreachable while the stdio above says `piped`, and a silent success
+        // would be a write that never happened.
+        None => Delivery::Stalled(0),
+    };
+    if let Delivery::Stalled(sent) = sent {
+        pending.abandon();
+        return Err(CaptureError::InputNotRead {
+            sent,
+            total: input.len(),
+        });
+    }
+
+    pending.finish(timeout, deadline)
+}
+
+/// What became of the value on its way to the child's stdin.
+enum Delivery {
+    /// Every byte reached the pipe, or the child stopped reading before the end
+    /// of its own accord.
+    ///
+    /// The two are one outcome deliberately. A backend that reads the lines it
+    /// needs and exits — which is what `security` does — closes the pipe on a
+    /// write that was still in progress, and that is a normal, successful
+    /// exchange rather than a fault. What the child then did with what it read
+    /// is reported by its exit status and its stderr, which the caller already
+    /// judges.
+    Done,
+    /// The deadline expired with bytes still unwritten, because nothing drained
+    /// the pipe. Carries how many bytes did land.
+    Stalled(usize),
+}
+
+/// Write `payload` to `pipe`, giving up at `deadline` rather than on the child.
+///
+/// # Why `O_NONBLOCK` and not a thread with a bound
+///
+/// This is the one place in the crate where a blocked syscall would hold
+/// plaintext. A blocking `write_all` to a pipe nobody reads never returns, and
+/// there is no sound way to interrupt it from outside: closing the descriptor
+/// under a parked writer is undefined, and scrubbing the buffer under it races
+/// a copy the kernel may be making. Bounding a JOIN therefore buys nothing —
+/// it converts a hang into a live thread holding a credential forever, which
+/// is the worse of the two.
+///
+/// Non-blocking is the only mechanism that removes the block itself. Every
+/// syscall below returns immediately or with a timeout, so this function's
+/// runtime is bounded by `deadline` no matter who holds the read end — the
+/// child, a grandchild it forked, or a process it passed the descriptor to.
+/// That is also why the write runs on the CALLING thread: with nothing that
+/// can park, no thread is needed and no copy of the value has to be made to
+/// move into one.
+///
+/// `O_NONBLOCK` is set on the WRITE end only. It is a property of that open
+/// file description, not of the pipe, so the child's own reads still block
+/// normally and no backend can tell the difference.
+///
+/// Dropping `pipe` at every exit closes it, which is what tells a child reading
+/// to end of input that there is no more — including on the give-up path, where
+/// a child left waiting on an EOF that never came would be a second hang.
+fn deliver(mut pipe: ChildStdin, payload: &[u8], deadline: Instant) -> Delivery {
+    if fcntl(&pipe, FcntlArg::F_SETFL(OFlag::O_NONBLOCK)).is_err() {
+        // Writing anyway would be a blocking write with no bound, which is the
+        // defect this function exists to remove. Refusing to write at all keeps
+        // the deadline true; the child gets EOF, fails, and says so.
+        return Delivery::Stalled(0);
+    }
+
+    let mut sent = 0;
+    while sent < payload.len() {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Delivery::Stalled(sent);
+        }
+        match pipe.write(&payload[sent..]) {
+            // Nothing was written and no reason was given. Retrying cannot make
+            // progress, and the honest report is that the value did not land.
+            Ok(0) => return Delivery::Stalled(sent),
+            Ok(written) => sent += written,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                // The pipe is full. Sleep until it drains or the deadline
+                // arrives, whichever comes first — never longer.
+                let mut watched = [PollFd::new(pipe.as_fd(), PollFlags::POLLOUT)];
+                let limit = PollTimeout::try_from(left).unwrap_or(PollTimeout::MAX);
+                // An error here is `EINTR` or a descriptor complaint; both are
+                // answered by looping, and the deadline check above is what
+                // stops the loop.
+                let _ = poll(&mut watched, limit);
+            }
+            // The read end is gone — the child took what it wanted and exited,
+            // or it died. Either way there is nobody left to write to.
+            Err(_) => return Delivery::Done,
+        }
+    }
+    Delivery::Done
 }
 
 /// The most this will hold from one of a backend's streams.
@@ -319,96 +463,166 @@ fn read_capped<R: io::Read>(mut source: R) -> (Vec<u8>, bool) {
     (kept, overflowed)
 }
 
-/// Wait for `child` with a deadline, killing it when the deadline expires.
-fn collect(mut child: std::process::Child, timeout: Duration) -> Result<Captured, CaptureError> {
-    // Captured before the child moves into the collector thread, because that
-    // thread owns it from then on and killing needs the id.
-    let pid = Pid::from_raw(child.id().cast_signed());
+/// Scrub bytes a reader thread captured and could not hand back.
+///
+/// A `send` on an `mpsc` channel FAILS once the receiver is gone, and hands the
+/// value back rather than dropping it. That happens on exactly one path and it
+/// is the path that matters: [`Pending::abandon`] waits [`REAP_GRACE`] for a
+/// killed child and then returns, so a reader still draining a pipe some
+/// grandchild holds open finishes afterwards, with nobody left to receive.
+///
+/// Without this the returned `Vec` would be dropped as an ordinary allocation.
+/// For a lookup that is a PARTIAL CREDENTIAL — stdout is where a value arrives
+/// — released to the allocator unscrubbed, which is the one thing
+/// [`Captured`]'s own `Drop` exists to prevent on every other path.
+///
+/// Not observable from outside the process, so no test asserts it. It is here
+/// because the drop is reachable, not because anything measured it.
+fn scrub_unsent(mut bytes: Vec<u8>) {
+    bytes.zeroize();
+}
 
-    // Both pipes are read CONCURRENTLY, which is the one shape that cannot
-    // deadlock on a child that fills one of them while writing to the other.
-    // `wait_with_output` gave that for free and is not usable here, because it
-    // reads without a bound — see [`MAX_CAPTURE_BYTES`].
-    let stdout = child.stdout.take();
-    let stderr = child.stderr.take();
+/// A child whose streams are being drained, waiting to be waited on.
+///
+/// Split from the wait so that a caller with something to WRITE can do it while
+/// the readers are already running, under one deadline covering both. Started
+/// and finished back to back, this is the whole of [`capture`].
+struct Pending {
+    /// Held rather than re-derived: the collector thread owns the `Child` from
+    /// [`Pending::start`] onwards, and killing needs the id.
+    pid: Pid,
+    errors: Receiver<(Vec<u8>, bool)>,
+    done: Receiver<io::Result<(std::process::ExitStatus, Vec<u8>, bool)>>,
+}
 
-    let (errors_read, errors) = mpsc::channel::<(Vec<u8>, bool)>();
-    if let Some(pipe) = stderr
-        && let Err(source) = thread::Builder::new()
-            .name("keyless-store-stderr".to_owned())
-            .spawn(move || {
-                let _ = errors_read.send(read_capped(pipe));
-            })
-    {
-        let _ = kill(pid, Signal::SIGKILL);
-        return Err(CaptureError::Threads(source));
-    }
+impl Pending {
+    /// Start draining `child`, and return before it has finished.
+    ///
+    /// # Errors
+    ///
+    /// [`CaptureError::Threads`] when the operating system refuses a thread.
+    /// The child is killed first, because a child nobody is reading and nobody
+    /// will wait on is a leak.
+    fn start(mut child: std::process::Child) -> Result<Self, CaptureError> {
+        let pid = Pid::from_raw(child.id().cast_signed());
 
-    let (finished, done) = mpsc::channel::<io::Result<(std::process::ExitStatus, Vec<u8>, bool)>>();
-    if let Err(source) = thread::Builder::new()
-        .name("keyless-store-output".to_owned())
-        .spawn(move || {
-            // Drained before the wait: a child cannot exit while blocked on a
-            // pipe nobody is reading.
-            let (bytes, overflowed) = match stdout {
-                Some(pipe) => read_capped(pipe),
-                None => (Vec::new(), false),
-            };
-            let _ = finished.send(child.wait().map(|status| (status, bytes, overflowed)));
-        })
-    {
-        // The closure was dropped with the `Child` inside it, and dropping a
-        // `Child` neither kills nor reaps. The process is therefore still
-        // running and still ours, so its pid cannot have been reused and
-        // signalling it is safe rather than a race.
-        let _ = kill(pid, Signal::SIGKILL);
-        return Err(CaptureError::Threads(source));
-    }
+        // Both pipes are read CONCURRENTLY, which is the one shape that cannot
+        // deadlock on a child that fills one of them while writing to the other.
+        // `wait_with_output` gave that for free and is not usable here, because
+        // it reads without a bound — see [`MAX_CAPTURE_BYTES`].
+        let stdout = child.stdout.take();
+        let stderr = child.stderr.take();
 
-    match done.recv_timeout(timeout) {
-        Ok(Ok((status, mut bytes, overflowed))) => {
-            if overflowed {
-                // Scrubbed rather than returned. The bytes are a prefix of
-                // something a backend produced, which is exactly the shape a
-                // truncated credential has, and no caller has any use for one.
-                bytes.zeroize();
-                return Err(CaptureError::TooLarge(MAX_CAPTURE_BYTES));
-            }
-            // A flooded stderr is dropped on the floor rather than waited for:
-            // stdout is what a lookup is about, and the whole point of arriving
-            // here is not to wait for a stream that will not end.
-            let stderr = match errors.recv_timeout(REAP_GRACE) {
-                Ok((bytes, false)) => bytes,
-                Ok((mut bytes, true)) => {
-                    bytes.zeroize();
-                    b"<stderr too large to quote>".to_vec()
-                }
-                Err(_) => Vec::new(),
-            };
-            Ok(Captured {
-                status,
-                stdout: bytes,
-                stderr,
-            })
-        }
-        Ok(Err(source)) => Err(CaptureError::Collect(source)),
-        Err(RecvTimeoutError::Timeout) => {
-            // The collector thread still holds the `Child`, so the pid has not
-            // been reaped and cannot yet have been reused by another process.
-            // Signalling it here is therefore safe rather than a race.
+        let (errors_read, errors) = mpsc::channel::<(Vec<u8>, bool)>();
+        if let Some(pipe) = stderr
+            && let Err(source) = thread::Builder::new()
+                .name("keyless-store-stderr".to_owned())
+                .spawn(move || {
+                    if let Err(rejected) = errors_read.send(read_capped(pipe)) {
+                        scrub_unsent(rejected.0.0);
+                    }
+                })
+        {
             let _ = kill(pid, Signal::SIGKILL);
-            // Collect whatever it managed to read, only to scrub it: a partial
-            // value is as sensitive as a whole one.
-            if let Ok(Ok((_, mut bytes, _))) = done.recv_timeout(REAP_GRACE) {
-                bytes.zeroize();
-            }
-            Err(CaptureError::TimedOut(timeout))
+            return Err(CaptureError::Threads(source));
         }
-        // The sender was dropped without sending, which means the collector
-        // thread panicked. Nothing was captured and nothing leaked.
-        Err(RecvTimeoutError::Disconnected) => Err(CaptureError::Collect(io::Error::other(
-            "the output collector stopped unexpectedly",
-        ))),
+
+        let (finished, done) =
+            mpsc::channel::<io::Result<(std::process::ExitStatus, Vec<u8>, bool)>>();
+        if let Err(source) = thread::Builder::new()
+            .name("keyless-store-output".to_owned())
+            .spawn(move || {
+                // Drained before the wait: a child cannot exit while blocked on
+                // a pipe nobody is reading.
+                let (bytes, overflowed) = match stdout {
+                    Some(pipe) => read_capped(pipe),
+                    None => (Vec::new(), false),
+                };
+                if let Err(rejected) =
+                    finished.send(child.wait().map(|status| (status, bytes, overflowed)))
+                    && let Ok((_, bytes, _)) = rejected.0
+                {
+                    scrub_unsent(bytes);
+                }
+            })
+        {
+            // The closure was dropped with the `Child` inside it, and dropping a
+            // `Child` neither kills nor reaps. The process is therefore still
+            // running and still ours, so its pid cannot have been reused and
+            // signalling it is safe rather than a race.
+            let _ = kill(pid, Signal::SIGKILL);
+            return Err(CaptureError::Threads(source));
+        }
+
+        Ok(Pending { pid, errors, done })
+    }
+
+    /// Kill the child and scrub whatever was read of its stdout.
+    ///
+    /// The collector thread still holds the `Child`, so the pid has not been
+    /// reaped and cannot yet have been reused by another process. Signalling it
+    /// here is therefore safe rather than a race.
+    fn abandon(self) {
+        let _ = kill(self.pid, Signal::SIGKILL);
+        // Collected only to scrub it: a partial value is as sensitive as a
+        // whole one.
+        if let Ok(Ok((_, mut bytes, _))) = self.done.recv_timeout(REAP_GRACE) {
+            bytes.zeroize();
+        }
+    }
+
+    /// Wait for the child until `deadline`, killing it when the deadline
+    /// expires.
+    ///
+    /// `timeout` is carried only to say how long the wait was in the error; the
+    /// wait itself runs against `deadline`, so time already spent writing to the
+    /// child is time this does not get to spend again.
+    ///
+    /// # Errors
+    ///
+    /// [`CaptureError::TimedOut`] at the deadline, [`CaptureError::TooLarge`]
+    /// past the capture cap, [`CaptureError::Collect`] when the pipes fail.
+    fn finish(self, timeout: Duration, deadline: Instant) -> Result<Captured, CaptureError> {
+        let left = deadline.saturating_duration_since(Instant::now());
+        let outcome = self.done.recv_timeout(left);
+        match outcome {
+            Ok(Ok((status, mut bytes, overflowed))) => {
+                if overflowed {
+                    // Scrubbed rather than returned. The bytes are a prefix of
+                    // something a backend produced, which is exactly the shape a
+                    // truncated credential has, and no caller has any use for
+                    // one.
+                    bytes.zeroize();
+                    return Err(CaptureError::TooLarge(MAX_CAPTURE_BYTES));
+                }
+                // A flooded stderr is dropped on the floor rather than waited
+                // for: stdout is what a lookup is about, and the whole point of
+                // arriving here is not to wait for a stream that will not end.
+                let stderr = match self.errors.recv_timeout(REAP_GRACE) {
+                    Ok((bytes, false)) => bytes,
+                    Ok((mut bytes, true)) => {
+                        bytes.zeroize();
+                        b"<stderr too large to quote>".to_vec()
+                    }
+                    Err(_) => Vec::new(),
+                };
+                Ok(Captured {
+                    status,
+                    stdout: bytes,
+                    stderr,
+                })
+            }
+            Ok(Err(source)) => Err(CaptureError::Collect(source)),
+            Err(RecvTimeoutError::Timeout) => {
+                self.abandon();
+                Err(CaptureError::TimedOut(timeout))
+            }
+            // The sender was dropped without sending, which means the collector
+            // thread panicked. Nothing was captured and nothing leaked.
+            Err(RecvTimeoutError::Disconnected) => Err(CaptureError::Collect(io::Error::other(
+                "the output collector stopped unexpectedly",
+            ))),
+        }
     }
 }
 
@@ -430,7 +644,8 @@ pub fn unavailable(store: &str, binary: &std::path::Path, error: &CaptureError) 
         CaptureError::TimedOut(_)
         | CaptureError::Collect(_)
         | CaptureError::Threads(_)
-        | CaptureError::TooLarge(_) => error.to_string(),
+        | CaptureError::TooLarge(_)
+        | CaptureError::InputNotRead { .. } => error.to_string(),
     };
     StoreError::Unavailable {
         store: store.to_owned(),
@@ -606,23 +821,37 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(
-        not(target_os = "macos"),
-        ignore = "the deadline does not reach the stdin writer thread, so this hangs on Linux -- capture_with_input joins that thread unbounded (see the join below). It passes on macOS only because /bin/sh there EXECs the command while dash FORKS it, leaving a grandchild holding the pipe. A DEFECT in the deadline, and a vacuous control on macOS"
-    )]
-    fn a_child_that_never_reads_its_input_is_still_killed_at_the_deadline() {
-        // The writer thread blocks on a full pipe. If the deadline did not also
-        // reach it, this hangs the suite rather than failing it.
-        let payload = vec![b'y'; 512 * 1024];
-        let mut command = Command::new("/bin/sh");
-        command.args(["-c", "sleep 60"]);
-        let started = Instant::now();
-        let error = capture_with_input(command, Duration::from_millis(300), &payload)
-            .expect_err("must not wait 60s");
-        assert!(matches!(error, CaptureError::TimedOut(_)));
-        assert!(
-            started.elapsed() < Duration::from_secs(5),
-            "the deadline was not enforced"
+    fn a_child_that_exits_without_reading_its_input_is_not_an_error() {
+        // A backend that takes the lines it needs and leaves is normal, and the
+        // write end breaking under it is the ordinary end of that exchange. It
+        // must not be reported as a value that failed to arrive: `true` never
+        // reads a byte, and what decides the outcome is its exit status.
+        //
+        // The value that never arrived is a different outcome with a different
+        // repair, and it is [`CaptureError::InputNotRead`]. Reaching that case
+        // needs a reader holding the pipe open past the deadline, which is a
+        // process fixture rather than a one-line command — it lives in
+        // `tests/hostile.rs`, property 8, where the `within` harness turns a
+        // regression into a named failure instead of a suite that never ends.
+        let payload = vec![b'z'; 512 * 1024];
+        let command = Command::new("/usr/bin/true");
+        let captured = capture_with_input(command, Duration::from_secs(10), &payload)
+            .expect("a child that ignores its stdin is not a capture failure");
+        assert!(captured.status.success());
+    }
+
+    #[test]
+    fn an_unread_value_is_reported_by_length_and_never_by_content() {
+        // The counts are metadata. A sentence built from this variant is put in
+        // front of a user and written to the audit log, so the one thing it
+        // must never carry is any part of the value.
+        let error = CaptureError::InputNotRead {
+            sent: 65_536,
+            total: 524_288,
+        };
+        assert_eq!(
+            error.to_string(),
+            "it read 65536 of the 524288 bytes it was given"
         );
     }
 
