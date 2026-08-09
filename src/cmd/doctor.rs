@@ -26,6 +26,19 @@
 //!   the three reads a credential of yours.
 //! - a **name** is proven only under `--probe`, which reads the real credential.
 //!
+//! # Why the extra variables a name delivers are printed here
+//!
+//! A bare `-s NAME` lands in `$NAME` **and** in every variable that name's own
+//! declaration says it answers to. That is a fact the tool holds and a person
+//! cannot otherwise discover: it is not in `ls`, whose four tab-separated fields
+//! are a parser's contract and may not grow a fifth, and it is not visible at
+//! the point of use, because a run that works prints nothing.
+//!
+//! The variables are read through [`Binding::declared`] — the same function the
+//! run itself calls — rather than re-derived from the route here. A second
+//! derivation would be free to disagree with the first, and the failure it would
+//! produce is a report promising a variable the child never gets.
+//!
 //! # Why a name whose store failed is not asked
 //!
 //! A store that is down makes every name under it fail, identically, for the
@@ -79,12 +92,13 @@ use std::collections::BTreeMap;
 use std::io::{self, Write};
 
 use crate::audit::AuditLog;
+use crate::cmd::run::Binding;
 use crate::config::{Config, ConfigLoad};
 use crate::error::StoreError;
 use crate::paths::Paths;
 use crate::store::{self, Registry, Resolution, Store};
 
-use super::status::{Mark, Style, action, heading, note, row};
+use super::status::{Mark, Style, action, heading, note, row, verbatim};
 
 /// Every backend this build knows about, in the order a report lists them.
 ///
@@ -531,6 +545,7 @@ fn report_names(
                 crate::NAME
             ),
         )?;
+        report_extra_variables(config, style, out)?;
         return Ok(0);
     }
 
@@ -575,7 +590,7 @@ fn report_names(
             Resolution::Found { store, .. } => (
                 Mark::Proven,
                 "proven",
-                format!("read back from {store}"),
+                format!("read back from {store}{}", delivered_suffix(config, name)),
                 None,
             ),
             Resolution::NotFound => (
@@ -616,6 +631,57 @@ fn report_names(
         problems += i32::from(mark.is_problem());
     }
     Ok(problems)
+}
+
+/// Which variables a bare `-s NAME` would set, beyond the name itself.
+///
+/// Through [`Binding::declared`], so this cannot disagree with the run. An
+/// undeclared name, and a declaration that names no variable, both yield an
+/// empty list and print nothing.
+fn extra_variables(config: &Config, name: &str) -> Vec<String> {
+    Binding::declared(name, config)
+        .map(|binding| binding.also)
+        .unwrap_or_default()
+}
+
+/// The tail of a proven name's detail: what the child will actually see.
+fn delivered_suffix(config: &Config, name: &str) -> String {
+    match extra_variables(config, name).as_slice() {
+        [] => String::new(),
+        extra => format!(", delivered as ${name} and ${}", extra.join(" and $")),
+    }
+}
+
+/// Say which names arrive under a second variable, when nothing was probed.
+///
+/// Printed even without `--probe`, because it costs no store call: it is a fact
+/// about the config file, and it is the one fact a person most often needs
+/// before a run rather than after one.
+fn report_extra_variables(config: &Config, style: Style, out: &mut dyn Write) -> io::Result<()> {
+    let mut said = false;
+    for name in config.secrets.keys() {
+        let extra = extra_variables(config, name);
+        if extra.is_empty() {
+            continue;
+        }
+        if !said {
+            note(
+                out,
+                style,
+                "these also arrive under a second variable, so a program reading its own \
+                 name finds the value without anybody spelling it:",
+            )?;
+            said = true;
+        }
+        // `verbatim`, so the indent that groups these under the sentence above
+        // survives: wrapping collapses runs of spaces.
+        verbatim(
+            out,
+            style,
+            &format!("  -s {name}  sets ${name} and ${}", extra.join(" and $")),
+        )?;
+    }
+    Ok(())
 }
 
 /// The AUDIT section. Returns how many rows are problems.

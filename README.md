@@ -225,6 +225,25 @@ discover those without ever reading a value; see [Discovery](#discovery).
 Running it twice is safe: an existing config is reported, never replaced, unless
 you pass `--force`.
 
+`init` also reports a **GUARDS** row: whether the hook pack in `hooks/` is
+registered in your Claude Code settings. Without it nothing refuses a command
+that would print a credential into a transcript, and `install/install.sh` places
+the binaries only — so a fresh clone has the tool and none of the protection.
+
+```console
+$ keyless init --hooks
+```
+
+That merges the pack in. The write belongs to `hooks/install.py`, which backs the
+file up first, merges rather than overwrites, re-parses the result before
+replacing the original, and takes itself back out with `--uninstall`. It is a
+step you ask for rather than something `init` does on its own: `~/.claude/
+settings.json` belongs to another program, and not everybody running `keyless`
+runs Claude Code at all.
+
+If the binary was copied to a machine without the checkout, the row says so and
+names `KEYLESS_HOOKS_DIR`, which points at the directory holding `install.py`.
+
 Add the name by hand, so `~/.config/keyless/config.json` reads:
 
 ```json
