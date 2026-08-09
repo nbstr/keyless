@@ -17,9 +17,16 @@
 //! more than one. Availability of the safe path does not win. Only being the
 //! *shortest* path wins — and a single verb that prints a value is always the
 //! shortest path.
+//!
+//! [`refuse`] is the same constraint aimed at the person rather than the code.
+//! An absence teaches nobody: somebody who types `keyless get` learns only that
+//! a word was unrecognized, which is what a CLI says about a typo and about a
+//! feature that has not been written yet. That module answers those words with
+//! the reason, so the design states itself at the moment somebody tests it.
 
 pub mod discover;
 pub mod doctor;
 pub mod ls;
+pub mod refuse;
 pub mod run;
 pub mod write;

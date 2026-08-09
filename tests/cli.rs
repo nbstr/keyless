@@ -65,6 +65,76 @@ fn there_is_no_verb_that_prints_a_value() {
     }
 }
 
+/// Refusing is half the job; the other half is that the refusal TEACHES.
+///
+/// `error: unrecognized subcommand 'get'` is what a CLI says about a typo and
+/// about a feature nobody has written yet, so it reads as a broken install
+/// rather than as the design. A person who concludes the tool is unfinished
+/// goes back to the plaintext path, which is the outcome this whole crate
+/// exists to prevent — so the message is a security property, not a courtesy.
+#[test]
+fn every_refused_word_explains_itself_and_points_at_run() {
+    for verb in keyless::cmd::refuse::REFUSED {
+        let output = keyless(&[verb, "DECOY"]);
+        assert!(
+            !output.status.success(),
+            "`keyless {verb}` must not succeed"
+        );
+
+        // Explanations go to stderr: this verb yields no result, and a message
+        // on stdout would land in whatever the caller piped it into.
+        let text = String::from_utf8_lossy(&output.stderr).into_owned();
+        assert!(
+            text.contains(&format!("there is no `{verb}`")),
+            "`{verb}` must be named back to the person who typed it: {text}"
+        );
+        assert!(
+            text.contains("will not be one"),
+            "`{verb}` must read as a decision, not as an unfinished feature: {text}"
+        );
+        assert!(
+            text.contains("run -s NAME"),
+            "`{verb}` must show the shape that does work: {text}"
+        );
+        assert!(
+            stdout_of(&output).is_empty(),
+            "`{verb}` must write nothing to stdout: {}",
+            stdout_of(&output)
+        );
+    }
+}
+
+/// The refusals are hidden, and the verb list is the reason.
+///
+/// `Cargo.toml` records that the verb set is a security property a reader must
+/// be able to check at a glance. A `get` printed in `--help` would undo that:
+/// somebody skimming for "does anything here print a value" would find one.
+#[test]
+fn the_help_verb_list_does_not_grow_a_reading_verb() {
+    let output = keyless(&["--help"]);
+    let text = stdout_of(&output);
+    let commands = text
+        .split_once("Commands:")
+        .expect("help must list commands")
+        .1;
+    // `skip(1)` drops what is left of the `Commands:` line itself, which is
+    // empty and would otherwise end the `take_while` before it read a row.
+    let listed = commands
+        .lines()
+        .skip(1)
+        .take_while(|line| !line.trim().is_empty())
+        .filter_map(|line| line.split_whitespace().next())
+        .collect::<Vec<_>>();
+    assert!(!listed.is_empty(), "the parser read no rows: {commands}");
+
+    assert_eq!(
+        listed,
+        ["run", "ls", "items", "fields", "new", "put", "doctor"],
+        "the visible verb set changed; every addition has to be justified against \
+         `no verb prints a value`"
+    );
+}
+
 #[test]
 fn there_is_no_flag_that_disables_masking() {
     let dir = scratch("no-reveal-flags");
