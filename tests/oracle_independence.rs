@@ -153,17 +153,28 @@ const CLASSIFIED: &[(&str, &str)] = &[
 /// Directories scanned, relative to the crate root.
 const SCANNED: &[&str] = &["src", "tests"];
 
-/// Below these, the scan has collapsed rather than found a clean suite.
+/// Below this, the directory walk has collapsed rather than found a clean tree.
 ///
-/// Set well under the measured counts on 2026-08-09 — 59 source files carrying
-/// 562 `#[test]` attributes — so this catches a scanner that reads nothing
-/// rather than a suite that lost a case. Re-measure rather than quoting those
-/// two numbers:
-///
-///     find src tests -name '*.rs' | wc -l
-///     grep -rc '#\[test\]' src tests --include='*.rs' | awk -F: '{s+=$2} END {print s}'
+/// Set well under the count measured on 2026-08-09 — 59 files — so it catches a
+/// walk that reads nothing rather than a tree that lost a file. Re-measure
+/// rather than quoting that number: `find src tests -name '*.rs' | wc -l`.
 const MIN_FILES: usize = 30;
-const MIN_TESTS: usize = 200;
+
+/// The share of `#[test]` attributes the block parser has to actually turn into
+/// bodies.
+///
+/// An absolute floor cannot do this job. The measured count is 546 blocks from
+/// 567 attributes, so a floor low enough to survive normal churn — 200, as this
+/// first stood — leaves a parser free to degrade by two thirds and still pass.
+/// A parser that silently stops matching most of the suite flags nothing, and
+/// flagging nothing is this gate's success condition. So the check is a RATIO
+/// against the same files' raw attribute count, which moves with the suite and
+/// cannot be satisfied by a scanner that has quietly gone blind.
+///
+/// The gap between the two counts is real and allowed for: an attribute inside
+/// a `//!` example, or one the parser reaches differently from a plain string
+/// count, is not a defect. Two thirds of the suite going missing is.
+const MIN_PARSED_SHARE: (usize, usize) = (9, 10);
 
 #[test]
 fn no_assertion_takes_its_expected_value_from_the_code_under_test() {
@@ -184,6 +195,7 @@ fn no_assertion_takes_its_expected_value_from_the_code_under_test() {
     );
 
     let mut seen_tests = 0usize;
+    let mut declared_tests = 0usize;
     let mut flagged: BTreeSet<String> = BTreeSet::new();
     for path in &sources {
         // This file's own fixtures are deliberately tautological. Scanning them
@@ -197,6 +209,7 @@ fn no_assertion_takes_its_expected_value_from_the_code_under_test() {
         let text = std::fs::read_to_string(path)
             .unwrap_or_else(|error| panic!("cannot read {}: {error}", path.display()));
         let key_prefix = relative(&root, path);
+        declared_tests += text.matches("#[test]").count();
         let seeds = crate_seeds(&text);
         for (name, body) in test_blocks(&text) {
             seen_tests += 1;
@@ -206,11 +219,15 @@ fn no_assertion_takes_its_expected_value_from_the_code_under_test() {
         }
     }
 
+    let (numerator, denominator) = MIN_PARSED_SHARE;
     assert!(
-        seen_tests >= MIN_TESTS,
-        "only {seen_tests} `#[test]` block(s) were parsed across {} file(s). The \
-         suite has more than that, so the block parser stopped matching the \
-         spelling the sources use — and that reads exactly like a pass.",
+        declared_tests > 0 && seen_tests * denominator >= declared_tests * numerator,
+        "the block parser turned {seen_tests} of {declared_tests} `#[test]` \
+         attribute(s) into bodies across {} file(s), which is under {numerator}/\
+         {denominator}. It has stopped matching the spelling the sources use, so \
+         most of the suite is no longer being read — and a scanner that reads \
+         nothing flags nothing, which is exactly what this gate passing looks \
+         like.",
         sources.len()
     );
 
