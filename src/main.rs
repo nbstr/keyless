@@ -194,6 +194,12 @@ struct RunArgs {
     /// secret there as `$PGURL`, so what a store calls something and what a
     /// program expects never have to agree.
     ///
+    /// A name also lands in the variables its own declaration says it answers
+    /// to, so `-s STAGING_DATABASE_URL` can arrive as `$DATABASE_URL` as well
+    /// without anybody spelling it here. Both, never instead. A spelled
+    /// `ENV=NAME` is an instruction and is never widened. `keyless doctor` lists
+    /// which names do this.
+    ///
     /// Repeat the flag for each name. A name that cannot be resolved does not
     /// stop the run: it is reported on stderr and the command runs with that
     /// variable unset.
@@ -266,6 +272,15 @@ struct InitArgs {
     /// exactly as it is and the run reports what it found.
     #[arg(long)]
     force: bool,
+
+    /// Also install the hook pack into your Claude Code settings file.
+    ///
+    /// Without this, `init` only REPORTS whether the pack is registered. The
+    /// settings file belongs to another program, so the write is a step you ask
+    /// for. `hooks/install.py` performs it: it merges rather than overwrites,
+    /// backs the file up first, and takes itself back out with `--uninstall`.
+    #[arg(long)]
+    hooks: bool,
 }
 
 fn main() {
@@ -566,6 +581,7 @@ fn dispatch() -> i32 {
                 assume_yes: args.yes,
                 only: args.store.as_deref(),
                 interactive,
+                install_hooks: args.hooks,
                 style: Style::detect(io::stdout().is_terminal()),
             };
             let stdin = io::stdin();

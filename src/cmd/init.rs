@@ -40,6 +40,31 @@
 //! A blocked prompt in CI is not a nuisance here, it is the never-block
 //! invariant broken by the one verb that was allowed to be interactive.
 //!
+//! # The guards, and why they are a step rather than a side effect
+//!
+//! `install/install.sh` places two binaries. It has never mentioned the hook
+//! pack, so a stranger who clones, builds and installs gets **no hooks, no allow
+//! list and no guards** — the protection exists on one machine because that
+//! machine's `settings.json` happens to point at a checkout. That is a hole in
+//! setup, and setup is this verb.
+//!
+//! It is a NAMED step rather than a silent one, for two reasons that are not
+//! symmetric with writing a config:
+//!
+//! - The config file belongs to `keyless`. `~/.claude/settings.json` belongs to
+//!   **another program**, and a secrets broker that edits a neighbour's
+//!   configuration without being asked is doing the thing this tool exists to
+//!   argue against.
+//! - Not everybody running `keyless` runs Claude Code at all, and for them the
+//!   write has no meaning and the file has no business existing.
+//!
+//! So `init` REPORTS the pack as a row — present, absent, or unreachable — and
+//! installs it when `--hooks` says to. `hooks/install.py` does the write, and it
+//! already refuses to overwrite blindly, backs up before every write, re-parses
+//! the merged file before replacing the original, and is idempotent in both
+//! directions. Nothing here re-implements any of that; this verb finds the
+//! script, runs it, and prints what it said, verbatim.
+//!
 //! # Never a GUI dialog
 //!
 //! Detection runs the same store health checks `doctor` runs, and those refuse
@@ -95,6 +120,8 @@ pub struct InitRequest<'a> {
     pub only: Option<&'a str>,
     /// Whether a question may be asked at all: stdin AND stdout are terminals.
     pub interactive: bool,
+    /// Install the hook pack into the Claude Code settings file.
+    pub install_hooks: bool,
     /// Colour and character set.
     pub style: Style,
 }
@@ -177,6 +204,8 @@ pub fn init(
         return Ok(0);
     }
 
+    report_hooks(request, out, err)?;
+
     let usable: Vec<&Finding> = findings.iter().filter(|f| f.is_usable()).collect();
     let chosen = match choose(request, &usable, stdin, out, err)? {
         Choice::Backend(id) => id,
@@ -205,6 +234,178 @@ pub fn init(
 
     next_steps(chosen, &findings, style, out)?;
     Ok(0)
+}
+
+/// The environment variable that names a packaged hook pack.
+const HOOKS_DIR_ENV: &str = "KEYLESS_HOOKS_DIR";
+
+/// The Claude Code settings file the pack registers itself in.
+fn settings_file() -> Option<std::path::PathBuf> {
+    crate::paths::home().map(|home| home.join(".claude").join("settings.json"))
+}
+
+/// Where `hooks/install.py` is, or the reason it could not be found.
+///
+/// Three places, in order, and the third is the one that covers the reported
+/// gap: `cargo install --path .` puts the binary on `PATH` and leaves `hooks/`
+/// in the checkout, so a binary that remembers where it was built can still
+/// reach it. A binary COPIED to another machine cannot, and that is the case
+/// [`HOOKS_DIR_ENV`] exists for — said out loud rather than guessed at.
+fn hooks_installer() -> Result<std::path::PathBuf, String> {
+    let mut looked = Vec::new();
+    let mut candidates: Vec<std::path::PathBuf> = Vec::new();
+
+    if let Ok(dir) = std::env::var(HOOKS_DIR_ENV)
+        && !dir.is_empty()
+    {
+        candidates.push(std::path::PathBuf::from(dir).join("install.py"));
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        let mut at = exe.parent().map(std::path::Path::to_path_buf);
+        // Two levels, because a build tree puts the binary at
+        // `target/<profile>/keyless` and an install puts it at `<prefix>/bin`.
+        for _ in 0..2 {
+            if let Some(dir) = at {
+                candidates.push(dir.join("hooks").join("install.py"));
+                at = dir.parent().map(std::path::Path::to_path_buf);
+            }
+        }
+    }
+    candidates.push(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("hooks")
+            .join("install.py"),
+    );
+
+    for candidate in candidates {
+        if candidate.is_file() {
+            return Ok(candidate);
+        }
+        looked.push(candidate.display().to_string());
+    }
+    Err(format!(
+        "the hook pack is not on this machine. Looked in: {}. \
+         Set {HOOKS_DIR_ENV} to the directory holding `install.py`",
+        looked.join(", ")
+    ))
+}
+
+/// Whether the pack is already registered in the settings file.
+///
+/// A substring test for the handler script's own name, which is the same signal
+/// `hooks/install.py` uses to recognise itself. It does NOT see a pack reached
+/// through somebody's own forwarder script — that reports `absent`, and running
+/// `--hooks` then is a no-op, because the installer recognises the folded
+/// arrangement even though this does not.
+fn hooks_are_registered() -> bool {
+    settings_file()
+        .and_then(|path| std::fs::read_to_string(path).ok())
+        .is_some_and(|text| text.contains("keyless_hook.py"))
+}
+
+/// The GUARDS row, and the install when it was asked for.
+fn report_hooks(
+    request: &InitRequest<'_>,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> io::Result<()> {
+    let style = request.style;
+    heading(out, style, "GUARDS")?;
+
+    let installer = match hooks_installer() {
+        Ok(path) => path,
+        Err(reason) => {
+            // Not a problem and not a failure. A packaged binary with no pack
+            // beside it is a legitimate install, and calling it broken would
+            // make this row noise on every machine that has one.
+            row(out, style, Mark::Off, "hooks", 9, "off", &reason)?;
+            return Ok(());
+        }
+    };
+
+    if hooks_are_registered() && !request.install_hooks {
+        row(
+            out,
+            style,
+            Mark::Proven,
+            "hooks",
+            9,
+            "proven",
+            "the pack is registered in your Claude Code settings",
+        )?;
+        return Ok(());
+    }
+
+    if !request.install_hooks {
+        row(
+            out,
+            style,
+            Mark::NotSetUp,
+            "hooks",
+            9,
+            "absent",
+            "no pack registered, so nothing refuses a command that would print a credential",
+        )?;
+        action(
+            out,
+            style,
+            &format!(
+                "{} init --hooks   merges it in, after backing the file up",
+                crate::NAME
+            ),
+        )?;
+        return Ok(());
+    }
+
+    // The write itself belongs to the installer. It backs up, re-parses before
+    // replacing, and is idempotent — so this runs it and repeats what it said
+    // rather than deciding anything about a file it does not own.
+    let output = std::process::Command::new("python3")
+        .arg(&installer)
+        .output();
+    match output {
+        Ok(done) if done.status.success() => {
+            row(
+                out,
+                style,
+                Mark::Proven,
+                "hooks",
+                9,
+                "proven",
+                &format!("installed by {}", installer.display()),
+            )?;
+            for line in String::from_utf8_lossy(&done.stdout).lines() {
+                verbatim(out, style, line)?;
+            }
+            Ok(())
+        }
+        Ok(done) => {
+            row(
+                out,
+                style,
+                Mark::Broken,
+                "hooks",
+                9,
+                "broken",
+                &format!("{} exited {}", installer.display(), done.status),
+            )?;
+            // The installer's own words, on the stream errors already go to.
+            write!(err, "{}", String::from_utf8_lossy(&done.stderr))?;
+            Ok(())
+        }
+        Err(problem) => {
+            row(
+                out,
+                style,
+                Mark::Broken,
+                "hooks",
+                9,
+                "broken",
+                &format!("cannot run python3: {problem}"),
+            )?;
+            Ok(())
+        }
+    }
 }
 
 /// What `choose` concluded.
@@ -544,6 +745,7 @@ mod tests {
             assume_yes: false,
             only: None,
             interactive,
+            install_hooks: false,
             style: Style::PLAIN,
         }
     }
