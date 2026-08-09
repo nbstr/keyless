@@ -26,6 +26,13 @@
     ]
   },
   "permissions": {
+    "allow": [
+      "Bash(keyless ls:*)",
+      "Bash(keyless items:*)",
+      "Bash(keyless fields:*)",
+      "Bash(keyless doctor:*)",
+      "Bash(keyless --version)"
+    ],
     "deny": [
       "Read(**/.ssh/id_*)",
       "Read(**/.aws/credentials)",
@@ -38,7 +45,22 @@
     ]
   },
   "_keylessComment": [
-    "The deny list above holds only OPAQUE credential stores \u2014 files whose names",
+    "The allow list holds the verbs that only REPORT. None of them runs a command",
+    "the caller chose and none can print a value, so a prompt on them asks a person",
+    "to approve a listing. Unapproved, an agent stops to ask before it can even",
+    "find out which names exist \u2014 and the next thing it reaches for is the file",
+    "the deny list below exists to keep it out of.",
+    "",
+    "`keyless run` is DELIBERATELY ABSENT, and this is the entry people will want",
+    "to add. `Bash(keyless run:*)` matches every command anyone can put after the",
+    "`--`, so it does not approve `keyless`; it approves arbitrary execution with",
+    "`keyless run` as the prefix. The prompt on a `run` is the prompt for the",
+    "command being run, and that one is correct. Adding it to your own settings is",
+    "your call to make; shipping it to everybody is not this pack's.",
+    "",
+    "`new` and `put` are absent for the other reason: they WRITE to a store.",
+    "",
+    "The deny list below holds only OPAQUE credential stores \u2014 files whose names",
     "are worthless to an agent and whose content is never legitimately needed.",
     "For those a hard permission gate is strictly better than the hook: it",
     "survives a broken hook, bypassPermissions, and the subagent boundary.",

@@ -119,6 +119,48 @@ def run():
     s.check("and leaves the file byte-identical",
             json.dumps(twice, sort_keys=True), json.dumps(merged, sort_keys=True))
 
+    # ── both permission lists, both directions ─────────────────────────────
+    # `allow` was added after `deny` had been handled by a hand-written block
+    # per direction. A list merged and never unmerged is a rule an uninstall
+    # leaves behind, so the round trip is asserted rather than the addition.
+    mine = {"permissions": {"allow": ["Bash(git status:*)"],
+                            "deny": ["Read(**/secret.txt)"]},
+            "model": "opus"}
+    merged_p, changes_p = install.merge(mine, fragment)
+    for verdict in ("allow", "deny"):
+        shipped = fragment["permissions"][verdict]
+        s.check("every %s rule is installed" % verdict,
+                [r for r in shipped if r in merged_p["permissions"][verdict]],
+                shipped)
+        s.check("the user's own %s rule is kept, and first" % verdict,
+                merged_p["permissions"][verdict][0],
+                mine["permissions"][verdict][0])
+        s.check("the %s addition is reported" % verdict,
+                bool([c for c in changes_p if verdict in c]), True)
+
+    restored, _ = install.unmerge(merged_p, fragment)
+    s.check("uninstall gives the permissions back exactly as they were",
+            json.dumps(restored["permissions"], sort_keys=True),
+            json.dumps(mine["permissions"], sort_keys=True))
+    s.check("and leaves everything else in the file alone",
+            restored.get("model"), "opus")
+
+    # THE CONTROL for the round trip: a settings file that had no `permissions`
+    # key at all must get one back to nothing, rather than an empty husk.
+    bare, _ = install.merge({}, fragment)
+    stripped, _ = install.unmerge(bare, fragment)
+    s.check("a file that had no permissions block is not left with an empty one",
+            "permissions" in stripped, False)
+
+    # `keyless run` must never ship in the allow list: it matches every command
+    # anyone can put after the `--`, so allowing it allows arbitrary execution
+    # rather than allowing this tool. Asserted, because it is the entry a
+    # well-meaning change would add.
+    s.check("no shipped allow rule approves running an arbitrary command",
+            [r for r in fragment["permissions"]["allow"]
+             if "keyless run" in r or "keyless put" in r or "keyless new" in r],
+            [])
+
     # ── never raises on a handler it cannot read ───────────────────────────
     missing = _settings_with("/nonexistent/path/to/forwarder.sh")
     merged_m, _ = install.merge(missing, fragment)

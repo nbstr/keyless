@@ -182,22 +182,52 @@ def merge(settings, fragment):
         existing.extend(groups)
         changes.append("added a %s handler" % event)
 
-    frag_deny = fragment.get("permissions", {}).get("deny", [])
-    if frag_deny:
-        perms = out.setdefault("permissions", {})
-        if not isinstance(perms, dict):
-            sys.stderr.write("REFUSING: `permissions` is not an object.\n")
-            raise SystemExit(2)
-        deny = perms.setdefault("deny", [])
-        if not isinstance(deny, list):
-            sys.stderr.write("REFUSING: `permissions.deny` is not a list.\n")
-            raise SystemExit(2)
-        added = [rule for rule in frag_deny if rule not in deny]
-        deny.extend(added)
-        if added:
-            changes.append("added %d permission deny rule(s)" % len(added))
+    for verdict in PERMISSION_LISTS:
+        _add_rules(out, fragment, verdict, changes)
 
     return out, changes
+
+
+# The permission lists this pack owns, in both directions. One tuple rather than
+# two hand-written blocks per direction: a list added by `merge` and forgotten by
+# `unmerge` is a rule an uninstall leaves behind, which is the failure an
+# uninstaller exists to prevent.
+PERMISSION_LISTS = ("allow", "deny")
+
+
+def _add_rules(out, fragment, verdict, changes):
+    """Merge `permissions.<verdict>` from the fragment into `out`, in place."""
+    rules = fragment.get("permissions", {}).get(verdict, [])
+    if not rules:
+        return
+    perms = out.setdefault("permissions", {})
+    if not isinstance(perms, dict):
+        sys.stderr.write("REFUSING: `permissions` is not an object.\n")
+        raise SystemExit(2)
+    existing = perms.setdefault(verdict, [])
+    if not isinstance(existing, list):
+        sys.stderr.write("REFUSING: `permissions.%s` is not a list.\n" % verdict)
+        raise SystemExit(2)
+    added = [rule for rule in rules if rule not in existing]
+    existing.extend(added)
+    if added:
+        changes.append("added %d permission %s rule(s)" % (len(added), verdict))
+
+
+def _remove_rules(out, fragment, verdict, changes):
+    """Take this pack's `permissions.<verdict>` rules back out, in place."""
+    rules = set(fragment.get("permissions", {}).get(verdict, []))
+    perms = out.get("permissions")
+    if not (isinstance(perms, dict) and isinstance(perms.get(verdict), list)):
+        return
+    kept = [rule for rule in perms[verdict] if rule not in rules]
+    removed = len(perms[verdict]) - len(kept)
+    if removed:
+        changes.append("removed %d permission %s rule(s)" % (removed, verdict))
+    if kept:
+        perms[verdict] = kept
+    else:
+        del perms[verdict]
 
 
 def unmerge(settings, fragment):
@@ -220,19 +250,10 @@ def unmerge(settings, fragment):
         if not hooks:
             del out["hooks"]
 
-    frag_deny = set(fragment.get("permissions", {}).get("deny", []))
-    perms = out.get("permissions")
-    if isinstance(perms, dict) and isinstance(perms.get("deny"), list):
-        kept = [r for r in perms["deny"] if r not in frag_deny]
-        removed = len(perms["deny"]) - len(kept)
-        if removed:
-            changes.append("removed %d permission deny rule(s)" % removed)
-        if kept:
-            perms["deny"] = kept
-        else:
-            del perms["deny"]
-        if not perms:
-            del out["permissions"]
+    for verdict in PERMISSION_LISTS:
+        _remove_rules(out, fragment, verdict, changes)
+    if out.get("permissions") == {}:
+        del out["permissions"]
 
     return out, changes
 
