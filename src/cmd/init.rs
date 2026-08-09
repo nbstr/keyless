@@ -73,7 +73,6 @@
 //! [`crate::store::keychain`]. A modal window with a **Reset To Defaults** button
 //! is not a failure mode a setup command may have.
 
-use std::collections::BTreeMap;
 use std::io::{self, BufRead, Write};
 
 use crate::config::Config;
@@ -154,7 +153,11 @@ pub fn init(
     err: &mut dyn Write,
 ) -> io::Result<i32> {
     let style = request.style;
-    let findings = detect();
+    // The config the rest of this machine reads, so DETECTED describes THIS
+    // machine rather than a hypothetical empty one. `load` never fails: an
+    // absent file gives the defaults, which is what a fresh install is.
+    let loaded = crate::config::Config::load(&request.paths.config);
+    let findings = detect(&loaded.config);
 
     writeln!(
         out,
@@ -165,6 +168,24 @@ pub fn init(
     )?;
 
     heading(out, style, "DETECTED")?;
+    // A file that exists and will not parse is the one case where the rows
+    // below are about the defaults again. Said out loud, because the whole
+    // point of reading the config was that a row must never quietly describe a
+    // machine other than this one.
+    if let Some(problem) = &loaded.problem {
+        row(
+            out,
+            style,
+            Mark::Broken,
+            "config",
+            6,
+            "broken",
+            &format!(
+                "{problem}. Every row below therefore describes a machine with no \
+                 config, not yours."
+            ),
+        )?;
+    }
     let width = findings
         .iter()
         .map(|f| f.store.len())
@@ -514,19 +535,39 @@ fn choose(
 /// safe default.
 const KNOWN: [&str; 3] = ["keychain", "infisical", "proton"];
 
-/// Probe each backend on its own, so one bad one cannot mask another.
+/// Probe each backend on its own, against the config that will actually be used.
 ///
-/// Each candidate is built as the ONLY store in a throwaway config, which is
-/// what makes the answers independent: with several enabled at once an ambiguous
-/// route would decide the outcome of a detection that is supposed to be about
-/// installation.
+/// Each candidate is built as the ONLY store enabled, which is what makes the
+/// answers independent: with several enabled at once an ambiguous route would
+/// decide the outcome of a detection that is supposed to be about installation.
+///
+/// 🚨 **ISOLATING A BACKEND MEANS TURNING THE OTHERS OFF — IT NEVER MEANT
+/// DISCARDING THE COORDINATES.** This built each candidate from a literal
+/// `{"stores": {...}}` string instead, so every probe ran against a config with
+/// no `secrets`, no `project_id` and no `session_dir`. Two consequences, and the
+/// second is worse than the first:
+///
+/// - The rows were FALSE on a configured machine, and `doctor` — same binary,
+///   same file, seconds later — contradicted them. DETECTED said "no Infisical
+///   environment is declared anywhere" about a config declaring four, and
+///   "`stores.proton.session_dir` is not set" about one that sets it.
+/// - Infisical and Proton could therefore never reach `proven`, on ANY machine.
+///   `health_coordinates` needs an `env` off a declared name and `session_dir`
+///   needs the key, and the throwaway config had neither by construction. So
+///   [`choose`] never saw them as usable, and detection could only ever offer
+///   the keychain.
+///
+/// Given the real config, the rows say what this machine can do and agree with
+/// `doctor` because both read the same file. With no config file at all,
+/// `Config::default()` is exactly the old behaviour, so a fresh machine reports
+/// what it always did.
 #[must_use]
-pub fn detect() -> Vec<Finding> {
-    KNOWN.iter().map(|id| probe_one(id)).collect()
+pub fn detect(base: &Config) -> Vec<Finding> {
+    KNOWN.iter().map(|id| probe_one(base, id)).collect()
 }
 
-fn probe_one(id: &'static str) -> Finding {
-    let config: Config = serde_json::from_str(&sole_store(id)).expect("a literal config");
+fn probe_one(base: &Config, id: &'static str) -> Finding {
+    let config = sole_store(base, id);
     let built = store::build(&config, &Invocation::for_verb("init"));
     let Some(store) = built.registry.stores().first() else {
         return Finding {
@@ -571,15 +612,24 @@ fn probe_one(id: &'static str) -> Finding {
     }
 }
 
-/// A config with exactly one backend switched on.
-fn sole_store(id: &str) -> String {
-    let mut flags: BTreeMap<&str, bool> = KNOWN.iter().map(|known| (*known, false)).collect();
-    flags.insert(id, true);
-    let body: Vec<String> = flags
-        .iter()
-        .map(|(name, on)| format!("\"{name}\":{{\"enabled\":{on}}}"))
-        .collect();
-    format!("{{\"stores\":{{{}}}}}", body.join(","))
+/// `base` with exactly one backend switched on, and everything else kept.
+///
+/// The `enabled` flags are the only thing this touches. `secrets`, `policy` and
+/// each backend's own settings are the coordinates a health check needs, and a
+/// probe that drops them reports on a machine nobody has.
+///
+/// The daemon is forced off, and that one IS a discard rather than an
+/// isolation: an enabled daemon suppresses every local backend whatever their
+/// flags say (see [`crate::store::build`]), and this verb's product is which
+/// LOCAL backend an unpinned name should use. Leaving it on would make all
+/// three rows describe the daemon.
+fn sole_store(base: &Config, id: &str) -> Config {
+    let mut config = base.clone();
+    config.stores.daemon.enabled = false;
+    config.stores.keychain.enabled = id == "keychain";
+    config.stores.infisical.enabled = id == "infisical";
+    config.stores.proton.enabled = id == "proton";
+    config
 }
 
 fn proven_detail(id: &str) -> String {
@@ -695,7 +745,9 @@ fn next_steps(
 
 #[cfg(test)]
 mod tests {
-    use super::{EXIT_NEEDS_AN_ANSWER, Finding, InitRequest, KNOWN, init, render, sole_store};
+    use super::{
+        Config, EXIT_NEEDS_AN_ANSWER, Finding, InitRequest, KNOWN, init, render, sole_store,
+    };
     use crate::cmd::status::{Mark, Style};
     use crate::paths::Paths;
     use std::io::Cursor;
@@ -757,10 +809,55 @@ mod tests {
     #[test]
     fn the_detection_config_isolates_one_backend_at_a_time() {
         for id in KNOWN {
-            let config: crate::config::Config =
-                serde_json::from_str(&sole_store(id)).expect("valid");
-            let on = crate::store::enabled_stores(&config);
+            let on = crate::store::enabled_stores(&sole_store(&Config::default(), id));
             assert_eq!(on, vec![id], "detecting `{id}` enabled {on:?}");
+        }
+    }
+
+    #[test]
+    fn isolating_a_backend_keeps_every_coordinate_the_probe_needs() {
+        // The defect: isolation was performed by BUILDING a config from a
+        // literal string rather than by switching flags on the real one, so
+        // every probe ran with no `secrets`, no `project_id` and no
+        // `session_dir`. Infisical's health check reads an `env` off a declared
+        // name and Proton's reads `session_dir`, so both reported a fault that
+        // was an artefact of the probe — and `doctor`, reading the same file,
+        // contradicted them minutes later.
+        let mine: Config = serde_json::from_str(
+            r#"{"stores":{"infisical":{"project_id":"proj-abc"},
+                          "proton":{"session_dir":"/tmp/session"}},
+                "secrets":{"DATABASE_URL":{"store":"infisical","env":"staging"}}}"#,
+        )
+        .expect("valid");
+
+        for id in KNOWN {
+            let probed = sole_store(&mine, id);
+            assert_eq!(
+                probed.stores.infisical.project_id.as_deref(),
+                Some("proj-abc"),
+                "probing `{id}` dropped the Infisical project"
+            );
+            assert!(
+                probed.stores.proton.session_dir.is_some(),
+                "probing `{id}` dropped the Proton session directory"
+            );
+            assert!(
+                probed.secrets.contains_key("DATABASE_URL"),
+                "probing `{id}` dropped the declared names, so no `env` can be found"
+            );
+        }
+    }
+
+    #[test]
+    fn an_enabled_daemon_never_answers_for_a_local_backend() {
+        // The one thing isolation must genuinely discard. An enabled daemon
+        // suppresses every local backend whatever its flag says, so leaving it
+        // on would make all three DETECTED rows describe the daemon.
+        let mut with_daemon = Config::default();
+        with_daemon.stores.daemon.enabled = true;
+        for id in KNOWN {
+            let on = crate::store::enabled_stores(&sole_store(&with_daemon, id));
+            assert_eq!(on, vec![id], "the daemon answered for `{id}`");
         }
     }
 
