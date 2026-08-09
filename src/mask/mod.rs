@@ -28,7 +28,7 @@ pub mod encodings;
 use std::io::{self, ErrorKind, Read, Write};
 use std::sync::Arc;
 
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::secret::Secret;
 
@@ -40,17 +40,25 @@ use crate::secret::Secret;
 pub const MIN_NEEDLE_LEN: usize = 4;
 
 struct Needle {
-    bytes: Vec<u8>,
+    /// A needle is a *derived* form of the plaintext and just as sensitive, so
+    /// the buffer scrubs itself when it is dropped.
+    ///
+    /// The scrub lives in the **type**, not in a `Drop` body written here. A
+    /// hand-written destructor is one edit away from being emptied, and nothing
+    /// in a test suite notices an empty destructor — the observable behaviour of
+    /// this struct is identical either way. Declaring the field as a type that
+    /// cannot exist without the scrub moves the guarantee somewhere an edit to
+    /// this file cannot reach.
+    bytes: Zeroizing<Vec<u8>>,
     /// Pre-rendered `[keyless:NAME]`, shared between the needles of one secret.
     replacement: Arc<str>,
 }
 
-impl Drop for Needle {
-    fn drop(&mut self) {
-        // A needle is a *derived* form of the plaintext and just as sensitive.
-        self.bytes.zeroize();
-    }
-}
+/// Compile-time proof of the paragraph above, bound to the actual field.
+const _: fn(&Needle) = |needle| {
+    fn scrubs_on_drop<T: zeroize::ZeroizeOnDrop + ?Sized>(_: &T) {}
+    scrubs_on_drop(&needle.bytes);
+};
 
 /// A compiled set of byte patterns to redact.
 ///
@@ -58,9 +66,13 @@ impl Drop for Needle {
 #[derive(Default)]
 pub struct Masker {
     needles: Vec<Needle>,
-    /// Bucketed by first byte so a scan touches only plausible needles. Each
-    /// bucket is ordered longest-first, which is what makes the longest match
-    /// win at a given position.
+    /// Bucketed by first byte so a scan touches only plausible needles.
+    ///
+    /// The order **within** a bucket carries no meaning. It used to: the bucket
+    /// was sorted longest-first and [`Masker::match_at`] took the first hit, so
+    /// the sort was the only thing making the longest match win. See that
+    /// method for why an invariant spread across two functions was the wrong
+    /// place to keep it.
     buckets: Vec<Vec<usize>>,
     max_len: usize,
 }
@@ -103,35 +115,33 @@ impl Masker {
         }
         let replacement: Arc<str> = Arc::from(format!("[{}:{}]", crate::NAME, name).as_str());
         for (_, rendered) in encodings::variants(secret.expose()) {
-            let bytes = rendered.into_bytes();
-            if bytes.len() < MIN_NEEDLE_LEN {
+            // Both rejections are decided on the rendering, which scrubs itself
+            // when this iteration ends. Copying first and rejecting afterwards
+            // left a plain `Vec<u8>` holding a derived form of the plaintext to
+            // be freed unscrubbed, once per rejected variant.
+            let candidate: &[u8] = rendered.as_bytes();
+            if candidate.len() < MIN_NEEDLE_LEN {
                 continue;
             }
-            if self.needles.iter().any(|n| n.bytes == bytes) {
+            if self.needles.iter().any(|n| n.bytes.as_slice() == candidate) {
                 continue;
             }
-            self.max_len = self.max_len.max(bytes.len());
+            self.max_len = self.max_len.max(candidate.len());
             self.needles.push(Needle {
-                bytes,
+                bytes: Zeroizing::new(candidate.to_vec()),
                 replacement: Arc::clone(&replacement),
             });
         }
     }
 
     /// Build the first-byte index. Idempotent.
+    ///
+    /// A bucket is a *set*. Nothing downstream reads the order of one, so there
+    /// is no order to establish here and none to get wrong.
     pub fn finish_build(&mut self) {
         let mut buckets: Vec<Vec<usize>> = vec![Vec::new(); 256];
-        let mut order: Vec<usize> = (0..self.needles.len()).collect();
-        // Longest first: at a given position the longest match must win, or a
-        // `0x`-prefixed hex value would be masked leaving its `0x` behind.
-        order.sort_by(|&a, &b| {
-            self.needles[b]
-                .bytes
-                .len()
-                .cmp(&self.needles[a].bytes.len())
-        });
-        for index in order {
-            if let Some(&first) = self.needles[index].bytes.first() {
+        for (index, needle) in self.needles.iter().enumerate() {
+            if let Some(&first) = needle.bytes.first() {
                 buckets[usize::from(first)].push(index);
             }
         }
@@ -200,13 +210,32 @@ impl Masker {
         })
     }
 
+    /// The needle to replace at `at`: the **longest** one that matches there.
+    ///
+    /// Longest wins, or a `0x`-prefixed hex value is masked leaving its `0x`
+    /// behind, and — far worse — a declared value that is a prefix of another
+    /// declared value swallows only the prefix and prints the remainder of the
+    /// longer secret in clear.
+    ///
+    /// That rule is enforced *here*, by asking for the longest match. It used to
+    /// live in [`Masker::finish_build`], as a sort that put the longest needle
+    /// first so that taking the first hit happened to take the longest one. An
+    /// invariant held jointly by a sort in one function and an iterator adaptor
+    /// in another is an invariant nothing owns: reversing that sort left the
+    /// whole suite green and made the binary leak. Order-independence is not a
+    /// tidier way to state the same guarantee — it deletes the way to break it.
+    ///
+    /// There is no tie to break. [`Masker::add`] drops a needle whose bytes are
+    /// already present, so two needles of equal length cannot both match at one
+    /// position: matching there with the same length means being the same bytes.
     fn match_at(&self, buf: &[u8], at: usize) -> Option<usize> {
         let first = *buf.get(at)?;
         let bucket = self.buckets.get(usize::from(first))?;
         bucket
             .iter()
             .copied()
-            .find(|&index| buf[at..].starts_with(&self.needles[index].bytes))
+            .filter(|&index| buf[at..].starts_with(&self.needles[index].bytes))
+            .max_by_key(|&index| self.needles[index].bytes.len())
     }
 
     /// Redact `buf`, emitting only the bytes it is safe to release.
@@ -390,11 +419,100 @@ mod tests {
     }
 
     #[test]
-    fn longest_match_wins_so_the_0x_prefix_goes_too() {
+    fn the_0x_prefixed_hex_form_is_a_needle_of_its_own() {
+        // The `0x` disappears because the prefixed form is compiled as a whole
+        // needle, not because anything chose between two candidates: `0x…` and
+        // the raw value begin with different bytes, so they are indexed under
+        // different first bytes and never compete. This test was once named for
+        // the longest-match rule and could not exercise it; the rule is checked
+        // by the test below, where the two forms DO compete.
         let masker = masker_for("decoy-value-1234");
         let hex = super::encodings::Encoding::HexPrefixedLower.encode("decoy-value-1234");
         let masked = stream(&masker, &[hex.as_bytes()]);
         assert_eq!(masked, "[keyless:DECOY]");
+    }
+
+    #[test]
+    fn one_secret_being_a_prefix_of_another_does_not_leak_the_remainder() {
+        // The failure this guards is total, not cosmetic: choose the SHORTER of
+        // two competing needles and the tail of the longer secret is printed in
+        // clear, with a mask token in front of it making the line look handled.
+        const SHORT: &str = "decoy-prefix-collision-11111";
+        const LONG: &str = "decoy-prefix-collision-11111-and-the-tail-in-clear";
+
+        // The fixture, asserted rather than assumed. Both conditions are needed
+        // for the two needles to compete at one position, and a fixture that
+        // quietly stopped meeting them would leave a test that passes for no
+        // reason — which is exactly how this rule went unguarded.
+        assert!(LONG.starts_with(SHORT), "one must be a prefix of the other");
+        assert_eq!(
+            SHORT.as_bytes()[0],
+            LONG.as_bytes()[0],
+            "sharing a first byte is what puts them in one bucket"
+        );
+
+        let short = Secret::new(SHORT.to_owned());
+        let long = Secret::new(LONG.to_owned());
+        let masker = Arc::new(Masker::from_secrets([("SHORT", &short), ("LONG", &long)]));
+
+        let masked = stream(&masker, &[format!("token={LONG} end").as_bytes()]);
+        assert_eq!(masked, "token=[keyless:LONG] end");
+        assert!(
+            !masked.contains("-and-the-tail-in-clear"),
+            "the longer secret's tail survived masking: {masked:?}"
+        );
+    }
+
+    #[test]
+    fn pump_releases_the_carry_at_the_end_of_the_stream() {
+        // A child's last bytes live in the carry until something declares the
+        // stream over. `pump` owns that declaration, and dropping it truncates
+        // the output silently — no error, no short write, just missing text.
+        let value = "decoy-pump-finish-value-13579";
+        let masker = masker_for(value);
+        let tail = &value[..12];
+        let source = format!("a={value} tail={tail}");
+
+        // Not vacuous: while the stream is open those trailing bytes are still
+        // withheld, because they could yet grow into a match. So they can only
+        // appear below if the end of the stream was actually announced.
+        assert_eq!(
+            seen_so_far(&masker, &[source.as_bytes()]),
+            "a=[keyless:DECOY] tail="
+        );
+
+        let mut sink: Vec<u8> = Vec::new();
+        super::pump(source.as_bytes(), &mut sink, Arc::clone(&masker))
+            .expect("pump over a Vec cannot fail");
+        assert_eq!(
+            String::from_utf8_lossy(&sink),
+            format!("a=[keyless:DECOY] tail={tail}")
+        );
+    }
+
+    #[test]
+    fn a_needle_buffer_reaches_the_allocator_scrubbed() {
+        // A needle holds a derived form of the plaintext for as long as the
+        // masker lives. This watches the raw form's buffer at the one instant
+        // the guarantee is decidable — see `secret::scrub_probe`.
+        const PLAINTEXT: &str = "decoy-needle-scrub-value-2468";
+        let state = crate::secret::scrub_probe::released_state(
+            || {
+                let secret = Secret::new(PLAINTEXT.to_owned());
+                Masker::from_secrets([("DECOY", &secret)])
+            },
+            |masker: &Masker| {
+                masker
+                    .needles
+                    .iter()
+                    .find(|needle| needle.bytes.as_slice() == PLAINTEXT.as_bytes())
+                    .expect("the raw form is always compiled as a needle")
+                    .bytes
+                    .as_slice()
+            },
+            PLAINTEXT.as_bytes(),
+        );
+        assert_eq!(state, crate::secret::scrub_probe::Released::Scrubbed);
     }
 
     #[test]

@@ -27,6 +27,19 @@
 //! These are accepted limits, written down rather than papered over. The threat
 //! model is a competent agent taking a shortcut, not an adversary; an adversary
 //! defeats masking in three tokens with `sh -c 'echo $TOKEN > /tmp/x'`.
+//!
+//! # Every buffer here is allocated once
+//!
+//! A `String` that outgrows its capacity copies itself to a new address and
+//! frees the old one, and nothing scrubs a buffer that a `Vec` has already
+//! abandoned — `zeroize`'s own documentation says so. So every encoder below
+//! reserves a capacity it provably cannot exceed *before* the first byte of the
+//! secret is written into it. The two hand-rolled escapers use an upper bound
+//! rather than an exact count, which costs a few unused bytes and removes the
+//! reallocation entirely; the spare bytes are scrubbed along with the rest,
+//! because `Zeroizing` zeroes a buffer's whole capacity.
+
+use zeroize::Zeroizing;
 
 /// A representation a secret can take on its way to a terminal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -152,8 +165,8 @@ impl Encoding {
             Encoding::Base32NoPad => base32(bytes, false),
             Encoding::HexLower => hex_lower(bytes),
             Encoding::HexUpper => hex_upper(bytes),
-            Encoding::HexPrefixedLower => format!("0x{}", hex_lower(bytes)),
-            Encoding::HexPrefixedUpper => format!("0x{}", hex_upper(bytes)),
+            Encoding::HexPrefixedLower => hex_prefixed(bytes, HEX_LOWER),
+            Encoding::HexPrefixedUpper => hex_prefixed(bytes, HEX_UPPER),
             Encoding::UrlQuery => url_escape(bytes, UrlMode::Query),
             Encoding::UrlPath => url_escape(bytes, UrlMode::Path),
             Encoding::UrlStrict => url_escape(bytes, UrlMode::Strict),
@@ -170,16 +183,24 @@ impl Encoding {
 /// Duplicates are dropped: for a value with no letters, `raw`, `lowercase` and
 /// `uppercase` collapse to one needle, and there is no point scanning for the
 /// same bytes three times.
+///
+/// Every rendering is a **derived form of the plaintext** and exactly as
+/// sensitive as the plaintext. So each one is wrapped in [`Zeroizing`], which
+/// covers the duplicates too: a rendering that loses the comparison below is
+/// dropped here, and dropping it scrubs it. The vector once carried a second,
+/// cloned copy of every rendering to answer that comparison; the comparison now
+/// reads the vector it is building, so that copy no longer exists to leak.
 #[must_use]
-pub fn variants(value: &str) -> Vec<(Encoding, String)> {
-    let mut seen: Vec<String> = Vec::with_capacity(ALL.len());
-    let mut out = Vec::with_capacity(ALL.len());
+pub fn variants(value: &str) -> Vec<(Encoding, Zeroizing<String>)> {
+    let mut out: Vec<(Encoding, Zeroizing<String>)> = Vec::with_capacity(ALL.len());
     for &encoding in ALL {
-        let rendered = encoding.encode(value);
-        if seen.iter().any(|existing| existing == &rendered) {
+        let rendered = Zeroizing::new(encoding.encode(value));
+        if out
+            .iter()
+            .any(|(_, existing)| existing.as_str() == rendered.as_str())
+        {
             continue;
         }
-        seen.push(rendered.clone());
         out.push((encoding, rendered));
     }
     out
@@ -245,11 +266,27 @@ pub fn hex_upper(data: &[u8]) -> String {
 
 fn hex_with(data: &[u8], table: &[u8; 16]) -> String {
     let mut out = String::with_capacity(data.len() * 2);
+    push_hex(&mut out, data, table);
+    out
+}
+
+/// `0x` followed by the hex digits, built in one allocation.
+///
+/// `format!("0x{}", hex_with(..))` produced the same string and two buffers: the
+/// inner one held the whole value in hex and was freed unscrubbed, and the outer
+/// one grew from empty, abandoning partial copies as it went.
+fn hex_prefixed(data: &[u8], table: &[u8; 16]) -> String {
+    let mut out = String::with_capacity(2 + data.len() * 2);
+    out.push_str("0x");
+    push_hex(&mut out, data, table);
+    out
+}
+
+fn push_hex(out: &mut String, data: &[u8], table: &[u8; 16]) {
     for byte in data {
         out.push(table[usize::from(byte >> 4)] as char);
         out.push(table[usize::from(byte & 0x0f)] as char);
     }
-    out
 }
 
 #[derive(Clone, Copy)]
@@ -260,7 +297,9 @@ enum UrlMode {
 }
 
 fn url_escape(data: &[u8], mode: UrlMode) -> String {
-    let mut out = String::with_capacity(data.len());
+    // A byte becomes at most `%XX`. Reserving the ceiling means the buffer holding
+    // the escaped secret is never reallocated, so no copy of it is abandoned.
+    let mut out = String::with_capacity(data.len() * 3);
     for &byte in data {
         let unreserved = byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~');
         let literal = match mode {
@@ -296,7 +335,11 @@ enum JsonMode {
 /// the same value inside a concatenated log line, whereas the bare escaped body
 /// matches in both places.
 fn json_escape(value: &str, mode: JsonMode) -> String {
-    let mut out = String::with_capacity(value.len() + 8);
+    // The worst case is a one-byte character becoming `\uXXXX`, so six times the
+    // input length is an upper bound and no reallocation can occur. It also
+    // covers a character outside the BMP, which becomes a twelve-byte surrogate
+    // pair from four input bytes.
+    let mut out = String::with_capacity(value.len() * 6);
     for ch in value.chars() {
         match ch {
             '"' => out.push_str("\\\""),
@@ -440,7 +483,10 @@ mod tests {
     fn variants_deduplicate_identical_renderings() {
         // A digit-only value renders identically as raw, lowercase and uppercase.
         let rendered = variants("12345678");
-        let raws = rendered.iter().filter(|(_, v)| v == "12345678").count();
+        let raws = rendered
+            .iter()
+            .filter(|(_, v)| v.as_str() == "12345678")
+            .count();
         assert_eq!(raws, 1);
     }
 }
