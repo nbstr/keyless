@@ -176,8 +176,16 @@ jobs:
             # The Proton live suite, and nothing else.
             ignored: 15
     steps:
+      # `fetch-depth: 0` is load-bearing here for the same reason it is in the
+      # hooks job below: `tests/publication.rs` runs its three grammars over
+      # every blob any ref can reach, and a depth-1 checkout hands that walk one
+      # commit. One commit with nothing to flag reads exactly like a clean
+      # history. The walk REFUSES a shallow checkout rather than reading it as
+      # clean, so dropping this line turns the job red rather than quiet.
       - name: Checkout
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
 
       - name: Install the pinned toolchain
         run: |
