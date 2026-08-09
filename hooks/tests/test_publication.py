@@ -28,12 +28,22 @@ fails, and so does the next one, whatever it counts and whoever writes it. A
 number carrying a UNIT, a VERSION or a DATE is exempt, because those describe the
 product or its environment rather than a population that was counted.
 
-Two directions are asserted, because a scanner that quietly stopped matching
+Both directions are asserted, because a scanner that quietly stopped matching
 would report a clean tree exactly like a clean tree does:
 
     the tree is clean            no prose in hooks/ carries a census claim
     a planted claim is caught    each of six shapes, one per real site scrubbed
     the exemptions are real      a unit, a version and a date each survive
+
+**Commit messages are scanned here too, and they are the surface every other
+guard in this repository is blind to.** The Rust guard next door reads `src/`,
+`tests/`, `hooks/`, `site/` and the README; nothing read a commit body, and five
+messages in this history carry a transcript total, a corpus size or a
+keychain-item count. A commit body is prose, and this is the only prose grammar
+in the repository — a second copy in Rust would be two graders that drift apart.
+See `KNOWN_UNSCRUBBED` for the ratchet that empties as the queued history
+rewrite lands, and `check_message_file` for the same grammar as a `commit-msg`
+hook body, which stops the next one being written at all.
 
 `PROVENANCE` is deliberately the list somebody has to extend. Adding a word is
 free; adding a NUMBER next to one is the moment a person has to answer out loud
@@ -42,6 +52,7 @@ whether they are describing the product or their own machine.
 
 import os
 import re
+import subprocess
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -49,6 +60,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from harness import Suite  # noqa: E402
 
 HOOKS = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+REPO = os.path.dirname(HOOKS)
 
 # Words that turn a number into a claim about an observed population. Each one
 # below is taken from a site that was really scrubbed out of this pack.
@@ -94,10 +106,20 @@ WINDOW = 160
 # pattern. There is no unit for "commands I have seen".
 _UNITS = (r"ms|milliseconds?|s|seconds?|minutes?|KB|MB|GB|bytes?|characters?|"
           r"chars?|lines?|x|%|columns?|deep|levels?")
+#
+#   exit code `exit 127`, `exits 1`, `exit code 0`
+#
+# An exit code is a protocol constant, exactly like a unit: 127 is what a shell
+# returns when it cannot find a command, and it means the same thing on every
+# machine. It earned its place by measurement rather than by taste — over this
+# repository's own commit messages it is the ONLY false positive the provenance
+# rule produced, from a sentence reading `exit 127 with no child at all — which
+# on a machine running twenty concurrent sessions`.
 _EXEMPT = re.compile(
     r"\d{4}-\d{2}-\d{2}"                        # a date
     r"|\d[\d,]*\.\d+(?:\.\d+)*"                 # a version
     r"|\bPython\s*\d[\d.]*"                     # `Python 3.6`
+    r"|\bexits?(?:\s+code|\s+status|ed)?\s+\d+" # an exit code
     r"|\+?\d[\d,]*(?:\.\d+)?\s*(?:" + _UNITS + r")\b")   # a number with a unit
 
 # A number that could be a census claim near a provenance word: two digits or
@@ -276,15 +298,34 @@ def prose_of(text, path):
     return units
 
 
-def census_claims(text):
-    """Every (number, provenance word) pair standing within WINDOW of each other."""
+def census_claims(text, ratios=True):
+    """Every (number, provenance word) pair standing within WINDOW of each other.
+
+    `ratios=False` drops the bare-ratio rule and keeps the provenance rule.
+
+    ⚠️ THAT SWITCH IS A MEASUREMENT, NOT A PREFERENCE, and turning it back on
+    for commit messages would delete this gate within a week. The ratio rule
+    earns its keep over `hooks/` prose, where a ratio of two measured integers
+    is always somebody's machine. A commit BODY is a different genre: it reports
+    what a change did to a test suite, and that is naturally written as a ratio
+    of two product counts. Measured over this repository's own 29 messages, the
+    rule fired five times and every one was a product count — `14 of 14`,
+    `13 of 13`, `71 of 71`, `64 of the 464 tests`, `0 of 415 tests run there`.
+    Five for five is not a threshold worth tuning; it is the wrong rule for the
+    genre.
+
+    The provenance rule alone flags five messages over the same history, and all
+    five are real: transcript totals, corpus sizes, a keychain-item count. So
+    dropping the ratio rule costs nothing measurable here and buys a gate whose
+    refusals a person will believe.
+    """
     found = []
     exempt = list(_EXEMPT.finditer(text))
 
     def _is_exempt(m):
         return any(e.start() <= m.start() and m.end() <= e.end() for e in exempt)
 
-    for m in _RATIO.finditer(text):
+    for m in _RATIO.finditer(text) if ratios else []:
         if not _is_exempt(m):
             found.append((m.group(0), "a ratio in figures"))
 
@@ -327,12 +368,128 @@ def census_claims(text):
 SELF = os.path.join("tests", "test_publication.py")
 
 
-def claims_in(units):
+def claims_in(units, ratios=True):
     """Every census claim, searched WITHIN each unit and never across two."""
     found = []
     for unit in _clean(units):
-        found.extend(census_claims(unit))
+        found.extend(census_claims(unit, ratios=ratios))
     return found
+
+
+# ── commit messages ─────────────────────────────────────────────────────────
+#
+# A commit message publishes exactly as much as a source file does, and nothing
+# else in this repository reads one. The Rust guard next door scans `src/`,
+# `tests/`, `hooks/`, `site/` and the README for store coordinates and for prose
+# about the author's own machine — and every one of its checks was green while
+# five messages in this history carried a transcript total, a corpus size and a
+# keychain-item count.
+#
+# The gate lives HERE rather than in Rust because a commit body is PROSE, and
+# this file already owns the only prose grammar in the repository, with its
+# plants, its exemptions and its false-positive controls. A second copy in Rust
+# would be two graders that drift apart, and the one that drifts is always the
+# one nobody is reading.
+
+
+def _git(*args):
+    """Run git in the repository, or return None if that is not possible."""
+    try:
+        done = subprocess.run(("git", "-C", REPO) + args,
+                              capture_output=True, text=True)
+    except (OSError, ValueError):
+        return None
+    return done.stdout if done.returncode == 0 else None
+
+
+def is_this_repository():
+    """True when REPO is the keyless checkout, not some host repo.
+
+    `hooks/` installs into other repositories, and its suite can be run from
+    there. Scanning THAT repository's commit messages would refuse work this
+    gate has no standing to judge — the exact way a gate earns its removal.
+    """
+    manifest = os.path.join(REPO, "Cargo.toml")
+    if not os.path.exists(manifest) or _git("rev-parse", "--git-dir") is None:
+        return False
+    with open(manifest, errors="replace") as fh:
+        return 'name = "keyless"' in fh.read()
+
+
+def commit_messages():
+    """[(sha, body)] for every commit reachable from HEAD, newest first."""
+    raw = _git("log", "--format=%H%x1e%B%x1f")
+    if raw is None:
+        return []
+    out = []
+    for record in raw.split("\x1f"):
+        record = record.strip()
+        if record:
+            sha, body = record.split("\x1e", 1)
+            out.append((sha, body))
+    return out
+
+
+def claims_in_message(body):
+    """Every census claim in one commit body.
+
+    A blank line separates paragraphs in a commit body the way it does in prose,
+    so a paragraph is the unit — the same choice `prose_of` makes, and for the
+    same reason: a number and the word that makes it an observation have to be
+    in the same piece of writing.
+    """
+    return claims_in(body.split("\n\n"), ratios=False)
+
+
+# The commits whose messages were written before this gate existed, and which
+# the queued history rewrite replaces.
+#
+# ⚠️ THIS LIST IS A RATCHET AND IT IS CHECKED IN BOTH DIRECTIONS. A commit that
+# is not on it and carries a claim fails the gate. A commit that IS on it and no
+# longer carries one — or whose sha is no longer reachable, which is what a
+# history rewrite does to every sha below — ALSO fails the gate. So the list
+# cannot rot into a permanent exemption, and whoever rewrites the history is
+# told, by a red test, to empty it.
+#
+# It holds shas and nothing else. Naming the figures here in order to forgive
+# them would republish the inventory this file exists to remove, which is the
+# same reason the Rust guard next door is an allowlist of decoys.
+KNOWN_UNSCRUBBED = [
+    "2d2efd9dc877fd766e22392309dec344bbcfdb22",
+    "b055488df8df75adda40492e61c47588f3728d88",
+    "9d2b88efcbbfdba9be9e5f9459f2c36863edb5d3",
+    "cee8f6b3ec3fc3de0916353500f9f4890641b238",
+    "7e935af6da4ddab2a9cccb8e012467adb9a6e9dc",
+]
+
+# One planted message per shape that was really written into this history.
+# Invented magnitudes, for the reason PLANTS gives above.
+MESSAGE_PLANTS = [
+    "replayed over 12,345 real agent commands, the check admits three more shapes",
+    "the decision log shows 47 organic denies across 9 sessions",
+    "an estate of 415 files, 12 of them credential-bearing",
+    "measured over the corpus: 2,569 payloads, 70 of them rewritten",
+]
+
+# What a commit body legitimately says, and must never be refused for saying.
+#
+# The last entry is TWO PARAGRAPHS and it is the one that proves the search
+# scope. Its number and its provenance word are in different paragraphs, so
+# paragraph-by-paragraph they are two ordinary sentences — and joined into one
+# string they stand 40 characters apart and read as a measurement nobody wrote.
+# A commit body is the genre where that is most likely: a subject line carries a
+# count, and a paragraph far below happens to say "sessions".
+MESSAGE_EXEMPT = [
+    "the suite is 509 tests and 15 ignored on both platforms",
+    "a missing binary makes the wrapper exit 127 with no child, in every session",
+    "measured against infisical 0.43.114 on 2026-08-06",
+    "the drain is bounded at 100 KB and costs +6 ms",
+    "14 of 14 required contexts reported, and 13 of 13 claims corrected",
+    # ⚠️ The number here must carry NO UNIT. `200 lines` was the first spelling
+    # and it is exempt as a number-with-a-unit, so the control could never fire
+    # in either direction — a fixture that reads exactly like a passing one.
+    "the retry budget is now 200.\n\nSessions that share one log are unaffected.",
+]
 
 
 def scan_tree(include_self=False):
@@ -480,9 +637,100 @@ def run():
     s.check("a wrapped census claim is still caught",
             bool(claims_in(prose_of(wrapped, "x.py"))), True)
 
+    # ── direction 7: no commit message carries a census claim ───────────────
+    _check_commit_messages(s)
+
     return s
 
 
+def _check_commit_messages(s):
+    # ⚠️ WHAT THE MUTATION CAMPAIGN CANNOT REACH, said here so its green is never
+    # read as covering it. `mutate.py` copies `hooks/` ALONE into a temporary
+    # directory and runs the suite from there, so `REPO` is that temporary
+    # directory, `is_this_repository()` is always False under mutation, and every
+    # assertion below the early return is skipped. Breaking one of them on
+    # purpose produces a SURVIVING mutant that is really an unreachable one.
+    #
+    # The grammar half is deliberately placed ABOVE that gate for exactly this
+    # reason, so the part a mutation can reach is the part that decides what
+    # counts as a claim. The tree-scanning half is proved instead against a real
+    # clone with history: a new commit carrying a figure fails the walk, a sha
+    # removed from KNOWN_UNSCRUBBED fails it, an unreachable sha on the list
+    # fails it, and a shallow checkout fails it rather than reading as clean.
+    #
+    # The scanner is proved FIRST and unconditionally, so that a checkout with
+    # no readable history can never leave the grammar untested. A gate whose
+    # only evidence is "the tree came back empty" is the failure this whole file
+    # exists to prevent.
+    for text in MESSAGE_PLANTS:
+        s.check("message plant is caught: %s" % text[:40],
+                bool(claims_in_message(text)), True)
+    for text in MESSAGE_EXEMPT:
+        s.check("message exempt survives: %s" % text[:40],
+                claims_in_message(text), [])
+
+    if not is_this_repository():
+        # Not a silent skip: a visible row saying which repository was judged.
+        # `hooks/` installs elsewhere, and refusing another project's commit
+        # messages would be a gate acting outside its standing.
+        s.check("the history gate applies only in the keyless checkout",
+                True, True)
+        return
+
+    # A shallow clone reads exactly like a clean history: one commit, nothing
+    # to flag, exit 0. CI checks out with `fetch-depth: 0` for this reason, and
+    # this turns a missing depth into a failure instead of a green line.
+    s.check("the checkout is not shallow",
+            (_git("rev-parse", "--is-shallow-repository") or "").strip(),
+            "false")
+
+    messages = commit_messages()
+    s.check("the history walk reads a substantial number of commits",
+            len(messages) >= 25, True)
+
+    known = set(KNOWN_UNSCRUBBED)
+    reachable = set(sha for sha, _ in messages)
+    flagged = set(sha for sha, body in messages if claims_in_message(body))
+
+    s.check("no commit message outside the known-unscrubbed set carries a claim",
+            sorted(sha[:12] for sha in flagged - known), [])
+    for sha, body in messages:
+        if sha in flagged and sha not in known:
+            for number, word in claims_in_message(body)[:6]:
+                sys.stderr.write("      census claim  %s: %r near %r\n"
+                                 % (sha[:12], number, word))
+
+    # The two directions that stop the list becoming a permanent exemption.
+    s.check("every known-unscrubbed sha is still reachable",
+            sorted(sha[:12] for sha in known - reachable), [])
+    s.check("every known-unscrubbed sha still carries a claim",
+            sorted(sha[:12] for sha in (known & reachable) - flagged), [])
+
+
+def check_message_file(path):
+    """Judge one commit message file. A `commit-msg` hook body.
+
+    Exit 0 when the message is clean, 1 when it carries a census claim. Prints
+    the claim's shape, never a value.
+    """
+    with open(path, errors="replace") as fh:
+        body = "\n".join(line for line in fh.read().split("\n")
+                         if not line.startswith("#"))
+    hits = claims_in_message(body)
+    if not hits:
+        return 0
+    sys.stderr.write(
+        "\nThis commit message states a measurement of one machine or account:\n")
+    for number, word in hits:
+        sys.stderr.write("  %r stands near %r\n" % (number, word))
+    sys.stderr.write(
+        "\nA figure nobody else can reproduce is an inventory, not evidence. Keep the\n"
+        "reasoning and drop the number, or say what the number is a property OF.\n")
+    return 1
+
+
 if __name__ == "__main__":
+    if len(sys.argv) == 3 and sys.argv[1] == "--message-file":
+        raise SystemExit(check_message_file(sys.argv[2]))
     ok = run().report()
     raise SystemExit(0 if ok else 1)

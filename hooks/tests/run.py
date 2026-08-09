@@ -34,7 +34,7 @@ MIN_CHECKS = {
     "test_install": 8,
     "test_latency": 4,
     "test_latency_controls": 10,
-    "test_publication": 18,
+    "test_publication": 30,
 }
 
 

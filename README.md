@@ -1486,7 +1486,7 @@ There are no `TODO` comments in the source. Work is either done or listed here.
 ## Development
 
 ```console
-cargo test                              # 464 pass, 15 ignored (the live Proton suite)
+cargo test                              # 518 pass, 15 ignored (the live Proton suite)
 cargo clippy --all-targets -- -D warnings
 cargo fmt --check
 ```
@@ -1500,6 +1500,24 @@ against fixed inputs, and `python3 hooks/tests/mutate.py` breaks each check on
 purpose and requires every breakage to be caught. Both print their own counts —
 this document deliberately does not restate one, because a count copied into
 prose goes stale the next time a check is added.
+
+Two guards police what this repository publishes about the person who wrote it.
+`tests/publication.rs` refuses a vault, item, account or service name that is
+not an allowlisted decoy, any prose that makes a claim about the machine it was
+written on, and any wall-clock instant that is not an obvious fixture — across
+every published file, not only the Rust sources. The publication layer of the
+hook suite refuses a number standing next to a word that makes it a measurement
+of one machine, in `hooks/` prose **and in commit messages**. Install the
+matching `commit-msg` hook so the second one fires before the message is written,
+which is the only point at which it can still be edited:
+
+```console
+ln -sf ../../install/commit-msg.sh .git/hooks/commit-msg
+```
+
+Who built it stays. What is inside their machine does not: the copyright, the
+author and the reasoning are identity, and a count only they can reproduce is an
+inventory.
 
 No test reads a real credential, and no test reaches a real vault. All three
 backends are exercised against shell stubs — `security find-generic-password` is
