@@ -44,6 +44,7 @@ nix = { version = "0.31", features = [
     "ioctl",   # TIOCGWINSZ / TIOCSWINSZ / TIOCSCTTY
     "poll",    # waking the stdin relay so it can be joined rather than leaked
     "pthread", # pthread_kill: the shutdown wake must reach ONE thread
+    "fs",      # fcntl(F_SETFL, O_NONBLOCK) on the pipe a credential is written to
 ] }
 
 [dev-dependencies]
