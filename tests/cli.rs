@@ -709,7 +709,13 @@ fn doctor_reports_a_healthy_setup_and_leaks_nothing() {
     let report = stdout_of(&output);
     assert!(report.contains("chain intact"), "report: {report}");
     assert!(report.contains("store    keychain ok"), "report: {report}");
-    assert!(report.contains("name     DECOY ok"), "report: {report}");
+    assert!(
+        report.contains("name     DECOY resolves"),
+        "report: {report}"
+    );
+    // The boundary line rides with every report, so no reader takes a resolving
+    // name for a credential whose scope somebody checked.
+    assert!(report.contains("scope    not checked"), "report: {report}");
     assert!(
         !report.contains(DECOY_VALUE),
         "doctor leaked a value: {report}"

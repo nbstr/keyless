@@ -153,10 +153,24 @@ store    keychain ok
 0 problem(s). A problem here degrades a run; it never blocks one.
 ```
 
-`doctor --probe` additionally asks each name whether it resolves, printing `ok`
-or `missing` — never a value, and never a length, because a length is still
-information about a secret. It may trigger a keychain access prompt, which a
-plain `doctor` does not.
+`doctor --probe` additionally asks each name whether it **resolves**, printing
+`resolves` or `missing` — never a value, and never a length, because a length is
+still information about a secret. It may trigger a keychain access prompt, which
+a plain `doctor` does not.
+
+`resolves` is deliberately not `ok`. It is a verdict on the lookup, not on the
+credential: an expired token, an account-wide one and somebody else's all
+resolve identically. Every report therefore carries the boundary, probed or not:
+
+```console
+scope    not checked, and never will be
+         a name that resolves proves a store answered. It proves nothing
+         about what the credential may DO or WHOSE it is. An `ls` note
+         claiming a scope is prose; ask the provider to enumerate its own
+         grant, and read that.
+```
+
+See [Why there is no capability check](#why-there-is-no-capability-check).
 
 `ls` prints four tab-separated fields — name, store, location, note — with `-`
 wherever there is nothing to say, so a parser never has to count them. The
@@ -166,10 +180,16 @@ real value* comes back.
 
 ```console
 $ keyless ls
+#NAME       	STORE   	LOCATION        	NOTE (yours, unchecked)
 DATABASE_URL	infisical	staging:/backend	staging read replica
 STRIPE_KEY  	infisical	no-env:/backend 	-
 GITHUB_TOKEN	keychain 	-               	-
 ```
+
+The header is written **only when stdout is a terminal**. A pipe gets exactly
+the four fields it always got, so no parser gains a fifth record. It exists
+because three of those columns are `keyless`'s own work and the fourth is a
+sentence somebody typed once — and they render identically.
 
 `no-env` is the set of names that will degrade until you give them an
 environment. A keychain account is not printed: it picks an item, not a tenant,
@@ -1009,6 +1029,48 @@ What it does not give you, stated so nobody assumes otherwise:
   If you do not trust it, generate the value in the provider's UI and `put` it.
 - **Nothing here survives `sudo`.** If you are an admin on your own machine,
   this is a boundary against your sessions, not against you.
+
+### Why there is no capability check
+
+`keyless` can tell you a name **resolves**. It will never tell you what the
+credential **can do**, or **whose** it is. That gap is where the expensive
+mistakes live — every link green while the value turns out to be an
+account-wide grant, or somebody else's key — so the gap is stated in every
+`doctor` report rather than left as a vacancy for a `note` to fill.
+
+A capability probe was designed and refused. Four reasons, each a measurement:
+
+- **A probe can only test the capability you already suspected.** Being wrong
+  about what a credential holds is the whole defect, and a probe aimed at the
+  powers you thought to declare cannot find the ones you did not. Two tokens
+  written down as a two-permission pair were measured holding **383 permission
+  groups**, including the right to mint further tokens and to change billing.
+  Nobody writing a probe for that pair would have thought to ask about billing.
+- **A read-only probe understates, and understating is the dangerous
+  direction.** An overstated credential fails loudly at the call. An understated
+  one stops the call being attempted, and *nothing errors*, because the call is
+  never made. Two sessions planned around a restriction that did not exist.
+- **A green probe would be a new false green.** A vendor's token-verify endpoint
+  answers 200 for a one-permission token and an account-wide one alike. A
+  `capability ok` line reads as "capability established" and is worth less than
+  the silence it replaces.
+- **Enumerating a grant is the provider's act.** One vendor will hand back a
+  token's own policies — and even there it is not general: of four real tokens
+  measured, two lacked the permission to read their own description and were
+  refused it. A feature that works at one endpoint of one vendor, sometimes, is
+  not a feature in a broker.
+
+There is a fifth reason, and it is the one that would rule the feature out on
+its own. **A declared probe makes the config file executable.** `run` already
+hands a value to an arbitrary command — but only one a person typed at that
+moment. A probe fires from a verb somebody runs for *health*, without naming
+what it runs, and output discarding does not help: exfiltration needs egress,
+not stdout. `~/.config` is not a place people read as code.
+
+So the honest shape is the one shipped: **say what was proven, say what was
+not, and never let the second read like the first.** If you need a credential's
+scope, ask the provider to enumerate its own grant, and read that — not a
+sentence somebody typed into a config a month ago.
 
 ---
 

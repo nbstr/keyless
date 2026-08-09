@@ -263,7 +263,9 @@ fn dispatch() -> i32 {
             }
         }
 
-        Verb::Ls => match ls(&load.config, &mut io::stdout()) {
+        // The header is for a person; a pipe gets the four fields it always
+        // got. `stdout` is the stream being asked about, so it is the one asked.
+        Verb::Ls => match ls(&load.config, io::stdout().is_terminal(), &mut io::stdout()) {
             Ok(()) => 0,
             Err(error) => {
                 eprintln!("{NAME}: {error}");
