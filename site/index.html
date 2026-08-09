@@ -3,8 +3,8 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>keyless — the vault was never the problem, its read verb is</title>
-<meta name="description" content="A secrets broker for AI coding agents. It resolves through the vault you already run - Proton Pass, Infisical - and ships no verb that prints a value.">
+<title>keyless — run the command, never read the secret</title>
+<meta name="description" content="Your vault can print a value. keyless cannot, so nothing in your transcript ever holds one. A secrets broker for AI coding agents, reading from Proton Pass and Infisical.">
 <link rel="canonical" href="https://keyless.hackistan.org/">
 <!-- Inline favicon. The page ships as ONE file with no external requests, so the
      icon is a data URI rather than a /favicon.ico the host would have to serve.
@@ -17,11 +17,11 @@
 <meta property="og:type" content="website">
 <meta property="og:site_name" content="keyless">
 <meta property="og:url" content="https://keyless.hackistan.org/">
-<meta property="og:title" content="keyless — the vault was never the problem, its read verb is">
-<meta property="og:description" content="A secrets broker for AI coding agents. It resolves through the vault you already run - Proton Pass, Infisical - and ships no verb that prints a value.">
+<meta property="og:title" content="keyless — run the command, never read the secret">
+<meta property="og:description" content="Your vault can print a value. keyless cannot, so nothing in your transcript ever holds one. A secrets broker for AI coding agents, reading from Proton Pass and Infisical.">
 <meta name="twitter:card" content="summary">
-<meta name="twitter:title" content="keyless — the vault was never the problem, its read verb is">
-<meta name="twitter:description" content="A secrets broker for AI coding agents. It resolves through the vault you already run - Proton Pass, Infisical - and ships no verb that prints a value.">
+<meta name="twitter:title" content="keyless — run the command, never read the secret">
+<meta name="twitter:description" content="Your vault can print a value. keyless cannot, so nothing in your transcript ever holds one. A secrets broker for AI coding agents, reading from Proton Pass and Infisical.">
 <style>
 /* ------------------------------------------------------------------ reset */
 *,*::before,*::after{box-sizing:border-box}
@@ -218,9 +218,17 @@ header.hero{padding:126px 0 88px}
   font-family:var(--mono);font-size:13px;line-height:19px;font-weight:500;
   letter-spacing:.26em;text-transform:uppercase;color:rgba(255,255,255,.6);
 }
+/* Both headline lines sit at full contrast. The old two-tone treatment dimmed
+   the second line, and here the two lines ARE the contrast — "run" against
+   "never read" — so fading either half argues against the sentence. Every h2 on
+   the page is single-tone for the same reason. */
 .hero h1{margin-top:26px;max-width:17ch}
-.hero h1 .fade{color:rgba(255,255,255,.55)}
-.hero .sub{margin-top:24px;max-width:60ch;font-size:16px;line-height:26px;color:rgba(255,255,255,.6)}
+/* `text-wrap:pretty` is the widow guard, not `balance`: these two blocks run to
+   three lines at 390 and it is the LAST line that strands a word there. */
+.hero .sub{
+  margin-top:24px;max-width:56ch;font-size:17px;line-height:27px;
+  color:rgba(255,255,255,.6);text-wrap:pretty;
+}
 .hero .sub b{color:#fff;font-weight:600}
 .hero-cmd-wrap{margin-top:52px}
 .cta-row{margin-top:36px;display:flex;flex-wrap:wrap;align-items:center;gap:20px}
@@ -353,7 +361,13 @@ pre .v{color:var(--violet)}
 /* The page's recurring device. The same five surfaces every time, so a reader
    learns the row once and then reads every later instance at a glance. */
 .ledger{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:1px;background:var(--panel)}
-@media(max-width:900px){.ledger{grid-template-columns:repeat(2,minmax(0,1fr))}}
+/* Five cells in two columns leaves an empty sixth slot, which reads as a
+   missing surface rather than as padding. The last one spans the row instead.
+   At one column `1 / -1` is simply that column, so this needs no second guard. */
+@media(max-width:900px){
+  .ledger{grid-template-columns:repeat(2,minmax(0,1fr))}
+  .ledger > div:last-child{grid-column:1 / -1}
+}
 @media(max-width:430px){.ledger{grid-template-columns:minmax(0,1fr)}}
 .ledger > div{background:var(--well);padding:13px 16px;min-width:0}
 .ledger .ln{
@@ -515,20 +529,15 @@ html{scroll-behavior:smooth}
 <header class="hero">
   <div class="col">
     <p class="hero-eyebrow cascade d1">Secrets broker for coding agents</p>
-    <h1 class="cascade d2">The vault was never the problem.<br><span class="fade">Its read verb is.</span></h1>
+    <!-- The non-breaking space keeps "the secret." together. Without it 390
+         breaks after "the" and strands "secret." — the payload word — on a line
+         of its own. It has no effect at any width where the line already fits. -->
+    <h1 class="cascade d2">Run the command.<br>Never read the&nbsp;secret.</h1>
     <p class="sub cascade d3">
-      Proton Pass and Infisical both keep a secret safe at rest, and both can put one into a process
-      without printing it. They also both ship a verb that <b>prints the value to stdout</b> — and stdout
-      is the transcript. <b>keyless resolves through your vault's own injection path and ships no verb
-      that prints.</b> An agent cannot print a value it has no way to ask for.
+      Your vault can print a value. <b>keyless cannot</b> — so nothing in your transcript ever holds one.
     </p>
 
-    <div class="cta-row cascade d4">
-      <a class="cta" href="#install">Install it <span class="arw">&rarr;</span></a>
-      <a class="cta-alt" href="#limits">Read what it does not catch <span class="arw">&rarr;</span></a>
-    </div>
-
-    <div class="hero-cmd-wrap cascade d5">
+    <div class="hero-cmd-wrap cascade d4">
       <div class="term hero-cmd">
         <div class="termbar">
           <span class="pip"></span>
@@ -540,6 +549,11 @@ html{scroll-behavior:smooth}
 <span class="c"># from your vault. printed nowhere.</span></pre>
         </div>
       </div>
+    </div>
+
+    <div class="cta-row cascade d5">
+      <a class="cta" href="#install">Install it <span class="arw">&rarr;</span></a>
+      <a class="cta-alt" href="#limits">Read what it does not catch <span class="arw">&rarr;</span></a>
     </div>
   </div>
 
@@ -575,7 +589,7 @@ html{scroll-behavior:smooth}
 
   <div class="col">
     <p class="caveat cascade d6">
-      keyless adds no injection your vault did not already have. <b>It removes the alternative.</b>
+      It reads from the vault you already run &mdash; <b>Proton Pass</b> or <b>Infisical</b>.
       &nbsp;&middot;&nbsp; <b>keyless get</b> is not a typo you can make; it does not exist.
       &nbsp;&middot;&nbsp; Two states, no third — <b>INJECTED</b> or <b>DEGRADED</b>.
       &nbsp;&middot;&nbsp; MIT &middot; Rust &middot; macOS &middot; five direct dependencies.
