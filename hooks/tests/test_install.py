@@ -68,13 +68,26 @@ UNRELATED = _forwarder(
     'printf \'%s\' "$PAYLOAD" | node "$HOME/.some-other/hook.js"\n')
 
 
+def _everything(fragment):
+    """The record an install of the whole fragment would leave behind.
+
+    `unmerge` is driven by a RECORD now rather than by the shipped list, so a
+    case that means "this was all installed by us" says so explicitly. The old
+    behaviour — remove anything that matches the fragment — is exactly this
+    record, which is why every pre-existing case below still reads the same.
+    """
+    return {"events": list(fragment.get("hooks", {})),
+            "allow": list(fragment.get("permissions", {}).get("allow", [])),
+            "deny": list(fragment.get("permissions", {}).get("deny", []))}
+
+
 def run():
     s = Suite("install")
     fragment = install.load_fragment()
 
     # ── the defect: a re-run must not add a rival beside the fold ───────────
     folded = _settings_with(FOLDED)
-    merged, changes = install.merge(folded, fragment)
+    merged, changes, _ = install.merge(folded, fragment)
     s.check("folded estate: no second PostToolUse handler is added",
             len(_handlers(merged, "PostToolUse")), 1)
     s.check("folded estate: the surviving handler is still the forwarder",
@@ -86,7 +99,7 @@ def run():
     #    case above and install nothing, anywhere, forever. An unrelated
     #    forwarder that never mentions this pack MUST still get a registration.
     unrelated = _settings_with(UNRELATED)
-    merged_u, changes_u = install.merge(unrelated, fragment)
+    merged_u, changes_u, _ = install.merge(unrelated, fragment)
     s.check("unrelated forwarder: a PostToolUse handler IS added",
             len(_handlers(merged_u, "PostToolUse")), 2)
     s.check("unrelated forwarder: and the change is reported",
@@ -101,20 +114,20 @@ def run():
     # `--uninstall` must never delete a script this pack does not own. The
     # forwarder has other passengers; removing its registration takes the whole
     # estate's chain for that event down with it.
-    unmerged, _ = install.unmerge(folded, fragment)
+    unmerged, _ = install.unmerge(folded, _everything(fragment))
     s.check("uninstall leaves the forwarder alone",
             _handlers(unmerged, "PostToolUse"), [FOLDED])
 
     # ...while a DIRECT registration is still removed, so uninstall still works.
     direct = _settings_with("python3 /somewhere/keyless_hook.py")
-    unmerged_d, changes_d = install.unmerge(direct, fragment)
+    unmerged_d, changes_d = install.unmerge(direct, _everything(fragment))
     s.check("uninstall still removes a direct registration",
             _handlers(unmerged_d, "PostToolUse"), [])
     s.check("uninstall reports that removal",
             bool([c for c in changes_d if "PostToolUse" in c]), True)
 
     # ── idempotence, end to end: merging the merged file changes nothing ────
-    twice, changes_twice = install.merge(merged, fragment)
+    twice, changes_twice, _ = install.merge(merged, fragment)
     s.check("a third run is a no-op", changes_twice, [])
     s.check("and leaves the file byte-identical",
             json.dumps(twice, sort_keys=True), json.dumps(merged, sort_keys=True))
@@ -126,7 +139,7 @@ def run():
     mine = {"permissions": {"allow": ["Bash(git status:*)"],
                             "deny": ["Read(**/secret.txt)"]},
             "model": "opus"}
-    merged_p, changes_p = install.merge(mine, fragment)
+    merged_p, changes_p, record_p = install.merge(mine, fragment)
     for verdict in ("allow", "deny"):
         shipped = fragment["permissions"][verdict]
         s.check("every %s rule is installed" % verdict,
@@ -138,7 +151,7 @@ def run():
         s.check("the %s addition is reported" % verdict,
                 bool([c for c in changes_p if verdict in c]), True)
 
-    restored, _ = install.unmerge(merged_p, fragment)
+    restored, _ = install.unmerge(merged_p, record_p)
     s.check("uninstall gives the permissions back exactly as they were",
             json.dumps(restored["permissions"], sort_keys=True),
             json.dumps(mine["permissions"], sort_keys=True))
@@ -147,8 +160,8 @@ def run():
 
     # THE CONTROL for the round trip: a settings file that had no `permissions`
     # key at all must get one back to nothing, rather than an empty husk.
-    bare, _ = install.merge({}, fragment)
-    stripped, _ = install.unmerge(bare, fragment)
+    bare, _, record_b = install.merge({}, fragment)
+    stripped, _ = install.unmerge(bare, record_b)
     s.check("a file that had no permissions block is not left with an empty one",
             "permissions" in stripped, False)
 
@@ -163,9 +176,54 @@ def run():
 
     # ── never raises on a handler it cannot read ───────────────────────────
     missing = _settings_with("/nonexistent/path/to/forwarder.sh")
-    merged_m, _ = install.merge(missing, fragment)
+    merged_m, _, _ = install.merge(missing, fragment)
     s.check("an unreadable handler is not treated as a fold",
             len(_handlers(merged_m, "PostToolUse")), 2)
+
+    # ── THE RULE THE USER WROTE FIRST SURVIVES AN UNINSTALL ────────────────
+    # The defect the record exists for. A rule the user had already written is
+    # correctly NOT added by the install — and used to be removed by the
+    # uninstall anyway, because the removal matched the shipped list rather than
+    # a record of what was actually added. The install was a no-op and the
+    # uninstall was destructive.
+    theirs = fragment["permissions"]["allow"][0]
+    already = {"permissions": {"allow": [theirs]}}
+    merged_a, _, record_a = install.merge(already, fragment)
+    s.check("a rule the user already had is not recorded as ours",
+            theirs in record_a["allow"], False)
+    back, _ = install.unmerge(merged_a, record_a)
+    s.check("and it is still there after an uninstall",
+            back.get("permissions", {}).get("allow"), [theirs])
+
+    # THE CONTROL: the rules we DID add on that same run are still removed, so
+    # the case above cannot pass on an uninstall that removes nothing at all.
+    s.check("while the rules we added are gone",
+            [r for r in fragment["permissions"]["allow"][1:]
+             if r in back.get("permissions", {}).get("allow", [])],
+            [])
+
+    # ── A DELETION STAYS DELETED, AND `--restore` IS THE WAY BACK ──────────
+    # Without a record, "never installed" and "installed and then thrown out"
+    # are the same observation, so every re-run silently overwrites a decision.
+    installed, _, record_i = install.merge({}, fragment)
+    tilted = json.loads(json.dumps(installed))
+    del tilted["permissions"]["allow"]
+    again, changes_again, _ = install.merge(tilted, fragment, record_i)
+    s.check("a re-run does not put back the allow list you deleted",
+            "allow" in again.get("permissions", {}), False)
+    s.check("and it says it left it alone rather than saying nothing",
+            bool([c for c in changes_again if "left alone" in c]), True)
+
+    restored_r, _, _ = install.merge(tilted, fragment, record_i, restore=True)
+    s.check("--restore is what puts it back",
+            restored_r["permissions"]["allow"], fragment["permissions"]["allow"])
+
+    # The same rule for a whole event: a handler somebody deleted stays deleted.
+    no_hooks = json.loads(json.dumps(installed))
+    del no_hooks["hooks"]
+    again_h, _, _ = install.merge(no_hooks, fragment, record_i)
+    s.check("a handler you removed is not re-registered",
+            "hooks" in again_h, False)
 
     return s
 
