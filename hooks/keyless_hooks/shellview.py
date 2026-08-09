@@ -20,7 +20,7 @@ the other sees `.env` with no idea what touches it. It takes both.
 import re
 
 __all__ = [
-    "strip_quoted", "strip_heredocs", "stripped",
+    "strip_quoted", "strip_heredocs", "heredocs", "Heredoc", "stripped",
     "statement_spans", "statements", "head_of", "head_or_wrapper", "words",
     "candidate_operands", "file_operands", "expand_local_assignments",
     "interpreter_payloads", "rest_after_head", "first_positional",
@@ -88,6 +88,67 @@ def strip_quoted(cmd):
     return "".join(out)
 
 
+class Heredoc(object):
+    """One here-document: its delimiter, how it was opened, and its body.
+
+    `opener` is the whole LINE that opened it, unblanked, so a caller can ask
+    what the heredoc is being fed to and where its output goes. `quoted` records
+    whether the delimiter was quoted, which decides whether the shell expands the
+    body before it lands.
+    """
+
+    __slots__ = ("tag", "quoted", "opener", "body", "spans")
+
+    def __init__(self, tag, quoted, opener, body, spans):
+        self.tag = tag
+        self.quoted = quoted
+        self.opener = opener
+        self.body = body
+        self.spans = spans
+
+    def __repr__(self):
+        return "Heredoc(%s, quoted=%r, %d body lines)" % (self.tag, self.quoted,
+                                                          len(self.spans))
+
+
+def heredocs(cmd):
+    """Every here-document in the command, in the order they open.
+
+    ONE walk, shared with `strip_heredocs`. The bodies a check may READ and the
+    bodies every other check must NOT read have to be the same set, or a body
+    becomes visible to an act-detection trigger by accident — which is the exact
+    failure blanking exists to prevent.
+
+    An UNTERMINATED heredoc is reported with the body it accumulated. It is still
+    a body: the tool call carries the text whether or not the delimiter arrived.
+    """
+    if not cmd or "<<" not in cmd:
+        return []
+    found = []
+    lines = cmd.split("\n")
+    pos = 0
+    pending = []          # [Heredoc], in the order the shell will read them
+    for line in lines:
+        line_start = pos
+        pos += len(line) + 1
+        if pending:
+            current = pending[0]
+            if line.strip() == current.tag:
+                pending.pop(0)
+            else:
+                end = min(line_start + len(line), len(cmd))
+                current.spans.append((line_start, end))
+                current.body.append(line)
+            continue
+        for m in _HEREDOC_OPEN.finditer(line):
+            doc = Heredoc(m.group(2), bool(m.group(1)), line, [], [])
+            pending.append(doc)
+            found.append(doc)
+    for doc in found:
+        doc.body = "\n".join(doc.body)
+    return found
+
+
 def strip_heredocs(cmd):
     """Blank here-document bodies, preserving length.
 
@@ -95,26 +156,19 @@ def strip_heredocs(cmd):
     ABOUT commands. A check that reads the raw command fires on the prose inside
     the body instead of on the command that carries it; this is that class closed
     once, for every check, rather than per check.
+
+    The blanking is about ACT detection — is this a command, or a mention of one.
+    It is not a claim that a body holds nothing worth reading: a body redirected
+    into a file IS that file's content, and `checks/heredoc_write` reads it
+    through `heredocs()` above, which walks the same spans this function blanks.
     """
     if not cmd or "<<" not in cmd:
         return cmd or ""
     out = list(cmd)
-    lines = cmd.split("\n")
-    pos = 0
-    pending = []
-    for line in lines:
-        line_start = pos
-        pos += len(line) + 1
-        if pending:
-            tag = pending[0]
-            if line.strip() == tag:
-                pending.pop(0)
-            else:
-                for k in range(line_start, min(line_start + len(line), len(out))):
-                    out[k] = " "
-            continue
-        for m in _HEREDOC_OPEN.finditer(line):
-            pending.append(m.group(2))
+    for doc in heredocs(cmd):
+        for start, end in doc.spans:
+            for k in range(start, end):
+                out[k] = " "
     return "".join(out)
 
 

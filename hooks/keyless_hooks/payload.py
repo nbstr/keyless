@@ -16,6 +16,10 @@ import json
 
 __all__ = ["Payload", "parse"]
 
+# The text keys a write tool can carry, at the top level and inside a bulk edit's
+# list entries. One tuple, so the two readers below cannot drift apart.
+_TEXT_KEYS = ("content", "new_string", "new_source", "old_string")
+
 
 def _s(obj, key, default=""):
     """A string field, or the default. Never raises, whatever `obj` is."""
@@ -61,11 +65,80 @@ class Payload(object):
         """
         ti = self.tool_input
         out = []
-        for key in ("content", "new_string", "new_source", "old_string"):
+        for key in _TEXT_KEYS:
             v = ti.get(key)
             if isinstance(v, str) and v:
                 out.append((key, v))
         return out
+
+    def text_slots(self):
+        """Every credential-carrying string, with an ADDRESS that can be written back.
+
+        `text_fields` answers "what text is here" and cannot answer "where does a
+        replacement go", because one of the write tools does not keep its text at
+        the top level. A bulk edit carries a LIST of edits, each a mapping with
+        its own `old_string` and `new_string`, and a check reading only the named
+        top-level keys sees an empty payload — a tool listed as covered, scanning
+        nothing, which is the shape of coverage that is worse than none.
+
+        An address is a top-level key (`"content"`), or the triple
+        `("edits", index, key)`. `rebuild` is the only thing that consumes one, so
+        the nesting is described in exactly one place.
+        """
+        out = list(self.text_fields())
+        edits = self.tool_input.get("edits")
+        if not isinstance(edits, list):
+            return out
+        for index, entry in enumerate(edits):
+            # A non-mapping entry is not addressable and is never rewritten. It is
+            # skipped rather than coerced: a list this check does not understand
+            # must survive it byte-for-byte.
+            if not isinstance(entry, dict):
+                continue
+            for key in _TEXT_KEYS:
+                v = entry.get(key)
+                if isinstance(v, str) and v:
+                    out.append((("edits", index, key), v))
+        return out
+
+    def rebuild(self, changes):
+        """The `updatedInput` fragment that applies `changes` — and nothing else.
+
+        `changes` maps an address from `text_slots` to its replacement string.
+        The guarantees, in order of how much damage their absence would do:
+
+          * A nested change rewrites ONE value inside ONE entry. Every other key
+            of that entry, every other entry, the list's length and the list's
+            order are carried over unchanged.
+          * An entry that is not a mapping is copied by reference and never read.
+          * An address that no longer resolves — an index past the end, a list
+            that is not a list — contributes nothing rather than raising. A
+            rewrite that raises is a guard that silently was not there.
+          * The fragment names only the top-level keys that actually changed, so
+            the engine's merge cannot carry a field this check never looked at.
+        """
+        fragment = {}
+        edit_changes = {}
+        for addr, value in changes.items():
+            if isinstance(addr, str):
+                fragment[addr] = value
+            elif (isinstance(addr, tuple) and len(addr) == 3
+                    and addr[0] == "edits" and isinstance(addr[1], int)):
+                edit_changes.setdefault(addr[1], {})[addr[2]] = value
+        if edit_changes:
+            edits = self.tool_input.get("edits")
+            if isinstance(edits, list):
+                rebuilt = []
+                for index, entry in enumerate(edits):
+                    patch = edit_changes.get(index)
+                    if patch and isinstance(entry, dict):
+                        merged = dict(entry)
+                        merged.update(patch)
+                        rebuilt.append(merged)
+                    else:
+                        rebuilt.append(entry)
+                fragment["edits"] = rebuilt
+        return fragment
 
 
 def parse(raw):

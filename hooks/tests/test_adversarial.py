@@ -141,10 +141,35 @@ ATTACKS = [
     # Rows that are EXPECTED to get through. They are here so the published
     # limit set is driven rather than asserted in prose, and so a future change
     # that closes one is visible instead of silently improving the claim.
-    ("outer_var",        "cat $ENVFILE",                   "a path set by an EARLIER call"),
-    ("script_then_run",  "printf 'cat .env' > s.sh; bash s.sh", "writing a reader, then running it"),
     ("assign_heredoc",   "cat > deploy.sh <<'EOF'\nexport GITHUB_TOKEN=%s\nEOF"
                          % DECOY["github_pat"], "the literal inside a heredoc BODY"),
+    ("heredoc_after",    "cat <<'EOF' > deploy.sh\nexport NPM_TOKEN=%s\nEOF"
+                         % DECOY["npm"], "the redirect written after the opener"),
+    ("heredoc_append",   "cat >> deploy.sh <<'EOF'\nexport SLACK_TOKEN=%s\nEOF"
+                         % DECOY["slack"], "an append redirect instead of a truncate"),
+    ("heredoc_dash",     "cat <<-EOF > deploy.sh\nexport JWT=%s\nEOF" % DECOY["jwt"],
+                         "the tab-stripping opener"),
+    ("heredoc_unquoted", "cat <<EOF > deploy.sh\nexport GOOGLE_API_KEY=%s\nEOF"
+                         % DECOY["google"], "an unquoted delimiter, so the shell expands"),
+    ("heredoc_source",   "cat > app.ts <<'EOF'\nconst k = \"%s\";\nEOF"
+                         % DECOY["aws_key"], "a vendor shape into a file that expands nothing"),
+    ("heredoc_late",     "cat > deploy.sh <<'EOF'\nset -e\n./build\nexport STRIPE_KEY=%s\nEOF"
+                         % DECOY["stripe"], "the literal buried below the first body line"),
+    ("heredoc_second",   "cat > a.sh <<'A'\nsafe\nA\ncat > b.sh <<'B'\nexport NPM_TOKEN=%s\nB"
+                         % DECOY["npm"], "the SECOND here-document in one command"),
+    # Rows that are EXPECTED to get through. They are here so the published
+    # limit set is driven rather than asserted in prose, and so a future change
+    # that closes one is visible instead of silently improving the claim.
+    ("outer_var",        "cat $ENVFILE",                   "a path set by an EARLIER call"),
+    ("script_then_run",  "printf 'cat .env' > s.sh; bash s.sh", "writing a reader, then running it"),
+    ("heredoc_tee",      "cat <<'EOF' | tee deploy.sh\nexport NPM_TOKEN=%s\nEOF"
+                         % DECOY["npm"], "the destination named by a PROGRAM, not a redirect"),
+    ("heredoc_stdin",    "node <<'EOF'\nconst k = \"%s\";\nEOF" % DECOY["aws_key"],
+                         "a body fed to an interpreter, with no file destination"),
+    ("heredoc_named_source",
+                         "cat > app.ts <<'EOF'\nconst password = \"%s\";\nEOF"
+                         % DECOY["generic"],
+                         "a NAME-keyed match into a file that expands nothing"),
 ]
 
 # Rows that are NOT blocked, with the reason each is structurally out of reach.
@@ -161,13 +186,24 @@ SURVIVORS = {
                        "process the harness never shows a hook. A content gate on "
                        "the WRITE could catch the common spelling and would be "
                        "trivially rephrased around; it is not attempted.",
-    "assign_heredoc": "the literal is in a heredoc BODY, which every check in this "
-                      "pack blanks because a body is text ABOUT commands — the rule "
-                      "that stops a runbook quoting `cat .env` being read as one. "
-                      "Authoring a `.env` through `cat > … <<EOF` is the KL-WRITE "
-                      "act performed on Bash, a real and separate surface with its "
-                      "own remediation; it is left whole rather than half-covered "
-                      "by a refusal that talks about `export`.",
+    "heredoc_tee": "the body reaches a file, but the file is named as an ARGUMENT "
+                   "to another program rather than as a redirect operand. Resolving "
+                   "it would mean modelling what every filter in a pipeline does "
+                   "with its arguments — `tee`, `sponge`, `dd of=`, a script of the "
+                   "user's own — which is the same unbounded set the reader "
+                   "allowlist next door refuses to enumerate.",
+    "heredoc_stdin": "the body is a program, a query or a manifest on a command's "
+                     "standard input, and no file is named at all. It is reported "
+                     "rather than refused: refusing a body fed to an interpreter "
+                     "would refuse ordinary work, and the remediation differs — "
+                     "there is no file to remove the value from.",
+    "heredoc_named_source": "the match came from the value's NAME rather than from "
+                            "its own shape, and the destination expands no "
+                            "reference. Refusing would refuse the ordinary source "
+                            "edit this class mostly is; substituting would put a "
+                            "reference nothing resolves into a file that has to "
+                            "parse. It is reported, which is the only act that is "
+                            "right whichever of the two it was.",
 }
 
 

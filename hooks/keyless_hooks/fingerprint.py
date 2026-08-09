@@ -16,7 +16,7 @@ caller logs them, and the decision log has no field they would fit in.
 
 import re
 
-__all__ = ["scan", "redact", "Finding"]
+__all__ = ["scan", "redact", "Finding", "VENDOR_KINDS", "is_vendor"]
 
 
 class Finding(object):
@@ -57,6 +57,27 @@ _VENDOR = re.compile(
     r"|(?P<jwt>\beyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b)"
     r"|(?P<private_key_block>-----BEGIN (?:RSA |EC |DSA |OPENSSH |PGP )?PRIVATE KEY-----)"
 )
+
+# The kinds a VENDOR pattern produces, read off the compiled alternation rather
+# than restated as a list. A caller asking "is this shape self-evidently a
+# credential" gets its answer from the same object that decides the shape, so a
+# pattern added above joins this set with no second edit — and a set maintained
+# by hand would answer "no" for the newest pattern, which is the one least likely
+# to be reviewed.
+#
+# The distinction it draws is the one that licenses a REFUSAL. A vendor prefix is
+# proof on its own: nothing but an AWS key is spelled `AKIA` plus sixteen upper
+# alphanumerics. Every other rule here is keyed on a NAME or on POSITION —
+# `password: <opaque>` — and cannot separate a literal from an identifier that
+# merely looks opaque, which is the residual class this module documents and does
+# not claim to have closed.
+VENDOR_KINDS = frozenset(_VENDOR.groupindex)
+
+
+def is_vendor(kind):
+    """True when the shape alone proves the value is a credential."""
+    return kind in VENDOR_KINDS
+
 
 # A credential inside a URL's userinfo. The password class excludes `/` and `@`
 # so it cannot run past the host, and both quantifiers sit over disjoint classes.

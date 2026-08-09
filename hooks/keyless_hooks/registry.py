@@ -27,7 +27,8 @@ def _table():
     # Imported inside the function so a broken check module cannot stop the
     # engine from loading the others: the import cost is paid once per process
     # either way, and the failure mode differs.
-    from .checks import env_dump, file_read, literal_write, shell_assign, vault_cli
+    from .checks import (env_dump, file_read, heredoc_write, literal_write,
+                         shell_assign, vault_cli)
 
     return [
         # id                event          tier      handler
@@ -42,7 +43,21 @@ def _table():
         # large body of real agent and interactive shell commands before it was
         # registered, and it denied nothing that was not a credential assignment.
         ("KL-ASSIGN", "PreToolUse", BLOCK,   shell_assign.run),
-        ("KL-WRITE",  "PreToolUse", REWRITE, literal_write.run),
+        # The same predicate again, against the one shape that is a FILE WRITE
+        # spelled as a command. It ships at BLOCK for KL-ASSIGN's reason and not
+        # by exemption from the rung above: `fingerprint` is already deployed and
+        # already licensed to rewrite a file unilaterally, and the only new
+        # judgement — does this here-document redirect into a file, and what does
+        # that file's reader do with a reference — was replayed over a large body
+        # of real commands before it was registered.
+        ("KL-HEREDOC", "PreToolUse", BLOCK,  heredoc_write.run),
+        # BLOCK rather than REWRITE, and the tier is the decision. This check
+        # substitutes `${NAME}` only where the destination's reader resolves it;
+        # everywhere else the substitution is a syntax error wearing the face of a
+        # repair, so the check needs the licence to refuse instead. A REWRITE-tier
+        # check returning "deny" is degraded to advice by the engine, which is the
+        # correct treatment of a registry error and the wrong outcome here.
+        ("KL-WRITE",  "PreToolUse", BLOCK,   literal_write.run),
         ("KL-SEEN",   "PostToolUse", WARN,   literal_write.run_post),
     ]
 
