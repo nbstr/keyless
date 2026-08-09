@@ -654,6 +654,143 @@ mod tests {
     }
 
     #[test]
+    fn a_log_that_cannot_be_read_is_an_error_rather_than_zero_rows() {
+        // The other half of the test above, and the one that matters. "Absent"
+        // verifies as zero rows because nothing has happened yet. "Present and
+        // unreadable" must NOT, or `verify` answers `Ok(0)` for a log it never
+        // opened — a verification that reports success without verifying is the
+        // worst possible failure of this function.
+        //
+        // Unreadable is arranged with a directory rather than with permissions,
+        // because a suite that runs as root can read a mode-000 file and the
+        // test would then prove nothing on exactly the machines that run it in a
+        // container.
+        let path = temp_path("unreadable");
+        std::fs::create_dir_all(&path).expect("stand in for an unreadable file");
+        let log = AuditLog::new(path.clone());
+        let error = log
+            .verify()
+            .expect_err("a log that cannot be read must not verify as empty");
+        assert!(
+            matches!(error, super::AuditError::Io { .. }),
+            "the failure must be reported as I/O, not as a broken chain: {error}"
+        );
+        let _ = std::fs::remove_dir_all(&path);
+    }
+
+    #[test]
+    fn a_row_whose_argv_the_writer_shrank_says_it_was_truncated() {
+        // 40 arguments of 190 characters each. Every one is under MAX_ARG_CHARS
+        // and there are fewer than MAX_ARGS of them, so `Event::new` clips
+        // nothing and reports nothing truncated — asserted below, because that
+        // is the whole point of the fixture. Together they are far past the row
+        // cap, so it is the WRITER that drops arguments.
+        //
+        // Nothing else covers that path. The two existing truncation tests both
+        // arrive with `argv_truncated` already true, so the writer's own term is
+        // never the term that decides, and a row could claim to carry a complete
+        // argv while carrying part of one.
+        let path = temp_path("writer-shrunk");
+        let log = AuditLog::new(path.clone());
+        let masker = Masker::new();
+        let args: Vec<String> = (0..40).map(|i| format!("arg{i:0>187}")).collect();
+        let event = Event::new("run", State::Injected, vec![], &args, &masker);
+        assert!(
+            !event.argv_truncated,
+            "the fixture must reach the writer untruncated, or it tests nothing"
+        );
+        log.append(&event).expect("append");
+
+        let raw = std::fs::read_to_string(&path).expect("read");
+        let line = raw.lines().next().expect("one row");
+        assert!(line.len() <= MAX_LINE_BYTES, "row was {} bytes", line.len());
+        assert!(
+            line.contains("\"argv_truncated\":true"),
+            "the writer dropped arguments and the row does not say so: {line}"
+        );
+        assert!(
+            !line.contains("\"argv\":[]"),
+            "this must be the shrink path, not the drop-everything fallback"
+        );
+        assert_eq!(log.verify().expect("verify"), 1);
+    }
+
+    #[test]
+    fn a_row_of_exactly_the_cap_keeps_its_names() {
+        // `MAX_LINE_BYTES` is a ceiling the row is allowed to touch, and the
+        // whole difference between `>` and `>=` at the fallback is that one
+        // length. At exactly the cap, `>=` throws away every name and every
+        // argument and clips the working directory — for a row that already
+        // fit. One row in every few thousand would arrive gutted, and nothing
+        // in the file would say why.
+        //
+        // The fixture SOLVES for that length instead of hard-coding it. The
+        // row also carries a timestamp and a schema, so a constant here would
+        // be a number that stops meaning anything the next time the row shape
+        // changes, and the test would keep passing while testing a different
+        // length.
+        let masker = Masker::new();
+        let name = "N".repeat(40);
+        let render_with = |tag: &str, cwd_len: usize| -> String {
+            let path = temp_path(tag);
+            let log = AuditLog::new(path.clone());
+            let event = Event::new(
+                "run",
+                State::Injected,
+                vec![name.clone()],
+                &[] as &[String],
+                &masker,
+            )
+            .with_cwd("d".repeat(cwd_len));
+            log.append(&event).expect("append");
+            let raw = std::fs::read_to_string(&path).expect("read");
+            raw.lines().next().expect("one row").to_owned()
+        };
+
+        // Every byte of the working directory is one byte of the row: `d` needs
+        // no JSON escaping. So one measurement gives the offset to the cap.
+        const PROBE: usize = 200;
+        let probe = render_with("cap-probe", PROBE);
+        let wanted = PROBE + MAX_LINE_BYTES - probe.len();
+        let line = render_with("cap-exact", wanted);
+        assert_eq!(
+            line.len(),
+            MAX_LINE_BYTES,
+            "the fixture did not land on the cap, so it tests the wrong length"
+        );
+
+        assert!(
+            line.contains(&name),
+            "a row that is exactly at the cap lost its names: {}",
+            &line[..120]
+        );
+        assert!(
+            line.contains("\"argv_truncated\":false"),
+            "a row that is exactly at the cap was reported as truncated"
+        );
+    }
+
+    #[test]
+    fn a_row_that_fits_is_not_marked_truncated() {
+        // The control for the test above. Without it, "always true" reads as a
+        // correct answer to "was this row truncated?", and every truncation
+        // assertion in this file passes for a flag that never says no.
+        let path = temp_path("not-truncated");
+        let log = AuditLog::new(path.clone());
+        let masker = Masker::new();
+        let event = Event::new("run", State::Injected, vec![], &["ls", "-la"], &masker);
+        log.append(&event).expect("append");
+
+        let raw = std::fs::read_to_string(&path).expect("read");
+        let line = raw.lines().next().expect("one row");
+        assert!(
+            line.contains("\"argv_truncated\":false"),
+            "a short row must not claim truncation: {line}"
+        );
+        assert_eq!(log.verify().expect("verify"), 1);
+    }
+
+    #[test]
     fn an_enormous_argv_is_truncated_below_the_atomic_write_cap() {
         let path = temp_path("huge");
         let log = AuditLog::new(path.clone());
