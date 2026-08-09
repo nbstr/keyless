@@ -67,12 +67,23 @@ where
     F: FnOnce() -> T + Send + 'static,
 {
     let (finished, done) = mpsc::channel();
-    let worker = thread::spawn(move || {
-        // The result travels on the channel rather than through `JoinHandle`,
-        // because `JoinHandle::join` has no timed form: joining a hung thread is
-        // the very hang this is meant to report.
-        let _ = finished.send(body());
-    });
+    // NAMED, and it is not decoration. A body that panics does so on this
+    // thread, so an unnamed worker makes every assertion failure in a wrapped
+    // suite report `thread '<unnamed>' panicked` — which is the one line a
+    // reader uses to tell which of nineteen cases blew up. Naming it restores
+    // exactly what an unwrapped `#[test]` prints.
+    let worker = thread::Builder::new()
+        .name(what.to_owned())
+        .spawn(move || {
+            // The result travels on the channel rather than through
+            // `JoinHandle`, because `JoinHandle::join` has no timed form:
+            // joining a hung thread is the very hang this is meant to report.
+            let _ = finished.send(body());
+        })
+        // The OS refused a thread. Reported rather than swallowed: running
+        // `body` inline instead would silently drop the bound, and a bound
+        // nobody can see is worse than none.
+        .unwrap_or_else(|error| panic!("`{what}` could not be given a thread to run on: {error}"));
     match done.recv_timeout(limit) {
         Ok(value) => {
             let _ = worker.join();
