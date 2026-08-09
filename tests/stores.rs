@@ -40,9 +40,9 @@ use keyless::store::proton::Reason;
 use keyless::store::{self, Invocation, Registry};
 
 use support::{
-    Backend, CONCEALED, INFISICAL_DECOY, Listing, PROTON_DECOY, SCOPED_SESSION_DIR, listing_count,
-    recorded, recorded_lines, run_with, scratch, stub_infisical, stub_pass_cli,
-    stub_pass_cli_discovery, stub_pass_cli_listing, witness, witnessed,
+    Backend, CONCEALED, INFISICAL_DECOY, Listing, NEIGHBOUR_KEY, PROTON_DECOY, SCOPED_SESSION_DIR,
+    listing_count, recorded, recorded_lines, run_with, scratch, stub_infisical, stub_pass_cli,
+    stub_pass_cli_discovery, stub_pass_cli_listing, witness, witness_env, witnessed, witnessed_env,
 };
 
 /// Whether `argv` carries `flag`, in either of the two spellings clap accepts.
@@ -76,20 +76,36 @@ fn registry_from(json: &str, reason: &Reason) -> Registry {
 /// every property below pass against a store that never spawned anything —
 /// which is exactly the vacuous green this file exists to avoid. The tests that
 /// are *about* a missing environment build their own config.
-fn infisical_config(binary: &Path, extra: &str) -> String {
-    infisical_config_for(binary, extra, r#""DECOY":{"env":"dev"}"#)
+fn infisical_config(binary: &Path) -> String {
+    infisical_config_for(binary, r#""DECOY":{"env":"dev"}"#)
 }
 
 /// The same, with the `secrets` block written out by the caller.
-fn infisical_config_for(binary: &Path, extra: &str, secrets: &str) -> String {
-    let extra = if extra.is_empty() {
-        String::new()
-    } else {
-        format!(",{extra}")
-    };
+///
+/// # The ceiling is spelled here, and it used to be spelled nowhere
+///
+/// Every fixture built from this one wants an ANSWER, so each needs a deadline
+/// the stub can finish inside. Naming none does not mean "no deadline": it
+/// means the crate's own `DEFAULT_TIMEOUT_MS`, which is 10 000 — HALF the floor
+/// `tests/suite_hygiene.rs` sets for a ceiling on a stub that must answer.
+///
+/// That gate reads `"timeout_ms":<digits>` out of these config strings, so a
+/// number nobody wrote is a number it cannot scan: the eleven fixtures built
+/// from here sat under an unwritten 10 000 while the gate reported green. The
+/// identical remediation had already reached `tests/cli.rs`,
+/// `tests/never_block.rs` and this file's own Proton call sites, beside the
+/// identical stub — and missed this builder. That is the drift the gate exists
+/// to prevent, arriving through the one spelling it cannot read.
+///
+/// It is a CEILING and never a measurement — no fixture here asserts anything
+/// about elapsed time. A test whose SUBJECT is the deadline writes its own
+/// config rather than taking this one, because two `timeout_ms` keys in one
+/// object are a serde error and because a deadline under test is not a bound on
+/// a test.
+fn infisical_config_for(binary: &Path, secrets: &str) -> String {
     format!(
         r#"{{"stores":{{"keychain":{{"enabled":false}},
-             "infisical":{{"enabled":true,"binary":"{}"{extra}}}}},
+             "infisical":{{"enabled":true,"binary":"{}","timeout_ms":60000}}}},
             "secrets":{{{secrets}}}}}"#,
         binary.display()
     )
@@ -101,26 +117,30 @@ fn infisical_config_for(binary: &Path, extra: &str, secrets: &str) -> String {
 /// degrades before it spawns anything and every property below would be
 /// exercised against a store that never ran. The tests that are *about* an
 /// unset session directory build their own config.
-/// The stub timeout every success-path fixture uses, in milliseconds, spelled
-/// into the config strings below as `"timeout_ms":60000`.
 ///
-/// It is a ceiling, never a measurement: a fixture that asserts a SUCCESS has
-/// no opinion about how long the stub took, and the tests that actually measure
-/// the timeout set 300 ms and assert on the message. So the only thing this
+/// # The ceiling, and why it moved from the call sites into here
+///
+/// `"timeout_ms":60000` is a ceiling, never a measurement: a fixture asserting
+/// a SUCCESS has no opinion about how long the stub took. So the only thing the
 /// number decides is how loaded this machine has to be before a passing test
 /// reports a failure.
 ///
-/// It was 5000, which encoded "no build is ever slower than five seconds".
-/// Measured 2026-08-09: with a `cargo mutants` campaign running beside it at
-/// `--jobs 2`, six of these tests failed with `no answer within 5000 ms`, and
-/// all forty-one passed the moment the suite ran alone. That is a false RED,
-/// and mutation testing turns a false red into a wrong baseline — a mutant that
-/// a flake killed is recorded as caught, and the next clean run reports it as a
-/// new survivor.
-fn proton_config(binary: &Path, extra: &str) -> String {
+/// It was 5000, which encoded "no fork of `/bin/sh` is ever slower than five
+/// seconds". Measured 2026-08-09: with a `cargo mutants` campaign running
+/// beside the suite at `--jobs 2`, six fixtures failed with `no answer within
+/// 5000 ms`, and all of them passed the moment the suite ran alone. That is a
+/// false RED, and mutation testing turns a false red into a wrong baseline — a
+/// mutant a flake killed is recorded as caught, and the next clean run reports
+/// it as a new survivor.
+///
+/// The repair then left the number at seven call sites for each caller to
+/// remember. It is written once, here, for the same reason
+/// `tests/suite_hygiene.rs` exists at all: a number that has to be remembered
+/// is a number that drifts back.
+fn proton_config(binary: &Path) -> String {
     format!(
         r#"{{"stores":{{"keychain":{{"enabled":false}},
-             "proton":{{"enabled":true,"binary":"{}","session_dir":"{SCOPED_SESSION_DIR}",{extra}}}}},
+             "proton":{{"enabled":true,"binary":"{}","session_dir":"{SCOPED_SESSION_DIR}","timeout_ms":60000}}}},
             "secrets":{{"DECOY":{{"reference":"{PROTON_REFERENCE}"}}}}}}"#,
         binary.display()
     )
@@ -143,7 +163,7 @@ fn an_absent_infisical_binary_still_spawns_the_child() {
     let dir = scratch("infisical-absent");
     let marker = dir.join("witness");
     let registry = registry_from(
-        &infisical_config(&dir.join("there-is-no-infisical-here"), ""),
+        &infisical_config(&dir.join("there-is-no-infisical-here")),
         &Reason::default(),
     );
 
@@ -171,8 +191,16 @@ fn an_infisical_that_never_answers_still_spawns_the_child() {
     let dir = scratch("infisical-hangs");
     let marker = dir.join("witness");
     let stub = stub_infisical(&dir, &Backend::Hangs);
+    // Its own config, not the shared builder: here the deadline is the SUBJECT
+    // — the assertion below quotes it — and a deadline under test is a
+    // different thing from a bound on a test.
     let registry = registry_from(
-        &infisical_config(&stub, r#""timeout_ms":300"#),
+        &format!(
+            r#"{{"stores":{{"keychain":{{"enabled":false}},
+                 "infisical":{{"enabled":true,"binary":"{}","timeout_ms":300}}}},
+                "secrets":{{"DECOY":{{"env":"dev"}}}}}}"#,
+            stub.display()
+        ),
         &Reason::default(),
     );
 
@@ -198,7 +226,7 @@ fn an_infisical_that_fails_its_own_lookup_still_spawns_the_child() {
     let dir = scratch("infisical-own-failure");
     let marker = dir.join("witness");
     let stub = stub_infisical(&dir, &Backend::OwnFailure);
-    let registry = registry_from(&infisical_config(&stub, ""), &Reason::default());
+    let registry = registry_from(&infisical_config(&stub), &Reason::default());
 
     let (outcome, notes) = run_with(&registry, &["DECOY"], &witness(&marker, "DECOY", 9), &[]);
 
@@ -268,10 +296,7 @@ fn an_absent_pass_cli_binary_still_spawns_the_child() {
     let dir = scratch("proton-absent");
     let marker = dir.join("witness");
     let registry = registry_from(
-        &proton_config(
-            &dir.join("there-is-no-pass-cli-here"),
-            r#""timeout_ms":60000"#,
-        ),
+        &proton_config(&dir.join("there-is-no-pass-cli-here")),
         &Reason::default(),
     );
 
@@ -296,8 +321,16 @@ fn a_pass_cli_that_never_answers_still_spawns_the_child() {
     let dir = scratch("proton-hangs");
     let marker = dir.join("witness");
     let stub = stub_pass_cli(&dir, &Backend::Hangs);
+    // Its own config, for the same reason as the Infisical hang above: the
+    // deadline is the subject here, not a bound.
     let registry = registry_from(
-        &proton_config(&stub, r#""timeout_ms":300"#),
+        &format!(
+            r#"{{"stores":{{"keychain":{{"enabled":false}},
+                 "proton":{{"enabled":true,"binary":"{}",
+                            "session_dir":"{SCOPED_SESSION_DIR}","timeout_ms":300}}}},
+                "secrets":{{"DECOY":{{"reference":"{PROTON_REFERENCE}"}}}}}}"#,
+            stub.display()
+        ),
         &Reason::default(),
     );
 
@@ -324,7 +357,7 @@ fn an_infisical_value_reaches_the_child_and_nothing_else() {
     let dir = scratch("infisical-happy");
     let marker = dir.join("witness");
     let stub = stub_infisical(&dir, &Backend::Injects(INFISICAL_DECOY));
-    let registry = registry_from(&infisical_config(&stub, ""), &Reason::default());
+    let registry = registry_from(&infisical_config(&stub), &Reason::default());
 
     let (outcome, notes) = run_with(&registry, &["DECOY"], &witness(&marker, "DECOY", 0), &[]);
 
@@ -339,10 +372,7 @@ fn a_proton_value_reaches_the_child_and_nothing_else() {
     let dir = scratch("proton-happy");
     let marker = dir.join("witness");
     let stub = stub_pass_cli(&dir, &Backend::Injects(PROTON_DECOY));
-    let registry = registry_from(
-        &proton_config(&stub, r#""timeout_ms":60000"#),
-        &Reason::default(),
-    );
+    let registry = registry_from(&proton_config(&stub), &Reason::default());
 
     let (outcome, notes) = run_with(&registry, &["DECOY"], &witness(&marker, "DECOY", 0), &[]);
 
@@ -390,7 +420,7 @@ fn an_unset_name_is_reported_as_missing_rather_than_as_a_broken_store() {
     let dir = scratch("infisical-unset");
     let marker = dir.join("witness");
     let stub = stub_infisical(&dir, &Backend::Unset);
-    let registry = registry_from(&infisical_config(&stub, ""), &Reason::default());
+    let registry = registry_from(&infisical_config(&stub), &Reason::default());
 
     let (outcome, notes) = run_with(&registry, &["DECOY"], &witness(&marker, "DECOY", 4), &[]);
 
@@ -413,7 +443,7 @@ fn an_empty_value_is_a_problem_rather_than_a_silent_blank() {
     let dir = scratch("infisical-empty");
     let marker = dir.join("witness");
     let stub = stub_infisical(&dir, &Backend::Empty);
-    let registry = registry_from(&infisical_config(&stub, ""), &Reason::default());
+    let registry = registry_from(&infisical_config(&stub), &Reason::default());
 
     let (outcome, notes) = run_with(&registry, &["DECOY"], &witness(&marker, "DECOY", 0), &[]);
 
@@ -437,7 +467,7 @@ fn the_infisical_invocation_uses_only_the_verb_that_prints_nothing() {
     let marker = dir.join("witness");
     let stub = stub_infisical(&dir, &Backend::Injects(INFISICAL_DECOY));
     let registry = registry_from(
-        &infisical_config_for(&stub, "", r#""DECOY":{"env":"staging","path":"/backend"}"#),
+        &infisical_config_for(&stub, r#""DECOY":{"env":"staging","path":"/backend"}"#),
         &Reason::default(),
     );
     let _ = run_with(&registry, &["DECOY"], &witness(&marker, "DECOY", 0), &[]);
@@ -480,8 +510,7 @@ fn the_invocation_environment_reaches_the_vendor_call() {
     let dir = scratch("infisical-invocation-env");
     let marker = dir.join("witness");
     let stub = stub_infisical(&dir, &Backend::Injects(INFISICAL_DECOY));
-    let registry =
-        registry_from_with_env(&infisical_config_for(&stub, "", r#""DECOY":{}"#), "staging");
+    let registry = registry_from_with_env(&infisical_config_for(&stub, r#""DECOY":{}"#), "staging");
 
     let (outcome, notes) = run_with(&registry, &["DECOY"], &witness(&marker, "DECOY", 0), &[]);
 
@@ -504,7 +533,7 @@ fn a_names_own_environment_beats_the_invocation_environment() {
     let marker = dir.join("witness");
     let stub = stub_infisical(&dir, &Backend::Injects(INFISICAL_DECOY));
     let registry = registry_from_with_env(
-        &infisical_config_for(&stub, "", r#""DECOY":{"env":"prod"}"#),
+        &infisical_config_for(&stub, r#""DECOY":{"env":"prod"}"#),
         "staging",
     );
 
@@ -530,10 +559,15 @@ fn a_stale_config_level_environment_is_ignored_and_named() {
     let dir = scratch("infisical-stale-env");
     let marker = dir.join("witness");
     let stub = stub_infisical(&dir, &Backend::Injects(INFISICAL_DECOY));
-    let config: Config = serde_json::from_str(&infisical_config_for(
-        &stub,
-        r#""env":"prod""#,
-        r#""DECOY":{}"#,
+    // Its own config: the stale `stores.infisical.env` key is the SUBJECT, and
+    // the shared builder deliberately does not carry a key it exists to warn
+    // about. The ceiling is spelled here for the same reason it is spelled
+    // there — the lookup below must get an answer.
+    let config: Config = serde_json::from_str(&format!(
+        r#"{{"stores":{{"keychain":{{"enabled":false}},
+             "infisical":{{"enabled":true,"binary":"{}","env":"prod","timeout_ms":60000}}}},
+            "secrets":{{"DECOY":{{}}}}}}"#,
+        stub.display()
     ))
     .expect("valid config");
     let built = store::build(&config, &Invocation::default());
@@ -576,7 +610,7 @@ fn the_infisical_invocation_switches_off_telemetry_and_pins_the_log_stream() {
     let dir = scratch("infisical-flags");
     let marker = dir.join("witness");
     let stub = stub_infisical(&dir, &Backend::Injects(INFISICAL_DECOY));
-    let registry = registry_from(&infisical_config(&stub, ""), &Reason::default());
+    let registry = registry_from(&infisical_config(&stub), &Reason::default());
     let _ = run_with(&registry, &["DECOY"], &witness(&marker, "DECOY", 0), &[]);
 
     let argv = recorded_lines(&dir.join("infisical.argv"));
@@ -594,7 +628,7 @@ fn every_proton_read_carries_a_reason_that_names_the_command() {
     let marker = dir.join("witness");
     let stub = stub_pass_cli(&dir, &Backend::Injects(PROTON_DECOY));
     let registry = registry_from(
-        &proton_config(&stub, r#""timeout_ms":60000"#),
+        &proton_config(&stub),
         &Reason::for_run(&witness(&marker, "DECOY", 0)),
     );
     let _ = run_with(&registry, &["DECOY"], &witness(&marker, "DECOY", 0), &[]);
@@ -624,10 +658,7 @@ fn the_proton_reason_never_carries_an_argument_value() {
         .iter()
         .map(OsString::from)
         .collect();
-    let registry = registry_from(
-        &proton_config(&stub, r#""timeout_ms":60000"#),
-        &Reason::for_run(&argv),
-    );
+    let registry = registry_from(&proton_config(&stub), &Reason::for_run(&argv));
     let _ = run_with(&registry, &["DECOY"], &argv, &[]);
 
     let reason = recorded(&dir.join("pass-cli.reason"));
@@ -649,10 +680,7 @@ fn a_concealed_value_is_refused_rather_than_injected() {
     let dir = scratch("proton-concealed");
     let marker = dir.join("witness");
     let stub = stub_pass_cli(&dir, &Backend::Concealed);
-    let registry = registry_from(
-        &proton_config(&stub, r#""timeout_ms":60000"#),
-        &Reason::default(),
-    );
+    let registry = registry_from(&proton_config(&stub), &Reason::default());
 
     let (outcome, notes) = run_with(&registry, &["DECOY"], &witness(&marker, "DECOY", 6), &[]);
 
@@ -1086,25 +1114,91 @@ fn a_backend_nobody_enabled_is_never_spawned() {
 #[test]
 fn only_the_names_that_were_asked_for_reach_the_child() {
     // The narrowing that nesting could not have done. `infisical run` injects
-    // every secret at the path; here the vault holds a second name and the
-    // child never sees it, because `keyless` spawns the command itself and
+    // every secret at the path; this vault really does hold a second one, and
+    // the child never sees it, because `keyless` spawns the command itself and
     // sets exactly what was requested.
+    //
+    // # Why the fixture holds a name nobody asks for
+    //
+    // This case used to witness `SOMETHING_ELSE`, a name that appeared NOWHERE
+    // — not in the stub, not in the config, not in this process's environment.
+    // Nothing the tool can do sets a name it was never given, so the assertion
+    // held with the whole Infisical adapter deleted: measured by replacing the
+    // registry with an empty one and the bindings with none, it still passed,
+    // in 0.00 s. It was a case named for an invariant it did not exercise.
+    // [`NEIGHBOUR_KEY`] is in the vault, so the absence asserted below is an
+    // absence the fixture could have supplied.
+    //
+    // # Two halves, and only one of them owns a clock
+    //
+    // The VALUE half needs the stub to answer, so it is bounded by the
+    // fixture's deadline — a stub that misses it turns this red for a reason
+    // that has nothing to do with narrowing, which is why the message names the
+    // degrade. The INVOCATION half is not bounded by anything: the stub records
+    // its argv on its first line, and what was ASKED FOR is settled there
+    // whatever happens next.
     let dir = scratch("infisical-narrow");
     let marker = dir.join("witness");
-    let stub = stub_infisical(&dir, &Backend::Injects(INFISICAL_DECOY));
-    let registry = registry_from(&infisical_config(&stub, ""), &Reason::default());
+    let stub = stub_infisical(&dir, &Backend::InjectsWholeVault);
+    let registry = registry_from(&infisical_config(&stub), &Reason::default());
 
-    let (outcome, _) = run_with(
+    let (outcome, notes) = run_with(
         &registry,
         &["DECOY"],
-        &witness(&marker, "SOMETHING_ELSE", 0),
+        &witness_env(&marker, &["DECOY", NEIGHBOUR_KEY]),
         &[],
     );
 
-    assert_eq!(outcome.state, State::Injected);
+    // Read from the other side of the interface: what the adapter actually
+    // asked the vendor for. One name, and no trace of the command the user
+    // gave — a tool that ran that command UNDER `infisical run` would have to
+    // put it right here.
+    let argv = recorded_lines(&dir.join("infisical.argv"));
+    let probe = argv
+        .iter()
+        .position(|arg| arg == "--")
+        .map(|at| &argv[at + 1..])
+        .expect("the invocation must hand the probe over after `--`");
     assert_eq!(
-        witnessed(&marker),
-        "<unset>",
+        probe.len(),
+        2,
+        "the vendor was handed something other than a one-name probe: {probe:?}"
+    );
+    assert_eq!(
+        probe[1], "DECOY",
+        "the probe asked for a name other than the one requested"
+    );
+    assert!(
+        !argv.iter().any(|arg| arg.contains(NEIGHBOUR_KEY)),
+        "a name nobody asked for was named to the vendor: {argv:?}"
+    );
+
+    assert_eq!(
+        outcome.state,
+        State::Injected,
+        "the lookup did not answer, so nothing was narrowed: {notes}"
+    );
+    let seen = witnessed_env(&marker);
+    // A value carrying variables of its own shows up here as names the witness
+    // never asked about — which is what a probe printing the whole environment
+    // instead of one variable produces.
+    let extra: Vec<&String> = seen
+        .keys()
+        .filter(|name| *name != "DECOY" && *name != NEIGHBOUR_KEY)
+        .collect();
+    assert!(
+        extra.is_empty(),
+        "an injected value carried variables of its own: {extra:?}"
+    );
+    // Exactly the value, never merely present and never merely non-empty.
+    assert_eq!(
+        seen.get("DECOY").map(String::as_str),
+        Some(INFISICAL_DECOY),
+        "the requested name did not arrive intact"
+    );
+    assert_eq!(
+        seen.get(NEIGHBOUR_KEY).map(String::as_str),
+        Some("<unset>"),
         "a name nobody asked for reached the child's environment"
     );
 }
@@ -1397,7 +1491,7 @@ fn doctor_report(dir: &Path, config: &str) -> (String, i32) {
 fn doctor_reports_an_expired_proton_session_as_a_problem() {
     let dir = scratch("doctor-dead-session");
     let stub = support::stub_pass_cli_dead_session(&dir);
-    let (report, code) = doctor_report(&dir, &proton_config(&stub, r#""timeout_ms":60000"#));
+    let (report, code) = doctor_report(&dir, &proton_config(&stub));
 
     assert!(
         report.contains("store    proton PROBLEM"),
@@ -1437,7 +1531,7 @@ fn doctor_reports_a_live_proton_session_as_ok() {
     // gets a health check deleted.
     let dir = scratch("doctor-live-session");
     let stub = stub_pass_cli_discovery(&dir, ONE_VAULT, LIVE_AND_TRASHED, "{}");
-    let (report, code) = doctor_report(&dir, &proton_config(&stub, r#""timeout_ms":60000"#));
+    let (report, code) = doctor_report(&dir, &proton_config(&stub));
 
     assert!(report.contains("store    proton ok"), "{report}");
     assert_eq!(code, 0, "{report}");

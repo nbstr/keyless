@@ -42,6 +42,18 @@ pub const INFISICAL_DECOY: &str = "decoy-Inf7-company-vault-value-0101";
 /// A decoy that only the fake Proton Pass CLI hands out.
 pub const PROTON_DECOY: &str = "decoy-Pro9-personal-vault-value-0202";
 
+/// The name of a second secret sitting at the same Infisical path as `DECOY`.
+///
+/// Nothing ever asks for it. It exists so that "only the names that were asked
+/// for reach the child" has something to be FALSE about: against a vault
+/// holding one name, a tool that narrows and a tool that does not look
+/// identical.
+pub const NEIGHBOUR_KEY: &str = "NEIGHBOUR";
+
+/// The value behind [`NEIGHBOUR_KEY`]. Distinct from every other decoy here, so
+/// an assertion that names it cannot be satisfied by another store's answer.
+pub const NEIGHBOUR_DECOY: &str = "decoy-Nb42-the-name-nobody-asked-for-0303";
+
 /// What the vendor CLIs' output masking substitutes for a value.
 pub const CONCEALED: &str = "<concealed by Proton Pass>";
 
@@ -136,6 +148,14 @@ pub fn stub_security(dir: &Path, behaviour: &Stub) -> PathBuf {
 pub enum Backend {
     /// Inject the value and exec the probe, as a working `run` does.
     Injects(&'static str),
+    /// Inject the WHOLE path's worth of secrets — [`INFISICAL_DECOY`] under
+    /// `DECOY` and [`NEIGHBOUR_DECOY`] under [`NEIGHBOUR_KEY`], which nobody
+    /// asks for — and then run whatever follows `--`, verbatim.
+    ///
+    /// That is what `infisical run` does, and [`Backend::Injects`] does not
+    /// model it: it sets exactly the one name the probe named, so a tool that
+    /// handed its child an entire vault would look identical against it.
+    InjectsWholeVault,
     /// Exec the probe with nothing injected, then report the child's status the
     /// way the CLI does.
     Unset,
@@ -159,6 +179,19 @@ impl Backend {
             Backend::Injects(value) => {
                 format!("exec /usr/bin/env \"$key={value}\" \"$child\" \"$key\"\n")
             }
+            // Two deliberate differences from the arm above, and both are the
+            // point. Both names are LITERAL, because what a vault holds does
+            // not depend on what was asked for — `"$key"` would make the
+            // fixture's contents follow the request, which is the coupling the
+            // case using this exists to deny. And `"$@"` rather than `"$child"
+            // "$key"`, because the vendor runs whatever it was handed after
+            // `--`: a fixture that re-spells the probe's two arguments could
+            // not show a longer command nested under it. For the two-argument
+            // probe the two spellings are identical.
+            Backend::InjectsWholeVault => format!(
+                "exec /usr/bin/env \"DECOY={INFISICAL_DECOY}\" \
+                 \"{NEIGHBOUR_KEY}={NEIGHBOUR_DECOY}\" \"$@\"\n"
+            ),
             Backend::Concealed => {
                 format!("exec /usr/bin/env \"$key={CONCEALED}\" \"$child\" \"$key\"\n")
             }
@@ -461,6 +494,53 @@ pub fn witness(marker: &Path, var: &str, code: i32) -> Vec<OsString> {
         OsString::from("sh"),
         OsString::from(marker),
     ]
+}
+
+/// A child command that reports SEVERAL names out of one environment.
+///
+/// It writes one `NAME=value` line per name — the literal `<unset>` where the
+/// variable is absent — then exits 0.
+///
+/// One child rather than one per name, because "did exactly the asked-for set
+/// arrive?" is a question about a single environment. Two children are two
+/// environments, and a name could be present in one and absent in the other
+/// with neither run able to notice.
+pub fn witness_env(marker: &Path, vars: &[&str]) -> Vec<OsString> {
+    let mut script = String::from(": > \"$1\"");
+    for var in vars {
+        // The format string is fixed and the value arrives as an argument, so a
+        // value holding a `%` is reported rather than interpreted.
+        script.push_str(&format!(
+            "; printf '%s=%s\\n' '{var}' \"${{{var}-<unset>}}\" >> \"$1\""
+        ));
+    }
+    script.push_str("; exit 0");
+    vec![
+        OsString::from("/bin/sh"),
+        OsString::from("-c"),
+        OsString::from(script),
+        OsString::from("sh"),
+        OsString::from(marker),
+    ]
+}
+
+/// What a [`witness_env`] child recorded, as a map from name to value.
+///
+/// # Panics
+///
+/// When a line is not `NAME=value`. A record this cannot read is a fixture
+/// failure, and skipping the line instead would report the name as absent —
+/// which is exactly the answer several callers assert on.
+pub fn witnessed_env(marker: &Path) -> std::collections::BTreeMap<String, String> {
+    witnessed(marker)
+        .lines()
+        .map(|line| {
+            let (name, value) = line.split_once('=').unwrap_or_else(|| {
+                panic!("the witness wrote a line that is not NAME=value: {line}")
+            });
+            (name.to_owned(), value.to_owned())
+        })
+        .collect()
 }
 
 /// A child command that prints `text` to stdout and exits 0.
