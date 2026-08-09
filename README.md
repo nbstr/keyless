@@ -86,7 +86,24 @@ flag](#storing-a-secret).
 git clone https://github.com/nbstr/keyless
 cd keyless
 cargo install --path .
-keyless --version
+keyless setup
+```
+
+**Two commands, and the second one is not optional.** `cargo install` places two
+binaries and nothing else — that is all a package manager can do, and for a while
+it was all this project did, so a fresh clone got the broker with none of its
+guards and nothing said so. `keyless setup` is the rest: it detects your stores
+and writes a config, registers the hook pack that refuses commands which would
+print a credential, installs the agent instructions, and reports the daemon. It
+names every file before it touches it, merges rather than replaces, and running
+it twice is safe and says so.
+
+Nothing here is one-way:
+
+```console
+keyless disable      the guards stop firing, instantly. Nothing is deleted
+keyless enable       back on
+keyless uninstall    removes what setup created, keeps what you wrote
 ```
 
 **The repository is private, and the clone is the step that tells you so
@@ -114,8 +131,14 @@ records what replaces each piece on Linux.
 That builds two binaries — `keyless`, the client, and `keylessd`, the daemon —
 and puts both on your `PATH`. Installing them is not standing the daemon up:
 until you do, nothing is listening, and `keyless` reads your keychain directly
-as you. For the uid boundary, see [`install/README.md`](install/README.md) —
-one `sudo`, and the installer is dry-run until you pass `--commit`.
+as you. `keyless setup --daemon` stands it up under `sudo`, and
+[`install/README.md`](install/README.md) is the script it runs — dry-run until
+you pass `--commit`, and worth reading first.
+
+**Setup cannot finish the daemon for you, and it is honest about that.** The
+boundary only exists once your secrets MOVE behind it and are deleted from your
+login keychain, and no installer can know which of your keychain items are meant
+to stay reachable by hand.
 
 ### Who this is for
 
@@ -158,8 +181,13 @@ is the one store that needs no account you do not already have.
 
 ```console
 $ cargo install --path .
-$ keyless --version
+$ keyless setup
 ```
+
+`setup` prints the resolved path of the binary that is running, which is how you
+find out now — rather than three commands later — whether `~/.cargo/bin` is on
+your `PATH`. It also writes the config that step 5 is about, so if you have run
+it already, that step is a re-read rather than a write.
 
 **2. Store something. Not a real credential yet — a throwaway.**
 
@@ -202,20 +230,22 @@ There *is* a way to ask whether a name resolves. It just never answers with a
 value — and it only knows about names you have **declared**, which is what the
 config file is for.
 
-**5. Write the config file. `init` does the store half for you.**
+**5. Write the config file. `setup` did the store half for you.**
 
 Everything above worked without one, because an undeclared name is looked up as
 its own account in the default store. What a config buys is that `keyless` now
 knows the name exists — so it can list it, and check it.
 
 ```console
-$ keyless init
+$ keyless setup
 ```
 
-`init` detects which backends are installed, proves the ones it can prove, writes
+It detects which backends are installed, proves the ones it can prove, writes
 `~/.config/keyless/config.json` with the provable one as the default, and says
 what each of the others is waiting for. It never asks for a credential and there
-is no field in what it writes that one would fit in.
+is no field in what it writes that one would fit in. (`keyless init` is the same
+store detection on its own, for anybody who wants the config and none of the
+rest.)
 
 It writes **stores**, not **secrets** — deliberately. Which vault, which item,
 which field, which environment are facts about your account, and a setup command
@@ -225,24 +255,33 @@ discover those without ever reading a value; see [Discovery](#discovery).
 Running it twice is safe: an existing config is reported, never replaced, unless
 you pass `--force`.
 
-`init` also reports a **GUARDS** row: whether the hook pack in `hooks/` is
-registered in your Claude Code settings. Without it nothing refuses a command
-that would print a credential into a transcript, and `install/install.sh` places
-the binaries only — so a fresh clone has the tool and none of the protection.
+The same run registered the **guards** — the hook pack in `hooks/`, which is what
+refuses a command that would print a credential into a transcript. The write
+belongs to `hooks/install.py`: it backs the settings file up first, merges rather
+than overwrites, re-parses the result before replacing the original, and records
+what it added so an uninstall can remove exactly that and nothing you wrote
+yourself.
 
-```console
-$ keyless init --hooks
-```
-
-That merges the pack in. The write belongs to `hooks/install.py`, which backs the
-file up first, merges rather than overwrites, re-parses the result before
-replacing the original, and takes itself back out with `--uninstall`. It is a
-step you ask for rather than something `init` does on its own: `~/.claude/
-settings.json` belongs to another program, and not everybody running `keyless`
-runs Claude Code at all.
+**A machine with no agent harness gets everything else and is told what was
+skipped.** `keyless` is a general tool; `~/.claude` is another program's
+directory, and setup does not create one for a machine that has no agent. Pass
+`--claude-dir DIR` if yours lives somewhere else.
 
 If the binary was copied to a machine without the checkout, the row says so and
-names `KEYLESS_HOOKS_DIR`, which points at the directory holding `install.py`.
+names `KEYLESS_PACK_DIR`, which points at the directory holding `hooks/` and
+`install/`.
+
+**If the guards are ever in your way, there is a switch and you should use it
+rather than working around them.**
+
+```console
+$ keyless disable      no check fires. Your config, your secrets and the
+                       registration are all untouched
+$ keyless enable       back on
+```
+
+`keyless doctor` says `SWITCHED OFF` for as long as they are off. A disabled
+install that reported healthy would be the worst false green in the tool.
 
 Add the name by hand, so `~/.config/keyless/config.json` reads:
 

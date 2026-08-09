@@ -12,10 +12,27 @@ harness. It works the same whether your secrets live in 1Password, Infisical,
 Proton Pass, the macOS Keychain, Vault, Doppler, or a `.env` file.
 
 ```console
-$ cd hooks && ./install.sh
-~/.claude/settings.json: added a PreToolUse handler; added a PostToolUse handler; added 8 permission deny rule(s)
+$ keyless setup
+~/.claude/settings.json: added a PreToolUse handler; added a PostToolUse handler; added 4 permission allow rule(s); added 8 permission deny rule(s)
 backup: ~/.claude/settings.json.keyless-backup-20260806T212412
 ```
+
+`keyless setup` installs this pack along with everything else, which is the point
+of it: for a while the binaries had one installer and this pack had another, and
+neither mentioned the other. `./install.sh` still works standalone and does the
+same merge.
+
+**Turning it off is one word**, and reaching for it is better than working around
+the pack by hand:
+
+```console
+$ keyless disable    no check fires. Nothing is unregistered and nothing is lost
+$ keyless enable     back on
+```
+
+It writes `"enabled": false` into `~/.config/keyless/hooks.json` — this pack's own
+config, read by `config.py`, and not the agent's settings file. `keyless doctor`
+reports `SWITCHED OFF` for as long as it is.
 
 ---
 

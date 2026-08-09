@@ -1,5 +1,10 @@
 # Installing the daemon
 
+**This is one step of the install, not the install.** `keyless setup` is the
+whole of it — config, guards, agent instructions — and it REPORTS this daemon
+rather than standing it up. `keyless setup --daemon` runs the script below under
+`sudo` for you; everything here is what that runs, and it is worth reading first.
+
 Two files to read before you run anything: [`install.sh`](install.sh) and
 [`sh.keyless.keylessd.plist`](sh.keyless.keylessd.plist).
 
@@ -16,7 +21,12 @@ It needs `sudo` exactly once, to create a user. Nothing afterwards does.
 
 [`uninstall.sh`](uninstall.sh) reverses all of it — the launchd job, the
 files, and the user account the install created. It is dry-run by default
-too, and takes the same `--commit`.
+too, and takes the same `--commit`. It deliberately keeps the audit log and the
+store; both are printed at the end so you deal with them on purpose.
+
+`keyless uninstall` is the other half, and the two do not overlap: this script
+owns everything under `/usr/local` and the system account, and that verb owns
+the config, the guards' registration and the agent instructions.
 
 ---
 
