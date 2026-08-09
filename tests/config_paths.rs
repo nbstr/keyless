@@ -66,7 +66,8 @@ impl Fixture {
         let path = self.dir.join("config.json");
         let body = format!(
             r#"{{"stores":{{"keychain":{{"enabled":false}},
-                 "proton":{{"enabled":true,"binary":"{binary}","session_dir":"{session_dir}"}}}},
+                 "proton":{{"enabled":true,"binary":"{binary}","session_dir":"{session_dir}",
+                            "timeout_ms":60000}}}},
                "secrets":{{"HOME_WIFI":{{"vault":"Personal","item":"Router","field":"password"}}}}}}"#,
             binary = self.binary.display()
         );
@@ -340,6 +341,7 @@ fn a_relative_manager_session_dir_refuses_the_write_outright() {
         format!(
             r#"{{"stores":{{"keychain":{{"enabled":false}},"proton":{{"enabled":true,
                  "binary":"{binary}","session_dir":"/tmp/keyless-reader",
+                 "timeout_ms":60000,
                  "manager":{{"session_dir":"manager-session"}}}}}},
                "secrets":{{"HOME_WIFI":{{"store":"proton","vault":"Personal",
                  "item":"Router","field":"password"}}}}}}"#,
@@ -645,7 +647,7 @@ fn the_missing_session_dir_remedy_advises_a_path_this_build_accepts() {
         &path,
         format!(
             r#"{{"stores":{{"keychain":{{"enabled":false}},
-                 "proton":{{"enabled":true,"binary":"{}"}}}}}}"#,
+                 "proton":{{"enabled":true,"binary":"{}","timeout_ms":60000}}}}}}"#,
             fixture.binary.display()
         ),
     )
@@ -669,7 +671,7 @@ fn the_manager_remedy_advises_a_path_this_build_accepts() {
         &path,
         format!(
             r#"{{"stores":{{"keychain":{{"enabled":false}},
-                 "proton":{{"enabled":true,"binary":"{}",
+                 "proton":{{"enabled":true,"binary":"{}","timeout_ms":60000,
                             "session_dir":"/tmp/keyless-reader"}}}},
                "secrets":{{"HOME_WIFI":{{"vault":"V","item":"I","field":"password"}}}}}}"#,
             fixture.binary.display()

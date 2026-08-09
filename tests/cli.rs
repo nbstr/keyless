@@ -636,7 +636,8 @@ fn a_name_with_no_environment_degrades_and_says_both_ways_to_fix_it() {
         &config,
         format!(
             r#"{{"stores":{{"keychain":{{"enabled":false}},
-                 "infisical":{{"enabled":true,"binary":"{}","env":"prod"}}}},
+                 "infisical":{{"enabled":true,"binary":"{}","env":"prod",
+                               "timeout_ms":60000}}}},
                 "secrets":{{"DATABASE_URL":{{}}}}}}"#,
             stub.display()
         ),

@@ -172,6 +172,134 @@ fn every_fixture_deadline_is_classified() {
     );
 }
 
+/// The two stores whose fixtures spawn a vendor CLI and whose `enabled` default
+/// is `false`, so that enabling one has to be spelled out and can be scanned for.
+///
+/// `keychain` is deliberately absent and that is this gate's largest blind
+/// spot: it is enabled by DEFAULT, so a fixture that spawns the `security` stub
+/// need write nothing at all, and there is no token here to find. Closing that
+/// needs a different mechanism than a source scan.
+const SPAWNING_STORES: &[&str] = &["infisical", "proton"];
+
+#[test]
+fn a_fixture_that_spawns_a_vendor_cli_names_its_deadline() {
+    // # The hole this closes, which is the ABSENCE of a number
+    //
+    // `every_fixture_deadline_is_classified` above reads the deadlines that
+    // were WRITTEN. A store object that names none is invisible to it and
+    // inherits `keyless::config::DEFAULT_TIMEOUT_MS` — 10 000 ms, which is half
+    // the floor that test sets for a ceiling on a stub that must answer.
+    //
+    // Measured 2026-08-09: seven store objects across three files named no
+    // deadline in source. Only some of those were actually unbounded — the
+    // Proton builder in `tests/stores.rs` took one from its callers, so it is
+    // flagged here while its fixtures were bounded correctly. The Infisical
+    // builder beside it took one from nobody, and the eleven fixtures built
+    // from it ran on the 10 000 ms default while reading as green.
+    //
+    // That difference is why this test asks about the OBJECT rather than the
+    // fixture: an object that carries its deadline somewhere a scan cannot see
+    // is indistinguishable, here, from one that has none. Both are refused, and
+    // spelling the number is the fix for either.
+    //
+    // So a number that has to be remembered drifts back, AND a number nobody
+    // wrote cannot be scanned for at all. This test asks the opposite question
+    // to its sibling: not "is this value classified?" but "is there a value?".
+    //
+    // # What it CANNOT see
+    //
+    // * A store enabled by default — see [`SPAWNING_STORES`].
+    // * A deadline supplied as a Rust value rather than JSON digits. The scan
+    //   only asks that `"timeout_ms"` appears inside the object; what follows
+    //   it is the sibling test's business.
+    // * Whether the number is big enough. That is the table above.
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests");
+    let mut sources = Vec::new();
+    collect_rust_sources(&root, &mut sources);
+
+    let mut spawning = 0usize;
+    let mut silent: Vec<String> = Vec::new();
+    for path in &sources {
+        if path
+            .file_name()
+            .is_some_and(|name| name == "suite_hygiene.rs")
+        {
+            continue;
+        }
+        let text = std::fs::read_to_string(path)
+            .unwrap_or_else(|error| panic!("cannot read {}: {error}", path.display()));
+        for store in SPAWNING_STORES {
+            for object in store_objects(&text, store) {
+                // A store that is not switched on spawns nothing, and one with
+                // no `binary` cannot reach a stub — neither has a deadline to
+                // miss.
+                if !object.contains(r#""enabled":true"#) || !object.contains(r#""binary""#) {
+                    continue;
+                }
+                spawning += 1;
+                if !object.contains(r#""timeout_ms""#) {
+                    silent.push(format!("{} — {store}", relative(&root, path)));
+                }
+            }
+        }
+    }
+
+    // A scan that matched nothing would report every fixture as compliant.
+    assert!(
+        spawning >= 5,
+        "only {spawning} spawning store fixture(s) were found under {}. The suite \
+         has more than that, so the scan below stopped matching the spelling they \
+         use — and that reads exactly like a pass.",
+        root.display()
+    );
+
+    assert!(
+        silent.is_empty(),
+        "store fixture(s) that spawn a vendor CLI and name no deadline: {}\n\n\
+         Each inherits keyless::config::DEFAULT_TIMEOUT_MS, which is below the \
+         {CEILING_FLOOR_MS} ms floor a ceiling has to clear, and no scan can see \
+         a number nobody wrote. Spell `\"timeout_ms\":60000` in the object, or \
+         give the fixture its own config if the deadline is what it tests.",
+        silent.join(", ")
+    );
+}
+
+/// Every `"<store>":{ … }` object in `text`, brace-balanced.
+///
+/// The config strings are `format!` templates, so their literal braces are
+/// doubled. They are halved first, which also turns a `{}` placeholder into a
+/// balanced empty pair — harmless here, because only the brace COUNT decides
+/// where an object ends.
+fn store_objects(text: &str, store: &str) -> Vec<String> {
+    let flattened = text.replace("{{", "{").replace("}}", "}");
+    let needle = format!("\"{store}\":{{");
+    let mut out = Vec::new();
+    let bytes: Vec<char> = flattened.chars().collect();
+    let mut from = 0;
+    while let Some(at) = flattened[from..].find(&needle) {
+        let open = from + at + needle.len() - 1;
+        let start = flattened[..open].chars().count();
+        let mut depth = 0usize;
+        let mut end = start;
+        for (offset, character) in bytes[start..].iter().enumerate() {
+            match character {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = start + offset;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        out.push(bytes[start..=end].iter().collect());
+        from = from + at + needle.len();
+    }
+    out
+}
+
 /// Every `"timeout_ms":<digits>` in `text`.
 ///
 /// A format placeholder (`"timeout_ms":{timeout_ms}` in the daemon helper) has
