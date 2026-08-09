@@ -3,8 +3,8 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>keyless — your agent gets the secret, your transcript never does</title>
-<meta name="description" content="A secrets broker for AI coding agents. Name a secret; the value reaches one child process and nothing else. There is no verb that prints it.">
+<title>keyless — the vault was never the problem, its read verb is</title>
+<meta name="description" content="A secrets broker for AI coding agents. It resolves through the vault you already run - Proton Pass, Infisical - and ships no verb that prints a value.">
 <link rel="canonical" href="https://keyless.hackistan.org/">
 <!-- Inline favicon. The page ships as ONE file with no external requests, so the
      icon is a data URI rather than a /favicon.ico the host would have to serve.
@@ -17,11 +17,11 @@
 <meta property="og:type" content="website">
 <meta property="og:site_name" content="keyless">
 <meta property="og:url" content="https://keyless.hackistan.org/">
-<meta property="og:title" content="keyless — your agent gets the secret, your transcript never does">
-<meta property="og:description" content="A secrets broker for AI coding agents. Name a secret; the value reaches one child process and nothing else. There is no verb that prints it.">
+<meta property="og:title" content="keyless — the vault was never the problem, its read verb is">
+<meta property="og:description" content="A secrets broker for AI coding agents. It resolves through the vault you already run - Proton Pass, Infisical - and ships no verb that prints a value.">
 <meta name="twitter:card" content="summary">
-<meta name="twitter:title" content="keyless — your agent gets the secret, your transcript never does">
-<meta name="twitter:description" content="A secrets broker for AI coding agents. Name a secret; the value reaches one child process and nothing else. There is no verb that prints it.">
+<meta name="twitter:title" content="keyless — the vault was never the problem, its read verb is">
+<meta name="twitter:description" content="A secrets broker for AI coding agents. It resolves through the vault you already run - Proton Pass, Infisical - and ships no verb that prints a value.">
 <style>
 /* ------------------------------------------------------------------ reset */
 *,*::before,*::after{box-sizing:border-box}
@@ -399,10 +399,18 @@ pre .v{color:var(--violet)}
 .side-note b{font-weight:500;color:rgba(255,255,255,.95)}
 
 /* --------------------------------------------------------- store sources */
-.srcs{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:1px;background:var(--panel);border:1px solid var(--panel)}
+/* Two cards, not three. The plaintext file used to sit in this same grid beside
+   the two vaults, which read at a glance as "these are the three things keyless
+   replaces" — exactly backwards. The vaults are what keyless reads FROM. The
+   lesser case now lives in its own strip, below, visibly not part of this set. */
+.srcs{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:1px;background:var(--panel);border:1px solid var(--panel)}
 @media(max-width:800px){.srcs{grid-template-columns:minmax(0,1fr)}}
 .src{background:var(--cell-a);padding:26px 24px;display:flex;flex-direction:column;gap:14px;min-width:0}
 .src.is-past{background:var(--ground-leak)}
+/* The demoted case: a horizontal strip, half the visual weight of a source card. */
+.lesser{display:flex;align-items:flex-start;gap:18px;flex-wrap:wrap}
+.lesser .mark{width:26px;height:26px;color:var(--leak)}
+.lesser div{min-width:0;flex:1 1 320px}
 /* The three marks share one 24-unit grid, one 1.5 stroke and one join style, so
    they read as a set rather than three logos pasted next to each other. */
 .mark{width:34px;height:34px;color:var(--green);flex:none}
@@ -507,11 +515,12 @@ html{scroll-behavior:smooth}
 <header class="hero">
   <div class="col">
     <p class="hero-eyebrow cascade d1">Secrets broker for coding agents</p>
-    <h1 class="cascade d2">Your agent gets the secret.<br><span class="fade">Your transcript never does.</span></h1>
+    <h1 class="cascade d2">The vault was never the problem.<br><span class="fade">Its read verb is.</span></h1>
     <p class="sub cascade d3">
-      You name a secret. <b>keyless</b> puts the value into one child process's environment and nowhere
-      else — not stdout, not scrollback, not the transcript. There is deliberately no verb that prints a
-      value, and there never will be. <b>That absence is the whole product.</b>
+      Proton Pass and Infisical both keep a secret safe at rest, and both can put one into a process
+      without printing it. They also both ship a verb that <b>prints the value to stdout</b> — and stdout
+      is the transcript. <b>keyless resolves through your vault's own injection path and ships no verb
+      that prints.</b> An agent cannot print a value it has no way to ask for.
     </p>
 
     <div class="cta-row cascade d4">
@@ -528,7 +537,7 @@ html{scroll-behavior:smooth}
         <div class="term-body">
 <pre><span class="c">$</span> <span class="k">keyless run -s DATABASE_URL -- psql</span>
 <span class="o">psql (16.2)</span>  <span class="g">connected.</span>
-<span class="c"># the value appeared nowhere</span></pre>
+<span class="c"># from your vault. printed nowhere.</span></pre>
         </div>
       </div>
     </div>
@@ -544,7 +553,7 @@ html{scroll-behavior:smooth}
         <div class="wire w1"><span class="dot"></span></div>
         <div class="stage is-broker">
           <span class="st-l">keyless</span>
-          <span class="st-v">resolves the name</span>
+          <span class="st-v">resolves via the vault’s own run</span>
         </div>
         <div class="wire w2"><span class="dot"></span></div>
         <div class="stage is-child">
@@ -566,8 +575,9 @@ html{scroll-behavior:smooth}
 
   <div class="col">
     <p class="caveat cascade d6">
-      Two states, no third — <b>INJECTED</b> or <b>DEGRADED</b>. A partial injection does not exist.
+      keyless adds no injection your vault did not already have. <b>It removes the alternative.</b>
       &nbsp;&middot;&nbsp; <b>keyless get</b> is not a typo you can make; it does not exist.
+      &nbsp;&middot;&nbsp; Two states, no third — <b>INJECTED</b> or <b>DEGRADED</b>.
       &nbsp;&middot;&nbsp; MIT &middot; Rust &middot; macOS &middot; five direct dependencies.
     </p>
   </div>
@@ -579,34 +589,38 @@ html{scroll-behavior:smooth}
     <div class="rule reveal">
       <div class="eyebrow"><span class="dash"></span><span class="eyebrow-txt">why this exists</span></div>
       <div class="head">
-        <h2>The transcript<br>is forever.</h2>
-        <p class="deck">A secret that reaches a chat is in a file on disk, in scrollback, and in whatever
-          that transcript syncs to. Deleting the message does not delete it. Each pair below is the same
-          moment, twice.</p>
+        <h2>A vault, used<br>correctly.</h2>
+        <p class="deck">These pairs come from a real setup with both vaults already in place, where the
+          secrets leaked anyway. Nothing about that setup was wrong. Each pair is the same moment, twice,
+          and the vault is present in both halves.</p>
       </div>
     </div>
 
     <!-- pair 1 ------------------------------------------------------------- -->
     <div class="pair reveal">
       <div class="pair-head">
-        <h3>You paste it once. It is on disk forever.</h3>
-        <p class="deck-s gap-s">The value is not only in the terminal you are looking at. It is in the
-          history file, and in the transcript that outlives the session.</p>
+        <h3>The vault did its job. The read verb undid it.</h3>
+        <p class="deck-s gap-s">The secret was encrypted at rest, in the right vault, with the right
+          access. Then something needed the value — a person debugging, a script, an agent — and every
+          vault has a verb for that. It writes to stdout, and stdout is the transcript.</p>
       </div>
       <div class="slab">
         <div class="duo">
           <div class="side side-leak">
             <div class="term">
-              <div class="termbar"><span class="pip leak"></span><span class="tag tag-leak">without keyless</span></div>
+              <div class="termbar"><span class="pip leak"></span><span class="tag tag-leak">your vault, read verb</span></div>
               <div class="term-body">
-<pre><span class="c">$</span> <span class="k">echo $DATABASE_URL</span>
-<span class="r">postgres://demo:not-a-real-password@db.example.com/app</span>
-<span class="c">$</span> <span class="k">psql "$DATABASE_URL"</span>
-<span class="o">psql (16.2)  connected.</span></pre>
+<pre><span class="c">$</span> <span class="k">pass-cli item view billing-db</span>
+<span class="o">password  </span><span class="r">postgres://demo:not-a-real-password@db.example.com/app</span>
+<span class="c">$</span> <span class="k">psql "</span><span class="r">postgres://demo:not-a-real-password@…</span><span class="k">"</span>
+<span class="o">psql (16.2)  connected.</span>
+
+<span class="c"># the vault was never breached. it was ASKED.</span></pre>
               </div>
             </div>
-            <p class="side-note">One command printed the value. <b>Four surfaces recorded it</b> before
-              the connection was even open.</p>
+            <p class="side-note">Correct credentials, correct permissions, correct vault. The value is
+              in the transcript now — <b>and in whatever that transcript syncs to</b>. No amount of vault
+              hygiene takes it back.</p>
             <div class="ledger">
               <div class="leak"><span class="ln">stdout</span><span class="lv">the value</span></div>
               <div class="leak"><span class="ln">scrollback</span><span class="lv">the value</span></div>
@@ -617,16 +631,17 @@ html{scroll-behavior:smooth}
           </div>
           <div class="side side-safe">
             <div class="term">
-              <div class="termbar"><span class="pip"></span><span class="tag tag-safe">with keyless</span></div>
+              <div class="termbar"><span class="pip"></span><span class="tag tag-safe">the same vault, via keyless</span></div>
               <div class="term-body">
 <pre><span class="c">$</span> <span class="k">keyless run -s DATABASE_URL -- psql</span>
 <span class="o">psql (16.2)</span>  <span class="g">connected.</span>
 
-<span class="c"># the command line carries a NAME, never a value</span></pre>
+<span class="c"># resolved through the vault's own injection path.</span>
+<span class="c"># nothing printed it, because nothing here can.</span></pre>
               </div>
             </div>
-            <p class="side-note">The same connection. <b>One surface holds the value</b>, and it exits
-              when psql does.</p>
+            <p class="side-note">Same vault, same secret, same permissions.
+              <b>keyless has no verb that would print it</b> — so no agent, and no habit, can reach one.</p>
             <div class="ledger">
               <div><span class="ln">stdout</span><span class="lv">nothing</span></div>
               <div><span class="ln">scrollback</span><span class="lv">nothing</span></div>
@@ -765,11 +780,12 @@ html{scroll-behavior:smooth}
 <section class="band" id="stores">
   <div class="col">
     <div class="rule reveal">
-      <div class="eyebrow"><span class="dash"></span><span class="eyebrow-txt">where the values already live</span></div>
+      <div class="eyebrow"><span class="dash"></span><span class="eyebrow-txt">your vault is the foundation</span></div>
       <div class="head">
         <h2>Not another<br>vault.</h2>
-        <p class="deck">keyless stores nothing you have not already stored. It reads the places you keep
-          secrets today, and stands between them and the process that needs one.</p>
+        <p class="deck">keyless stores nothing. It resolves through the vault you already run, using
+          that vault's own injection path — the safe one it already shipped. What it will not do is put
+          that vault's read verb anywhere an agent can reach it.</p>
       </div>
     </div>
 
@@ -782,10 +798,11 @@ html{scroll-behavior:smooth}
             <path d="M12 13.2v3.2" stroke-linecap="round"/>
           </svg>
           <div>
-            <div class="src-k">supported today</div>
+            <div class="src-k">keyless reads from this</div>
             <h4 class="gap-s">Proton Pass</h4>
           </div>
-          <p>Read through the Pass CLI. keyless keeps no copy of anything it reads.</p>
+          <p>Resolved through the Pass CLI's own injection path — the verb that hands a secret to a
+            process without printing it. keyless keeps no copy of anything it reads.</p>
         </div>
         <div class="src">
           <svg class="mark" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round" aria-hidden="true">
@@ -793,22 +810,11 @@ html{scroll-behavior:smooth}
             <path d="M12 8.1 16.1 10.4v4.2L12 16.9 7.9 14.6v-4.2z"/>
           </svg>
           <div>
-            <div class="src-k">supported today</div>
+            <div class="src-k">keyless reads from this</div>
             <h4 class="gap-s">Infisical</h4>
           </div>
-          <p>Read through the Infisical CLI, per project and per environment.</p>
-        </div>
-        <div class="src is-past">
-          <svg class="mark" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round" aria-hidden="true">
-            <path d="M6 2.4h7.6L19 7.9v13.7H6z"/>
-            <path d="M13.6 2.4v5.5H19"/>
-            <path d="M9 12.6h7M9 16.1h4.6" stroke-linecap="round"/>
-          </svg>
-          <div>
-            <div class="src-k">what it replaces</div>
-            <h4 class="gap-s">The plaintext file</h4>
-          </div>
-          <p>Plaintext on disk, copied between machines, pasted into chats, committed by accident.</p>
+          <p>Resolved through the Infisical CLI's own injection path, per project and per environment.
+            Your access rules stay exactly where they are.</p>
         </div>
       </div>
     </div>
@@ -816,19 +822,22 @@ html{scroll-behavior:smooth}
     <div class="slab reveal slab-gap">
       <div class="grid g2">
         <div class="pad">
-          <div class="lbl">what you can see</div>
-          <div class="scroll-x gap-m">
-<pre><span class="c">$</span> <span class="k">keyless ls</span>
-<span class="g">DATABASE_URL</span>  <span class="c">resolvable</span>
-<span class="g">DEPLOY_TOKEN</span>  <span class="c">resolvable</span>
-<span class="o">STALE_KEY   </span>  <span class="v">unresolvable</span>  <span class="c"># and it says so</span></pre>
-          </div>
+          <h3>The verbs it will not call on your vault</h3>
+          <p class="deck-s gap-s">Your vault ships a printing verb whatever keyless does. The guarantee
+            is that keyless never builds a command containing one.</p>
+          <ul class="rows gap-m">
+            <li><span class="k">view &middot; show &middot; get</span><span class="lbl">Proton Pass — printing an entry</span></li>
+            <li><span class="k">export &middot; read &middot; reveal</span><span class="lbl">Infisical — printing a value</span></li>
+          </ul>
           <p class="micro gap-l">
-            names, and whether each one resolves &mdash; that is the entire readable surface
+            <b>a test asserts none of these words ever appears</b> in the command keyless builds &mdash;
+            for either store, in both directions
           </p>
         </div>
         <div class="pad">
-          <div class="lbl">what you cannot</div>
+          <h3>And the verbs it does not have itself</h3>
+          <p class="deck-s gap-s">The other half of the same property. A narrower door onto your vault
+            is worth nothing if the door has a window.</p>
           <div class="scroll-x gap-m">
 <pre><span class="c">$</span> <span class="k">keyless get DATABASE_URL</span>
 <span class="r">error: unrecognized subcommand 'get'</span>
@@ -839,6 +848,28 @@ html{scroll-behavior:smooth}
           <p class="micro gap-l">
             both observed live &mdash; <b>the absence is the design</b>
           </p>
+        </div>
+      </div>
+    </div>
+
+    <div class="slab reveal slab-gap">
+      <div class="grid g1">
+        <div class="pad">
+          <div class="lesser">
+            <svg class="mark" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round" aria-hidden="true">
+              <path d="M6 2.4h7.6L19 7.9v13.7H6z"/>
+              <path d="M13.6 2.4v5.5H19"/>
+              <path d="M9 12.6h7M9 16.1h4.6" stroke-linecap="round"/>
+            </svg>
+            <div>
+              <div class="src-k r">the lesser case</div>
+              <h4 class="gap-s">The plaintext file on disk</h4>
+              <p class="deck-s gap-s">If you have no vault at all, this is where the secret is: plaintext,
+                copied between machines, committed by accident. keyless helps here too. But it is not the
+                interesting case, and it is not the one that brought this tool into existence — <b>that
+                one had both vaults already.</b></p>
+            </div>
+          </div>
         </div>
       </div>
     </div>
