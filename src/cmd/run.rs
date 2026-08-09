@@ -44,6 +44,7 @@ use std::ffi::OsString;
 use std::io::{self, Write};
 use std::os::fd::OwnedFd;
 use std::os::unix::process::CommandExt;
+use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::{Arc, mpsc};
 use std::thread;
@@ -320,6 +321,10 @@ pub fn run(request: RunRequest<'_>, notes: &mut dyn Write) -> Result<Outcome, Ru
     // landed in the same one have been separated. Computed before anything is
     // resolved, because it is a property of what was asked for.
     let plans = deconflict(request.bindings, notes);
+
+    for warning in quoting_warnings(program, args, &plans) {
+        let _ = writeln!(notes, "{NAME}: warning: {warning}");
+    }
 
     let mut resolved: Vec<(Vec<String>, Secret)> = Vec::new();
     let mut injected_names: Vec<String> = Vec::new();
@@ -616,6 +621,71 @@ pub fn run(request: RunRequest<'_>, notes: &mut dyn Write) -> Result<Outcome, Ru
 /// is written, because it is the one case where the right answer is genuinely
 /// not knowable from what was asked.
 ///
+/// Programs whose argument is itself a program, so a `$VAR` inside it is
+/// expanded by the CHILD and is correct.
+///
+/// `sh -c 'psql "$DATABASE_URL"'` is the sanctioned form and must never be
+/// warned about, which is the whole reason this list exists. Anything not on it
+/// receives its arguments already expanded, by the shell that typed them.
+const EXPANDS_ITS_OWN_ARGUMENTS: [&str; 12] = [
+    "sh", "bash", "zsh", "dash", "ksh", "fish", "env", "eval", "ssh", "docker", "make", "just",
+];
+
+/// The quoting mistake, caught at the moment it is made rather than taught in
+/// advance.
+///
+/// # The wall this removes
+///
+/// A variable this tool injects exists in the CHILD's environment. Two spellings
+/// look right and send nothing:
+///
+/// ```text
+/// keyless run -s TOKEN -- curl -H "Authorization: Bearer $TOKEN" …
+///     expanded by the CALLING shell, where TOKEN is unset — an EMPTY header
+/// keyless run -s TOKEN -- curl -H 'Authorization: Bearer $TOKEN' …
+///     never expanded by anybody — the literal five characters reach curl
+/// ```
+///
+/// The second is visible from inside this process: the argument arrives holding
+/// `$TOKEN` verbatim, and `curl` does not expand anything. So it is reported,
+/// with the corrected line, instead of living in a document somebody has to have
+/// read first.
+///
+/// **The first is NOT visible and that is stated rather than papered over.** By
+/// the time this process starts, the calling shell has already replaced it with
+/// the empty string, and an empty argument is a legitimate thing to pass. There
+/// is no measurement that distinguishes them, so nothing here guesses.
+///
+/// It is a warning and never a refusal: the never-block invariant has no
+/// exceptions, and a literal `$TOKEN` is occasionally what somebody means.
+fn quoting_warnings(program: &OsString, args: &[OsString], plans: &[Vec<String>]) -> Vec<String> {
+    let head = Path::new(program)
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    if EXPANDS_ITS_OWN_ARGUMENTS.contains(&head.as_str()) {
+        return Vec::new();
+    }
+
+    let mut warnings = Vec::new();
+    for variable in plans.iter().flatten() {
+        let needle = format!("${variable}");
+        let braced = format!("${{{variable}}}");
+        if args.iter().any(|argument| {
+            let text = argument.to_string_lossy();
+            text.contains(&needle) || text.contains(&braced)
+        }) {
+            warnings.push(format!(
+                "`{needle}` reached `{head}` unexpanded — it is a literal, not the \
+                 credential. `{head}` does not expand variables; only a shell does, \
+                 and the variable is set in the CHILD. Wrap the command: \
+                 `-- sh -c '{head} … {needle} …'`, with the body in SINGLE quotes"
+            ));
+        }
+    }
+    warnings
+}
+
 /// A variable the caller SPELLED is never displaced either. `-s VAR=NAME` is an
 /// instruction, and a derived variable is an inference; an inference that
 /// overwrote an instruction would make the typed form unreliable, and the typed
@@ -1275,5 +1345,60 @@ mod tests {
             "the master neither ended nor errored, so something is still holding \
              the slave"
         );
+    }
+
+    /// The wall, removed rather than documented.
+    ///
+    /// Every one of these was a paragraph in somebody's rules file, which is a
+    /// deferred fix: it reaches whoever read it, once, before they made the
+    /// mistake. The warning reaches them at the moment they make it.
+    #[test]
+    fn a_literal_dollar_name_handed_to_a_non_shell_is_reported() {
+        use super::quoting_warnings;
+        use std::ffi::OsString;
+
+        let plans = vec![vec!["TOKEN".to_owned()]];
+        let args: Vec<OsString> = ["-H", "Authorization: Bearer $TOKEN"]
+            .iter()
+            .map(OsString::from)
+            .collect();
+        let warnings = quoting_warnings(&OsString::from("curl"), &args, &plans);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("$TOKEN"), "{warnings:?}");
+        assert!(warnings[0].contains("sh -c"), "{warnings:?}");
+        // `${TOKEN}` is the same mistake with braces, and it used to slip past
+        // a check that only looked for the bare spelling.
+        let braced: Vec<OsString> = vec![OsString::from("Bearer ${TOKEN}")];
+        assert_eq!(
+            quoting_warnings(&OsString::from("curl"), &braced, &plans).len(),
+            1
+        );
+    }
+
+    /// THE CONTROL, and it is the reason the list of interpreters exists.
+    ///
+    /// `sh -c '… $TOKEN …'` is the CORRECT form and contains the same literal.
+    /// A check that warned on it would fire on every properly written command
+    /// in the tool's own documentation — and a warning that fires on the right
+    /// answer is one people learn to ignore, which costs more than it saves.
+    #[test]
+    fn the_sanctioned_shell_form_is_never_warned_about() {
+        use super::quoting_warnings;
+        use std::ffi::OsString;
+
+        let plans = vec![vec!["TOKEN".to_owned()]];
+        for program in ["sh", "/bin/bash", "zsh", "env", "ssh"] {
+            let args: Vec<OsString> = ["-c", "curl -H \"Authorization: Bearer $TOKEN\" $URL"]
+                .iter()
+                .map(OsString::from)
+                .collect();
+            assert!(
+                quoting_warnings(&OsString::from(program), &args, &plans).is_empty(),
+                "`{program}` was warned about, and it expands its own arguments"
+            );
+        }
+        // A name nobody asked for is not this tool's business either.
+        let args = vec![OsString::from("$SOMETHING_ELSE")];
+        assert!(quoting_warnings(&OsString::from("curl"), &args, &plans).is_empty());
     }
 }
