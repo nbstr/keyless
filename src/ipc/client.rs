@@ -208,11 +208,41 @@ mod tests {
         "/tests/support/short_socket.rs"
     ));
 
+    /// The deadline both cases below hand the client.
+    ///
+    /// # It is a CEILING, and reading it as a subject is what broke
+    ///
+    /// Neither case asserts anything about elapsed time; both assert the error
+    /// VARIANT. That is what makes this number load-bearing, because
+    /// [`Client::request`] bounds a THREAD SPAWN and a channel round trip with
+    /// the same value it uses for the socket. An absent socket answers
+    /// `Unreachable` only if the worker is scheduled and replies before the
+    /// deadline — so a machine busy enough to delay the spawn turns the answer
+    /// into `Timeout`, and a case named for `Unreachable` goes red having found
+    /// nothing whatever wrong with the code.
+    ///
+    /// Measured 2026-08-09 on macOS, 14 cores, timing exactly that work — spawn,
+    /// failing connect, channel send — over 400 samples: **0.06 ms** worst idle,
+    /// and **16.89 ms** worst with 200 spinners and 48 fork-storms running, none
+    /// over 200 ms. So CPU contention alone does not explain it; the one red
+    /// observed came while the machine was under CRITICAL MEMORY pressure, a
+    /// regime spinners do not reproduce and one nobody should reproduce
+    /// deliberately on a shared machine.
+    ///
+    /// Twenty seconds is the floor `tests/suite_hygiene.rs` sets for a ceiling on
+    /// work that must answer. It is still a bound, which is the half the name
+    /// promises: a genuine hang here reds in twenty seconds rather than never.
+    ///
+    /// **The race is not removed, only made unloseable.** Removing it needs
+    /// `request` to report a connect failure that lands after the deadline, and
+    /// that is a change to what ships, not to a test.
+    const ABSENT_SOCKET_CEILING: Duration = Duration::from_secs(20);
+
     #[test]
     fn an_absent_socket_is_unreachable_rather_than_a_hang() {
         let client = Client::new(
             short_socket_path(std::path::Path::new("ipc-client-absent")),
-            Duration::from_millis(200),
+            ABSENT_SOCKET_CEILING,
         );
         let error = client
             .request(&Request::ping())
@@ -224,7 +254,7 @@ mod tests {
     fn a_path_that_is_a_regular_file_is_unreachable_rather_than_a_panic() {
         let path = short_socket_path(std::path::Path::new("ipc-client-regular-file"));
         std::fs::write(&path, b"not a socket").expect("write");
-        let client = Client::new(path.clone(), Duration::from_millis(200));
+        let client = Client::new(path.clone(), ABSENT_SOCKET_CEILING);
         assert!(matches!(
             client.request(&Request::ping()),
             Err(ClientError::Unreachable(_))
