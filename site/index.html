@@ -3,46 +3,54 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>keyless — name a secret, never hold one</title>
-<meta name="description" content="A secrets broker for AI coding agents. The value reaches one child process and nothing else. There is no verb that prints it.">
+<title>keyless — your agent gets the secret, your transcript never does</title>
+<meta name="description" content="A secrets broker for AI coding agents. Name a secret; the value reaches one child process and nothing else. There is no verb that prints it.">
 <link rel="canonical" href="https://keyless.hackistan.org/">
 <!-- Inline favicon. The page ships as ONE file with no external requests, so the
-     icon is a data URI rather than a /favicon.ico the host would have to serve. -->
+     icon is a data URI rather than a /favicon.ico the host would have to serve.
+     This is the only reason data: appears in the CSP's img-src. -->
 <link rel="icon" href="data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAzMiAzMiI+PHJlY3Qgd2lkdGg9IjMyIiBoZWlnaHQ9IjMyIiByeD0iNyIgZmlsbD0iIzA5MEEwQiIvPjxjaXJjbGUgY3g9IjE2IiBjeT0iMTIuNSIgcj0iNSIgZmlsbD0ibm9uZSIgc3Ryb2tlPSIjNUZEMzlBIiBzdHJva2Utd2lkdGg9IjMiLz48cmVjdCB4PSIxNC41IiB5PSIxNi41IiB3aWR0aD0iMyIgaGVpZ2h0PSI5IiByeD0iMS41IiBmaWxsPSIjNUZEMzlBIi8+PC9zdmc+">
 <meta name="theme-color" content="#090A0B">
-<!-- Open Graph / Twitter. There is deliberately no og:image: every candidate was
-     a rendering of a terminal, and this page does not publish a screenshot of a
+<!-- Open Graph. There is deliberately no og:image: every candidate was a
+     rendering of a terminal, and this page does not publish a screenshot of a
      real machine. A missing image is better than a leaking one. -->
 <meta property="og:type" content="website">
 <meta property="og:site_name" content="keyless">
 <meta property="og:url" content="https://keyless.hackistan.org/">
-<meta property="og:title" content="keyless — name a secret, never hold one">
-<meta property="og:description" content="A secrets broker for AI coding agents. The value reaches one child process and nothing else. There is no verb that prints it.">
+<meta property="og:title" content="keyless — your agent gets the secret, your transcript never does">
+<meta property="og:description" content="A secrets broker for AI coding agents. Name a secret; the value reaches one child process and nothing else. There is no verb that prints it.">
 <meta name="twitter:card" content="summary">
-<meta name="twitter:title" content="keyless — name a secret, never hold one">
-<meta name="twitter:description" content="A secrets broker for AI coding agents. The value reaches one child process and nothing else. There is no verb that prints it.">
+<meta name="twitter:title" content="keyless — your agent gets the secret, your transcript never does">
+<meta name="twitter:description" content="A secrets broker for AI coding agents. Name a secret; the value reaches one child process and nothing else. There is no verb that prints it.">
 <style>
 /* ------------------------------------------------------------------ reset */
 *,*::before,*::after{box-sizing:border-box}
-html,body,h1,h2,h3,p,ul,ol,li,figure,pre,table{margin:0;padding:0}
+html,body,h1,h2,h3,h4,p,ul,ol,li,figure,pre,table{margin:0;padding:0}
 ul,ol{list-style:none}
 button{font:inherit;color:inherit;background:none;border:0;cursor:pointer}
 a{color:inherit;text-decoration:none}
-table{border-collapse:collapse;width:100%}
 img,svg{display:block;max-width:100%}
 
 /* -------------------------------------------------------------- variables */
 :root{
   --bg:#090A0B;
-  --card:#0E0F10;
+  --well:#050505;
   --cell-a:#070807;
   --cell-b:#080908;
-  --well:#050505;
   --text:#F6F7F9;
   --hair:#23262A;
   --panel:rgba(255,255,255,.09);
+  /* The two semantic states, and the third that is neither.
+     Measured against --well #050505: green 10.94:1, coral 7.66:1,
+     violet 8.06:1. The coral is deliberately desaturated — an alarm red would
+     fight the green for the eye, and the page needs both readable in one row. */
   --green:#5FD39A;
+  --leak:#E8836B;
   --violet:#9D9BEA;
+  /* The before/after asymmetry is carried by the GROUND, not only by the text,
+     so a reader knows which column is which before reading a word. */
+  --ground-leak:#0E0806;
+  --ground-safe:#050A08;
   --btn:#1C1E21;
   --code-bg:rgba(255,255,255,.06);
   --sans:ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
@@ -63,66 +71,54 @@ body{
   text-rendering:optimizeLegibility;
 }
 ::selection{background:rgba(95,211,154,.22)}
+:focus-visible{outline:2px solid var(--green);outline-offset:3px;border-radius:3px}
 
 /* ------------------------------------------------------------ type system */
 h1{
-  font-size:clamp(2.5rem,min(7.6vw,9.2vh),6.5rem);
-  font-weight:600;line-height:.95;letter-spacing:-.03em;color:#fff;
+  font-size:clamp(2.5rem,min(7.2vw,8.6vh),5.4rem);
+  font-weight:600;line-height:.98;letter-spacing:-.035em;color:#fff;
+  text-wrap:balance;
 }
 h2{
-  font-size:clamp(2.7rem,5.4vw,5.2rem);
-  font-weight:600;line-height:.88;letter-spacing:-.055em;color:#fff;
+  font-size:clamp(2.2rem,4.6vw,3.9rem);
+  font-weight:600;line-height:.94;letter-spacing:-.045em;color:#fff;
+  text-wrap:balance;
 }
-h3{font-size:24.8px;font-weight:600;line-height:1;letter-spacing:-.035em;color:var(--text)}
-h3.compact{font-size:18.4px;line-height:23px;letter-spacing:-.03em}
-/* The dimming system is alpha steps of white, and the FLOOR is .50.
+h3{font-size:22px;font-weight:600;line-height:1.18;letter-spacing:-.03em;color:var(--text);text-wrap:balance}
+h4{font-size:17px;font-weight:600;line-height:1.3;letter-spacing:-.02em;color:#fff}
+/* The dimming system is alpha steps of white and the FLOOR is .55.
    Composited over the darkest surface on the page (--well #050505) that is
-   5.30:1, which clears WCAG AA for text under 18.66px — which is all of it.
-   .45 was tried and rejected: 4.50:1 against --bg but 4.46:1 against --well,
-   so it passes on the page and fails inside every readout cell.
-   The steps that survive: .50 floor, .55 labels, .60 the caveats, then .70
-   .80 .85 .95 and #fff above. Hierarchy is carried by SIZE, TRACKING and CASE
-   at the quiet end, not by contrast — a limit nobody can read is not published. */
+   6.22:1, which clears WCAG AA at every text size used here. Hierarchy at the
+   quiet end is carried by SIZE, TRACKING and CASE, never by dimming further —
+   a limit nobody can read is not published. */
 .dim{color:rgba(255,255,255,.55)}
-
 .mono{font-family:var(--mono)}
-.lbl{ /* the standard 11px label */
-  font-family:var(--mono);font-size:11px;line-height:14px;font-weight:500;
+.lbl{
+  font-family:var(--mono);font-size:11px;line-height:15px;font-weight:500;
   letter-spacing:.16em;text-transform:uppercase;color:rgba(255,255,255,.55);
 }
-.lbl-dim{color:rgba(255,255,255,.5)}
 .micro{
-  font-family:var(--mono);font-size:11px;line-height:16px;letter-spacing:.15em;
+  font-family:var(--mono);font-size:11px;line-height:17px;letter-spacing:.14em;
   text-transform:uppercase;color:rgba(255,255,255,.55);
 }
-.eyebrow-txt{
-  font-family:var(--mono);font-size:11px;line-height:15px;letter-spacing:.20em;
-  text-transform:uppercase;color:rgba(255,255,255,.55);
-}
-.deck{font-size:16px;line-height:24px;color:rgba(255,255,255,.55)}
+.micro b,.lbl b{font-weight:500;color:rgba(255,255,255,.95)}
+.deck{font-size:16px;line-height:25px;color:rgba(255,255,255,.6);max-width:64ch}
+.deck-s{font-size:15px;line-height:23px;color:rgba(255,255,255,.6);max-width:60ch}
+.deck b,.deck-s b{color:#fff;font-weight:600}
 code{
-  /* .875em of an 11px label is 9.6px. The relative size is right everywhere the
-     parent is body-sized; the floor is what stops it collapsing inside a label. */
   font-family:var(--mono);font-size:max(11px,.875em);
   background:var(--code-bg);border-radius:4px;padding:.12em .38em;
-  color:rgba(255,255,255,.8);
+  color:rgba(255,255,255,.82);
 }
-pre{
-  font-family:var(--mono);font-size:11px;line-height:1.75;letter-spacing:.22px;
-  background:transparent;color:rgba(255,255,255,.7);
-  overflow-x:auto;white-space:pre;
-}
-pre .c{color:rgba(255,255,255,.55)}
-pre .k{color:rgba(255,255,255,.95)}
-pre .g{color:var(--green)}
 .g{color:var(--green)}
+.r{color:var(--leak)}
 .v{color:var(--violet)}
 
 /* ----------------------------------------------------------------- layout */
 .col{max-width:1152px;margin:0 auto;padding:0 24px}
 /* Full-bleed escape. --sbw is the scrollbar width, measured in JS: 100vw
-   INCLUDES the scrollbar, so without subtracting it the slab is wider than the
-   visible area and the whole page scrolls sideways. */
+   INCLUDES the scrollbar, so without subtracting it every slab is wider than
+   the visible area and the whole document scrolls sideways. */
 .slab{
   position:relative;left:50%;
   width:calc(100vw - var(--sbw,0px) - 3rem);
@@ -130,54 +126,54 @@ pre .g{color:var(--green)}
   transform:translateX(-50%);
 }
 @media(max-width:640px){.slab{width:calc(100vw - var(--sbw,0px) - 2rem)}}
-section.band{padding:112px 0}
-@media(min-width:640px){section.band{padding:160px 0}}
-.rule{border-top:1px solid var(--panel);padding-top:24px;margin-bottom:48px}
-@media(min-width:640px){.rule{padding-top:32px;margin-bottom:64px}}
+.slab-gap{margin-top:44px}
+section.band{padding:104px 0}
+@media(min-width:640px){section.band{padding:144px 0}}
+.rule{border-top:1px solid var(--panel);padding-top:24px;margin-bottom:44px}
+@media(min-width:640px){.rule{padding-top:32px;margin-bottom:60px}}
 .eyebrow{display:flex;align-items:center;gap:12px}
-.eyebrow .idx{font-family:var(--mono);font-size:11px;letter-spacing:.20em;color:var(--green)}
-.eyebrow .dash{width:40px;height:1px;background:var(--green);flex:none}
-.head{
-  display:grid;grid-template-columns:minmax(0,1fr) minmax(240px,.42fr);
-  align-items:end;gap:32px;margin-top:32px;
+.eyebrow .dash{width:36px;height:1px;background:var(--green);flex:none}
+.eyebrow-txt{
+  font-family:var(--mono);font-size:11px;line-height:15px;letter-spacing:.20em;
+  text-transform:uppercase;color:rgba(255,255,255,.6);
 }
-@media(max-width:900px){.head{grid-template-columns:1fr;align-items:start;gap:20px}}
+.head{
+  display:grid;grid-template-columns:minmax(0,1fr) minmax(260px,.52fr);
+  align-items:end;gap:28px;margin-top:28px;
+}
+@media(max-width:900px){.head{grid-template-columns:1fr;align-items:start;gap:18px}}
 .caveat{
   margin-top:32px;font-family:var(--mono);font-size:11px;line-height:19px;
-  letter-spacing:.16em;text-transform:uppercase;color:rgba(255,255,255,.6);
-  max-width:70ch;
+  letter-spacing:.14em;text-transform:uppercase;color:rgba(255,255,255,.6);
+  /* `ch` ignores letter-spacing, so 76ch of this face renders about 60 visible
+     characters and orphans a narrow column on a wide screen. Measured, not
+     guessed at. */
+  max-width:96ch;
 }
 .caveat b{font-weight:500;color:rgba(255,255,255,.95)}
 
 /* the hairline grid: the wrapper's background IS every divider */
-.grid{
-  display:grid;gap:1px;background:var(--panel);
-  border:1px solid var(--panel);
-}
-.grid > *{background:var(--cell-a)}
+.grid{display:grid;gap:1px;background:var(--panel);border:1px solid var(--panel)}
+.grid > *{background:var(--cell-a);min-width:0}
 .grid > *:nth-child(even){background:var(--cell-b)}
 /* Column counts live in classes, never inline: an inline grid-template-columns
-   cannot be overridden by a media query, so a slab set inline stays multi-column
-   at 390px and its cells get clipped. */
+   cannot be overridden by a media query, so a slab set inline stays
+   multi-column at 390px and clips its own cells. */
 .g1{grid-template-columns:minmax(0,1fr)}
 .g2{grid-template-columns:repeat(2,minmax(0,1fr))}
-.g3{grid-template-columns:repeat(3,minmax(0,1fr))}
-.g4{grid-template-columns:repeat(4,minmax(0,1fr))}
-.g2w{grid-template-columns:minmax(0,1.3fr) minmax(0,1fr)}
-@media(max-width:1024px){
-  .g2,.g2w{grid-template-columns:minmax(0,1fr)}
-  .g3,.g4{grid-template-columns:repeat(2,minmax(0,1fr))}
-}
-@media(max-width:640px){
-  .g3,.g4{grid-template-columns:minmax(0,1fr)}
-}
+@media(max-width:1024px){.g2{grid-template-columns:minmax(0,1fr)}}
 .pad{padding:24px}
 @media(min-width:640px){.pad{padding:28px 32px}}
+.stack{display:flex;flex-direction:column;gap:14px}
+.hr{border-top:1px solid rgba(255,255,255,.08);margin:24px 0}
+.gap-s{margin-top:12px}
+.gap-m{margin-top:18px}
+.gap-l{margin-top:22px}
 
 /* ------------------------------------------------------------------- nav */
 nav{
-  position:fixed;top:0;left:0;right:0;height:65px;z-index:50;
-  background:rgba(9,10,11,.85);backdrop-filter:blur(12px);
+  position:fixed;top:0;left:0;right:0;height:64px;z-index:50;
+  background:rgba(9,10,11,.86);backdrop-filter:blur(12px);
   -webkit-backdrop-filter:blur(12px);
   border-bottom:1px solid rgba(255,255,255,.08);
 }
@@ -185,28 +181,27 @@ nav .inner{
   max-width:1152px;margin:0 auto;padding:0 24px;height:100%;
   display:flex;align-items:center;justify-content:space-between;gap:24px;
 }
-.wordmark{display:flex;align-items:baseline;gap:10px}
+.wordmark{display:flex;align-items:baseline;gap:10px;flex:none}
 .wordmark .name{font-size:16px;font-weight:600;letter-spacing:-.03em;color:#fff}
+.wordmark .tail{letter-spacing:.16em}
 nav ul{display:flex;align-items:center;gap:22px;min-width:0}
 nav ul li{flex:none;white-space:nowrap}
 nav .actions{display:flex;align-items:center;gap:8px;flex:none}
 nav a.navlink{transition:color .15s var(--ease-hover)}
-nav a.navlink:hover{color:rgba(255,255,255,.9)}
+nav a.navlink:hover{color:rgba(255,255,255,.92)}
 .chip{
   font-family:var(--mono);font-size:11px;letter-spacing:.16em;text-transform:uppercase;
-  color:rgba(255,255,255,.55);border:1px solid var(--hair);border-radius:8px;
+  color:rgba(255,255,255,.6);border:1px solid var(--hair);border-radius:8px;
   padding:5px 9px;white-space:nowrap;
   transition:color .15s var(--ease-hover),border-color .15s var(--ease-hover);
 }
-a.chip:hover{color:rgba(255,255,255,.85);border-color:rgba(255,255,255,.24)}
-/* Below 860px the section links used to be display:none, which left no way to
-   reach five of the six sections except scrolling the whole page. They now
-   scroll sideways INSIDE the bar. No JS, so it cannot break the way a hamburger
-   would with scripting off; min-width:0 keeps the overflow in this box and off
-   the document, which is what stops the page scrolling horizontally. */
-@media(max-width:860px){
+a.chip:hover{color:rgba(255,255,255,.9);border-color:rgba(255,255,255,.26)}
+/* Below 880px the section links scroll sideways INSIDE the bar rather than
+   disappearing. No JS, so it cannot break with scripting off; min-width:0 keeps
+   the overflow in this box and off the document. */
+@media(max-width:880px){
   nav .inner{gap:14px}
-  .wordmark .lbl{display:none}
+  .wordmark .tail{display:none}
   nav ul{
     gap:18px;flex:1 1 auto;overflow-x:auto;overflow-y:hidden;
     -webkit-overflow-scrolling:touch;scrollbar-width:none;
@@ -217,159 +212,258 @@ a.chip:hover{color:rgba(255,255,255,.85);border-color:rgba(255,255,255,.24)}
 }
 
 /* ------------------------------------------------------------------ hero */
-header.hero{padding:140px 0 96px}
-@media(min-width:640px){header.hero{padding:180px 0 120px}}
+header.hero{padding:126px 0 88px}
+@media(min-width:640px){header.hero{padding:164px 0 104px}}
 .hero-eyebrow{
-  font-family:var(--mono);font-size:14px;line-height:20px;font-weight:500;
-  letter-spacing:.30em;text-transform:uppercase;color:rgba(255,255,255,.55);
+  font-family:var(--mono);font-size:13px;line-height:19px;font-weight:500;
+  letter-spacing:.26em;text-transform:uppercase;color:rgba(255,255,255,.6);
 }
-.hero h1{margin-top:28px;max-width:18ch}
-.hero .sub{
-  margin-top:24px;max-width:62ch;font-size:15px;line-height:1.5;
-  color:rgba(255,255,255,.5);
-}
-@media(min-width:640px){.hero .sub{font-size:16px}}
-.cta-row{margin-top:40px;display:flex;flex-wrap:wrap;align-items:center;gap:20px}
+.hero h1{margin-top:26px;max-width:17ch}
+.hero h1 .fade{color:rgba(255,255,255,.55)}
+.hero .sub{margin-top:24px;max-width:60ch;font-size:16px;line-height:26px;color:rgba(255,255,255,.6)}
+.hero .sub b{color:#fff;font-weight:600}
+.hero-cmd-wrap{margin-top:52px}
+.cta-row{margin-top:36px;display:flex;flex-wrap:wrap;align-items:center;gap:20px}
 .cta{
   display:inline-flex;align-items:center;justify-content:center;gap:10px;
-  height:52px;width:400px;max-width:100%;border-radius:9999px;
+  height:52px;width:340px;max-width:100%;border-radius:9999px;
   background:var(--btn);border:1px solid var(--hair);color:#fff;
   font-size:15px;font-weight:500;letter-spacing:-.01em;
   transition:background .15s var(--ease-hover),border-color .15s var(--ease-hover);
 }
-.cta:hover{background:#24272B;border-color:rgba(255,255,255,.2)}
-.cta .arw{transition:transform .2s var(--ease-out)}
-.cta:hover .arw{transform:translateX(4px)}
+.cta:hover{background:#24272B;border-color:rgba(255,255,255,.22)}
+.cta .arw,.cta-alt .arw{transition:transform .2s var(--ease-out)}
+.cta:hover .arw,.cta-alt:hover .arw{transform:translateX(4px)}
 @media(max-width:640px){.cta{width:100%}}
 .cta-alt{
   display:inline-flex;align-items:center;gap:8px;
   font-family:var(--mono);font-size:11px;letter-spacing:.16em;text-transform:uppercase;
-  color:rgba(255,255,255,.55);transition:color .15s var(--ease-hover);
+  color:rgba(255,255,255,.6);transition:color .15s var(--ease-hover);
 }
-.cta-alt:hover{color:rgba(255,255,255,.85)}
-.cta-alt .arw{transition:transform .2s var(--ease-out)}
-.cta-alt:hover .arw{transform:translateX(4px)}
+.cta-alt:hover{color:rgba(255,255,255,.9)}
+.linkline{color:var(--green);border-bottom:1px solid rgba(95,211,154,.4)}
 
-.flow{margin-top:72px}
-.flow .row{
-  display:grid;grid-template-columns:150px minmax(0,1fr) 190px;
-  align-items:center;gap:20px;
+/* ------------------------------------------------------------- terminals */
+.term{background:var(--well);border:1px solid var(--panel)}
+.termbar{
+  display:flex;align-items:center;gap:10px;padding:11px 18px;
+  border-bottom:1px solid var(--panel);flex-wrap:wrap;
+}
+.pip{width:6px;height:6px;border-radius:50%;background:var(--green);flex:none}
+.pip.leak{background:var(--leak)}
+.scroll-x{overflow-x:auto}
+.term-body{padding:20px 18px;overflow-x:auto}
+@media(min-width:640px){.term-body{padding:24px}}
+pre{
+  font-family:var(--mono);font-size:12px;line-height:1.85;letter-spacing:.2px;
+  background:transparent;color:rgba(255,255,255,.72);white-space:pre;
+}
+pre .c{color:rgba(255,255,255,.55)}   /* comments and prompts */
+pre .k{color:rgba(255,255,255,.95)}   /* what you typed */
+pre .o{color:rgba(255,255,255,.72)}   /* what came back */
+pre .g{color:var(--green)}
+pre .r{color:var(--leak)}
+pre .v{color:var(--violet)}
+/* The hero command is the single most important line on the page, so it is set
+   larger than every other terminal and nothing shares its box. */
+.hero-cmd .term-body{padding:26px 20px}
+@media(min-width:640px){.hero-cmd .term-body{padding:34px}}
+.hero-cmd pre{font-size:clamp(11.5px,1.95vw,17px);line-height:1.75}
+
+/* ---------------------------------------------------------- the pipeline */
+/* Motion that teaches: one pulse leaves the store, passes through keyless into
+   the child process, and stops dead at the wall. The surfaces below never
+   light. That is the whole product, in four seconds, without a sentence. */
+.pipe{
+  display:grid;align-items:stretch;
+  grid-template-columns:minmax(0,1fr) 44px minmax(0,1fr) 44px minmax(0,1fr) 16px;
+  padding:26px 22px;
+}
+@media(max-width:860px){.pipe{grid-template-columns:minmax(0,1fr);padding:22px}}
+.stage{
+  border:1px solid rgba(255,255,255,.14);padding:14px 16px;
+  display:flex;flex-direction:column;justify-content:center;gap:8px;min-height:94px;
+}
+.stage .st-l{font-family:var(--mono);font-size:10px;letter-spacing:.18em;text-transform:uppercase;color:rgba(255,255,255,.55)}
+.stage .st-v{font-family:var(--mono);font-size:13px;line-height:1.5;color:rgba(255,255,255,.92);overflow-wrap:anywhere}
+.stage.is-store{border-color:rgba(157,155,234,.35)}
+.stage.is-broker{border-color:rgba(255,255,255,.24)}
+.stage.is-child{border-color:rgba(95,211,154,.42)}
+.wire{position:relative;display:flex;align-items:center;justify-content:center}
+.wire::before{content:"";position:absolute;left:0;right:0;top:50%;height:1px;background:rgba(255,255,255,.22)}
+/* The arrowhead carries DIRECTION when the pulse is elsewhere in its cycle —
+   and it is the only thing that does when motion is off entirely. */
+.wire::after{
+  content:"";position:absolute;right:0;top:50%;margin-top:-3px;width:0;height:0;
+  border-left:5px solid rgba(255,255,255,.34);
+  border-top:3px solid transparent;border-bottom:3px solid transparent;
+}
+.dot{
+  position:absolute;top:50%;left:0;width:7px;height:7px;border-radius:50%;
+  background:var(--green);margin-top:-3.5px;opacity:0;
+  box-shadow:0 0 0 3px rgba(95,211,154,.14);
+}
+.js .dot{animation:travel 4s var(--ease-hover) infinite}
+.js .wire.w2 .dot{animation-delay:.7s}
+@keyframes travel{
+  0%{left:0;opacity:0}
+  8%{opacity:1}
+  50%{left:calc(100% - 7px);opacity:1}
+  70%{left:calc(100% - 7px);opacity:1}
+  80%{opacity:0}
+  100%{left:0;opacity:0}
+}
+/* The wall. Nothing crosses it, so it is the only thing on this page that
+   flashes — and it flashes on ARRIVAL, not on a timer of its own. */
+.wall{position:relative;display:flex;align-items:stretch;justify-content:center}
+.wall i{display:block;width:2px;background:var(--green);opacity:.3;border-radius:2px}
+/* An unlabelled green line is a mystery, not a diagram. This says what it is. */
+.pipe-cap{grid-column:1/-1;margin-top:18px;display:flex;justify-content:flex-end}
+.pipe-cap span{color:rgba(255,255,255,.6);text-align:right}
+@media(max-width:860px){.pipe-cap{justify-content:flex-start;margin-top:14px}.pipe-cap span{text-align:left}}
+.js .wall i{animation:wallhit 4s var(--ease-hover) infinite}
+@keyframes wallhit{
+  0%,44%{opacity:.3;box-shadow:none}
+  52%{opacity:1;box-shadow:0 0 14px 2px rgba(95,211,154,.45)}
+  74%,100%{opacity:.3;box-shadow:none}
 }
 @media(max-width:860px){
-  .flow .row{grid-template-columns:1fr;gap:8px;align-items:start}
+  .wire{height:30px}
+  .wire::before{left:50%;right:auto;top:0;bottom:0;height:auto;width:1px}
+  .dot{left:50%;top:0;margin-top:0;margin-left:-3.5px}
+  .js .dot{animation-name:travel-v}
+  .wall{height:18px}
+  .wall i{width:100%;height:2px;align-self:center}
+  .wire::after{
+    right:50%;margin-right:-3px;top:auto;bottom:0;margin-top:0;
+    border-left:3px solid transparent;border-right:3px solid transparent;
+    border-top:5px solid rgba(255,255,255,.34);border-bottom:0;
+  }
 }
-.flow .row .what{font-family:var(--mono);font-size:12px;line-height:1.6;color:rgba(255,255,255,.8);word-break:break-word}
-.flow .verdict{text-align:right}
-@media(max-width:860px){.flow .verdict{text-align:left}}
-.legend{
-  display:grid;gap:1px;background:var(--panel);
-  grid-template-columns:repeat(5,minmax(0,1fr));
+@keyframes travel-v{
+  0%{top:0;opacity:0}
+  8%{opacity:1}
+  50%{top:calc(100% - 7px);opacity:1}
+  70%{top:calc(100% - 7px);opacity:1}
+  80%{opacity:0}
+  100%{top:0;opacity:0}
 }
-.legend > div{background:var(--well);padding:16px 20px}
-@media(max-width:860px){.legend{grid-template-columns:repeat(2,minmax(0,1fr))}}
-@media(max-width:480px){.legend{grid-template-columns:1fr}}
-.legend .val{margin-top:6px;font-family:var(--mono);font-size:12px;color:rgba(255,255,255,.7)}
 
-/* ------------------------------------------------------------------ stats */
-.stat .n{
-  font-size:clamp(2rem,4.4vw,3.4rem);font-weight:600;letter-spacing:-.04em;
-  line-height:1;color:#fff;
+/* ------------------------------------------------------- the leak ledger */
+/* The page's recurring device. The same five surfaces every time, so a reader
+   learns the row once and then reads every later instance at a glance. */
+.ledger{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:1px;background:var(--panel)}
+@media(max-width:900px){.ledger{grid-template-columns:repeat(2,minmax(0,1fr))}}
+@media(max-width:430px){.ledger{grid-template-columns:minmax(0,1fr)}}
+.ledger > div{background:var(--well);padding:13px 16px;min-width:0}
+.ledger .ln{
+  font-family:var(--mono);font-size:10px;line-height:14px;letter-spacing:.16em;
+  text-transform:uppercase;color:rgba(255,255,255,.55);display:block;
 }
-.stat .l{margin-top:14px;max-width:34ch}
-.rail{height:1px;background:rgba(255,255,255,.1);margin-top:14px;position:relative;overflow:hidden}
-.rail i{
-  display:block;height:1px;width:0;background:rgba(255,255,255,.45);
-  transition:width .7s var(--ease-out);
+.ledger .lv{
+  display:flex;align-items:center;gap:7px;margin-top:7px;
+  font-family:var(--mono);font-size:12px;line-height:16px;color:rgba(255,255,255,.6);
+  overflow-wrap:anywhere;
 }
-.shape-row{display:grid;grid-template-columns:minmax(0,1fr) 64px;gap:16px;align-items:baseline;padding:14px 0}
-.shape-row + .shape-row{border-top:1px solid rgba(255,255,255,.06)}
-.shape-row .num{font-family:var(--mono);font-size:13px;color:rgba(255,255,255,.8);text-align:right}
+.ledger .lv::before{content:"";width:5px;height:5px;border-radius:50%;background:rgba(255,255,255,.28);flex:none}
+.ledger .leak .lv{color:var(--leak)}
+.ledger .leak .lv::before{background:var(--leak)}
+.ledger .held .lv{color:var(--green)}
+.ledger .held .lv::before{background:var(--green)}
+/* Inside a before/after column the ledger sits on that column's own ground, so
+   the two halves never read as the same surface. */
+.side-leak .ledger > div{background:var(--ground-leak)}
+.side-safe .ledger > div{background:var(--ground-safe)}
 
-/* ------------------------------------------------------------- instrument */
-.seg{display:flex;flex-wrap:wrap;gap:8px}
-.seg button{
-  font-family:var(--mono);font-size:11px;letter-spacing:.16em;text-transform:uppercase;
-  padding:9px 14px;border-radius:8px;border:1px solid var(--hair);
-  color:rgba(255,255,255,.55);background:transparent;
-  transition:color .15s var(--ease-hover),background-color .15s var(--ease-hover),border-color .15s var(--ease-hover);
+/* ------------------------------------------------------ before/after pair */
+.pair + .pair{margin-top:60px}
+.pair-head{margin-bottom:22px;max-width:70ch}
+.duo{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:1px;background:var(--panel);border:1px solid var(--panel)}
+@media(max-width:1024px){.duo{grid-template-columns:minmax(0,1fr)}}
+.side{min-width:0;display:flex;flex-direction:column}
+.side-leak{background:var(--ground-leak)}
+.side-safe{background:var(--ground-safe)}
+.side .term{background:transparent;border:0;flex:1}
+.side .termbar{border-bottom:1px solid rgba(255,255,255,.08)}
+.tag{
+  font-family:var(--mono);font-size:10px;letter-spacing:.18em;text-transform:uppercase;
+  padding:3px 8px;border-radius:5px;border:1px solid;white-space:nowrap;
 }
-.seg button:hover{color:rgba(255,255,255,.75)}
-.seg button[aria-pressed="true"]{background:#fff;color:#0A0B0C;border-color:#fff}
-.readout{display:grid;gap:1px;background:var(--panel)}
-.readout > div{
-  background:var(--well);padding:13px 20px;display:grid;
-  grid-template-columns:minmax(0,1fr) auto;gap:16px;align-items:baseline;
+.tag-leak{color:var(--leak);border-color:rgba(232,131,107,.4)}
+.tag-safe{color:var(--green);border-color:rgba(95,211,154,.4)}
+.side-note{
+  padding:0 18px 18px;font-family:var(--mono);font-size:11px;line-height:18px;
+  letter-spacing:.05em;color:rgba(255,255,255,.6);
 }
-.readout .rv{font-family:var(--mono);font-size:12px;color:rgba(255,255,255,.8);text-align:right}
-.termbar{
-  display:flex;align-items:center;gap:10px;padding:12px 20px;
-  border-bottom:1px solid var(--panel);
-}
-.pip{width:6px;height:6px;border-radius:50%;background:var(--green);animation:blink 1s steps(1) infinite}
-@keyframes blink{50%{opacity:.25}}
-.cmd{padding:24px 20px;min-height:120px;display:flex;align-items:center}
-@media(min-width:640px){.cmd{padding:32px}}
-.cmd pre{font-size:12px;white-space:pre-wrap;word-break:break-word;line-height:1.85}
+@media(min-width:640px){.side-note{padding:0 24px 22px}}
+.side-note b{font-weight:500;color:rgba(255,255,255,.95)}
 
-/* -------------------------------------------------------------- enc table */
-.enc{width:100%;font-family:var(--mono);font-size:11px;line-height:1.6}
-.enc th{
-  text-align:left;font-weight:500;letter-spacing:.16em;text-transform:uppercase;
-  font-size:11px;color:rgba(255,255,255,.55);padding:0 12px 12px 0;white-space:nowrap;
+/* --------------------------------------------------------- store sources */
+.srcs{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:1px;background:var(--panel);border:1px solid var(--panel)}
+@media(max-width:800px){.srcs{grid-template-columns:minmax(0,1fr)}}
+.src{background:var(--cell-a);padding:26px 24px;display:flex;flex-direction:column;gap:14px;min-width:0}
+.src.is-past{background:var(--ground-leak)}
+/* The three marks share one 24-unit grid, one 1.5 stroke and one join style, so
+   they read as a set rather than three logos pasted next to each other. */
+.mark{width:34px;height:34px;color:var(--green);flex:none}
+.src.is-past .mark{color:var(--leak)}
+.src .src-k{
+  font-family:var(--mono);font-size:11px;letter-spacing:.14em;text-transform:uppercase;
+  color:rgba(255,255,255,.55);
 }
-.enc td{padding:7px 12px 7px 0;vertical-align:top;border-top:1px solid rgba(255,255,255,.06)}
-.enc td.i{color:rgba(255,255,255,.5);width:24px}
-.enc td.nm{color:rgba(255,255,255,.7);white-space:nowrap}
-.enc td.gl{color:rgba(255,255,255,.55);white-space:nowrap}
-.enc td.out{color:rgba(255,255,255,.85);word-break:break-all;min-width:200px}
-/* A duplicate row reads as quieter, but it still has to be READABLE — it is the
-   evidence for the headline. .5 is the floor, and .85 above it keeps the
-   distinct rows obviously dominant. */
-.enc tr.dup td.out{color:rgba(255,255,255,.5)}
-.enc tr.dup td.nm{color:rgba(255,255,255,.5)}
-.enc td.dupflag{color:rgba(255,255,255,.5);white-space:nowrap;text-align:right}
-.tbl-scroll{overflow-x:auto}
+.src.is-past .src-k{color:var(--leak)}
+.src p{font-size:14px;line-height:22px;color:rgba(255,255,255,.6)}
 
-/* ------------------------------------------------------------------ boxes */
-.box{border:1px solid rgba(255,255,255,.16);padding:24px}
-@media(min-width:640px){.box{padding:32px}}
-.box .big{font-size:20px;line-height:1.35;letter-spacing:-.02em;color:#fff;max-width:44ch}
-.verdict-list li{
+/* ----------------------------------------------------------- misc blocks */
+.rows li{
   display:grid;grid-template-columns:minmax(0,1fr) auto;gap:16px;align-items:baseline;
-  padding:14px 0;
+  padding:13px 0;
 }
-.verdict-list li + li{border-top:1px solid rgba(255,255,255,.06)}
-.verdict-list .k{font-family:var(--mono);font-size:12px;color:rgba(255,255,255,.8)}
-/* a grid child with no min-width refuses to shrink below its content, which is
-   how a long code chip pushes a two-column row wider than the screen */
-.verdict-list li > *,.readout > div > *,.shape-row > *{min-width:0;overflow-wrap:anywhere}
+.rows li + li{border-top:1px solid rgba(255,255,255,.07)}
+.rows .k{font-family:var(--mono);font-size:12px;line-height:19px;color:rgba(255,255,255,.82)}
+.rows li > *{min-width:0;overflow-wrap:anywhere}
 @media(max-width:640px){
-  .verdict-list li,.readout > div{grid-template-columns:minmax(0,1fr);gap:6px}
-  .verdict-list li .lbl,.readout .rv{text-align:left}
-  .flow .verdict{text-align:left}
+  .rows li{grid-template-columns:minmax(0,1fr);gap:5px}
+  .rows li .lbl{text-align:left}
 }
-.notes li{padding:16px 0;color:rgba(255,255,255,.7);font-size:15px;line-height:1.6}
-.notes li + li{border-top:1px solid rgba(255,255,255,.06)}
+.notes li{padding:15px 0;color:rgba(255,255,255,.65);font-size:15px;line-height:24px}
+.notes li + li{border-top:1px solid rgba(255,255,255,.07)}
 .notes b{color:#fff;font-weight:600}
+.notes em{font-style:normal;color:#fff}
+.stat .n{font-size:clamp(1.9rem,4vw,3rem);font-weight:600;letter-spacing:-.04em;line-height:1;color:#fff}
+.stat .l{margin-top:13px;max-width:36ch}
+.verbs{font-family:var(--mono);font-size:14px;color:rgba(255,255,255,.9);line-height:2.1}
 
 /* ----------------------------------------------------------------- footer */
-footer{border-top:1px solid var(--panel);padding:64px 0 80px}
+footer{border-top:1px solid var(--panel);padding:60px 0 76px}
 footer .cols{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:32px;align-items:start}
 @media(max-width:640px){footer .cols{grid-template-columns:1fr}}
+footer ul{display:grid;gap:10px;text-align:right}
+@media(max-width:640px){footer ul{text-align:left}}
 
 /* ----------------------------------------------------------------- motion */
 /* Gated on .js: without scripting the reveal never resolves, and an ungated
    rule would leave the whole page at opacity 0 — blank, with no way back. */
 .js .reveal{opacity:0;transform:translateY(14px);
-  transition:opacity .45s var(--ease-reveal),transform .45s var(--ease-reveal)}
+  transition:opacity .5s var(--ease-reveal),transform .5s var(--ease-reveal)}
 .js .reveal.in{opacity:1;transform:none}
-/* a .slab is centred BY a transform, so a reveal on the same element must
-   carry that centring through both states or the panel jumps off-axis */
+/* a .slab is centred BY a transform, so a reveal on the same element must carry
+   that centring through both states or the panel jumps off-axis */
 .js .slab.reveal{transform:translateX(-50%) translateY(14px)}
 .js .slab.reveal.in{transform:translateX(-50%)}
-.cascade{opacity:0;transform:translateY(14px);
-  animation:cascade .45s var(--ease-reveal) forwards}
+.cascade{opacity:0;transform:translateY(14px);animation:cascade .5s var(--ease-reveal) forwards}
 @keyframes cascade{to{opacity:1;transform:none}}
+/* A .slab is centred BY a transform, so an animation on the same element has to
+   carry that centring through EVERY keyframe. `transform:none` does not mean
+   "leave the other transform alone" — it wipes translateX(-50%), and the panel
+   lands half a viewport to the right, dragging the whole document's scrollWidth
+   with it. Measured: at 1440 the page scrolled to 2112px. The .reveal twin
+   below has always handled this; .cascade needs its own keyframes for the same
+   reason, not a shared one. */
+.slab.cascade{transform:translateX(-50%) translateY(14px);animation-name:cascade-slab}
+@keyframes cascade-slab{to{opacity:1;transform:translateX(-50%)}}
+.d1{animation-delay:40ms}.d2{animation-delay:100ms}.d3{animation-delay:170ms}
+.d4{animation-delay:250ms}.d5{animation-delay:340ms}.d6{animation-delay:440ms}
 @media(prefers-reduced-motion:reduce){
   *,*::before,*::after{
     animation-duration:.001ms!important;animation-iteration-count:1!important;
@@ -377,6 +471,11 @@ footer .cols{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:32px;alig
   .js .reveal{opacity:1;transform:none}
   .js .slab.reveal,.js .slab.reveal.in{transform:translateX(-50%)}
   .cascade{opacity:1;transform:none;animation:none}
+  .slab.cascade{transform:translateX(-50%)}
+  /* The pulse parks AT the wall rather than hiding: the end state is the thing
+     the diagram teaches, so stillness must still show it. */
+  .js .dot{animation:none;opacity:1;left:calc(100% - 7px)}
+  .js .wall i{animation:none;opacity:1}
 }
 html{scroll-behavior:smooth}
 @media(prefers-reduced-motion:reduce){html{scroll-behavior:auto}}
@@ -389,14 +488,13 @@ html{scroll-behavior:smooth}
   <div class="inner">
     <div class="wordmark">
       <span class="name">keyless</span>
-      <span class="lbl" style="letter-spacing:.16em">secrets broker</span>
+      <span class="lbl tail">secrets broker</span>
     </div>
     <ul class="lbl">
-      <li><a class="navlink" href="#measure">measurement</a></li>
-      <li><a class="navlink" href="#spellings">spellings</a></li>
-      <li><a class="navlink" href="#masking">masking</a></li>
+      <li><a class="navlink" href="#leak">the leak</a></li>
+      <li><a class="navlink" href="#stores">your stores</a></li>
+      <li><a class="navlink" href="#degraded">the sharp edge</a></li>
       <li><a class="navlink" href="#limits">limits</a></li>
-      <li><a class="navlink" href="#hooks">hooks</a></li>
     </ul>
     <div class="actions">
       <a class="chip" href="https://github.com/nbstr/keyless" rel="noopener">github</a>
@@ -408,410 +506,484 @@ html{scroll-behavior:smooth}
 <!-- =============================================================== HERO -->
 <header class="hero">
   <div class="col">
-    <p class="hero-eyebrow cascade" style="animation-delay:40ms">Secrets broker for coding agents</p>
-    <h1 class="cascade" style="animation-delay:80ms">Seven verbs. <span class="dim">Not one of them prints a secret.</span></h1>
-    <p class="sub cascade" style="animation-delay:140ms">
-      <code>keyless</code> puts a secret into one child process's environment and nowhere else — not stdout,
-      not scrollback, not the transcript. There is deliberately no verb that prints a value, and there never
-      will be. That absence is the whole product.
+    <p class="hero-eyebrow cascade d1">Secrets broker for coding agents</p>
+    <h1 class="cascade d2">Your agent gets the secret.<br><span class="fade">Your transcript never does.</span></h1>
+    <p class="sub cascade d3">
+      You name a secret. <b>keyless</b> puts the value into one child process's environment and nowhere
+      else — not stdout, not scrollback, not the transcript. There is deliberately no verb that prints a
+      value, and there never will be. <b>That absence is the whole product.</b>
     </p>
-    <div class="cta-row cascade" style="animation-delay:200ms">
+
+    <div class="cta-row cascade d4">
       <a class="cta" href="#install">Install it <span class="arw">&rarr;</span></a>
       <a class="cta-alt" href="#limits">Read what it does not catch <span class="arw">&rarr;</span></a>
     </div>
 
-    <div class="flow slab">
-      <div class="grid g1">
-        <div class="pad cascade" style="animation-delay:250ms">
-          <div class="row">
-            <span class="lbl">01 &nbsp;you type</span>
-            <span class="what">keyless run -s STRIPE_KEY -- sh -c 'curl -H "$STRIPE_KEY" https://api.example.com'</span>
-            <span class="lbl verdict">the name only</span>
-          </div>
+    <div class="hero-cmd-wrap cascade d5">
+      <div class="term hero-cmd">
+        <div class="termbar">
+          <span class="pip"></span>
+          <span class="lbl">the whole interface</span>
         </div>
-        <div class="pad cascade" style="animation-delay:400ms">
-          <div class="row">
-            <span class="lbl">02 &nbsp;keyless</span>
-            <span class="what">resolves STRIPE_KEY from the store and spawns the child with it in the environment</span>
-            <span class="lbl verdict">never printed</span>
-          </div>
+        <div class="term-body">
+<pre><span class="c">$</span> <span class="k">keyless run -s DATABASE_URL -- psql</span>
+<span class="o">psql (16.2)</span>  <span class="g">connected.</span>
+<span class="c"># the value appeared nowhere</span></pre>
         </div>
-        <div class="pad cascade" style="animation-delay:550ms">
-          <div class="row">
-            <span class="lbl">03 &nbsp;the child</span>
-            <span class="what">curl reads $STRIPE_KEY from its own environment and sends the header</span>
-            <span class="lbl verdict" style="color:var(--green)">injected &check;</span>
-          </div>
-        </div>
-      </div>
-      <div class="legend cascade" style="animation-delay:1250ms;margin-top:1px">
-        <div><div class="micro">stdout</div><div class="val">nothing</div></div>
-        <div><div class="micro">scrollback</div><div class="val">nothing</div></div>
-        <div><div class="micro">shell history</div><div class="val">nothing</div></div>
-        <div><div class="micro">the transcript</div><div class="val">nothing</div></div>
-        <div><div class="micro">the child's environ</div><div class="val" style="color:rgba(255,255,255,.9)">the value</div></div>
       </div>
     </div>
+  </div>
 
-    <p class="caveat cascade" style="animation-delay:1350ms">
+  <div class="slab cascade d6 gap-l">
+    <div class="grid g1">
+      <div class="pipe">
+        <div class="stage is-store">
+          <span class="st-l">your store</span>
+          <span class="st-v">Proton Pass<br>Infisical</span>
+        </div>
+        <div class="wire w1"><span class="dot"></span></div>
+        <div class="stage is-broker">
+          <span class="st-l">keyless</span>
+          <span class="st-v">resolves the name</span>
+        </div>
+        <div class="wire w2"><span class="dot"></span></div>
+        <div class="stage is-child">
+          <span class="st-l">the child process</span>
+          <span class="st-v">psql, with the value in its environment</span>
+        </div>
+        <div class="wall"><i></i></div>
+        <div class="pipe-cap"><span class="micro">nothing to the right of this line ever receives the value</span></div>
+      </div>
+    </div>
+    <div class="ledger">
+      <div><span class="ln">stdout</span><span class="lv">nothing</span></div>
+      <div><span class="ln">scrollback</span><span class="lv">nothing</span></div>
+      <div><span class="ln">shell history</span><span class="lv">nothing</span></div>
+      <div><span class="ln">the transcript</span><span class="lv">nothing</span></div>
+      <div class="held"><span class="ln">the child's environ</span><span class="lv">the value</span></div>
+    </div>
+  </div>
+
+  <div class="col">
+    <p class="caveat cascade d6">
       Two states, no third — <b>INJECTED</b> or <b>DEGRADED</b>. A partial injection does not exist.
-      <b>keyless get</b> is not a typo you can make; it does not exist.
-      MIT licensed &middot; Rust &middot; five direct dependencies &middot; 24 packages in the lock file.
+      &nbsp;&middot;&nbsp; <b>keyless get</b> is not a typo you can make; it does not exist.
+      &nbsp;&middot;&nbsp; MIT &middot; Rust &middot; macOS &middot; five direct dependencies.
     </p>
   </div>
 </header>
 
-<!-- ======================================================== 01 MEASUREMENT -->
-<section class="band" id="measure">
+<!-- ========================================================== THE LEAK -->
+<section class="band" id="leak">
   <div class="col">
     <div class="rule reveal">
-      <div class="eyebrow"><span class="idx">01</span><span class="dash"></span><span class="eyebrow-txt">measure your own</span></div>
+      <div class="eyebrow"><span class="dash"></span><span class="eyebrow-txt">why this exists</span></div>
       <div class="head">
-        <h2>Your number,<br>not ours.</h2>
-        <p class="deck">A credential reaches a command in four shapes. This page will not tell you how often
-          it happens on someone else's laptop — count it on yours.</p>
+        <h2>The transcript<br>is forever.</h2>
+        <p class="deck">A secret that reaches a chat is in a file on disk, in scrollback, and in whatever
+          that transcript syncs to. Deleting the message does not delete it. Each pair below is the same
+          moment, twice.</p>
+      </div>
+    </div>
+
+    <!-- pair 1 ------------------------------------------------------------- -->
+    <div class="pair reveal">
+      <div class="pair-head">
+        <h3>You paste it once. It is on disk forever.</h3>
+        <p class="deck-s gap-s">The value is not only in the terminal you are looking at. It is in the
+          history file, and in the transcript that outlives the session.</p>
+      </div>
+      <div class="slab">
+        <div class="duo">
+          <div class="side side-leak">
+            <div class="term">
+              <div class="termbar"><span class="pip leak"></span><span class="tag tag-leak">without keyless</span></div>
+              <div class="term-body">
+<pre><span class="c">$</span> <span class="k">echo $DATABASE_URL</span>
+<span class="r">postgres://demo:not-a-real-password@db.example.com/app</span>
+<span class="c">$</span> <span class="k">psql "$DATABASE_URL"</span>
+<span class="o">psql (16.2)  connected.</span></pre>
+              </div>
+            </div>
+            <p class="side-note">One command printed the value. <b>Four surfaces recorded it</b> before
+              the connection was even open.</p>
+            <div class="ledger">
+              <div class="leak"><span class="ln">stdout</span><span class="lv">the value</span></div>
+              <div class="leak"><span class="ln">scrollback</span><span class="lv">the value</span></div>
+              <div class="leak"><span class="ln">shell history</span><span class="lv">the value</span></div>
+              <div class="leak"><span class="ln">the transcript</span><span class="lv">the value</span></div>
+              <div class="leak"><span class="ln">the child's environ</span><span class="lv">the value</span></div>
+            </div>
+          </div>
+          <div class="side side-safe">
+            <div class="term">
+              <div class="termbar"><span class="pip"></span><span class="tag tag-safe">with keyless</span></div>
+              <div class="term-body">
+<pre><span class="c">$</span> <span class="k">keyless run -s DATABASE_URL -- psql</span>
+<span class="o">psql (16.2)</span>  <span class="g">connected.</span>
+
+<span class="c"># the command line carries a NAME, never a value</span></pre>
+              </div>
+            </div>
+            <p class="side-note">The same connection. <b>One surface holds the value</b>, and it exits
+              when psql does.</p>
+            <div class="ledger">
+              <div><span class="ln">stdout</span><span class="lv">nothing</span></div>
+              <div><span class="ln">scrollback</span><span class="lv">nothing</span></div>
+              <div><span class="ln">shell history</span><span class="lv">the name</span></div>
+              <div><span class="ln">the transcript</span><span class="lv">the name</span></div>
+              <div class="held"><span class="ln">the child's environ</span><span class="lv">the value</span></div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- pair 2 ------------------------------------------------------------- -->
+    <div class="pair reveal">
+      <div class="pair-head">
+        <h3>Nobody typed a secret. The machine printed four.</h3>
+        <p class="deck-s gap-s">A credential on a command line is readable by anything that can list
+          processes. One routine listing put four live tokens into a transcript — no paste, no mistake,
+          no warning.</p>
+      </div>
+      <div class="slab">
+        <div class="duo">
+          <div class="side side-leak">
+            <div class="term">
+              <div class="termbar"><span class="pip leak"></span><span class="tag tag-leak">values on the command line</span></div>
+              <div class="term-body">
+<pre><span class="c">$</span> <span class="k">&lt;a routine process listing&gt;</span>
+<span class="o">4812  deploy  --token</span> <span class="r">not-a-real-token-7b3e91</span>
+<span class="o">4855  sync    --key  </span> <span class="r">not-a-real-key-4f2a9c</span>
+<span class="o">4901  mailer  --pass </span> <span class="r">not-a-real-pass-d0177a</span>
+<span class="o">4933  worker  --auth </span> <span class="r">not-a-real-auth-9e42bc</span></pre>
+              </div>
+            </div>
+            <p class="side-note">Four live values, in one command's output, in the transcript.
+              <b>Nothing was typed wrong.</b></p>
+            <div class="ledger">
+              <div class="leak"><span class="ln">stdout</span><span class="lv">4 values</span></div>
+              <div class="leak"><span class="ln">scrollback</span><span class="lv">4 values</span></div>
+              <div><span class="ln">shell history</span><span class="lv">the listing</span></div>
+              <div class="leak"><span class="ln">the transcript</span><span class="lv">4 values</span></div>
+              <div class="leak"><span class="ln">any process table</span><span class="lv">4 values</span></div>
+            </div>
+          </div>
+          <div class="side side-safe">
+            <div class="term">
+              <div class="termbar"><span class="pip"></span><span class="tag tag-safe">names on the command line</span></div>
+              <div class="term-body">
+<pre><span class="c">$</span> <span class="k">&lt;the same routine listing&gt;</span>
+<span class="o">4812  keyless run -s</span> <span class="g">DEPLOY_TOKEN</span> <span class="o">-- deploy</span>
+<span class="o">4855  keyless run -s</span> <span class="g">SYNC_KEY    </span> <span class="o">-- sync</span>
+<span class="o">4901  keyless run -s</span> <span class="g">MAIL_PASS   </span> <span class="o">-- mailer</span>
+<span class="o">4933  keyless run -s</span> <span class="g">WORKER_AUTH </span> <span class="o">-- worker</span></pre>
+              </div>
+            </div>
+            <p class="side-note">The same listing, the same four jobs. <b>It reads out four names</b> —
+              which is exactly what a listing should be able to see.</p>
+            <div class="ledger">
+              <div><span class="ln">stdout</span><span class="lv">4 names</span></div>
+              <div><span class="ln">scrollback</span><span class="lv">4 names</span></div>
+              <div><span class="ln">shell history</span><span class="lv">the listing</span></div>
+              <div><span class="ln">the transcript</span><span class="lv">4 names</span></div>
+              <div class="held"><span class="ln">any process table</span><span class="lv">4 names</span></div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- pair 3 ------------------------------------------------------------- -->
+    <div class="pair reveal">
+      <div class="pair-head">
+        <h3>Every leak costs a rotation. Then it costs everyone else one.</h3>
+        <p class="deck-s gap-s">Rotate, re-enter, re-wire, tell the team. The work is not the leak — the
+          work is the treadmill the leak starts.</p>
+      </div>
+      <div class="slab">
+        <div class="duo">
+          <div class="side side-leak">
+            <div class="term">
+              <div class="termbar"><span class="pip leak"></span><span class="tag tag-leak">the treadmill</span></div>
+              <div class="term-body">
+<pre><span class="r">ROTATE</span>  <span class="o">DEPLOY_TOKEN</span>  <span class="c">value reached a transcript</span>
+<span class="r">ROTATE</span>  <span class="o">SYNC_KEY    </span>  <span class="c">value reached a transcript</span>
+<span class="r">ROTATE</span>  <span class="o">MAIL_PASS   </span>  <span class="c">value reached a transcript</span>
+<span class="r">ROTATE</span>  <span class="o">WORKER_AUTH </span>  <span class="c">value reached a transcript</span>
+<span class="r">ROTATE</span>  <span class="o">DATABASE_URL</span>  <span class="c">value reached a transcript</span>
+<span class="c">…and each one is a re-wire, and a message to the team</span></pre>
+              </div>
+            </div>
+            <p class="side-note">A rotation is not the fix. <b>It is the bill for a leak that already
+              happened</b> — and it arrives again next week.</p>
+            <div class="ledger">
+              <div class="leak"><span class="ln">values to rotate</span><span class="lv">5</span></div>
+              <div class="leak"><span class="ln">places to re-wire</span><span class="lv">5</span></div>
+              <div class="leak"><span class="ln">people to tell</span><span class="lv">the team</span></div>
+              <div class="leak"><span class="ln">transcripts to purge</span><span class="lv">not possible</span></div>
+              <div class="leak"><span class="ln">next week</span><span class="lv">again</span></div>
+            </div>
+          </div>
+          <div class="side side-safe">
+            <div class="term">
+              <div class="termbar"><span class="pip"></span><span class="tag tag-safe">the treadmill stops</span></div>
+              <div class="term-body">
+<pre><span class="c">$</span> <span class="k">keyless ls</span>
+<span class="g">DEPLOY_TOKEN</span>  <span class="c">resolvable</span>
+<span class="g">SYNC_KEY    </span>  <span class="c">resolvable</span>
+<span class="g">MAIL_PASS   </span>  <span class="c">resolvable</span>
+<span class="g">WORKER_AUTH </span>  <span class="c">resolvable</span>
+<span class="g">DATABASE_URL</span>  <span class="c">resolvable</span>
+
+<span class="c"># nothing to rotate. no value ever reached a transcript.</span></pre>
+              </div>
+            </div>
+            <p class="side-note"><b>ls names what it can resolve.</b> It prints no values, because there
+              is no verb on this tool that prints one.</p>
+            <div class="ledger">
+              <div><span class="ln">values to rotate</span><span class="lv">0</span></div>
+              <div><span class="ln">places to re-wire</span><span class="lv">0</span></div>
+              <div><span class="ln">people to tell</span><span class="lv">nobody</span></div>
+              <div><span class="ln">transcripts to purge</span><span class="lv">none carry one</span></div>
+              <div class="held"><span class="ln">next week</span><span class="lv">the same</span></div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <p class="caveat reveal">
+      Every value on this page is invented and says so in its own text. <b>Nothing here is a real
+      credential</b>, and a test scans this file on every commit to keep it that way.
+    </p>
+  </div>
+</section>
+
+<!-- ========================================================== THE STORES -->
+<section class="band" id="stores">
+  <div class="col">
+    <div class="rule reveal">
+      <div class="eyebrow"><span class="dash"></span><span class="eyebrow-txt">where the values already live</span></div>
+      <div class="head">
+        <h2>Not another<br>vault.</h2>
+        <p class="deck">keyless stores nothing you have not already stored. It reads the places you keep
+          secrets today, and stands between them and the process that needs one.</p>
+      </div>
+    </div>
+
+    <div class="slab reveal">
+      <div class="srcs">
+        <div class="src">
+          <svg class="mark" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round" aria-hidden="true">
+            <path d="M12 2.4 20 5.9v6.6c0 4.4-3.2 7.6-8 9.1-4.8-1.5-8-4.7-8-9.1V5.9z"/>
+            <circle cx="12" cy="11" r="2.2"/>
+            <path d="M12 13.2v3.2" stroke-linecap="round"/>
+          </svg>
+          <div>
+            <div class="src-k">supported today</div>
+            <h4 class="gap-s">Proton Pass</h4>
+          </div>
+          <p>Read through the Pass CLI. keyless keeps no copy of anything it reads.</p>
+        </div>
+        <div class="src">
+          <svg class="mark" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round" aria-hidden="true">
+            <path d="M12 2.4 20.2 7v10L12 21.6 3.8 17V7z"/>
+            <path d="M12 8.1 16.1 10.4v4.2L12 16.9 7.9 14.6v-4.2z"/>
+          </svg>
+          <div>
+            <div class="src-k">supported today</div>
+            <h4 class="gap-s">Infisical</h4>
+          </div>
+          <p>Read through the Infisical CLI, per project and per environment.</p>
+        </div>
+        <div class="src is-past">
+          <svg class="mark" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round" aria-hidden="true">
+            <path d="M6 2.4h7.6L19 7.9v13.7H6z"/>
+            <path d="M13.6 2.4v5.5H19"/>
+            <path d="M9 12.6h7M9 16.1h4.6" stroke-linecap="round"/>
+          </svg>
+          <div>
+            <div class="src-k">what it replaces</div>
+            <h4 class="gap-s">The plaintext file</h4>
+          </div>
+          <p>Plaintext on disk, copied between machines, pasted into chats, committed by accident.</p>
+        </div>
+      </div>
+    </div>
+
+    <div class="slab reveal slab-gap">
+      <div class="grid g2">
+        <div class="pad">
+          <div class="lbl">what you can see</div>
+          <div class="scroll-x gap-m">
+<pre><span class="c">$</span> <span class="k">keyless ls</span>
+<span class="g">DATABASE_URL</span>  <span class="c">resolvable</span>
+<span class="g">DEPLOY_TOKEN</span>  <span class="c">resolvable</span>
+<span class="o">STALE_KEY   </span>  <span class="v">unresolvable</span>  <span class="c"># and it says so</span></pre>
+          </div>
+          <p class="micro gap-l">
+            names, and whether each one resolves &mdash; that is the entire readable surface
+          </p>
+        </div>
+        <div class="pad">
+          <div class="lbl">what you cannot</div>
+          <div class="scroll-x gap-m">
+<pre><span class="c">$</span> <span class="k">keyless get DATABASE_URL</span>
+<span class="r">error: unrecognized subcommand 'get'</span>
+
+<span class="c">$</span> <span class="k">keyless put DATABASE_URL --value …</span>
+<span class="r">error: unexpected argument '--value' found</span></pre>
+          </div>
+          <p class="micro gap-l">
+            both observed live &mdash; <b>the absence is the design</b>
+          </p>
+        </div>
+      </div>
+    </div>
+
+    <p class="caveat reveal">
+      A value on a command line is recorded by the shell, the history file and the transcript alike
+      &mdash; which is the documented reason <b>keyless put has no --value flag</b>. You are prompted, or
+      you pipe.
+    </p>
+  </div>
+</section>
+
+<!-- ======================================================= THE SHARP EDGE -->
+<section class="band" id="degraded">
+  <div class="col">
+    <div class="rule reveal">
+      <div class="eyebrow"><span class="dash"></span><span class="eyebrow-txt">the sharp edge</span></div>
+      <div class="head">
+        <h2>A green run<br>can be a lie.</h2>
+        <p class="deck">This is the one thing that will bite you, so it gets a section rather than a
+          footnote. Read the banner, not the exit code.</p>
       </div>
     </div>
 
     <div class="slab reveal">
       <div class="grid g2">
         <div class="pad">
-          <h3 class="compact">The four shapes</h3>
-          <p class="deck" style="margin-top:12px;font-size:15px">Each one puts the value itself on the command
-            line, where the shell, the history file and the transcript all record it.</p>
-          <ul class="verdict-list" style="margin-top:16px">
-            <li><span class="k">url-embedded</span><span class="lbl"><code>https://user:VALUE@host</code></span></li>
-            <li><span class="k">env assignment</span><span class="lbl"><code>export TOKEN=VALUE</code></span></li>
-            <li><span class="k">cli flag</span><span class="lbl"><code>--token VALUE</code></span></li>
-            <li><span class="k">http header</span><span class="lbl"><code>Authorization: Bearer VALUE</code></span></li>
-          </ul>
-          <p class="micro" style="margin-top:20px;line-height:17px">
-            all four are one primitive wide &mdash; spawn a child with the secret in its environment
-          </p>
+          <div class="scroll-x">
+<pre><span class="c">$</span> <span class="k">keyless run -s TYPOED_NAME -- deploy</span>
+<span class="v">DEGRADED</span><span class="o">: TYPOED_NAME did not resolve.</span>
+<span class="o">Running the command anyway, with an untouched environment.</span>
+
+<span class="o">deploy: 401 Unauthorized</span>
+<span class="c">$</span> <span class="k">echo $?</span>
+<span class="o">0</span>   <span class="c">← the exit code cannot tell you</span></pre>
+          </div>
         </div>
         <div class="pad">
-          <h3 class="compact">Count them in your own history</h3>
-          <p class="deck" style="margin-top:12px;font-size:15px">Standard tools, nothing installed.
-            <span style="color:rgba(255,255,255,.85)">Each line prints a count and never prints a matching
-            line</span> — the same rule the tool follows.</p>
-<pre style="margin-top:20px"><span class="c"># swap in ~/.bash_history, or any transcript directory</span>
-<span class="k">H=~/.zsh_history</span>
+          <h3>keyless never refuses your command.</h3>
+          <p class="deck-s gap-m">An unresolvable name warns on stderr, runs the child with an untouched
+            environment, and forwards the child's exit code. <b>So a missing credential is a 401 at exit
+            0.</b></p>
+          <p class="deck-s gap-m">Nothing in the exit status separates a working secret from a missing
+            one. Only the <span class="v">DEGRADED</span> banner does — which is why it is a banner and
+            not a debug line.</p>
+          <div class="hr"></div>
+          <p class="micro">a trade, stated out loud: keyless will not be the reason your pipeline stops</p>
+        </div>
+      </div>
+    </div>
 
-grep -acE 'https?://[^ /]*:[^ /@]*@' <span class="k">"$H"</span>          <span class="c"># url</span>
-grep -acE '[A-Z_]{4,}=[^ ]{12,}' <span class="k">"$H"</span>              <span class="c"># env</span>
-grep -acE '\-\-(token|key|secret|password)[= ][^ -][^ ]*' <span class="k">"$H"</span>   <span class="c"># flag</span>
-grep -acE '[Aa]uthorization: *(Bearer|Basic) [^ "]+' <span class="k">"$H"</span>       <span class="c"># header</span></pre>
-          <p class="micro" style="margin-top:18px;line-height:17px">
-            four counts. that is your number, and it is the only one that should persuade you
+    <div class="slab reveal slab-gap">
+      <div class="grid g1">
+        <div class="pad">
+          <div class="lbl">and one rule of syntax, because it catches everyone once</div>
+          <div class="scroll-x gap-m">
+<pre><span class="r">✗</span> <span class="k">keyless run -s TOKEN -- curl -H "$TOKEN" …</span>        <span class="c"># your shell expands it FIRST → arrives empty</span>
+<span class="r">✗</span> <span class="k">keyless run -s TOKEN -- curl -H '$TOKEN' …</span>        <span class="c"># keyless expands nothing → arrives literal</span>
+<span class="g">✓</span> <span class="k">keyless run -s TOKEN -- sh -c 'curl -H "$TOKEN" …'</span>  <span class="c"># only the INNER shell expands</span></pre>
+          </div>
+          <p class="micro gap-l">
+            both wrong spellings inject correctly and still send nothing useful &mdash; neither fault is
+            visible to the broker, because by the time it runs the argument is already empty or already
+            literal
           </p>
         </div>
       </div>
     </div>
-
-    <p class="caveat reveal">
-      <b>The counts are lines, not secrets</b> &mdash; a shape is checkable without anyone reading a value,
-      which is why this page counts shapes and never values. &nbsp;&middot;&nbsp; A correctly wrapped
-      <b>keyless run</b> matches none of the four, so the recipe does not count the fix as the problem.
-      &nbsp;&middot;&nbsp; The CLI-flag shape is the documented reason <b>keyless put has no --value flag</b>.
-    </p>
   </div>
 </section>
 
-<!-- ========================================================= 02 SPELLINGS -->
-<section class="band" id="spellings">
-  <div class="col">
-    <div class="rule reveal">
-      <div class="eyebrow"><span class="idx">02</span><span class="dash"></span><span class="eyebrow-txt">where a secret goes</span></div>
-      <div class="head">
-        <h2>Four spellings.<br>One works.</h2>
-        <p class="deck">The instrument is driven by the command, not by a secret. Nothing here asks you to
-          paste a credential — asking is the offence, whatever the client-side code does.</p>
-      </div>
-    </div>
-
-    <div class="slab reveal">
-      <div class="grid g2w" id="spellGrid">
-        <div>
-          <div class="termbar">
-            <span class="pip" id="pip"></span>
-            <span class="lbl" id="spellState" style="color:#5FD39A">injected</span>
-            <span style="flex:1"></span>
-            <span class="micro">what the child actually receives</span>
-          </div>
-          <div style="padding:20px 20px 0">
-            <div class="seg" role="group" aria-label="command spelling">
-              <button type="button" data-spell="0" aria-pressed="false">no keyless</button>
-              <button type="button" data-spell="1" aria-pressed="false">naive</button>
-              <button type="button" data-spell="2" aria-pressed="false">quoted</button>
-              <button type="button" data-spell="3" aria-pressed="true">correct</button>
-            </div>
-          </div>
-          <!-- Rendered statically at the DEFAULT state (spelling 3, "correct"),
-               byte-identical to what renderSpelling(3) produces. The script
-               replaces it on the first interaction. Without this the panel is an
-               empty box with scripting off, on a page whose readers switch it
-               off. The duplication is the price and it is worth paying. -->
-          <div class="cmd"><pre id="spellCmd"><span class="c"># single-quote the body, and keep it inside sh -c</span>
-<span class="k">keyless run -s TOKEN -- sh -c 'curl -H "$TOKEN" https://api.example.com'</span></pre></div>
-          <div style="padding:0 20px 24px">
-            <p class="micro" id="spellNote" style="line-height:17px;max-width:64ch">Only the INNER shell expands, and it expands from the environment keyless just handed it. This is the one spelling where the value reaches the request.</p>
-          </div>
-        </div>
-        <div style="background:var(--cell-b)">
-          <div class="readout" id="spellReadout">
-            <div><span class="lbl">the argument carries</span><span class="rv">the value</span></div>
-            <div><span class="lbl">in scrollback</span><span class="rv">nothing</span></div>
-            <div><span class="lbl">in shell history</span><span class="rv">nothing</span></div>
-            <div><span class="lbl">in the transcript</span><span class="rv">nothing</span></div>
-            <div><span class="lbl">in the child environ</span><span class="rv">the value</span></div>
-            <div><span class="lbl">exit code</span><span class="rv" style="color:rgba(255,255,255,.95)">0</span></div>
-            <div><span class="lbl">exposed in</span><span class="rv" style="color:rgba(255,255,255,.95)">1 place</span></div>
-            <div><span class="lbl">basis</span><span class="rv">documented behaviour</span></div>
-            <div><span class="lbl">verdict</span><span class="lbl" style="letter-spacing:.16em;color:#5FD39A">correct</span></div>
-          </div>
-        </div>
-      </div>
-    </div>
-
-    <p class="caveat reveal">
-      <b>The exit code is 0 in all four rows.</b> keyless never refuses: an unresolvable name warns on stderr,
-      runs the child with an untouched environment, and forwards its exit code. A missing credential is a 401
-      at exit 0 — read the DEGRADED banner, because the exit code cannot tell you.
-    </p>
-
-    <div class="slab reveal" style="margin-top:48px">
-      <div class="box">
-        <p class="big">Two of these four spellings inject correctly and still send nothing useful.</p>
-        <p class="deck" style="margin-top:16px;max-width:72ch">
-          The calling shell expands <code>"$TOKEN"</code> before <code>keyless</code> is ever executed, and
-          <code>keyless</code> does not expand its own arguments. Neither fault is visible to the broker —
-          by the time it runs, the argument is already empty or already literal. Single-quote the body and
-          keep it inside <code>sh -c</code>, and the rule holds for every command you will ever wrap.
-        </p>
-      </div>
-    </div>
-  </div>
-</section>
-
-<!-- =========================================================== 03 MASKING -->
-<section class="band" id="masking">
-  <div class="col">
-    <div class="rule reveal">
-      <div class="eyebrow"><span class="idx">03</span><span class="dash"></span><span class="eyebrow-txt">twenty encodings</span></div>
-      <div class="head">
-        <h2>Twenty shapes.<br>Ten needles.</h2>
-        <p class="deck">The masker generates twenty encodings of a secret, in a fixed order, and deduplicates.
-          For a plain alphanumeric value, half of them are the same string.</p>
-      </div>
-    </div>
-
-    <div class="slab reveal">
-      <div class="grid g1">
-        <div style="padding:20px 24px;display:flex;flex-wrap:wrap;gap:20px;align-items:center">
-          <div class="seg" role="group" aria-label="demo value">
-            <button type="button" data-val="0" aria-pressed="true">plain value</button>
-            <button type="button" data-val="1" aria-pressed="false">awkward value</button>
-          </div>
-          <div style="flex:1;min-width:220px">
-            <div class="micro">the value being masked</div>
-            <div class="mono" id="encValue" style="font-size:13px;color:rgba(255,255,255,.85);margin-top:6px;word-break:break-all">not-a-real-key-4f2a9c1d</div>
-          </div>
-          <div style="text-align:right">
-            <div class="micro">distinct needles</div>
-            <div class="mono" id="encCount" style="font-size:22px;letter-spacing:-.02em;margin-top:4px"><span style="color:#fff">10</span><span style="color:rgba(255,255,255,.5)"> / 20</span></div>
-          </div>
-        </div>
-        <div style="padding:24px;overflow:hidden">
-          <div class="tbl-scroll">
-            <table class="enc">
-              <thead><tr><th>#</th><th>encoder</th><th>reads as</th><th>rendered</th><th>same as</th></tr></thead>
-              <!-- The DEFAULT state, rendered statically and byte-identical to
-                   renderEnc(0). The script replaces it on the first interaction. -->
-              <tbody id="encBody">
-<tr><td class="i">01</td><td class="nm">raw</td><td class="gl">as stored</td><td class="out">not-a-real-key-4f2a9c1d</td><td class="dupflag"></td></tr>
-<tr class="dup"><td class="i">02</td><td class="nm">lowercase</td><td class="gl">case-folded</td><td class="out">not-a-real-key-4f2a9c1d</td><td class="dupflag">= raw</td></tr>
-<tr><td class="i">03</td><td class="nm">uppercase</td><td class="gl">case-folded</td><td class="out">NOT-A-REAL-KEY-4F2A9C1D</td><td class="dupflag"></td></tr>
-<tr><td class="i">04</td><td class="nm">base64-std</td><td class="gl">the usual base64</td><td class="out">bm90LWEtcmVhbC1rZXktNGYyYTljMWQ=</td><td class="dupflag"></td></tr>
-<tr><td class="i">05</td><td class="nm">base64-std-nopad</td><td class="gl">Go writes this</td><td class="out">bm90LWEtcmVhbC1rZXktNGYyYTljMWQ</td><td class="dupflag"></td></tr>
-<tr class="dup"><td class="i">06</td><td class="nm">base64-url</td><td class="gl">url-safe alphabet</td><td class="out">bm90LWEtcmVhbC1rZXktNGYyYTljMWQ=</td><td class="dupflag">= base64-std</td></tr>
-<tr class="dup"><td class="i">07</td><td class="nm">base64-url-nopad</td><td class="gl">a JWT segment</td><td class="out">bm90LWEtcmVhbC1rZXktNGYyYTljMWQ</td><td class="dupflag">= base64-std-nopad</td></tr>
-<tr><td class="i">08</td><td class="nm">base32</td><td class="gl">a TOTP seed</td><td class="out">NZXXILLBFVZGKYLMFVVWK6JNGRTDEYJZMMYWI===</td><td class="dupflag"></td></tr>
-<tr><td class="i">09</td><td class="nm">base32-nopad</td><td class="gl">unpadded base32</td><td class="out">NZXXILLBFVZGKYLMFVVWK6JNGRTDEYJZMMYWI</td><td class="dupflag"></td></tr>
-<tr><td class="i">10</td><td class="nm">hex-lower</td><td class="gl">hexdump</td><td class="out">6e6f742d612d7265616c2d6b65792d3466326139633164</td><td class="dupflag"></td></tr>
-<tr><td class="i">11</td><td class="nm">hex-upper</td><td class="gl">hexdump, shouting</td><td class="out">6E6F742D612D7265616C2D6B65792D3466326139633164</td><td class="dupflag"></td></tr>
-<tr><td class="i">12</td><td class="nm">hex-0x-lower</td><td class="gl">a literal in code</td><td class="out">0x6e6f742d612d7265616c2d6b65792d3466326139633164</td><td class="dupflag"></td></tr>
-<tr><td class="i">13</td><td class="nm">hex-0x-upper</td><td class="gl">a literal in code</td><td class="out">0x6E6F742D612D7265616C2D6B65792D3466326139633164</td><td class="dupflag"></td></tr>
-<tr class="dup"><td class="i">14</td><td class="nm">url-query</td><td class="gl">space becomes +</td><td class="out">not-a-real-key-4f2a9c1d</td><td class="dupflag">= raw</td></tr>
-<tr class="dup"><td class="i">15</td><td class="nm">url-path</td><td class="gl">space becomes %20</td><td class="out">not-a-real-key-4f2a9c1d</td><td class="dupflag">= raw</td></tr>
-<tr class="dup"><td class="i">16</td><td class="nm">url-strict</td><td class="gl">RFC 3986</td><td class="out">not-a-real-key-4f2a9c1d</td><td class="dupflag">= raw</td></tr>
-<tr class="dup"><td class="i">17</td><td class="nm">json-minimal</td><td class="gl">JSON.stringify</td><td class="out">not-a-real-key-4f2a9c1d</td><td class="dupflag">= raw</td></tr>
-<tr class="dup"><td class="i">18</td><td class="nm">json-html</td><td class="gl">Go escapes &amp; &lt; &gt;</td><td class="out">not-a-real-key-4f2a9c1d</td><td class="dupflag">= raw</td></tr>
-<tr class="dup"><td class="i">19</td><td class="nm">json-slash</td><td class="gl">PHP escapes /</td><td class="out">not-a-real-key-4f2a9c1d</td><td class="dupflag">= raw</td></tr>
-<tr class="dup"><td class="i">20</td><td class="nm">json-ascii-only</td><td class="gl">Python escapes é</td><td class="out">not-a-real-key-4f2a9c1d</td><td class="dupflag">= raw</td></tr>
-              </tbody>
-            </table>
-          </div>
-        </div>
-      </div>
-    </div>
-
-    <p class="caveat reveal">
-      Rendered in your browser, by the same twenty encoders in the same order. <b>The repo's test table is an
-      independent oracle</b> — its literals are generated by Python's standard library, not by the code under
-      test. &nbsp;&middot;&nbsp; Split at every byte is still caught: the masker holds back bytes that could
-      <b>begin</b> a needle and releases them the instant they cannot. Observed live against <b>fold -w1</b>.
-      It is a prefix withhold, content-aware — not a suffix carry.
-    </p>
-  </div>
-</section>
-
-<!-- ============================================================ 04 LIMITS -->
+<!-- =========================================================== THE LIMITS -->
 <section class="band" id="limits">
   <div class="col">
     <div class="rule reveal">
-      <div class="eyebrow"><span class="idx">04</span><span class="dash"></span><span class="eyebrow-txt">what it does not catch</span></div>
+      <div class="eyebrow"><span class="dash"></span><span class="eyebrow-txt">what it does not catch</span></div>
       <div class="head">
         <h2>A filter,<br>not a control.</h2>
-        <p class="deck">Three tokens defeat it: <code>sh -c 'echo $TOKEN &gt; /tmp/x'</code>. By design. The
-          threat model is a capable agent taking a shortcut, not an adversary.</p>
+        <p class="deck">Three tokens defeat it: <code>sh -c 'echo $TOKEN &gt; /tmp/x'</code>. By design.
+          The threat model is a capable agent taking a shortcut, not an adversary.</p>
       </div>
     </div>
 
     <div class="slab reveal">
       <div class="grid g2">
         <div class="pad">
-          <h3 class="compact">Six shapes, driven at the real binary</h3>
-          <ul class="verdict-list" style="margin-top:16px">
-            <li><span class="k">the raw value, echoed</span><span class="lbl" style="color:var(--green)">masked</span></li>
-            <li><span class="k">contiguous hex</span><span class="lbl" style="color:var(--green)">masked</span></li>
-            <li><span class="k">one byte per write &mdash; <code>fold -w1</code></span><span class="lbl" style="color:var(--green)">masked</span></li>
+          <h3>Output masking, driven at the real binary</h3>
+          <p class="deck-s gap-s">keyless filters what comes back out through the pipe. Six shapes were
+            driven at it, and these verdicts are what was observed rather than what was hoped.</p>
+          <ul class="rows gap-m">
+            <li><span class="k">the raw value, echoed</span><span class="lbl g">masked</span></li>
+            <li><span class="k">contiguous hex</span><span class="lbl g">masked</span></li>
+            <li><span class="k">one byte per write — <code>fold -w1</code></span><span class="lbl g">masked</span></li>
             <li><span class="k">gzip</span><span class="lbl">not caught</span></li>
             <li><span class="k"><code>xxd -p</code> wrapped at 60 columns</span><span class="lbl">not caught</span></li>
-            <li><span class="k">HTTP Basic &mdash; <code>user:pass</code> base64'd together</span><span class="lbl" style="color:rgba(255,255,255,.5)">length-dependent</span></li>
+            <li><span class="k">HTTP Basic — user and secret base64'd together</span><span class="lbl">length-dependent</span></li>
           </ul>
         </div>
-        <div class="pad">
-          <h3 class="compact">The Basic-auth limit, measured</h3>
-          <p class="deck" style="margin-top:12px;font-size:15px">The username is folded into the same base64
-            block, so whether the secret survives as a recognisable needle depends on how the bytes align.</p>
-          <ul class="verdict-list" style="margin-top:12px">
-            <li><span class="k">username <code>ab:</code> &mdash; 3 bytes</span><span class="lbl" style="color:var(--green)">caught</span></li>
-            <li><span class="k">username <code>abcde:</code> &mdash; 6 bytes</span><span class="lbl" style="color:var(--green)">caught</span></li>
-            <li><span class="k">username <code>apiuser:</code> &mdash; 8 bytes</span><span class="lbl">prints in the clear</span></li>
-          </ul>
-          <p class="micro" style="margin-top:18px;line-height:17px">one username length in three, proven &mdash;
-            <span style="color:rgba(255,255,255,.6)">not estimated</span></p>
-        </div>
-      </div>
-    </div>
-
-    <div class="slab reveal" style="margin-top:48px">
-      <div class="box">
-        <div class="lbl" style="margin-bottom:16px">the number that hurts</div>
-        <p class="big"><code style="font-size:1em">keyless run</code> never refuses.</p>
-        <p class="deck" style="margin-top:14px;max-width:72ch">
-          An unresolvable name warns on stderr, runs the child with an untouched environment, and forwards the
-          child's exit code. <span style="color:rgba(255,255,255,.85)">So a missing credential is a 401 at exit
-          0.</span> Nothing in the exit status distinguishes a working secret from a missing one; only the
-          <span class="v">DEGRADED</span> banner does.
-        </p>
-      </div>
-    </div>
-
-    <div class="slab reveal" style="margin-top:48px">
-      <div class="grid g1">
         <div class="pad">
           <ul class="notes">
-            <li><b>The child gets the real value.</b> It can write it to a file, POST it anywhere, or print it.
-              Masking filters what comes back out through the pipe; it does not constrain the process.</li>
-            <li><b>Nothing here survives <code>sudo</code>.</b> If you are an admin on your own machine, this is
-              a boundary against your sessions — not against you.</li>
-            <li><b>One part is a control, not a habit.</b> The daemon's store is owned by a uid you are not:
-              <code>secrets.json</code> at mode <code>0600</code>, user <code>_keyless</code>. The install asks
-              for <code>sudo</code> exactly once, to create that user, and nothing afterwards does. The audit log
-              is readable by you and not writable by you, and each row is hashed as
-              <code>sha256(previous || row)</code>.</li>
-            <li><b>15 tests are <code>#[ignore]</code>d and never run in CI</b> — the entire live Proton Pass
-              suite, which needs a real account. CI asserts <code>ignored == 15</code> precisely so that stays
-              visible rather than quietly drifting.</li>
-            <li><b>macOS only for the daemon.</b> CI runs the Linux link and <em style="font-style:normal;color:#fff">requires it to fail</em>,
-              on exactly four named XNU symbols. Linux is unshipped because it is untested, and the build says so
+            <li><b>The child gets the real value.</b> It can write it to a file, POST it anywhere, or
+              print it. Masking filters the pipe; it does not constrain the process.</li>
+            <li><b>Nothing here survives <code>sudo</code>.</b> If you are an admin on your own machine,
+              this is a boundary against your sessions — not against you.</li>
+            <li><b>One part is a control, not a habit.</b> The daemon's store is owned by a uid you are
+              not, at mode <code>0600</code>. The install asks for <code>sudo</code> exactly once, to
+              create that user, and nothing afterwards does.</li>
+            <li><b>macOS only for the daemon.</b> CI runs the Linux link and <em>requires it to fail</em>,
+              on four named XNU symbols. Linux is unshipped because it is untested, and the build says so
               out loud.</li>
-            <li><b>There is no "leaks prevented" counter on this page, and there never will be.</b> A security
-              product's success is a non-event. <code>keyless</code> cannot show you the leak that did not
-              happen, and a number nobody can audit is exactly the wrong thing to put on this page.</li>
           </ul>
+        </div>
+      </div>
+    </div>
+
+    <div class="slab reveal slab-gap">
+      <div class="grid g2">
+        <div class="pad stat">
+          <div class="n"><span class="v">4</span></div>
+          <p class="deck-s l">attacks get past the hook pack that rides alongside — each one named in
+            the repository, and pinned by a suite that fails in both directions.</p>
+        </div>
+        <div class="pad">
+          <div class="lbl">the number that is not here</div>
+          <p class="deck-s gap-s"><b>There is no "leaks prevented" counter on this page, and there never
+            will be.</b> A security product's success is a non-event. keyless cannot show you the leak
+            that did not happen, and a number nobody can audit is exactly the wrong thing to put on a page
+            like this one.</p>
         </div>
       </div>
     </div>
 
     <p class="caveat reveal">
       Every verdict above was driven at the real binary, not read from a document.
-      &nbsp;&middot;&nbsp; <b>Three of five masking limits carry a test.</b> The other two do not, and this page
-      will not claim otherwise.
+      &nbsp;&middot;&nbsp; <b>Three of five masking limits carry a test.</b> The other two do not, and
+      this page will not claim otherwise.
     </p>
   </div>
 </section>
 
-<!-- ============================================================= 05 HOOKS -->
-<section class="band" id="hooks">
-  <div class="col">
-    <div class="rule reveal">
-      <div class="eyebrow"><span class="idx">05</span><span class="dash"></span><span class="eyebrow-txt">the hook pack</span></div>
-      <div class="head">
-        <h2>Four ways past.<br>All four named.</h2>
-        <p class="deck">A Python hook pack rides alongside the binary and guards the paths an agent actually
-          takes. An attack corpus is driven at it, and the suite fails in both directions — if a row that is
-          not on the published survivor list gets through, and if a row on it is now blocked. A stale limit is
-          a lie in the other direction.</p>
-      </div>
-    </div>
-
-    <div class="slab reveal">
-      <div class="grid g2">
-        <div class="pad stat">
-          <div class="n"><span class="v">4</span></div>
-          <div class="lbl l">attacks get past the pack &mdash; named below, and pinned by the suite</div>
-        </div>
-        <div class="pad stat">
-          <div class="n">~ +6 ms</div>
-          <div class="lbl l">added per tool call &mdash; stated as about, never to one decimal</div>
-        </div>
-      </div>
-      <div class="grid g4" style="border-top:0">
-        <div class="pad"><div class="mono" style="font-size:22px;letter-spacing:-.02em">7</div><div class="lbl l" style="margin-top:10px">checks</div></div>
-        <div class="pad"><div class="mono" style="font-size:22px;letter-spacing:-.02em">16 / 36</div><div class="lbl l" style="margin-top:10px">vault CLIs, verb rows</div></div>
-        <div class="pad"><div class="mono" style="font-size:22px;letter-spacing:-.02em">20 + 4</div><div class="lbl l" style="margin-top:10px">vendor patterns, generic shapes</div></div>
-        <div class="pad"><div class="mono" style="font-size:22px;letter-spacing:-.02em">22</div><div class="lbl l" style="margin-top:10px">protected paths</div></div>
-      </div>
-      <div class="grid g1" style="border-top:0">
-        <div class="pad">
-          <div class="lbl" style="margin-bottom:8px">the four that get through</div>
-          <ul class="verdict-list">
-            <li><span class="k">xargs</span><span class="lbl" style="text-align:right">the operand arrives on stdin at run time, so no static view of the command text holds it</span></li>
-            <li><span class="k">a path set by an earlier call</span><span class="lbl" style="text-align:right">the hook sees one command and holds no model of the shell's state</span></li>
-            <li><span class="k">write a reader, then run it</span><span class="lbl" style="text-align:right">the read happens inside a process no hook is ever shown</span></li>
-            <li><span class="k">a literal in a heredoc body</span><span class="lbl" style="text-align:right">a body is text ABOUT commands &mdash; the rule that stops a runbook being read as one</span></li>
-          </ul>
-        </div>
-      </div>
-    </div>
-
-    <p class="caveat reveal">
-      The pack also rewrites a credential-shaped literal into a <b>${NAME}</b> reference before a file write
-      reaches disk. Of four probe literals, <b>three were rewritten</b> &mdash; a GitHub token, an AWS key id,
-      a Slack token &mdash; and an invented value matching no vendor pattern was left alone. Every literal in
-      that probe is a decoy. The pack replaces what it recognises and names the shapes it matched. It does not
-      guess.
-    </p>
-  </div>
-</section>
-
-<!-- =========================================================== 06 INSTALL -->
+<!-- ============================================================= INSTALL -->
 <section class="band" id="install">
   <div class="col">
     <div class="rule reveal">
-      <div class="eyebrow"><span class="idx">06</span><span class="dash"></span><span class="eyebrow-txt">install &amp; proof</span></div>
+      <div class="eyebrow"><span class="dash"></span><span class="eyebrow-txt">install</span></div>
       <div class="head">
         <h2>Dry-run<br>by default.</h2>
         <p class="deck">The installer prints every command it would run, in order, and changes nothing.
@@ -822,70 +994,59 @@ grep -acE '[Aa]uthorization: *(Bearer|Basic) [^ "]+' <span class="k">"$H"</span>
     <div class="slab reveal">
       <div class="grid g2">
         <div class="pad">
-          <div class="lbl" style="margin-bottom:16px">the client</div>
-<pre style="font-size:12px"><span class="k">git clone https://github.com/nbstr/keyless</span>
+          <div class="lbl">the client</div>
+          <div class="scroll-x gap-m">
+<pre><span class="k">git clone https://github.com/nbstr/keyless</span>
 <span class="k">cd keyless</span>
 <span class="k">cargo install --path .</span>
 <span class="k">keyless --version</span>              <span class="c"># proves it is on your PATH</span></pre>
-          <p class="micro" style="margin-top:18px;line-height:17px">
-            requires rust 1.89 or later &middot; <b>cargo install writes to ~/.cargo/bin, which has to be on
-            your PATH</b> &mdash; the --version line is there so you find that out now rather than three
+          </div>
+          <p class="micro gap-m">
+            rust 1.89 or later &middot; <b>cargo install writes to ~/.cargo/bin, which has to be on your
+            PATH</b> &mdash; the --version line is there so you find that out now rather than three
             commands later
           </p>
-          <div style="border-top:1px solid rgba(255,255,255,.08);margin:24px 0"></div>
-          <div class="lbl" style="margin-bottom:16px">and the uid boundary</div>
-<pre style="font-size:12px"><span class="k">cargo build --release</span>            <span class="c"># the installer copies from target/release</span>
+          <div class="hr"></div>
+          <div class="lbl">and the uid boundary</div>
+          <div class="scroll-x gap-m">
+<pre><span class="k">cargo build --release</span>            <span class="c"># the installer copies from target/release</span>
 <span class="k">./install/install.sh</span>             <span class="c"># prints the plan, changes nothing</span>
 <span class="k">sudo ./install/install.sh --commit</span></pre>
-          <p class="deck" style="margin-top:20px;font-size:15px">
+          </div>
+          <p class="deck-s gap-l">
             It needs <code>sudo</code> exactly once, to create a user. Nothing afterwards does.
-            <code>uninstall.sh</code> reverses all of it — the launchd job, the files, and the account —
+            <code>uninstall.sh</code> reverses all of it — the launchd job, the files and the account —
             and is dry-run too.
           </p>
-          <p class="micro" style="margin-top:20px;line-height:17px">
-            MIT licensed &middot; <a class="navlink" href="https://github.com/nbstr/keyless" rel="noopener"
-              style="color:var(--green);border-bottom:1px solid rgba(95,211,154,.4)">github.com/nbstr/keyless</a>
-          </p>
         </div>
         <div class="pad">
-          <div class="lbl" style="margin-bottom:16px">the seven verbs</div>
-          <p class="mono" style="font-size:13px;color:rgba(255,255,255,.85);line-height:2">
-            run &middot; ls &middot; items &middot; fields &middot; new &middot; put &middot; doctor
-          </p>
-          <div style="border-top:1px solid rgba(255,255,255,.08);margin:20px 0"></div>
-          <div class="lbl" style="margin-bottom:12px">and the two that do not exist</div>
-<pre style="font-size:11px"><span class="c">$</span> <span class="k">keyless get FOO</span>
-error: unrecognized subcommand 'get'
-
-<span class="c">$</span> <span class="k">keyless put FOO --value hunter2</span>
-error: unexpected argument '--value' found</pre>
-          <p class="micro" style="margin-top:16px;line-height:17px">both observed live &mdash; the absence is the design</p>
-        </div>
-      </div>
-      <div class="grid g3" style="border-top:0">
-        <div class="pad"><div class="mono" style="font-size:20px">24</div><div class="lbl l" style="margin-top:10px">packages in the lock file</div></div>
-        <div class="pad"><div class="mono" style="font-size:20px">464</div><div class="lbl l" style="margin-top:10px">tests, 0 failed, 15 ignored</div></div>
-        <div class="pad"><div class="mono" style="font-size:20px">0</div><div class="lbl l" style="margin-top:10px">values printed, ever</div></div>
-      </div>
-    </div>
-
-    <div class="slab reveal" style="margin-top:48px">
-      <div class="grid g1">
-        <div class="pad">
-          <div class="lbl" style="margin-bottom:8px">observed, not quoted</div>
-          <ul class="verdict-list">
-            <li><span class="k">cargo test</span><span class="lbl" style="color:var(--green)">exit 0 &mdash; 464 passed, 0 failed, 15 ignored</span></li>
-            <li><span class="k">cargo fmt --check</span><span class="lbl" style="color:var(--green)">exit 0 &mdash; zero bytes out</span></li>
-            <li><span class="k">python3 hooks/tests/run.py</span><span class="lbl" style="color:var(--green)">613 checks, all green</span></li>
-            <li><span class="k">python3 hooks/tests/mutate.py</span><span class="lbl" style="color:var(--green)">41 / 41 mutations caught</span></li>
-            <li><span class="k">CI at this sha</span><span class="lbl" style="color:var(--green)">6 jobs, 1m29s, clippy -D warnings on both runners</span></li>
+          <div class="lbl">the seven verbs, and there is no eighth</div>
+          <p class="verbs gap-s">run &middot; ls &middot; items &middot; fields &middot; new &middot; put &middot; doctor</p>
+          <p class="deck-s gap-s">Six of them name things. One of them runs a command with a value in its
+            environment. None of them prints a value.</p>
+          <div class="hr"></div>
+          <div class="lbl">observed, not quoted</div>
+          <ul class="rows gap-s">
+            <li><span class="k">cargo test</span><span class="lbl g">464 passed, 0 failed, 15 ignored</span></li>
+            <li><span class="k">cargo fmt --check</span><span class="lbl g">exit 0 — zero bytes out</span></li>
+            <li><span class="k">hooks/tests/run.py</span><span class="lbl g">613 checks, all green</span></li>
+            <li><span class="k">hooks/tests/mutate.py</span><span class="lbl g">41 / 41 mutations caught</span></li>
+            <li><span class="k">packages in the lock file</span><span class="lbl">24</span></li>
+            <li><span class="k">values printed, ever</span><span class="lbl">0</span></li>
           </ul>
+          <p class="micro gap-l">
+            <a class="linkline" href="https://github.com/nbstr/keyless" rel="noopener">github.com/nbstr/keyless</a>
+            &nbsp;&middot;&nbsp; MIT
+          </p>
         </div>
       </div>
     </div>
 
     <p class="caveat reveal">
-      There is no telemetry, and a test scans the binary for endpoint strings to keep it that way.
+      The 15 ignored tests are the entire live Proton Pass suite, which needs a real account &mdash; CI
+      asserts <b>ignored == 15</b> precisely so that stays visible rather than quietly drifting.
+      &nbsp;&middot;&nbsp; There is no telemetry, and a test scans the binary for endpoint strings to keep
+      it that way.
     </p>
   </div>
 </section>
@@ -894,23 +1055,21 @@ error: unexpected argument '--value' found</pre>
   <div class="col">
     <div class="cols">
       <div>
-        <div class="wordmark"><span class="name">keyless</span><span class="lbl" style="letter-spacing:.16em">use a secret without holding one</span></div>
-        <p class="deck" style="margin-top:16px;max-width:56ch;font-size:15px">
-          Name it, and it reaches the child process and nothing else. Rust, MIT, macOS.
+        <div class="wordmark"><span class="name">keyless</span><span class="lbl tail">use a secret without holding one</span></div>
+        <p class="deck-s gap-m">
+          Name it, and the value reaches the child process and nothing else. Rust, MIT, macOS.
         </p>
       </div>
-      <ul class="lbl" style="display:grid;gap:10px;text-align:right">
-        <li><a class="navlink" href="#measure">the measurement</a></li>
-        <li><a class="navlink" href="#spellings">the four spellings</a></li>
-        <li><a class="navlink" href="#masking">twenty encodings</a></li>
+      <ul class="lbl">
+        <li><a class="navlink" href="#leak">the leak</a></li>
+        <li><a class="navlink" href="#stores">your stores</a></li>
+        <li><a class="navlink" href="#degraded">the sharp edge</a></li>
         <li><a class="navlink" href="#limits">what it does not catch</a></li>
-        <li><a class="navlink" href="#hooks">the hook pack</a></li>
         <li><a class="navlink" href="#install">install</a></li>
-        <li><a class="navlink" href="https://github.com/nbstr/keyless" rel="noopener"
-          style="color:var(--green)">github.com/nbstr/keyless</a></li>
+        <li><a class="navlink linkline" href="https://github.com/nbstr/keyless" rel="noopener">github.com/nbstr/keyless</a></li>
       </ul>
     </div>
-    <p class="micro" style="margin-top:48px;line-height:17px;max-width:78ch">
+    <p class="micro" style="margin-top:44px;max-width:78ch">
       Every number on this page has an artifact behind it in the repository.
     </p>
   </div>
@@ -933,322 +1092,20 @@ window.addEventListener("load", measureScrollbar);
 
 /* ------------------------------------------------------------------ reveal */
 var reduce = window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
-
-function fillRails(root){
-  var rails = root.querySelectorAll(".rail i[data-fill]");
-  for (var i=0;i<rails.length;i++){
-    (function(el){
-      var w = el.getAttribute("data-fill") + "%";
-      if (reduce) { el.style.width = w; }
-      else { window.requestAnimationFrame(function(){ el.style.width = w; }); }
-    })(rails[i]);
-  }
-}
-
 var targets = document.querySelectorAll(".reveal");
+
 if (reduce || !("IntersectionObserver" in window)) {
-  for (var i=0;i<targets.length;i++) targets[i].classList.add("in");
-  fillRails(document);
+  for (var i = 0; i < targets.length; i++) targets[i].classList.add("in");
 } else {
   var io = new IntersectionObserver(function(entries){
     entries.forEach(function(e){
       if (!e.isIntersecting) return;
       e.target.classList.add("in");
-      fillRails(e.target);
       io.unobserve(e.target);
     });
-  }, {rootMargin:"0px 0px -12% 0px", threshold:0.08});
-  for (var j=0;j<targets.length;j++) io.observe(targets[j]);
+  }, {rootMargin:"0px 0px -10% 0px", threshold:0.06});
+  for (var j = 0; j < targets.length; j++) io.observe(targets[j]);
 }
-
-/* Segmented control state.
-   The CSS rule on [aria-pressed="true"] is the no-JS fallback; the active look is
-   ALSO written inline here so the rendered state never depends on a selector
-   re-match, and so it can be asserted directly from the element. */
-function setSegment(buttons, activeIndex){
-  for (var i=0;i<buttons.length;i++){
-    var on = (i === activeIndex);
-    buttons[i].setAttribute("aria-pressed", on ? "true" : "false");
-    buttons[i].style.background  = on ? "#ffffff" : "transparent";
-    buttons[i].style.color       = on ? "#0A0B0C" : "rgba(255,255,255,.55)";
-    buttons[i].style.borderColor = on ? "#ffffff" : "#23262A";
-  }
-}
-
-/* ------------------------------------------------- instrument 1: spellings */
-/* An invented value that says so in its own text. It matches none of the 20
-   vendor patterns, so it survives a file write unrewritten, and it cannot be
-   mistaken for a live credential by a reader or by a secret scanner — the
-   previous value read as a Stripe key one underscore away from the real prefix,
-   which is an own goal on a page about secrets. Every table below is computed
-   from it, and it yields the same 10 distinct needles the headline claims. */
-var DEMO = "not-a-real-key-4f2a9c1d";
-
-var SPELLINGS = [
-  {
-    id:"no keyless",
-    state:"unbrokered",
-    cmd:[
-      {c:"# the shell holds the value, and so does everything downstream"},
-      {k:'export TOKEN=' + DEMO},
-      {k:'curl -H "Authorization: Bearer $TOKEN" https://api.example.com'}
-    ],
-    note:"The value is now a string in your shell. Every process you start inherits it, and every surface that recorded the command recorded the secret.",
-    rows:[
-      ["the argument carries","the value"],
-      ["in scrollback","the value"],
-      ["in shell history","the value"],
-      ["in the transcript","the value"],
-      ["in the child environ","the value"],
-      ["exit code","0"],
-      ["exposed in","4 places"],
-      ["basis","how a shell works"]
-    ],
-    verdict:["verdict","leaks"], verdictTone:"plain"
-  },
-  {
-    id:"naive",
-    state:"injected",
-    cmd:[
-      {c:"# the CALLING shell expands $TOKEN before keyless is executed"},
-      {k:'keyless run -s TOKEN -- curl -H "$TOKEN" https://api.example.com'}
-    ],
-    note:"TOKEN is unset in your shell, so the argument arrives empty. keyless injected correctly and cannot see that the argument was already destroyed.",
-    rows:[
-      ["the argument carries","(empty)"],
-      ["in scrollback","nothing"],
-      ["in shell history","nothing"],
-      ["in the transcript","nothing"],
-      ["in the child environ","the value"],
-      ["exit code","0"],
-      ["exposed in","1 place"],
-      ["basis","documented behaviour"]
-    ],
-    verdict:["verdict","silently empty"], verdictTone:"plain"
-  },
-  {
-    id:"quoted",
-    state:"injected",
-    cmd:[
-      {c:"# single quotes survive the shell, and keyless does not expand arguments"},
-      {k:"keyless run -s TOKEN -- curl -H '$TOKEN' https://api.example.com"}
-    ],
-    note:"The argument reaches curl as the seven literal characters $TOKEN. keyless passes arguments through untouched — expanding them would be a second place a value could appear.",
-    rows:[
-      ["the argument carries","the literal $TOKEN"],
-      ["in scrollback","nothing"],
-      ["in shell history","nothing"],
-      ["in the transcript","nothing"],
-      ["in the child environ","the value"],
-      ["exit code","0"],
-      ["exposed in","1 place"],
-      ["basis","documented behaviour"]
-    ],
-    verdict:["verdict","silently literal"], verdictTone:"plain"
-  },
-  {
-    id:"correct",
-    state:"injected",
-    cmd:[
-      {c:"# single-quote the body, and keep it inside sh -c"},
-      {k:'keyless run -s TOKEN -- sh -c \'curl -H "$TOKEN" https://api.example.com\''}
-    ],
-    note:"Only the INNER shell expands, and it expands from the environment keyless just handed it. This is the one spelling where the value reaches the request.",
-    rows:[
-      ["the argument carries","the value"],
-      ["in scrollback","nothing"],
-      ["in shell history","nothing"],
-      ["in the transcript","nothing"],
-      ["in the child environ","the value"],
-      ["exit code","0"],
-      ["exposed in","1 place"],
-      ["basis","documented behaviour"]
-    ],
-    verdict:["verdict","correct"], verdictTone:"green"
-  }
-];
-
-var spellCmd = document.getElementById("spellCmd");
-var spellReadout = document.getElementById("spellReadout");
-var spellNote = document.getElementById("spellNote");
-var spellState = document.getElementById("spellState");
-var pip = document.getElementById("pip");
-var spellButtons = document.querySelectorAll("[data-spell]");
-
-function renderSpelling(n){
-  var s = SPELLINGS[n];
-
-  spellCmd.textContent = "";
-  s.cmd.forEach(function(line, idx){
-    var span = document.createElement("span");
-    span.className = line.c ? "c" : "k";
-    span.textContent = (line.c || line.k);
-    spellCmd.appendChild(span);
-    if (idx < s.cmd.length - 1) spellCmd.appendChild(document.createTextNode("\n"));
-  });
-
-  spellReadout.textContent = "";
-  s.rows.concat([s.verdict]).forEach(function(r, idx){
-    var row = document.createElement("div");
-    var k = document.createElement("span");
-    k.className = "lbl"; k.textContent = r[0];
-    var v = document.createElement("span");
-    v.className = "rv"; v.textContent = r[1];
-    var last = (idx === s.rows.length);
-    if (last){
-      v.className = "lbl";
-      v.style.letterSpacing = ".16em";
-      v.style.color = (s.verdictTone === "green") ? "#5FD39A" : "rgba(255,255,255,.8)";
-    }
-    if (r[0] === "exit code" || r[0] === "exposed in") v.style.color = "rgba(255,255,255,.95)";
-    row.appendChild(k); row.appendChild(v);
-    spellReadout.appendChild(row);
-  });
-
-  spellNote.textContent = s.note;
-  spellState.textContent = s.state;
-  spellState.style.color = (s.state === "injected") ? "#5FD39A" : "rgba(255,255,255,.55)";
-  pip.style.background = (s.state === "injected") ? "#5FD39A" : "rgba(255,255,255,.55)";
-
-  setSegment(spellButtons, n);
-}
-for (var b=0;b<spellButtons.length;b++){
-  spellButtons[b].addEventListener("click", function(){
-    renderSpelling(Number(this.getAttribute("data-spell")));
-  });
-}
-renderSpelling(3);
-
-/* --------------------------------------------- instrument 2: 20 encodings */
-var B32A = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
-
-function utf8(s){
-  var out = [], i, c;
-  for (i=0;i<s.length;i++){
-    c = s.codePointAt(i);
-    if (c > 0xFFFF) i++;
-    if (c < 0x80) out.push(c);
-    else if (c < 0x800){ out.push(0xC0|(c>>6), 0x80|(c&63)); }
-    else if (c < 0x10000){ out.push(0xE0|(c>>12), 0x80|((c>>6)&63), 0x80|(c&63)); }
-    else { out.push(0xF0|(c>>18), 0x80|((c>>12)&63), 0x80|((c>>6)&63), 0x80|(c&63)); }
-  }
-  return out;
-}
-function b64(bytes){
-  var bin = "";
-  for (var i=0;i<bytes.length;i++) bin += String.fromCharCode(bytes[i]);
-  return btoa(bin);
-}
-function b32(bytes){
-  var out = "", bits = 0, val = 0, i;
-  for (i=0;i<bytes.length;i++){
-    val = (val << 8) | bytes[i]; bits += 8;
-    while (bits >= 5){ out += B32A[(val >>> (bits-5)) & 31]; bits -= 5; }
-  }
-  if (bits > 0) out += B32A[(val << (5-bits)) & 31];
-  while (out.length % 8 !== 0) out += "=";
-  return out;
-}
-function hex(bytes){
-  var out = "";
-  for (var i=0;i<bytes.length;i++) out += (bytes[i] < 16 ? "0" : "") + bytes[i].toString(16);
-  return out;
-}
-function jsonBody(v){ return JSON.stringify(v).slice(1,-1); }
-function jsonAscii(v){
-  return jsonBody(v).replace(/[\u0080-\uFFFF]/g, function(ch){
-    return "\\u" + ("000" + ch.charCodeAt(0).toString(16)).slice(-4);
-  });
-}
-
-function variants(v){
-  var by = utf8(v);
-  var s = b64(by);
-  var u = s.replace(/\+/g,"-").replace(/\//g,"_");
-  var t = b32(by);
-  var h = hex(by);
-  var p = encodeURIComponent(v);
-  var strict = p.replace(/[!'()*]/g, function(c){
-    return "%" + c.charCodeAt(0).toString(16).toUpperCase();
-  });
-  var jm = jsonBody(v);
-  return [
-    ["raw",              "as stored",           v],
-    ["lowercase",        "case-folded",         v.toLowerCase()],
-    ["uppercase",        "case-folded",         v.toUpperCase()],
-    ["base64-std",       "the usual base64",    s],
-    ["base64-std-nopad", "Go writes this",      s.replace(/=+$/,"")],
-    ["base64-url",       "url-safe alphabet",   u],
-    ["base64-url-nopad", "a JWT segment",       u.replace(/=+$/,"")],
-    ["base32",           "a TOTP seed",         t],
-    ["base32-nopad",     "unpadded base32",     t.replace(/=+$/,"")],
-    ["hex-lower",        "hexdump",             h],
-    ["hex-upper",        "hexdump, shouting",   h.toUpperCase()],
-    ["hex-0x-lower",     "a literal in code",   "0x"+h],
-    ["hex-0x-upper",     "a literal in code",   "0x"+h.toUpperCase()],
-    ["url-query",        "space becomes +",     p.replace(/%20/g,"+")],
-    ["url-path",         "space becomes %20",   p],
-    ["url-strict",       "RFC 3986",            strict],
-    ["json-minimal",     "JSON.stringify",      jm],
-    ["json-html",        "Go escapes & < >",    jm.replace(/&/g,"\\u0026").replace(/</g,"\\u003c").replace(/>/g,"\\u003e")],
-    ["json-slash",       "PHP escapes /",       jm.replace(/\//g,"\\/")],
-    ["json-ascii-only",  "Python escapes é",    jsonAscii(v)]
-  ];
-}
-
-var VALUES = [DEMO, "Kx7 <a&b>\"/c!D\u00e99zQ"];
-var encBody  = document.getElementById("encBody");
-var encValue = document.getElementById("encValue");
-var encCount = document.getElementById("encCount");
-var valButtons = document.querySelectorAll("[data-val]");
-
-function renderEnc(n){
-  var v = VALUES[n];
-  var rows = variants(v);
-  var seen = {}, distinct = 0;
-
-  encBody.textContent = "";
-  rows.forEach(function(r, i){
-    var first = !Object.prototype.hasOwnProperty.call(seen, r[2]);
-    if (first){ seen[r[2]] = r[0]; distinct++; }
-
-    var tr = document.createElement("tr");
-    if (!first) tr.className = "dup";
-
-    var cells = [
-      ["i",  String(i+1).padStart(2,"0")],
-      ["nm", r[0]],
-      ["gl", r[1]],
-      ["out", r[2]],
-      ["dupflag", first ? "" : "= " + seen[r[2]]]
-    ];
-    cells.forEach(function(c){
-      var td = document.createElement("td");
-      td.className = c[0];
-      td.textContent = c[1];
-      tr.appendChild(td);
-    });
-    encBody.appendChild(tr);
-  });
-
-  encValue.textContent = v;
-  encCount.textContent = "";
-  var strong = document.createElement("span");
-  strong.textContent = String(distinct);
-  strong.style.color = "#fff";
-  var rest = document.createElement("span");
-  rest.textContent = " / 20";
-  rest.style.color = "rgba(255,255,255,.5)";
-  encCount.appendChild(strong); encCount.appendChild(rest);
-
-  setSegment(valButtons, n);
-}
-for (var c2=0;c2<valButtons.length;c2++){
-  valButtons[c2].addEventListener("click", function(){
-    renderEnc(Number(this.getAttribute("data-val")));
-  });
-}
-renderEnc(0);
 
 })();
 </script>
