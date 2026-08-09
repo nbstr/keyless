@@ -36,11 +36,30 @@
 //! The boundary does not change the rule above it. A daemon that is absent,
 //! wedged, refusing or slow is a [`State::Degraded`] like any other store
 //! failure, and the child still runs.
+//!
+//! # The daemon is macOS-only, and that is a compile-time fact
+//!
+//! Attestation rests on four XNU calls — `csops`, `getpeereid`, `proc_pidinfo`
+//! and `proc_pidpath` — so [`daemon`] is compiled on macOS only. Everything a
+//! session needs is not: the client, the stores, the masking, the PTY and the
+//! never-block invariant are portable, and `store::daemon` still speaks to a
+//! socket on any Unix.
+//!
+//! Nothing is stubbed. There is no non-macOS [`daemon`] that attests weakly —
+//! there is no non-macOS [`daemon`] at all, so code that reaches for one fails
+//! to compile rather than getting a weaker answer. A session on a platform with
+//! no daemon behaves exactly as a session whose daemon is absent already does:
+//! it degrades, and the child runs.
+//!
+//! `keyless_force_xnu` compiles the macOS-only half anywhere, so CI can run the
+//! link on Linux and require it to fail on exactly those four names. See
+//! `Cargo.toml` and `.github/workflows/ci.yml`.
 
 pub mod attest;
 pub mod audit;
 pub mod cmd;
 pub mod config;
+#[cfg(any(target_os = "macos", keyless_force_xnu))]
 pub mod daemon;
 pub mod error;
 pub mod ipc;

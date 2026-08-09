@@ -6,6 +6,12 @@
 //! real socket, a real child process, and the secret arriving in its
 //! environment and nowhere else.
 
+// The daemon is macOS-only (`src/lib.rs`), so this whole file is. On any other
+// platform the crate below compiles to nothing and the binary reports 0 tests —
+// ABSENT rather than ignored, which is why CI's `ignored == 15` assertion is
+// unchanged and still means "the Proton live suite, and nothing else".
+#![cfg(any(target_os = "macos", keyless_force_xnu))]
+
 mod support;
 
 use std::sync::Arc;

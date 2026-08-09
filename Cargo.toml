@@ -48,6 +48,29 @@ nix = { version = "0.31", features = [
 
 [dev-dependencies]
 
+# ---------------------------------------------------------------------------
+# `keyless_force_xnu` — the cfg that keeps the platform boundary provable
+# ---------------------------------------------------------------------------
+#
+# The daemon's attestation calls four symbols that exist only on macOS:
+# `csops`, `getpeereid`, `proc_pidinfo` and `proc_pidpath`. Those modules are
+# therefore gated on `any(target_os = "macos", keyless_force_xnu)`.
+#
+# The second half is what stops the gate from being an unfalsifiable claim. CI
+# builds on Linux with `RUSTFLAGS=--cfg keyless_force_xnu`, which compiles the
+# macOS-only modules on a platform that cannot link them, and REQUIRES the link
+# to fail on exactly those four names. So the gate is not trusted, it is
+# measured: a fifth unportable symbol turns CI red, and so does a successful
+# link.
+#
+# Declared here rather than left undeclared because `unexpected_cfgs` fires on
+# every use otherwise, and `clippy -D warnings` is the acceptance bar.
+#
+# NEVER pass this flag to a real build. It produces a binary that cannot link on
+# Linux and is identical to the default on macOS; its only purpose is the probe.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(keyless_force_xnu)'] }
+
 [profile.release]
 strip = true
 lto = true

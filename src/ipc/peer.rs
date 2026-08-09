@@ -38,13 +38,39 @@
 //! That is a property of the platform, not of this code, and
 //! [`crate::attest`] handles it by refusing rather than by pretending.
 
+//! # What is macOS-only here, and what is not
+//!
+//! [`PeerIdentity`], [`PeerError`] and [`decode_hex`] are plain data and plain
+//! parsing. They carry no `#[cfg]`, compile everywhere, and are exercised
+//! everywhere.
+//!
+//! The two functions that ASK the system a question live in [`live`], a module
+//! compiled on macOS only: [`live::identify`] goes through XNU, and
+//! [`live::code_hash_of_file`] shells out to `codesign`. Keeping them behind one
+//! module boundary rather than sprinkling `#[cfg]` down the file is the point —
+//! the data half of this module has no second configuration to reason about.
+//!
+//! Off macOS there is no `identify`, so nothing can attest a peer against a
+//! stub; a caller fails to compile. A `PeerIdentity` can still be written out
+//! field by field — it is public data, and the audit log needs to describe one —
+//! but it grants nothing on its own: the only thing that reads one for a
+//! decision is [`crate::attest::Policy::judge`], whose verdict reaches a caller
+//! solely inside a [`crate::attest::Attestation`], and that type has no
+//! constructor off macOS.
+
 use std::fmt;
 use std::io;
-use std::os::fd::BorrowedFd;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
-use crate::ipc::ffi::{self, CDHASH_LEN};
 use crate::mask::encodings::hex_lower;
+
+/// Length of a truncated code directory hash, as `csops` returns it.
+///
+/// Lives here rather than in [`crate::ipc::ffi`] because it describes the hash
+/// rather than the syscall, and [`crate::attest::Policy`] stores hashes of this
+/// width on every platform. `ffi` re-exports it, so the macOS-side spelling
+/// `ipc::ffi::CDHASH_LEN` is unchanged.
+pub const CDHASH_LEN: usize = 20;
 
 /// Everything the kernel will say about the peer, after cross-checking.
 ///
@@ -158,131 +184,6 @@ impl PeerError {
     }
 }
 
-fn kernel(call: &'static str) -> impl FnOnce(io::Error) -> PeerError {
-    move |source| PeerError::Kernel { call, source }
-}
-
-/// Establish who is on the other end, or refuse.
-///
-/// Called on **every request**, not once per connection. A process can `exec` a
-/// different image while keeping its sockets open, which would otherwise let a
-/// peer authorise itself as one program and then be another for the rest of the
-/// conversation. Re-attesting costs two `proc_pidinfo` calls and one `csops`;
-/// the alternative costs the whole boundary.
-pub fn identify(fd: BorrowedFd<'_>) -> Result<PeerIdentity, PeerError> {
-    let (uid, gid) = ffi::peer_effective_ids(fd).map_err(kernel("getpeereid"))?;
-
-    let (cred_uid, groups) = ffi::peer_credentials(fd).map_err(kernel("LOCAL_PEERCRED"))?;
-    if cred_uid != uid {
-        return Err(PeerError::Disagreement {
-            detail: format!("getpeereid says uid {uid}, LOCAL_PEERCRED says uid {cred_uid}"),
-        });
-    }
-
-    let pid = ffi::peer_pid(fd).map_err(kernel("LOCAL_PEERPID"))?;
-    let token = ffi::peer_audit_token(fd).map_err(kernel("LOCAL_PEERTOKEN"))?;
-    if token.pid() != pid {
-        return Err(PeerError::Disagreement {
-            detail: format!(
-                "LOCAL_PEERPID says pid {pid}, the audit token says pid {}",
-                token.pid()
-            ),
-        });
-    }
-    if token.euid() != uid {
-        return Err(PeerError::Disagreement {
-            detail: format!(
-                "getpeereid says uid {uid}, the audit token says euid {}",
-                token.euid()
-            ),
-        });
-    }
-
-    // The generation the kernel stamped on the connection. Everything below is
-    // measured against this one number.
-    let stamped = token.pid_generation();
-
-    let before = ffi::live_process(pid).map_err(kernel("proc_pidinfo"))?;
-    if before.generation != stamped {
-        return Err(PeerError::Recycled {
-            expected: stamped,
-            found: before.generation,
-        });
-    }
-
-    let code_hash = ffi::live_code_hash(pid).map_err(kernel("csops"))?;
-
-    // Bracket the code hash. If the pid changed hands at any point during the
-    // measurement, the second read disagrees and the peer is refused. Without
-    // this the code hash could belong to a process that took over the pid after
-    // the first check passed.
-    let after = ffi::live_process(pid).map_err(kernel("proc_pidinfo"))?;
-    if after.generation != stamped {
-        return Err(PeerError::Recycled {
-            expected: stamped,
-            found: after.generation,
-        });
-    }
-    if after.unique_id != before.unique_id {
-        return Err(PeerError::Disagreement {
-            detail: "the process identifier changed while its code hash was being read".to_owned(),
-        });
-    }
-
-    // Diagnostic only, so a failure here must not refuse a peer that the checks
-    // above accepted.
-    let image = ffi::image_path(pid).unwrap_or_else(|_| PathBuf::from("<unknown>"));
-
-    Ok(PeerIdentity {
-        uid,
-        gid,
-        groups,
-        pid,
-        generation: stamped,
-        unique_id: before.unique_id,
-        code_hash,
-        image,
-    })
-}
-
-/// The code hash of an executable **file**, for pinning at install time.
-///
-/// This is the one place a path is hashed, and it is not on the request path:
-/// it answers "which hash should I put in the allowlist for this binary?" once,
-/// under review, before the daemon ever runs. Every check afterwards reads the
-/// running image instead.
-///
-/// Implemented by running the file and asking the kernel about the result, so
-/// the hash pinned is the hash `csops` will later report — computing it from
-/// the file's own contents would be a second implementation that could disagree
-/// with the kernel's.
-pub fn code_hash_of_file(path: &Path) -> io::Result<[u8; CDHASH_LEN]> {
-    let output = std::process::Command::new("/usr/bin/codesign")
-        .arg("-d")
-        .arg("--verbose=4")
-        .arg(path)
-        .output()?;
-    // `codesign -d` writes its report to stderr.
-    let report = String::from_utf8_lossy(&output.stderr);
-    for line in report.lines() {
-        if let Some(rest) = line.strip_prefix("CDHash=") {
-            let hex = rest.trim();
-            if let Some(bytes) = decode_hex(hex) {
-                return Ok(bytes);
-            }
-            return Err(io::Error::other(format!(
-                "codesign reported a CDHash of {} characters, not {}",
-                hex.len(),
-                CDHASH_LEN * 2
-            )));
-        }
-    }
-    Err(io::Error::other(format!(
-        "codesign did not report a CDHash for {}; the file may be unsigned",
-        path.display()
-    )))
-}
-
 /// Parse exactly `CDHASH_LEN` bytes of lower- or upper-case hex.
 ///
 /// Rejects anything else, so a truncated or over-long pin in a config file is a
@@ -313,32 +214,7 @@ const fn nibble(c: u8) -> Option<u8> {
 
 #[cfg(test)]
 mod tests {
-    use super::{code_hash_of_file, decode_hex, identify};
-    use std::os::fd::AsFd;
-    use std::os::unix::net::UnixStream;
-    use std::path::Path;
-
-    #[test]
-    fn a_socketpair_peer_is_this_very_process() {
-        // Both ends of a socketpair belong to us, so the identity the kernel
-        // reports must be our own — which makes this the cheapest possible end
-        // -to-end check that every cross-check agrees.
-        let (a, _b) = UnixStream::pair().expect("socketpair");
-        let peer = identify(a.as_fd()).expect("our own process must attest");
-        assert_eq!(peer.pid, std::process::id().cast_signed());
-        // SAFETY: `geteuid` takes no arguments, reads a value the kernel
-        // maintains for this process, and cannot fail. It is `unsafe` only
-        // because it is an extern.
-        let euid = unsafe { libc_geteuid() };
-        assert_eq!(peer.uid, euid);
-        assert!(peer.code_hash.iter().any(|b| *b != 0));
-        assert_eq!(peer.code_hash_hex().len(), 40);
-    }
-
-    unsafe extern "C" {
-        #[link_name = "geteuid"]
-        fn libc_geteuid() -> u32;
-    }
+    use super::decode_hex;
 
     #[test]
     fn hex_decoding_refuses_anything_but_a_full_hash() {
@@ -351,22 +227,197 @@ mod tests {
         assert_eq!(decoded[1], 0x11);
         assert_eq!(decoded[19], 0x33);
     }
+}
 
-    #[test]
-    fn pinning_a_real_binary_agrees_with_what_the_kernel_reports() {
-        // The pin path and the request path must agree, or every install would
-        // produce an allowlist that authorises nothing. `/bin/sh` is signed on
-        // every macOS install and is not this process, so it exercises the file
-        // path rather than the running-image path.
-        let pinned = code_hash_of_file(Path::new("/bin/sh")).expect("/bin/sh is signed");
-        assert!(pinned.iter().any(|b| *b != 0));
+/// The two questions only the running system can answer. macOS only.
+///
+/// One module boundary rather than a `#[cfg]` per function, so the data half of
+/// this file has exactly one configuration and needs no reasoning about a
+/// second. Nothing stands in for these off macOS; see the module header.
+#[cfg(any(target_os = "macos", keyless_force_xnu))]
+pub mod live {
+    use std::io;
+    use std::os::fd::BorrowedFd;
+    use std::path::{Path, PathBuf};
+
+    use super::{CDHASH_LEN, PeerError, PeerIdentity, decode_hex};
+    use crate::ipc::ffi;
+
+    fn kernel(call: &'static str) -> impl FnOnce(io::Error) -> PeerError {
+        move |source| PeerError::Kernel { call, source }
     }
 
-    #[test]
-    fn pinning_something_unsigned_is_an_error_rather_than_a_zero_hash() {
-        let path = std::env::temp_dir().join(format!("keyless-unsigned-{}", std::process::id()));
-        std::fs::write(&path, b"#!/bin/sh\nexit 0\n").expect("write");
-        assert!(code_hash_of_file(&path).is_err());
-        let _ = std::fs::remove_file(&path);
+    /// Establish who is on the other end, or refuse.
+    ///
+    /// Called on **every request**, not once per connection. A process can `exec` a
+    /// different image while keeping its sockets open, which would otherwise let a
+    /// peer authorise itself as one program and then be another for the rest of the
+    /// conversation. Re-attesting costs two `proc_pidinfo` calls and one `csops`;
+    /// the alternative costs the whole boundary.
+    pub fn identify(fd: BorrowedFd<'_>) -> Result<PeerIdentity, PeerError> {
+        let (uid, gid) = ffi::peer_effective_ids(fd).map_err(kernel("getpeereid"))?;
+
+        let (cred_uid, groups) = ffi::peer_credentials(fd).map_err(kernel("LOCAL_PEERCRED"))?;
+        if cred_uid != uid {
+            return Err(PeerError::Disagreement {
+                detail: format!("getpeereid says uid {uid}, LOCAL_PEERCRED says uid {cred_uid}"),
+            });
+        }
+
+        let pid = ffi::peer_pid(fd).map_err(kernel("LOCAL_PEERPID"))?;
+        let token = ffi::peer_audit_token(fd).map_err(kernel("LOCAL_PEERTOKEN"))?;
+        if token.pid() != pid {
+            return Err(PeerError::Disagreement {
+                detail: format!(
+                    "LOCAL_PEERPID says pid {pid}, the audit token says pid {}",
+                    token.pid()
+                ),
+            });
+        }
+        if token.euid() != uid {
+            return Err(PeerError::Disagreement {
+                detail: format!(
+                    "getpeereid says uid {uid}, the audit token says euid {}",
+                    token.euid()
+                ),
+            });
+        }
+
+        // The generation the kernel stamped on the connection. Everything below is
+        // measured against this one number.
+        let stamped = token.pid_generation();
+
+        let before = ffi::live_process(pid).map_err(kernel("proc_pidinfo"))?;
+        if before.generation != stamped {
+            return Err(PeerError::Recycled {
+                expected: stamped,
+                found: before.generation,
+            });
+        }
+
+        let code_hash = ffi::live_code_hash(pid).map_err(kernel("csops"))?;
+
+        // Bracket the code hash. If the pid changed hands at any point during the
+        // measurement, the second read disagrees and the peer is refused. Without
+        // this the code hash could belong to a process that took over the pid after
+        // the first check passed.
+        let after = ffi::live_process(pid).map_err(kernel("proc_pidinfo"))?;
+        if after.generation != stamped {
+            return Err(PeerError::Recycled {
+                expected: stamped,
+                found: after.generation,
+            });
+        }
+        if after.unique_id != before.unique_id {
+            return Err(PeerError::Disagreement {
+                detail: "the process identifier changed while its code hash was being read"
+                    .to_owned(),
+            });
+        }
+
+        // Diagnostic only, so a failure here must not refuse a peer that the checks
+        // above accepted.
+        let image = ffi::image_path(pid).unwrap_or_else(|_| PathBuf::from("<unknown>"));
+
+        Ok(PeerIdentity {
+            uid,
+            gid,
+            groups,
+            pid,
+            generation: stamped,
+            unique_id: before.unique_id,
+            code_hash,
+            image,
+        })
+    }
+
+    /// The code hash of an executable **file**, for pinning at install time.
+    ///
+    /// This is the one place a path is hashed, and it is not on the request path:
+    /// it answers "which hash should I put in the allowlist for this binary?" once,
+    /// under review, before the daemon ever runs. Every check afterwards reads the
+    /// running image instead.
+    ///
+    /// Implemented by running the file and asking the kernel about the result, so
+    /// the hash pinned is the hash `csops` will later report — computing it from
+    /// the file's own contents would be a second implementation that could disagree
+    /// with the kernel's.
+    pub fn code_hash_of_file(path: &Path) -> io::Result<[u8; CDHASH_LEN]> {
+        let output = std::process::Command::new("/usr/bin/codesign")
+            .arg("-d")
+            .arg("--verbose=4")
+            .arg(path)
+            .output()?;
+        // `codesign -d` writes its report to stderr.
+        let report = String::from_utf8_lossy(&output.stderr);
+        for line in report.lines() {
+            if let Some(rest) = line.strip_prefix("CDHash=") {
+                let hex = rest.trim();
+                if let Some(bytes) = decode_hex(hex) {
+                    return Ok(bytes);
+                }
+                return Err(io::Error::other(format!(
+                    "codesign reported a CDHash of {} characters, not {}",
+                    hex.len(),
+                    CDHASH_LEN * 2
+                )));
+            }
+        }
+        Err(io::Error::other(format!(
+            "codesign did not report a CDHash for {}; the file may be unsigned",
+            path.display()
+        )))
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::{code_hash_of_file, identify};
+        use std::os::fd::AsFd;
+        use std::os::unix::net::UnixStream;
+        use std::path::Path;
+
+        #[test]
+        fn a_socketpair_peer_is_this_very_process() {
+            // Both ends of a socketpair belong to us, so the identity the kernel
+            // reports must be our own — which makes this the cheapest possible end
+            // -to-end check that every cross-check agrees.
+            let (a, _b) = UnixStream::pair().expect("socketpair");
+            let peer = identify(a.as_fd()).expect("our own process must attest");
+            assert_eq!(peer.pid, std::process::id().cast_signed());
+            // SAFETY: `geteuid` takes no arguments, reads a value the kernel
+            // maintains for this process, and cannot fail. It is `unsafe` only
+            // because it is an extern.
+            let euid = unsafe { libc_geteuid() };
+            assert_eq!(peer.uid, euid);
+            assert!(peer.code_hash.iter().any(|b| *b != 0));
+            assert_eq!(peer.code_hash_hex().len(), 40);
+        }
+
+        unsafe extern "C" {
+            #[link_name = "geteuid"]
+            fn libc_geteuid() -> u32;
+        }
+
+        #[test]
+        fn pinning_a_real_binary_agrees_with_what_the_kernel_reports() {
+            // The pin path and the request path must agree, or every install would
+            // produce an allowlist that authorises nothing. `/bin/sh` is signed on
+            // every macOS install and is not this process, so it exercises the file
+            // path rather than the running-image path.
+            let pinned = code_hash_of_file(Path::new("/bin/sh")).expect("/bin/sh is signed");
+            assert!(pinned.iter().any(|b| *b != 0));
+        }
+
+        #[test]
+        fn pinning_something_unsigned_is_an_error_rather_than_a_zero_hash() {
+            let path =
+                std::env::temp_dir().join(format!("keyless-unsigned-{}", std::process::id()));
+            std::fs::write(&path, b"#!/bin/sh\nexit 0\n").expect("write");
+            assert!(code_hash_of_file(&path).is_err());
+            let _ = std::fs::remove_file(&path);
+        }
     }
 }
+
+#[cfg(any(target_os = "macos", keyless_force_xnu))]
+pub use live::{code_hash_of_file, identify};

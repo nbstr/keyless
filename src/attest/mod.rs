@@ -47,12 +47,39 @@
 //! caller's response to a refusal is to degrade, which is safe, while the
 //! response to a wrong allow is to hand over a credential, which is not.
 
+//! # Where the platform line falls, and why it is ONE line
+//!
+//! Everything in this file decides, and all of it is portable: [`Policy`],
+//! [`Denial`], [`Attestation`] and [`Policy::judge`] are pure functions of a
+//! [`PeerIdentity`]. There is no `#[cfg]` anywhere among them, on purpose —
+//! conditional compilation inside the code that grants access is how a second,
+//! unexercised state gets built by accident.
+//!
+//! Exactly one thing is platform-bound: taking a socket and asking the kernel
+//! who is on it. That lives in [`live`], a module compiled on macOS only, and
+//! it is the ONLY constructor of an [`Attestation`] anywhere in the crate.
+//!
+//! # Why a module and not a trait
+//!
+//! A trait would be the reflex, and it would be worse. A trait is an invitation
+//! to write a second implementation, and the second implementation of "who is
+//! on this socket?" on a platform that cannot answer is a stub that returns
+//! *something* — which is precisely the hole that must not exist. There is one
+//! implementation because there is one honest answer, and a module says that
+//! where a trait would quietly solicit the opposite.
+//!
+//! # The stub is not discouraged, it is impossible
+//!
+//! [`Attestation`]'s fields are private and no constructor is exported. Off
+//! macOS the only constructor is not compiled, so no code — in this crate, in a
+//! test, or downstream — can produce a value that reports `is_allowed()`. A
+//! Linux "attested" is not a shortcut somebody is asked not to take; there is
+//! no expression that evaluates to one.
+
 use std::collections::BTreeSet;
 use std::fmt;
-use std::os::fd::BorrowedFd;
 
-use crate::ipc::ffi::CDHASH_LEN;
-use crate::ipc::peer::{self, PeerError, PeerIdentity};
+use crate::ipc::peer::{CDHASH_LEN, PeerError, PeerIdentity};
 
 /// Programs whose code identity is the identity of an interpreter rather than
 /// of the thing being run.
@@ -257,12 +284,17 @@ impl fmt::Display for Denial {
 /// Both halves are kept, including on a refusal, because the audit row for a
 /// denial is worth more than the row for a success and it needs the identity
 /// that was refused.
+/// # Private fields, deliberately
+///
+/// A caller cannot build one. That is the whole mechanism behind "there is no
+/// Linux stub": the sole constructor is [`live::attest`], which is compiled on
+/// macOS only, so off macOS the type is inhabited by nothing at all. Public
+/// fields would have made an allowed attestation a struct literal away on every
+/// platform, which is a hole no `#[cfg]` can close.
 #[derive(Debug)]
 pub struct Attestation {
-    /// The peer, when it could be identified at all.
-    pub peer: Option<PeerIdentity>,
-    /// The refusal, when there was one.
-    pub denial: Option<Denial>,
+    peer: Option<PeerIdentity>,
+    denial: Option<Denial>,
 }
 
 impl Attestation {
@@ -271,42 +303,26 @@ impl Attestation {
     pub const fn is_allowed(&self) -> bool {
         self.denial.is_none()
     }
-}
 
-/// Identify the peer on `fd` and apply `policy`.
-///
-/// Called once per request rather than once per connection: a process may
-/// `exec` a different image without closing its sockets, so a per-connection
-/// decision authorises a program that may no longer be running.
-#[must_use]
-pub fn attest(fd: BorrowedFd<'_>, policy: &Policy) -> Attestation {
-    match peer::identify(fd) {
-        Ok(peer) => {
-            let denial = policy.judge(&peer);
-            Attestation {
-                peer: Some(peer),
-                denial,
-            }
-        }
-        Err(error) => Attestation {
-            peer: None,
-            denial: Some(Denial::Unidentified(error)),
-        },
+    /// The peer, when it could be identified at all.
+    ///
+    /// Kept on a refusal too: the audit row for a denial is worth more than the
+    /// row for a success, and it needs the identity that was refused.
+    #[must_use]
+    pub const fn peer(&self) -> Option<&PeerIdentity> {
+        self.peer.as_ref()
+    }
+
+    /// The refusal, when there was one.
+    #[must_use]
+    pub const fn denial(&self) -> Option<&Denial> {
+        self.denial.as_ref()
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Denial, Policy, attest, is_interpreter};
-    use crate::ipc::peer;
-    use std::os::fd::AsFd;
-    use std::os::unix::net::UnixStream;
-    use std::path::PathBuf;
-
-    fn me() -> crate::ipc::peer::PeerIdentity {
-        let (a, _b) = UnixStream::pair().expect("socketpair");
-        peer::identify(a.as_fd()).expect("this process attests")
-    }
+    use super::is_interpreter;
 
     #[test]
     fn interpreters_are_recognised_including_versioned_names() {
@@ -325,96 +341,157 @@ mod tests {
             assert!(!is_interpreter(name), "{name} is not an interpreter");
         }
     }
+}
 
-    #[test]
-    fn an_empty_policy_authorises_nothing() {
-        let peer = me();
-        let denial = Policy::new().judge(&peer).expect("an empty policy denies");
-        assert_eq!(denial.kind(), "uid-not-allowed");
+/// Asking the kernel who is on a socket. macOS only.
+///
+/// The single `#[cfg]` in this file's decision path, and the single constructor
+/// of an [`Attestation`]. See the module header for why this is a module rather
+/// than a trait, and why nothing stands in for it off macOS.
+#[cfg(any(target_os = "macos", keyless_force_xnu))]
+pub mod live {
+    use std::os::fd::BorrowedFd;
+
+    use super::{Attestation, Denial, Policy};
+    use crate::ipc::peer;
+
+    /// Identify the peer on `fd` and apply `policy`.
+    ///
+    /// Called once per request rather than once per connection: a process may
+    /// `exec` a different image without closing its sockets, so a per-connection
+    /// decision authorises a program that may no longer be running.
+    #[must_use]
+    pub fn attest(fd: BorrowedFd<'_>, policy: &Policy) -> Attestation {
+        match peer::identify(fd) {
+            Ok(peer) => {
+                let denial = policy.judge(&peer);
+                Attestation {
+                    peer: Some(peer),
+                    denial,
+                }
+            }
+            Err(error) => Attestation {
+                peer: None,
+                denial: Some(Denial::Unidentified(error)),
+            },
+        }
     }
 
-    #[test]
-    fn a_uid_alone_is_not_enough() {
-        let peer = me();
-        let denial = Policy::new()
-            .allow_uid(peer.uid)
-            .judge(&peer)
-            .expect("no image pinned");
-        assert_eq!(denial.kind(), "no-image-pinned");
-    }
+    #[cfg(test)]
+    mod tests {
+        use super::attest;
+        use crate::attest::{Denial, Policy};
+        use crate::ipc::peer;
+        use std::os::fd::AsFd;
+        use std::os::unix::net::UnixStream;
+        use std::path::PathBuf;
 
-    #[test]
-    fn the_right_uid_and_the_right_image_pass() {
-        let peer = me();
-        let policy = Policy::new()
-            .allow_uid(peer.uid)
-            .allow_image(peer.code_hash);
-        assert!(policy.judge(&peer).is_none());
-    }
+        /// A REAL attested peer, not a hand-built one.
+        ///
+        /// That is why every test below it is macOS-only even though
+        /// [`crate::attest::Policy::judge`] is pure: the fixture is the point. Judging a
+        /// `PeerIdentity` written out field by field would test the policy against
+        /// a shape this crate invented, where this tests it against the shape the
+        /// kernel actually produces. Swapping in a synthetic peer to buy a Linux
+        /// test run would weaken the macOS one, so it is not done.
+        fn me() -> crate::ipc::peer::PeerIdentity {
+            let (a, _b) = UnixStream::pair().expect("socketpair");
+            peer::identify(a.as_fd()).expect("this process attests")
+        }
 
-    #[test]
-    fn a_pinned_image_under_the_wrong_uid_is_refused() {
-        let peer = me();
-        let policy = Policy::new()
-            .allow_uid(peer.uid.wrapping_add(1))
-            .allow_image(peer.code_hash);
-        assert!(matches!(policy.judge(&peer), Some(Denial::Uid(_))));
-    }
+        #[test]
+        fn an_empty_policy_authorises_nothing() {
+            let peer = me();
+            let denial = Policy::new().judge(&peer).expect("an empty policy denies");
+            assert_eq!(denial.kind(), "uid-not-allowed");
+        }
 
-    #[test]
-    fn a_different_image_is_refused_even_with_the_right_uid() {
-        let peer = me();
-        let mut other = peer.code_hash;
-        other[0] ^= 0xff;
-        let policy = Policy::new().allow_uid(peer.uid).allow_image(other);
-        assert!(matches!(
-            policy.judge(&peer),
-            Some(Denial::UnknownImage { .. })
-        ));
-    }
+        #[test]
+        fn a_uid_alone_is_not_enough() {
+            let peer = me();
+            let denial = Policy::new()
+                .allow_uid(peer.uid)
+                .judge(&peer)
+                .expect("no image pinned");
+            assert_eq!(denial.kind(), "no-image-pinned");
+        }
 
-    #[test]
-    fn pinning_an_interpreter_does_not_authorise_it() {
-        // The belt-and-braces claim, exercised: an operator pins the hash of
-        // an interpreter, and it is still refused.
-        let mut peer = me();
-        peer.image = PathBuf::from("/opt/homebrew/bin/node");
-        let policy = Policy::new()
-            .allow_uid(peer.uid)
-            .allow_image(peer.code_hash);
-        let denial = policy.judge(&peer).expect("an interpreter is refused");
-        assert_eq!(denial.kind(), "interpreted-caller");
-        assert!(denial.to_string().contains("keyless run"));
-    }
+        #[test]
+        fn the_right_uid_and_the_right_image_pass() {
+            let peer = me();
+            let policy = Policy::new()
+                .allow_uid(peer.uid)
+                .allow_image(peer.code_hash);
+            assert!(policy.judge(&peer).is_none());
+        }
 
-    #[test]
-    fn the_interpreter_refusal_has_a_negative_control() {
-        // Without this the previous test could pass because of the allowlist
-        // rather than because of the interpreter rule.
-        let mut peer = me();
-        peer.image = PathBuf::from("/opt/homebrew/bin/node");
-        let policy = Policy::new()
-            .allow_uid(peer.uid)
-            .allow_image(peer.code_hash)
-            .permitting_interpreters();
-        assert!(
-            policy.judge(&peer).is_none(),
-            "with the rule off, the same peer must pass — otherwise the rule is not what refused it"
-        );
-    }
+        #[test]
+        fn a_pinned_image_under_the_wrong_uid_is_refused() {
+            let peer = me();
+            let policy = Policy::new()
+                .allow_uid(peer.uid.wrapping_add(1))
+                .allow_image(peer.code_hash);
+            assert!(matches!(policy.judge(&peer), Some(Denial::Uid(_))));
+        }
 
-    #[test]
-    fn attesting_a_live_socket_yields_this_process() {
-        let (a, _b) = UnixStream::pair().expect("socketpair");
-        let peer = me();
-        let policy = Policy::new()
-            .allow_uid(peer.uid)
-            .allow_image(peer.code_hash);
-        let attestation = attest(a.as_fd(), &policy);
-        assert!(attestation.is_allowed());
-        assert_eq!(
-            attestation.peer.map(|p| p.pid),
-            Some(std::process::id().cast_signed())
-        );
+        #[test]
+        fn a_different_image_is_refused_even_with_the_right_uid() {
+            let peer = me();
+            let mut other = peer.code_hash;
+            other[0] ^= 0xff;
+            let policy = Policy::new().allow_uid(peer.uid).allow_image(other);
+            assert!(matches!(
+                policy.judge(&peer),
+                Some(Denial::UnknownImage { .. })
+            ));
+        }
+
+        #[test]
+        fn pinning_an_interpreter_does_not_authorise_it() {
+            // The belt-and-braces claim, exercised: an operator pins the hash of
+            // an interpreter, and it is still refused.
+            let mut peer = me();
+            peer.image = PathBuf::from("/opt/homebrew/bin/node");
+            let policy = Policy::new()
+                .allow_uid(peer.uid)
+                .allow_image(peer.code_hash);
+            let denial = policy.judge(&peer).expect("an interpreter is refused");
+            assert_eq!(denial.kind(), "interpreted-caller");
+            assert!(denial.to_string().contains("keyless run"));
+        }
+
+        #[test]
+        fn the_interpreter_refusal_has_a_negative_control() {
+            // Without this the previous test could pass because of the allowlist
+            // rather than because of the interpreter rule.
+            let mut peer = me();
+            peer.image = PathBuf::from("/opt/homebrew/bin/node");
+            let policy = Policy::new()
+                .allow_uid(peer.uid)
+                .allow_image(peer.code_hash)
+                .permitting_interpreters();
+            assert!(
+                policy.judge(&peer).is_none(),
+                "with the rule off, the same peer must pass — otherwise the rule is not what refused it"
+            );
+        }
+
+        #[test]
+        fn attesting_a_live_socket_yields_this_process() {
+            let (a, _b) = UnixStream::pair().expect("socketpair");
+            let peer = me();
+            let policy = Policy::new()
+                .allow_uid(peer.uid)
+                .allow_image(peer.code_hash);
+            let attestation = attest(a.as_fd(), &policy);
+            assert!(attestation.is_allowed());
+            assert_eq!(
+                attestation.peer.map(|p| p.pid),
+                Some(std::process::id().cast_signed())
+            );
+        }
     }
 }
+
+#[cfg(any(target_os = "macos", keyless_force_xnu))]
+pub use live::attest;

@@ -15,60 +15,95 @@
 # present on Linux. `install/README.md` says the daemon is macOS-only and lists
 # the Linux equivalents; this file is the mechanical half of that sentence.
 #
-# Measured on Linux (rust 1.89.0, aarch64-unknown-linux-gnu) on 2026-08-08:
+# The crate draws that line at FOUR module boundaries and nowhere else --
+# `ipc::ffi`, `ipc::peer::live`, `attest::live` and `daemon` -- each gated on
+# `any(target_os = "macos", keyless_force_xnu)`. Everything a SESSION uses is
+# portable: the client, the stores, the masking, the PTY and the never-block
+# invariant all compile and are TESTED on both platforms.
 #
-#   cargo fmt --check                        exit 0
-#   cargo clippy --all-targets -- -D warnings exit 0   <- compiles EVERY line of
-#                                                         the daemon, links none
-#   cargo build --bin keyless                exit 0    (debug and release)
-#   cargo build --bin keylessd               exit 101  4 undefined references
-#   cargo build            (all targets)     exit 101  same 4
-#   cargo test                               exit 101  same 4 — the LIB TEST
-#                                                      binary links them too, so
-#                                                      not one Rust test runs
+# Measured on Linux (rust 1.89.0, aarch64-unknown-linux-gnu) on 2026-08-09:
 #
-# Two traps live in those numbers and this file avoids both.
+#   cargo fmt --check                          exit 0
+#   cargo clippy --all-targets -- -D warnings  exit 0
+#   cargo build            (all targets)       exit 0
+#   cargo build --bin keyless                  exit 0   debug and release
+#   cargo build --bin keylessd                 exit 0   builds, then REFUSES at
+#                                                       runtime, naming macOS
+#   cargo test                                 exit 0   the whole portable suite
+#   RUSTFLAGS=--cfg keyless_force_xnu \
+#     cargo build --bin keylessd               exit 101 4 undefined references
 #
-# 1. `cargo build` on Linux condemns a binary that is fine. A cold
-#    `cargo build --release` was run six times — five in parallel, once with
-#    `-j1` — and `target/release/keyless` was linked and on disk every time,
-#    while the exit code said 101. So the exit code and the artifact disagree,
-#    and checking either one alone gives a wrong answer: the code condemns a
-#    working client, and the artifact absolves a failed build.
+# Three traps live in those numbers and this file avoids all three.
 #
-#    That is a measurement, not a guarantee. Cargo does not promise to finish a
-#    unit before another unit's failure ends the build, so it could stop being
-#    true. Naming `--bin keyless` is what makes this file not depend on it.
+# 1. A daemon that is silently ABSENT from a Linux build is indistinguishable
+#    from one that broke, and `command not found` teaches an operator nothing.
+#    So `keylessd` is built on Linux and RUN, and the job requires it to exit
+#    non-zero with a message naming `csops`. An absence is not asserted; a
+#    refusal is.
 #
-# 2. Skipping the daemon on Linux would be the false green in the other
-#    direction — a job that never mentions `keylessd` is a job that will not
-#    notice the day someone breaks it. So Linux does two things instead of
-#    skipping: `clippy --all-targets` type-checks and lints every line of the
-#    daemon (only the final link is macOS-only), and the "platform boundary"
-#    step below runs the link, REQUIRES it to fail, and requires it to fail on
-#    exactly those four symbols. A fifth unportable symbol turns CI red. A
-#    successful link turns CI red. Either way somebody has to come back here and
-#    to `install/README.md`.
+# 2. Gating the daemon behind `target_os` alone would make its unportable
+#    surface unmeasurable: a fifth macOS-only symbol could be added inside the
+#    gated modules and no job on earth would notice, because Linux would never
+#    compile them. `--cfg keyless_force_xnu` defeats the gate, so the link still
+#    runs on Linux and is still REQUIRED to fail on exactly those four names. A
+#    fifth name turns CI red. A successful link turns CI red. That assertion is
+#    unchanged from the days when the daemon was compiled unconditionally; what
+#    it gained is that it now ALSO proves the gate is drawn in the right place,
+#    because anything gated that did not need to be would link fine here.
+#
+# 3. A suite that stops linking is a suite that stops running, and it reads as
+#    an infrastructure problem rather than as lost coverage. Every test binary
+#    used to link the four symbols, so ZERO Rust tests ran on Linux -- not a
+#    failing suite, an absent one. They run now, under the same floor-and-count
+#    assertions as macOS.
+#
+# ---------------------------------------------------------------------------
+# Known-broken on Linux -- ignored, named, and counted
+# ---------------------------------------------------------------------------
+#
+# Making the suite RUN on Linux immediately found two defects in code that is
+# portable, compiled on both platforms, and shipped by the client build this
+# file already produces. Neither is a platform limitation and neither is fixed
+# here; both are marked `#[ignore]` off macOS with the mechanism written at the
+# marker, and the ignored count below is what stops them being forgotten.
+#
+# 1. `tests/pty.rs` -- 9 of 10 cases hang INDEFINITELY on Linux, with and
+#    without a controlling terminal. The relay in `src/tty/` never returns.
+#
+# 2. `store::exec::tests::a_child_that_never_reads_its_input_is_still_killed_at
+#    _the_deadline` -- `capture_with_input` joins its stdin writer thread with
+#    no bound, so a backend whose deadline expires can still block the caller.
+#    On Linux it blocks for the child's full lifetime.
+#
+#    That case passes on macOS for a reason that has nothing to do with the
+#    code: macOS `/bin/sh` EXECs a single `-c` command, so killing the child
+#    closes the pipe, while Debian's dash FORKS it and the grandchild keeps the
+#    pipe open. The test's own comment names the hazard it fails to catch. It is
+#    a VACUOUS control on macOS, and only running it on a second platform showed
+#    that.
 #
 # ---------------------------------------------------------------------------
 # What is deliberately NOT here
 # ---------------------------------------------------------------------------
 #
-# * `cargo test` on Linux. It cannot run: every test binary links the lib, and
-#   the lib references the four symbols. Step 2 above is what keeps that fact
-#   honest instead of silent.
+# * A Linux daemon. There is no port of `csops`; `SO_PEERCRED` plus `/proc` is a
+#   different design with different guarantees, and inventing one to make a test
+#   suite greener would be the worst trade in this repository.
 # * The hook pack's latency layer. It asserts `floor < 2.5 x a bare interpreter`
-#   — a RATIO against interpreter start time, which is a property of the machine.
-#   On macOS a bare `python3 -c pass` costs ~19 ms and the pack's ~7 ms of
-#   imports hide inside it (1.35x, passes). On Linux the interpreter starts in
+#   -- a RATIO against interpreter start time, which is a property of the
+#   machine. On macOS a bare `python3 -c pass` costs ~19 ms and the pack's ~7 ms
+#   of imports hide inside it (1.35x, passes). On Linux the interpreter starts in
 #   ~4.6 ms and the same ~18 ms of imports read as 5.0x (fails). It is a
 #   benchmark, and a benchmark on shared CI hardware measures the neighbours. It
 #   runs on a developer machine; `--fast` is how CI says so out loud rather than
 #   by omission, and the check-count assertion below is what stops anything
 #   ELSE going quiet.
 # * `secrets:` of any kind, and the 15 `#[ignore]` Proton tests that would need
-#   one. Nothing here passes `--ignored`, and the macOS job asserts that exactly
-#   15 tests were ignored and 0 of them ran.
+#   one. Nothing here passes `--ignored`, and BOTH jobs assert that exactly 15
+#   tests were ignored and 0 of them ran. The number is the same on both
+#   platforms because `proton_live.rs` is portable; the macOS-only test files
+#   are ABSENT off macOS rather than ignored, which is what keeps `ignored`
+#   meaning exactly one thing.
 #
 # Third-party actions: none. `actions/checkout`, `actions/cache` and
 # `actions/setup-python` are GitHub's own and are pinned by commit sha, because
@@ -104,6 +139,21 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
+        # Per platform, because the macOS-only test files do not exist off
+        # macOS. Each floor is set BELOW the measured count so it catches a
+        # suite that collapsed rather than a suite that lost one case.
+        # Measured 2026-08-09: 464 on macOS, 400 on Linux.
+        include:
+          - os: ubuntu-latest
+            test-floor: 360
+            # 15 Proton live + 9 pty + 1 exec deadline. The last two are
+            # DEFECTS in portable code, named at their `#[ignore]`, not
+            # platform limits -- see "Known-broken on Linux" in the header.
+            ignored: 25
+          - os: macos-latest
+            test-floor: 420
+            # The Proton live suite, and nothing else.
+            ignored: 15
     steps:
       - name: Checkout
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
@@ -172,7 +222,7 @@ jobs:
           cargo build --locked --release --bin keyless
           ./target/release/keyless --version
 
-      # ---- macOS: the daemon links, and the whole suite runs ----------------
+      # ---- macOS: the daemon links --------------------------------------------
 
       - name: Build the daemon (macOS)
         if: runner.os == 'macOS'
@@ -182,21 +232,31 @@ jobs:
           cargo build --locked --release --bin keylessd
           ./target/release/keylessd --version
 
+      # ---- Both platforms: the suite runs, and its size is asserted ----------
+
+      # ONE step for both, deliberately. Two near-identical shell blocks drift,
+      # and the half that drifts is always the one nobody reads. The only thing
+      # that differs is the floor, which is a matrix value.
+      #
       # The exit code is judged on its own line. Never `cargo test | tail`: a
       # pipeline reports its LAST stage's status and `tail` always succeeds, so
       # a failing suite reads as green and the evidence is truncated as well.
       #
       # Then the counts, because exit 0 is not evidence that anything ran. A
-      # filtered run that matches zero tests exits 0. The floor is set below the
-      # 415 measured on 2026-08-08 so it catches a suite that collapsed, not a
-      # suite that lost a case.
+      # filtered run that matches zero tests exits 0, and before the platform
+      # gate existed a Linux `cargo test` could not link at all -- which is a
+      # suite of zero, arriving as a build error rather than as a red test.
       #
-      # `15 ignored` is the Proton live suite. Asserting it EQUALS 15 pins both
-      # halves of the claim: the live tests still exist, and CI ran none of them.
-      # Nothing here passes `--ignored`, and if anyone ever adds it this line is
-      # what turns red.
-      - name: Test (macOS)
-        if: runner.os == 'macOS'
+      # The ignored count is asserted EXACTLY, per platform, and it is the line
+      # that stops a gap going quiet. On macOS it is 15 -- the Proton live
+      # suite, which needs a real account. On Linux it is 25, because ten more
+      # tests cover code that is portable and CURRENTLY BROKEN there; they are
+      # ignored rather than compiled out precisely so they stay countable.
+      #
+      # Nothing here passes `--ignored`. Pinning the number both ways means the
+      # live tests cannot silently start running, and a Linux defect cannot
+      # silently be joined by an eleventh.
+      - name: Test
         run: |
           set -uo pipefail
           cargo test --locked > test.log 2>&1
@@ -217,14 +277,19 @@ jobs:
           ignored=$(count 'ignored;')
           failed=$(count 'failed;')
           echo "passed=$passed ignored=$ignored failed=$failed"
-          if [ "$passed" -lt 380 ]; then
-            echo "::error::only $passed tests ran; the floor is 380. A suite that"
-            echo "::error::exercised nothing exits 0 and reads exactly like a pass."
+          if [ "$passed" -lt ${{ matrix.test-floor }} ]; then
+            echo "::error::only $passed tests ran; the floor is ${{ matrix.test-floor }}."
+            echo "::error::A suite that exercised nothing exits 0 and reads exactly"
+            echo "::error::like a pass."
             exit 1
           fi
-          if [ "$ignored" -ne 15 ]; then
-            echo "::error::expected exactly 15 ignored tests (the Proton live suite,"
-            echo "::error::which needs a real account and must never run here); saw $ignored."
+          if [ "$ignored" -ne ${{ matrix.ignored }} ]; then
+            echo "::error::expected exactly ${{ matrix.ignored }} ignored tests on"
+            echo "::error::${{ matrix.os }}; saw $ignored. Read the reason strings in"
+            echo "::error::the log above -- each ignored test says why it is ignored."
+            echo "::error::A macOS-only test file is ABSENT off macOS rather than"
+            echo "::error::ignored, so this number counts only two things: the Proton"
+            echo "::error::live suite, and known defects in portable code."
             exit 1
           fi
           if [ "$failed" -ne 0 ]; then
@@ -232,22 +297,65 @@ jobs:
             exit 1
           fi
 
-      # ---- Linux: the boundary, pinned rather than skipped ------------------
+      # ---- Linux: the boundary, measured rather than asserted ----------------
 
-      - name: The daemon does not link on Linux, and this says exactly why
+      # The daemon binary EXISTS here and refuses. Asserted positively -- run it,
+      # require a non-zero exit, and require the message to name the actual
+      # reason -- because "the binary is missing" is a fact no job can tell apart
+      # from a build that quietly broke.
+      - name: keylessd builds on Linux and refuses to run, naming why
         if: runner.os == 'Linux'
+        run: |
+          set -uo pipefail
+          cargo build --locked --bin keylessd || exit 1
+          ./target/debug/keylessd run > refusal.log 2>&1
+          code=$?
+          cat refusal.log
+          if [ "$code" -eq 0 ]; then
+            echo "::error::keylessd exited 0 on Linux. There is no daemon on this"
+            echo "::error::platform, so a success here means something is pretending."
+            exit 1
+          fi
+          for word in macOS csops proc_pidinfo install/README.md; do
+            if ! grep -qF "$word" refusal.log; then
+              echo "::error::the refusal never mentions '$word'. It is the only thing"
+              echo "::error::an operator on this platform will read, so it has to name"
+              echo "::error::the interface and point at the porting table."
+              exit 1
+            fi
+          done
+          echo "keylessd refuses on Linux, with exit $code, and says why."
+
+      # The original assertion of this file, preserved exactly: run the link and
+      # require it to fail on precisely the four XNU names. `keyless_force_xnu`
+      # defeats the platform gate so that there is something to link at all.
+      #
+      # Without this step the gate would be an unfalsifiable claim -- see trap 2
+      # in the header.
+      - name: The daemon's unportable surface is exactly four XNU symbols
+        if: runner.os == 'Linux'
+        env:
+          RUSTFLAGS: --cfg keyless_force_xnu
         run: |
           set -uo pipefail
           if cargo build --locked --bin keylessd > keylessd-link.log 2>&1; then
             cat keylessd-link.log
-            echo "::error::keylessd LINKED on Linux. That is good news and this"
-            echo "::error::file is now wrong: give Linux a real daemon job, and"
-            echo "::error::update the porting table in install/README.md."
+            echo "::error::keylessd LINKED on Linux with the XNU modules forced on."
+            echo "::error::That is good news and this file is now wrong: give Linux"
+            echo "::error::a real daemon job, and update the porting table in"
+            echo "::error::install/README.md."
             exit 1
           fi
           cat keylessd-link.log
           sed -nE "s/.*undefined reference to \`([A-Za-z0-9_]+)'.*/\1/p" \
             keylessd-link.log | sort -u > got.txt
+          if [ ! -s got.txt ]; then
+            echo "::error::the forced build failed BEFORE linking, so the unportable"
+            echo "::error::surface was never measured. Read keylessd-link.log: this is"
+            echo "::error::a compile error under --cfg keyless_force_xnu, not a"
+            echo "::error::portability finding."
+            exit 1
+          fi
           printf '%s\n' csops getpeereid proc_pidinfo proc_pidpath > want.txt
           if ! diff -u want.txt got.txt; then
             echo "::error::the daemon's unportable surface changed. It is meant to"

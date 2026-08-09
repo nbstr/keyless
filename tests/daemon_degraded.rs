@@ -20,6 +20,14 @@
 
 mod support;
 
+// Twelve of the seventeen cases below stand up a FAKE daemon out of a plain
+// `UnixListener` and misbehave on purpose, so they need no attestation and run
+// on every platform — which is the half of this file worth the most, since the
+// never-block invariant is what a session depends on when a daemon is missing.
+//
+// The five marked `#[cfg(target_os = "macos")]` bind a REAL `keylessd`. That
+// needs the XNU attestation, so they exist on macOS only.
+
 use std::io::{Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
@@ -312,6 +320,7 @@ fn a_daemon_claiming_success_with_no_value_degrades() {
     against_fake("daemon-okempty", Misbehaviour::OkWithNoValue);
 }
 
+#[cfg(any(target_os = "macos", keyless_force_xnu))]
 #[test]
 fn a_daemon_that_refuses_the_caller_degrades() {
     // A refused attestation must look exactly like every other failure from
@@ -328,6 +337,7 @@ fn a_daemon_that_refuses_the_caller_degrades() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+#[cfg(any(target_os = "macos", keyless_force_xnu))]
 #[test]
 fn a_daemon_whose_store_is_broken_degrades() {
     let dir = scratch("daemon-brokenstore");
@@ -343,6 +353,7 @@ fn a_daemon_whose_store_is_broken_degrades() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+#[cfg(any(target_os = "macos", keyless_force_xnu))]
 #[test]
 fn a_daemon_that_does_not_have_the_name_degrades() {
     let dir = scratch("daemon-absentname");
@@ -357,6 +368,7 @@ fn a_daemon_that_does_not_have_the_name_degrades() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+#[cfg(any(target_os = "macos", keyless_force_xnu))]
 #[test]
 fn a_daemon_that_dies_between_two_runs_degrades_the_second() {
     // The transition is what matters: the same config, the same command, and
@@ -384,6 +396,7 @@ fn a_daemon_that_dies_between_two_runs_degrades_the_second() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+#[cfg(any(target_os = "macos", keyless_force_xnu))]
 #[test]
 fn killing_the_daemon_never_widens_what_a_session_can_reach() {
     // Invariant 2, stated as a test. The config asks for the daemon AND all
