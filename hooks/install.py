@@ -273,6 +273,12 @@ def merge(settings, fragment, record=None, restore=False):
 
     It grows monotonically until an uninstall clears it, so "installed once and
     since deleted" stays distinguishable from "never installed".
+
+    🔴 **THE RECORD HOLDS WHAT THIS RUN DID, NEVER WHAT IT FOUND.** An entry
+    already present when `merge` arrived belongs to whoever put it there, and it
+    is left out — of both lists, for both of the jobs above. Recording it makes
+    `unmerge` delete somebody else's work, and makes a re-run refuse to install
+    something it never installed. A no-op is recorded as a no-op.
     """
     out = json.loads(json.dumps(settings))
     record = dict(record or {})
@@ -293,10 +299,22 @@ def merge(settings, fragment, record=None, restore=False):
         # Registered directly, OR already reached from somebody's forwarder.
         # The second test is what stops a re-run undoing a consolidated estate;
         # `unmerge` deliberately does not share it. See `_is_folded_in`.
+        #
+        # 🚨 FINDING ONE ALREADY THERE IS NOT INSTALLING ONE, so the event is
+        # NOT recorded here. `record["events"]` is the list `unmerge` walks, and
+        # an event on it is an event whose handler `--uninstall` will delete. A
+        # machine that registered this pack by hand months ago hands `merge` a
+        # handler it did not add; recording the event made the receipt claim it,
+        # and the uninstall then stripped a registration nobody here created.
+        # Measured: settings holding one hand-written PreToolUse handler, one
+        # install, one uninstall, and the handler was gone.
+        #
+        # This is the same fault `_add_rules` already avoids one screen down —
+        # a rule already in the file is skipped by `continue` and never enters
+        # `known`, which is why the allow rule the user wrote first survives.
+        # The two halves of the record now agree: it holds ACTS, not findings.
         if any(isinstance(g, dict) and (_has_our_handler(g) or _is_folded_in(g))
                for g in existing):
-            if event not in known_events:
-                known_events.append(event)
             continue
         if event in known_events and not restore:
             skipped.append("a %s handler you removed" % event)
@@ -565,7 +583,12 @@ def main():
         merged, changes, new_record = merge(settings, fragment, record,
                                             restore=args.restore)
         new_record["settings"] = path
-        new_record["created"] = not existed
+        # Sticky, for the same reason `events` is now narrow: this says whether
+        # the settings file did not exist when this pack first wrote to it, and
+        # a later run finds it existing — the run before created it. Recomputed
+        # each time, the record flipped to `false` on the second install and the
+        # machine lost the one fact that says the file is ours to remove.
+        new_record["created"] = bool(new_record.get("created")) or not existed
 
     if not changes:
         print("%s: nothing to do (%s)."

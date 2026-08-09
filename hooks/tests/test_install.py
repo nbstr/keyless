@@ -222,6 +222,49 @@ def run():
     s.check("--restore is what puts it back",
             restored_r["permissions"]["allow"], fragment["permissions"]["allow"])
 
+    # ── THE HANDLER TWIN OF THE RULE CASE ABOVE ───────────────────────────
+    # The rule half was fixed and the handler half was not, and the handler
+    # half is the expensive one: a rule is a line somebody retypes, a
+    # registration is the guard itself.
+    #
+    # Measured on a machine whose settings file carried a keyless PreToolUse
+    # handler registered by hand months ago. `merge` correctly added nothing
+    # there — and recorded the event anyway, so the receipt claimed a handler
+    # it had not installed, and `unmerge` walked that record and deleted it.
+    #
+    # These four cases fail on the code before this comment existed: the first
+    # two on the record, the third on the settings file it produces.
+    theirs_hook = {"hooks": {"PreToolUse": [
+        {"hooks": [{"type": "command",
+                    "command": "python3 /theirs/keyless_hook.py"}]}]}}
+    merged_h, changes_h, record_h = install.merge(theirs_hook, fragment)
+    s.check("a handler the user already had is not recorded as ours",
+            "PreToolUse" in record_h["events"], False)
+    s.check("nothing claims to have added it",
+            [c for c in changes_h if "PreToolUse" in c], [])
+    back_h, _ = install.unmerge(merged_h, record_h)
+    s.check("and it is still registered after an uninstall",
+            _handlers(back_h, "PreToolUse"),
+            ["python3 /theirs/keyless_hook.py"])
+
+    # THE CONTROL, exactly as for the rules: the event we DID install on that
+    # same run is still removed, so the three checks above cannot pass on an
+    # uninstall that has quietly stopped removing handlers at all.
+    s.check("while the handler we added on the other event is gone",
+            _handlers(back_h, "PostToolUse"), [])
+
+    # A pack reached through somebody's forwarder is the same claim, one step
+    # removed. `unmerge` already declines to touch a forwarder, so the lie is
+    # inert today — and it is one widened test away from deleting an estate's
+    # whole chain for the event. The record must not carry it either.
+    folded_r = _settings_with(FOLDED, event="PreToolUse")
+    _, _, record_f = install.merge(folded_r, fragment)
+    s.check("a folded-in pack is not recorded as a handler we installed",
+            "PreToolUse" in record_f["events"], False)
+
+    _created_survives_the_second_run(s)
+    _a_preexisting_handler_survives_the_whole_verb(s)
+
     # The same rule for a whole event: a handler somebody deleted stays deleted.
     no_hooks = json.loads(json.dumps(installed))
     del no_hooks["hooks"]
@@ -285,6 +328,83 @@ def _no_litter(s):
     # produced by a copy written somewhere else, which is not the fix.
     s.check("no function writes a copy of the settings file",
             [n for n in dir(install) if "backup" in n.lower()], [])
+
+
+def _run(*arguments):
+    """Drive the installer the way `keyless setup` drives it."""
+    return subprocess.run([sys.executable, INSTALLER, "--report", *arguments],
+                          capture_output=True, text=True)
+
+
+def _created_survives_the_second_run(s):
+    """`created` is a fact about the install, so a re-run may not contradict it.
+
+    Recomputed from `os.path.exists` on every run, it said "setup did not create
+    this file" from the second install onwards — about a file the first install
+    had created. Driven through `main`, because that is where the field is set
+    and a unit test of `merge` cannot see it.
+    """
+    root = tempfile.mkdtemp(prefix="keyless-created-")
+    claude = os.path.join(root, "claude")
+    os.makedirs(claude)
+    receipt = os.path.join(root, "receipt.json")
+    arguments = ("--claude-dir", claude, "--receipt", receipt)
+
+    first = _run(*arguments)
+    s.check("the first install succeeds", first.returncode, 0)
+    with open(receipt) as fh:
+        s.check("it records that it created the settings file",
+                json.load(fh)["claude"]["created"], True)
+
+    second = _run(*arguments)
+    s.check("the second install succeeds", second.returncode, 0)
+    with open(receipt) as fh:
+        s.check("and the second run does not take that back",
+                json.load(fh)["claude"]["created"], True)
+
+    # THE CONTROL. Without it the two checks above pass on a field hardcoded to
+    # `true`, which would tell an uninstall it owns a file the user wrote.
+    other = os.path.join(root, "other")
+    os.makedirs(other)
+    with open(os.path.join(other, "settings.json"), "w") as fh:
+        fh.write('{"model": "opus"}\n')
+    receipt_o = os.path.join(root, "receipt-other.json")
+    _run("--claude-dir", other, "--receipt", receipt_o)
+    with open(receipt_o) as fh:
+        s.check("a settings file that was already there is not claimed",
+                json.load(fh)["claude"]["created"], False)
+
+
+def _a_preexisting_handler_survives_the_whole_verb(s):
+    """The end-to-end shape of the defect, through the command line.
+
+    `merge` and `unmerge` are asserted directly above. This drives the two real
+    processes `keyless setup` and `keyless uninstall` shell out to, because the
+    receipt is written between them and the receipt is where the claim lived.
+    """
+    root = tempfile.mkdtemp(prefix="keyless-preexisting-")
+    claude = os.path.join(root, "claude")
+    os.makedirs(claude)
+    receipt = os.path.join(root, "receipt.json")
+    settings = os.path.join(claude, "settings.json")
+    theirs = "python3 /theirs/keyless_hook.py"
+    with open(settings, "w") as fh:
+        json.dump({"hooks": {"PreToolUse": [
+            {"hooks": [{"type": "command", "command": theirs}]}]}}, fh)
+
+    arguments = ("--claude-dir", claude, "--receipt", receipt)
+    s.check("the install succeeds", _run(*arguments).returncode, 0)
+    with open(receipt) as fh:
+        s.check("the receipt does not claim the handler it found",
+                json.load(fh)["claude"]["events"], ["PostToolUse"])
+
+    s.check("the uninstall succeeds", _run("--uninstall", *arguments).returncode, 0)
+    with open(settings) as fh:
+        after = json.load(fh)
+    s.check("the hand-registered handler is still registered",
+            _handlers(after, "PreToolUse"), [theirs])
+    s.check("and the handler the install DID add is gone",
+            _handlers(after, "PostToolUse"), [])
 
 
 def _write_survives_a_failure(s):
