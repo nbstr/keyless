@@ -414,3 +414,105 @@ fn a_dry_run_names_every_file_and_writes_none_of_them() {
         "a dry run edited the settings file"
     );
 }
+
+// ---------------------------------------------------------------------------
+// what the receipt is allowed to say
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_guard_registered_by_hand_survives_setup_and_uninstall() {
+    // The measured defect, at the level a person meets it. A machine that
+    // registered this pack by hand months ago hands `setup` a PreToolUse
+    // handler it did not create. `setup` correctly adds none — and the receipt
+    // recorded the event anyway, so `uninstall` walked that record and stripped
+    // a registration nobody here installed.
+    //
+    // The receipt is written between the two commands, which is why this is end
+    // to end and not a unit test of the merge: the claim lived in the file.
+    let theirs = "python3 /theirs/keyless_hook.py";
+    let machine = Machine::fresh("preexisting-guard").with_harness(&format!(
+        r#"{{"hooks": {{"PreToolUse": [{{"hooks": [
+             {{"type": "command", "command": "{theirs}"}}]}}]}}}}"#
+    ));
+
+    let installed = out(&machine.setup(&[]));
+    let receipt: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(machine.receipt()).expect("a receipt"))
+            .expect("the receipt must parse");
+    assert_eq!(
+        receipt["claude"]["events"],
+        serde_json::json!(["PostToolUse"]),
+        "the receipt claimed an event setup did not register\n{installed}"
+    );
+
+    let removed = out(&machine.uninstall());
+    let after = machine.settings_json();
+    assert_eq!(
+        after["hooks"]["PreToolUse"][0]["hooks"][0]["command"],
+        serde_json::json!(theirs),
+        "uninstall deleted a registration setup never created\n{removed}"
+    );
+    // THE CONTROL. Without it this passes on an uninstall that has quietly
+    // stopped removing handlers at all, which would be the opposite defect.
+    assert!(
+        after["hooks"].get("PostToolUse").is_none(),
+        "uninstall left behind the handler it DID install\n{after:#}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// what DETECTED is allowed to say
+// ---------------------------------------------------------------------------
+
+#[test]
+fn detected_reads_the_config_this_machine_actually_uses() {
+    // DETECTED probed each backend inside a config built from a literal string,
+    // so every probe ran with no `secrets`, no `project_id` and no
+    // `session_dir`. Two things followed, and this pins both:
+    //
+    // - the rows were FALSE on a configured machine — "no Infisical environment
+    //   is declared anywhere" about a config declaring one — and `doctor`, same
+    //   binary and same file, contradicted them.
+    // - Infisical and Proton could never reach `proven` at all, on any machine,
+    //   so `init` could only ever offer the keychain as a default.
+    //
+    // Both stores answer here, so `proven` is reachable and is the assertion.
+    let machine = Machine::fresh("detected-reads-the-config");
+    let session = machine.root.join("proton-session");
+    std::fs::create_dir_all(&session).expect("mkdir");
+    let infisical = support::stub_infisical(&machine.root, &support::Backend::Injects("probe"));
+    let pass_cli = support::stub_pass_cli_discovery(
+        &machine.root,
+        r#"{"vaults":[{"name":"personal","id":"V1"}]}"#,
+        "{}",
+        "{}",
+    );
+    std::fs::write(
+        machine.config(),
+        format!(
+            r#"{{"stores": {{
+                 "keychain": {{"enabled": false}},
+                 "infisical": {{"enabled": true, "binary": "{}", "project_id": "proj"}},
+                 "proton": {{"enabled": true, "binary": "{}", "session_dir": "{}"}},
+                 "default": "infisical"
+               }},
+               "secrets": {{"DECOY": {{"store": "infisical", "env": "staging"}}}}}}"#,
+            infisical.display(),
+            pass_cli.display(),
+            session.display()
+        ),
+    )
+    .expect("write config");
+
+    let text = out(&machine.run(&["init"]));
+    for store in ["infisical", "proton"] {
+        let row = text
+            .lines()
+            .find(|line| line.contains(store))
+            .unwrap_or_default();
+        assert!(
+            row.contains("proven"),
+            "`{store}` cannot reach proven in DETECTED, whatever the config says\n{text}"
+        );
+    }
+}
