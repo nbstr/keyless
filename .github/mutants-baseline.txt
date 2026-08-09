@@ -14,15 +14,44 @@
 # key carrying a line number reds on a comment, and a gate that reds on a
 # comment gets deleted.
 #
-# REGENERATE (about 38 minutes; do not hand-edit a line, re-derive it):
+# This file describes the RUST crate. The python hook pack has its own,
+# unrelated mutation campaign in `hooks/tests/mutate.py`, and a count from that
+# one says nothing about any line below.
 #
-#     cargo mutants -f 'src/mask/**' -f 'src/secret.rs' -f 'src/audit/**' \
-#       --jobs 2 --timeout-multiplier 8 --output /tmp/mutants-run
+# REGENERATE — dispatch the workflow. Do not hand-edit a line, re-derive it:
 #
-# then normalise `/tmp/mutants-run/mutants.out/missed.txt` with the same three
-# lines the workflow uses. Run it through the workflow's own normaliser rather
-# than by hand: a baseline produced by different code from the one that checks
-# it is a baseline that reds on the day it lands.
+#     gh workflow run mutants.yml --ref <your-branch>
+#     gh run watch "$(gh run list --workflow=mutants.yml --limit 1 \
+#       --json databaseId --jq '.[0].databaseId')"
+#
+# With no `-f scope=…` the run uses the one scope this file describes. A run on
+# any other scope is REPORTED and never diffed, so it cannot regenerate this.
+#
+# A run whose survivors differ from this file FAILS and uploads its evidence:
+#
+#     gh run download <run-id> -n mutants-run
+#
+# `mutants-run/mutants.out/missed.txt` is the raw list. Normalise it with the
+# SAME three lines the workflow uses — the `NORMALISE` heredoc in
+# `.github/workflows/mutants.yml` — and paste the result below, each line with
+# its reason. A baseline produced by different code from the one that checks it
+# is a baseline that reds on the day it lands. There is deliberately no artifact
+# on a green run: a green run has nothing to regenerate from, because this file
+# already matches.
+#
+# THIS COMMAND USED TO BE A LOCAL `cargo mutants` INVOCATION, and whoever read
+# it ran one, which is the whole reason the line is now a dispatch. The campaign
+# is about forty minutes of saturated CPU. On a workstation running many
+# concurrent sessions behind one job queue it holds a slot for the whole of it
+# while every other session's typecheck and test run waits behind it; measured,
+# one local campaign held the queue eighty minutes with no output and another
+# drove the machine to critical memory pressure and was killed. The runner is
+# waiting on nobody.
+#
+# A maintainer debugging the GATE ITSELF still needs a local run, and that is
+# legitimate — the invocation lives in the workflow, `--copy-vcs true` and all.
+# What is not legitimate is a local campaign as the ROUTINE path, and that is
+# what this line used to hand people.
 #
 # ---------------------------------------------------------------------------
 # WHAT MAY BE ADDED HERE, AND WHAT MAY NOT
