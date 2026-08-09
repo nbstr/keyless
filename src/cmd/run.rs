@@ -362,7 +362,7 @@ pub fn run(request: RunRequest<'_>, notes: &mut dyn Write) -> Result<Outcome, Ru
     };
 
     let mut plan = match prepared.as_mut().and_then(Prepared::take_slave) {
-        Some(slave) => StdioPlan::Pty(slave),
+        Some(slave) => StdioPlan::Pty(Some(slave)),
         None if masking => StdioPlan::Pipes,
         None => StdioPlan::Inherit,
     };
@@ -409,10 +409,19 @@ pub fn run(request: RunRequest<'_>, notes: &mut dyn Write) -> Result<Outcome, Ru
         }
     };
 
+    // The child holds the pty now, so this process must not. Ordered here, and
+    // not at the end of the function where the descriptor would otherwise fall
+    // out of scope, because the output filter below cannot reach end-of-stream
+    // while any slave copy is open — see `StdioPlan::release_slave` for the
+    // platform difference that kept this invisible.
+    plan.release_slave();
     // The plaintext has reached the child. Drop our copies now rather than at
     // the end of the function, so they are not resident for the child's whole
     // life. `Command` keeps its own copy of the environment which std gives us
     // no way to scrub — an honest limit, not a solved problem.
+    //
+    // This is also the second half of the release above: `wire_pty` put three
+    // more duplicates of the slave into this command, and they close here.
     drop(command);
     resolved.clear();
 
@@ -489,8 +498,13 @@ pub fn run(request: RunRequest<'_>, notes: &mut dyn Write) -> Result<Outcome, Ru
     // Drop order matters: the relay drains the child's remaining output, stops
     // its threads, and only then puts the terminal back. Everything printed
     // after this point is written to a terminal in its normal mode.
-    if let Some(relay) = relay.as_mut() {
-        relay.drain();
+    if let Some(relay) = relay.as_mut()
+        && !relay.drain()
+    {
+        // The pty's own bounded drain gave up. Same sentence as the pipe path,
+        // because it is the same event: something the child started is still
+        // holding the stream open.
+        warn_output_left_open(notes);
     }
     drop(relay);
 
@@ -602,17 +616,36 @@ fn resolve_all(
 ///
 /// reaps `sh` immediately and then waits five minutes on a pipe held open by a
 /// grandchild nobody is watching. Measured 2026-08-08: 300 s on this path, 0.20 s
-/// with no secret to mask, 0.01 s on a real pty. **The hang belongs to masking
-/// plus pipes, which is exactly what a CI job, a script and an agent's shell
-/// call all get** — the one caller who would have seen a terminal is the one
-/// caller not affected.
+/// with no secret to mask.
 ///
-/// Two seconds is far more than draining a pipe that already has its bytes in it
-/// needs, and it is not a wait anybody experiences as a hang. What it costs, in
-/// the case above, is the output a backgrounded grandchild writes after its
+/// **The pty path has the same hole and it is bounded by this same number.** A
+/// pty master reports end-of-stream on the same rule a pipe does — when the last
+/// holder lets go — so [`crate::tty::relay::Relay::drain`] reads this constant
+/// too. On Linux the grandchild has to survive the `SIGHUP` that ends the
+/// child's session before it can hold the terminal open, which one `trap` does;
+/// on macOS it cannot hold it open at all, because XNU revokes a controlling
+/// terminal when its session dies. So this bound is load-bearing on exactly one
+/// of the two platforms, and unobservable on the other.
+///
+/// Two seconds is far more than draining a stream that already has its bytes in
+/// it needs, and it is not a wait anybody experiences as a hang. What it costs,
+/// in the case above, is the output a backgrounded grandchild writes after its
 /// parent exits — which a shell would not have shown either once its pipeline
 /// ended.
-const PUMP_DRAIN_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+pub(crate) const PUMP_DRAIN_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// The one thing a caller needs to know when a filter is abandoned at the
+/// deadline.
+///
+/// Shared by the pipe path and the pty path, because they abandon for the same
+/// reason and the reader's next question is the same either way.
+fn warn_output_left_open(notes: &mut dyn Write) {
+    let _ = writeln!(
+        notes,
+        "{NAME}: warning: the child exited but something it started still holds its \
+         output open; anything written from here on is not shown"
+    );
+}
 
 /// Wait for the masking filters, but not forever.
 fn drain_pumps(pumps: usize, done: &mpsc::Receiver<()>, notes: &mut dyn Write) {
@@ -620,11 +653,7 @@ fn drain_pumps(pumps: usize, done: &mpsc::Receiver<()>, notes: &mut dyn Write) {
     for _ in 0..pumps {
         let left = deadline.saturating_duration_since(std::time::Instant::now());
         if done.recv_timeout(left).is_err() {
-            let _ = writeln!(
-                notes,
-                "{NAME}: warning: the child exited but something it started still holds its \
-                 output open; anything written from here on is not shown"
-            );
+            warn_output_left_open(notes);
             return;
         }
     }
@@ -641,7 +670,45 @@ enum StdioPlan {
     /// Two pipes through the masking filters.
     Pipes,
     /// One pseudo-terminal, held so it can be wired more than once.
-    Pty(OwnedFd),
+    ///
+    /// `None` once the child has been spawned and this process has closed its
+    /// own copy — see [`StdioPlan::release_slave`], which is the step that
+    /// decides whether the run ever ends. The variant stays `Pty` either way,
+    /// because "the pty wiring survived" is what the caller tests it for.
+    Pty(Option<OwnedFd>),
+}
+
+impl StdioPlan {
+    /// Close this process's copy of the pty slave, now the child has its own.
+    ///
+    /// # Why this is not housekeeping
+    ///
+    /// A pty master reports end-of-stream only when the LAST slave descriptor
+    /// closes. The output filter reads that master, so one forgotten copy in
+    /// this process leaves the filter blocked in `read` forever — after the
+    /// child is dead, after it has been reaped, with nothing left to report it.
+    ///
+    /// **macOS hid this and Linux did not, which is why it shipped.** The child
+    /// is a session leader owning the pty, and XNU *revokes* a controlling
+    /// terminal when its session ends: every other descriptor onto that
+    /// terminal is invalidated and the master is handed an end-of-file it never
+    /// earned. Linux performs no such revoke, so the leaked descriptor keeps
+    /// the pty open and `keyless run` hangs indefinitely. Measured 2026-08-09
+    /// on rust 1.89 / aarch64, parent holding one slave copy, child gone:
+    ///
+    /// | child owned the tty as session leader | macOS | Linux |
+    /// |---|---|---|
+    /// | no  | master read blocks | master read blocks |
+    /// | yes | master read returns 0 | master read blocks |
+    ///
+    /// So the macOS column was never evidence that this process had let go. It
+    /// is evidence that something else let go on its behalf.
+    fn release_slave(&mut self) {
+        if let StdioPlan::Pty(slave) = self {
+            // Dropping the descriptor is the close.
+            drop(slave.take());
+        }
+    }
 }
 
 /// What actually goes into the child's environment, given the state.
@@ -672,7 +739,23 @@ fn assemble(
             command.stdout(Stdio::piped());
             command.stderr(Stdio::piped());
         }
-        StdioPlan::Pty(slave) => {
+        // `None` cannot happen: the plan is only ever re-assembled BEFORE the
+        // spawn, and the slave is released only after one. It is still handled
+        // as an ordinary wiring failure rather than with an `unwrap`, because
+        // falling back to pipes is the right outcome for every other way this
+        // step fails and the never-block rule does not make an exception for a
+        // case the author believes is unreachable.
+        StdioPlan::Pty(None) => {
+            let _ = writeln!(
+                notes,
+                "{NAME}: warning: the pseudo-terminal was already handed to a child; \
+                 falling back to pipes"
+            );
+            *plan = StdioPlan::Pipes;
+            command.stdout(Stdio::piped());
+            command.stderr(Stdio::piped());
+        }
+        StdioPlan::Pty(Some(slave)) => {
             if let Err(error) = wire_pty(&mut command, slave) {
                 let _ = writeln!(notes, "{NAME}: warning: {error}; falling back to pipes");
                 *plan = StdioPlan::Pipes;
@@ -862,5 +945,59 @@ mod tests {
     #[test]
     fn underscores_and_digits_are_fine_after_the_first_character() {
         assert!(Binding::parse("_PRIVATE_1").is_ok());
+    }
+
+    // The shared timeout harness, from the file the integration suites use.
+    // Included rather than copied: a unit test in `src/` cannot see `tests/`,
+    // and a second copy of a hang-detector is a second copy that can rot.
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/support/within.rs"
+    ));
+
+    /// The pty half of the never-block invariant, tested where BOTH platforms
+    /// can see it fail.
+    ///
+    /// `tests/pty.rs` covers this end to end, and on Linux it is merciless — but
+    /// it is BLIND on macOS, because XNU revokes a controlling terminal when the
+    /// child's session ends and cleans up the leak on this process's behalf.
+    /// Measured 2026-08-09 against the source with `release_slave` absent: 10 of
+    /// 11 pty cases fail on Linux and 11 of 11 pass on macOS.
+    ///
+    /// So this drops to the mechanism, where there is no session and no child
+    /// and therefore nothing to revoke. A master whose last slave is closed must
+    /// END the stream — Linux says `EIO`, macOS says end-of-file — and a slave
+    /// this process is still holding makes both of them block forever instead.
+    /// That is why the read is inside `within`: without a bound the regression
+    /// is a hang, and a hang reports nothing.
+    #[test]
+    fn releasing_the_pty_slave_lets_the_master_reach_end_of_stream() {
+        use super::StdioPlan;
+        use nix::pty::{OpenptyResult, openpty};
+        use std::io::Read;
+
+        let OpenptyResult { master, slave } =
+            openpty(None, None).expect("this platform must provide a pty");
+        let mut plan = StdioPlan::Pty(Some(slave));
+        plan.release_slave();
+
+        let ended = within(
+            PATIENCE,
+            "reading a pty master whose only slave has been released",
+            move || {
+                let mut buf = [0u8; 16];
+                match std::fs::File::from(master).read(&mut buf) {
+                    // macOS: end-of-file. Linux: EIO. Both mean the same thing.
+                    Ok(0) => true,
+                    Err(error) => error.raw_os_error() == Some(nix::libc::EIO),
+                    Ok(_) => false,
+                }
+            },
+        );
+        assert!(
+            ended,
+            "the master neither ended nor errored, so something is still holding \
+             the slave"
+        );
     }
 }

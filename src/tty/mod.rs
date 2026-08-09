@@ -163,10 +163,44 @@ pub fn allocate() -> Result<Pty, TtyError> {
     let attrs = termios::tcgetattr(io::stdin()).map_err(TtyError::from("tcgetattr"))?;
     let OpenptyResult { master, slave } =
         openpty(Some(&size), Some(&attrs)).map_err(TtyError::from("openpty"))?;
+    close_on_exec(&master)?;
+    close_on_exec(&slave)?;
     Ok(Pty {
         master,
         slave: Some(slave),
     })
+}
+
+/// Stop a descriptor being inherited by anything this process starts.
+///
+/// `openpty` hands back descriptors with `FD_CLOEXEC` **clear**, so without this
+/// every child — and every grandchild it starts — inherits both ends of the
+/// terminal as stray numbered descriptors, on top of the three it is meant to
+/// have. Two consequences, and the second is the serious one:
+///
+/// - A stray *slave* copy is one more holder keeping the pty from ever
+///   reporting end-of-stream. This process closes its own after the spawn; a
+///   copy that walked into a grandchild cannot be closed by anybody.
+/// - A stray *master* copy is a hole in the masking. Everything the filter is
+///   about to redact is readable on it, and anything written to it is injected
+///   into the user's terminal as though the user had typed it. A child gets a
+///   terminal on purpose; it never gets the other end of one.
+///
+/// The three descriptors the child is *meant* to have are unaffected: they are
+/// `dup2`'d onto 0, 1 and 2, and `dup2` clears the flag on the descriptor it
+/// creates.
+///
+/// Reached through `libc` rather than `nix::fcntl`, which would need a cargo
+/// feature this crate does not otherwise use.
+fn close_on_exec(fd: &OwnedFd) -> Result<(), TtyError> {
+    // SAFETY: `fd` is live and owned by the caller, and `F_SETFD` takes an int.
+    if unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) } == -1 {
+        return Err(TtyError::Syscall {
+            call: "fcntl(F_SETFD, FD_CLOEXEC)",
+            source: Errno::last(),
+        });
+    }
+    Ok(())
 }
 
 impl Pty {

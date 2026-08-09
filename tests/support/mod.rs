@@ -8,6 +8,15 @@
 // Each integration test file is its own crate and uses a different subset.
 #![allow(dead_code)]
 
+/// The bound that turns a hang into a red test. Its own file so a unit test in
+/// `src/` can `include!` the same source rather than keep a second copy.
+mod within;
+// Only the suites that drive a child or a terminal need the bound, and each
+// integration test file is its own crate — same reason as the `dead_code` allow
+// above, which does not cover a re-export.
+#[allow(unused_imports)]
+pub use within::{PATIENCE, within};
+
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
