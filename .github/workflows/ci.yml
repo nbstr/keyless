@@ -58,29 +58,48 @@
 #    assertions as macOS.
 #
 # ---------------------------------------------------------------------------
-# Known-broken on Linux -- ignored, named, and counted
+# What the second platform found -- nothing is skipped on Linux now
 # ---------------------------------------------------------------------------
 #
-# Making the suite RUN on Linux immediately found two defects in code that is
-# portable, compiled on both platforms, and shipped by the client build this
-# file already produces. Neither is a platform limitation and neither is fixed
-# here; both are marked `#[ignore]` off macOS with the mechanism written at the
-# marker, and the ignored count below is what stops them being forgotten.
+# Making the suite RUN on Linux found defects in code that is portable,
+# compiled on both platforms, and shipped by the client build this file already
+# produces. Both are fixed. The ignored count is now the same number on both
+# platforms, and every remaining difference is a test file ABSENT off macOS
+# rather than a test skipped there.
 #
-# 1. `tests/pty.rs` -- 9 of 10 cases hang INDEFINITELY on Linux, with and
-#    without a controlling terminal. The relay in `src/tty/` never returns.
+# The pty relay was one of them: `keyless run` kept its own copy of the pty
+# slave for the life of the run, and a master reports end-of-stream only when
+# the LAST slave closes, so the output filter blocked in `read` forever after
+# the child was dead and reaped.
 #
-# 2. `store::exec::tests::a_child_that_never_reads_its_input_is_still_killed_at
-#    _the_deadline` -- `capture_with_input` joins its stdin writer thread with
-#    no bound, so a backend whose deadline expires can still block the caller.
-#    On Linux it blocks for the child's full lifetime.
+# It could not be caught on macOS, and no amount of green there would have said
+# so. XNU REVOKES a controlling terminal when its session ends, which
+# invalidates the leaked descriptor and hands the master an end-of-file that
+# `keyless` never earned. Linux performs no such revoke. Measured 2026-08-09
+# against the unfixed source with today's tests: 11 of 11 pty cases PASS on
+# macOS, 10 of 11 FAIL on Linux. For this class Linux is not a second opinion,
+# it is the only one.
 #
-#    That case passes on macOS for a reason that has nothing to do with the
-#    code: macOS `/bin/sh` EXECs a single `-c` command, so killing the child
-#    closes the pipe, while Debian's dash FORKS it and the grandchild keeps the
-#    pipe open. The test's own comment names the hazard it fails to catch. It is
-#    a VACUOUS control on macOS, and only running it on a second platform showed
-#    that.
+# A hang REPORTS NOTHING -- `cargo test` never returns, which is why nine broken
+# cases sat unnoticed. Every case in `tests/pty.rs` and `tests/hostile.rs` runs
+# through `support::within`. Keep that wrapper on anything driving a child, a
+# terminal, or a descriptor another process can hold open.
+#
+# The stdin deadline in `store::exec` was the other one, and it is fixed:
+# `capture_with_input` no longer parks a thread inside a blocking write, so
+# nothing there is ignored on either platform. Its lesson is worth more than
+# its entry was. The case that guarded it PASSED on macOS against completely
+# unbounded code, for a reason that has nothing to do with the code: macOS
+# `/bin/sh` EXECs a single `-c` command, so killing the child closed the pipe
+# by accident, while Debian's dash FORKS it and the grandchild kept the pipe
+# open. One platform therefore reported a hang and the other reported a pass,
+# from one defect and one test.
+#
+# **That is what the second platform is FOR.** A fixture whose validity rests
+# on an undocumented detail of whichever shell the runner ships is not a
+# fixture, and no amount of green on one operating system will say so. The
+# replacement -- `tests/hostile.rs`, property 8 -- builds the reader that holds
+# the pipe explicitly, so it discriminates identically on both.
 #
 # ---------------------------------------------------------------------------
 # What is deliberately NOT here
@@ -142,16 +161,18 @@ jobs:
         # Per platform, because the macOS-only test files do not exist off
         # macOS. Each floor is set BELOW the measured count so it catches a
         # suite that collapsed rather than a suite that lost one case.
-        # Measured 2026-08-09: 464 on macOS, 400 on Linux.
+        # Measured 2026-08-09, by running both: 501 on macOS, 437 on Linux.
         include:
           - os: ubuntu-latest
-            test-floor: 360
-            # 15 Proton live + 9 pty + 1 exec deadline. The last two are
-            # DEFECTS in portable code, named at their `#[ignore]`, not
-            # platform limits -- see "Known-broken on Linux" in the header.
-            ignored: 25
-          - os: macos-latest
             test-floor: 420
+            # The Proton live suite, and nothing else -- the same number as
+            # macOS, which is the point. Every remaining difference between the
+            # two platforms is a test file ABSENT off macOS, never a test that
+            # is skipped there. The pty cases were once ignored here; that was
+            # a leaked descriptor in portable code, fixed, and they now run.
+            ignored: 15
+          - os: macos-latest
+            test-floor: 480
             # The Proton live suite, and nothing else.
             ignored: 15
     steps:
