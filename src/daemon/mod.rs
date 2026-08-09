@@ -320,7 +320,7 @@ impl Connection {
 
         let attestation = attest(stream.as_fd(), &self.policy);
 
-        if let Some(denial) = &attestation.denial {
+        if let Some(denial) = attestation.denial() {
             self.record(&request, &attestation, denial.kind(), State::Degraded, None);
             return Reply::Denied(denial.to_string());
         }
@@ -405,7 +405,7 @@ impl Connection {
             .with_unresolved(unresolved)
             .with_decision(decision);
 
-        if let Some(peer) = &attestation.peer {
+        if let Some(peer) = attestation.peer() {
             event = event.with_peer(Peer {
                 uid: peer.uid,
                 pid: peer.pid,

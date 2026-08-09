@@ -30,6 +30,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 use keyless::config::Config;
+#[cfg(any(target_os = "macos", keyless_force_xnu))]
 use keyless::daemon::config::DaemonConfig;
 use keyless::paths::{ConfigPath, home};
 use support::{Backend, Listing, PROTON_DECOY, recorded, scratch, stub_pass_cli_listing};
@@ -461,6 +462,7 @@ fn every_session_config_path_field_expands() {
     assert_eq!(checked.len(), fields.len());
 }
 
+#[cfg(any(target_os = "macos", keyless_force_xnu))]
 #[test]
 fn every_daemon_config_path_field_expands() {
     let json = format!(

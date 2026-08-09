@@ -17,6 +17,12 @@
 //!   mid-connection, which is the same class and is forcible. Wrapping the pid
 //!   space to recycle a specific number is not.
 
+// The daemon is macOS-only (`src/lib.rs`), so this whole file is. On any other
+// platform the crate below compiles to nothing and the binary reports 0 tests —
+// ABSENT rather than ignored, which is why CI's `ignored == 15` assertion is
+// unchanged and still means "the Proton live suite, and nothing else".
+#![cfg(any(target_os = "macos", keyless_force_xnu))]
+
 mod support;
 
 use std::path::{Path, PathBuf};

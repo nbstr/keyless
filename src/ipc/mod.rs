@@ -11,8 +11,20 @@
 //! [`crate::attest`]. Splitting "who is it" from "may they" is not tidiness:
 //! the identification is kernel facts and is the same everywhere, while the
 //! policy is an operator's choice and changes per install.
+//!
+//! # The platform line runs through this module
+//!
+//! [`ffi`] is XNU and nothing else. It is compiled on macOS only, and
+//! `keyless_force_xnu` compiles it anywhere so CI can run the link and require
+//! it to fail — see the header of `.github/workflows/ci.yml`.
+//!
+//! [`client`] and [`protocol`] are portable, and so is the half of [`peer`]
+//! that is plain data. What is macOS-only is exactly what asks the kernel a
+//! question: nothing here degrades to a weaker answer off macOS, it ceases to
+//! exist, and a caller that wanted it fails to compile.
 
 pub mod client;
+#[cfg(any(target_os = "macos", keyless_force_xnu))]
 pub mod ffi;
 pub mod peer;
 pub mod protocol;

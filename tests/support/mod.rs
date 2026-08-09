@@ -528,11 +528,22 @@ pub fn witnessed(marker: &Path) -> String {
 // Daemon fixtures
 // ---------------------------------------------------------------------------
 
+// The daemon is macOS-only (see `src/lib.rs`), so every fixture that binds
+// one, or that asks the kernel who this process is, is gated with it. The
+// portable fixtures below it are NOT gated: `write_secrets`, `client_config`
+// and `example_binary` describe a session's side of the socket, which is what
+// `daemon_degraded.rs` exercises without a daemon anywhere.
+#[cfg(any(target_os = "macos", keyless_force_xnu))]
 use keyless::attest::Policy;
+#[cfg(any(target_os = "macos", keyless_force_xnu))]
 use keyless::daemon::config::{DaemonConfig, DaemonStores, FileStoreConfig, PeerConfig};
+#[cfg(any(target_os = "macos", keyless_force_xnu))]
 use keyless::daemon::{Daemon, Running};
+#[cfg(any(target_os = "macos", keyless_force_xnu))]
 use keyless::ipc::peer;
+#[cfg(any(target_os = "macos", keyless_force_xnu))]
 use std::os::fd::AsFd;
+#[cfg(any(target_os = "macos", keyless_force_xnu))]
 use std::os::unix::net::UnixStream;
 
 /// This process's own verified identity.
@@ -540,18 +551,21 @@ use std::os::unix::net::UnixStream;
 /// Both ends of a socketpair belong to us, so attesting one end is attesting
 /// ourselves — which is how a test pins the test binary as an authorised
 /// client without shelling out to anything.
+#[cfg(any(target_os = "macos", keyless_force_xnu))]
 pub fn own_identity() -> peer::PeerIdentity {
     let (a, _b) = UnixStream::pair().expect("socketpair");
     peer::identify(a.as_fd()).expect("this process must be able to attest itself")
 }
 
 /// A policy that authorises this test process and nothing else.
+#[cfg(any(target_os = "macos", keyless_force_xnu))]
 pub fn policy_allowing_self() -> Policy {
     let me = own_identity();
     Policy::new().allow_uid(me.uid).allow_image(me.code_hash)
 }
 
 /// A policy that authorises this process's uid but no image at all.
+#[cfg(any(target_os = "macos", keyless_force_xnu))]
 pub fn policy_allowing_nobody() -> Policy {
     Policy::new().allow_uid(own_identity().uid)
 }
@@ -586,6 +600,7 @@ pub fn short_socket_path(dir: &Path) -> PathBuf {
 }
 
 /// A daemon config rooted in `dir`, backed by a file store.
+#[cfg(any(target_os = "macos", keyless_force_xnu))]
 pub fn daemon_config(dir: &Path) -> DaemonConfig {
     DaemonConfig {
         socket: short_socket_path(dir).into(),
@@ -605,6 +620,7 @@ pub fn daemon_config(dir: &Path) -> DaemonConfig {
 }
 
 /// Bind and start serving.
+#[cfg(any(target_os = "macos", keyless_force_xnu))]
 pub fn start_daemon(config: &DaemonConfig, policy: Policy) -> Running {
     let daemon = Daemon::bind(config, policy).expect("bind the daemon");
     Running::spawn(daemon).expect("start the accept loop")

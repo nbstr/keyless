@@ -21,6 +21,19 @@
 //! against `size_of` and refuses on a mismatch**. That turns a layout error
 //! from silent misattestation into a loud refusal, which is the direction a
 //! security boundary must fail in.
+//!
+//! # This file is the whole of the platform boundary
+//!
+//! Four of the symbols declared below — `csops`, `getpeereid`, `proc_pidinfo`
+//! and `proc_pidpath` — exist on macOS and nowhere else, so this module is
+//! compiled on macOS only. Nothing in the crate stubs it: a caller that needs
+//! a kernel fact off macOS does not get a weaker fact, it fails to compile.
+//!
+//! CI defeats the gate with `--cfg keyless_force_xnu`, runs the link on Linux
+//! and requires it to fail on exactly those four names. That is what keeps the
+//! porting table in `install/README.md` honest, and it is why the gate is
+//! written as `any(target_os = "macos", keyless_force_xnu)` rather than as a
+//! bare `target_os`.
 
 use std::ffi::{c_char, c_int, c_uint, c_void};
 use std::io;
@@ -61,7 +74,12 @@ const PROC_PIDUNIQIDENTIFIERINFO: c_int = 17;
 const PROC_PIDPATHINFO_MAXSIZE: usize = 4 * 1024;
 
 /// Length of a truncated code directory hash, as `csops` returns it.
-pub const CDHASH_LEN: usize = 20;
+///
+/// Defined in [`crate::ipc::peer`], which is portable, and re-exported here so
+/// this module still reads as the description of what the kernel returns. The
+/// length is a fact about the hash rather than about the syscall, and
+/// [`crate::attest::Policy`] needs it on every platform.
+pub use crate::ipc::peer::CDHASH_LEN;
 
 /// `struct xucred` from `<sys/ucred.h>`.
 ///
