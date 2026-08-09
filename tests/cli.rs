@@ -129,7 +129,9 @@ fn the_help_verb_list_does_not_grow_a_reading_verb() {
 
     assert_eq!(
         listed,
-        ["run", "ls", "items", "fields", "new", "put", "doctor"],
+        [
+            "run", "ls", "items", "fields", "new", "put", "doctor", "init"
+        ],
         "the visible verb set changed; every addition has to be justified against \
          `no verb prints a value`"
     );
@@ -172,7 +174,9 @@ fn help_advertises_the_whole_verb_set_and_the_constraint() {
     let output = keyless(&["--help"]);
     assert!(output.status.success());
     let help = stdout_of(&output);
-    for verb in ["run", "ls", "items", "fields", "new", "put", "doctor"] {
+    for verb in [
+        "run", "ls", "items", "fields", "new", "put", "doctor", "init",
+    ] {
         assert!(help.contains(verb), "help must mention `{verb}`:\n{help}");
     }
     assert!(
@@ -778,14 +782,23 @@ fn doctor_reports_a_healthy_setup_and_leaks_nothing() {
 
     let report = stdout_of(&output);
     assert!(report.contains("chain intact"), "report: {report}");
-    assert!(report.contains("store    keychain ok"), "report: {report}");
     assert!(
-        report.contains("name     DECOY resolves"),
+        row_for(&report, "keychain").contains("proven"),
         "report: {report}"
     );
+    assert!(
+        row_for(&report, "DECOY").contains("proven"),
+        "report: {report}"
+    );
+    // `ok` is the word this report no longer has anywhere. It was a verdict on
+    // the credential, printed after a check that measured a binary.
+    assert!(!report.contains(" ok "), "report: {report}");
     // The boundary line rides with every report, so no reader takes a resolving
     // name for a credential whose scope somebody checked.
-    assert!(report.contains("scope    not checked"), "report: {report}");
+    assert!(
+        report.contains("not checked, and never will be"),
+        "report: {report}"
+    );
     assert!(
         !report.contains(DECOY_VALUE),
         "doctor leaked a value: {report}"
@@ -805,7 +818,20 @@ fn doctor_reports_a_broken_store_without_blocking_anything() {
         "doctor",
     ]);
     assert_eq!(output.status.code(), Some(1));
-    assert!(stdout_of(&output).contains("PROBLEM"));
+    let report = stdout_of(&output);
+    assert!(report.contains("problem(s)"), "{report}");
+    assert!(!report.contains("\n0 problem(s)"), "{report}");
+    // The row that failed must say what to do about it. A diagnosis with no
+    // next action is the shape this report used to have.
+    assert!(report.contains("→"), "{report}");
+}
+
+/// The one report row whose subject is `subject`.
+fn row_for<'a>(report: &'a str, subject: &str) -> &'a str {
+    report
+        .lines()
+        .find(|line| line.split_whitespace().nth(1) == Some(subject))
+        .unwrap_or_else(|| panic!("the report has no `{subject}` row:\n{report}"))
 }
 
 // ---------------------------------------------------------------------------
@@ -1006,6 +1032,199 @@ fn the_daemon_carries_no_telemetry_string_of_its_own() {
         assert!(
             allowed.contains(&at),
             "keylessd contains a `telemetry` string that is not `{ONLY_ALLOWED}`"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The status display: what a person sees, and what a pipe gets.
+//
+// These are at the binary boundary on purpose. `Style` is unit-tested as a pure
+// function of five variables, and that proves the DECISION. It cannot prove the
+// binary wires the decision to the stream it is writing to — which is the half
+// that was wrong in `ls` once already, and the half a reader is actually exposed
+// to.
+// ---------------------------------------------------------------------------
+
+/// Run the binary with extra environment, and with stdout captured (never a tty).
+fn keyless_env(env: &[(&str, &str)], args: &[&str]) -> Output {
+    let mut command = Command::new(BIN);
+    for (key, value) in env {
+        command.env(key, value);
+    }
+    command.args(args).output().expect("the binary must run")
+}
+
+#[test]
+fn a_redirected_doctor_is_clean_text() {
+    let dir = scratch("e2e-doctor-piped");
+    let config = config_with_stub(&dir, &Stub::Returns(DECOY_VALUE));
+    let output = keyless(&[
+        "--config",
+        &config.display().to_string(),
+        "--audit",
+        &dir.join("audit.jsonl").display().to_string(),
+        "doctor",
+    ]);
+    let report = stdout_of(&output);
+    assert!(
+        !report.contains('\x1b'),
+        "a redirected report carried an escape sequence: {report:?}"
+    );
+    // The control. Without it this passes on a build that has no colour at all,
+    // which would make the assertion above a statement about nothing.
+    let forced = keyless_env(
+        &[("CLICOLOR_FORCE", "1")],
+        &[
+            "--config",
+            &config.display().to_string(),
+            "--audit",
+            &dir.join("audit.jsonl").display().to_string(),
+            "doctor",
+        ],
+    );
+    assert!(
+        stdout_of(&forced).contains('\x1b'),
+        "the binary emits no colour on any path, so the piped assertion proves nothing"
+    );
+}
+
+#[test]
+fn a_reader_who_refused_colour_is_never_overruled() {
+    // `NO_COLOR` is a refusal and `CLICOLOR_FORCE` is a request. The first
+    // spelling of this decision let the request win, which makes `NO_COLOR` a
+    // preference rather than the guarantee it is meant to be.
+    let dir = scratch("e2e-doctor-no-color");
+    let config = config_with_stub(&dir, &Stub::Returns(DECOY_VALUE));
+    let output = keyless_env(
+        &[("NO_COLOR", "1"), ("CLICOLOR_FORCE", "1")],
+        &[
+            "--config",
+            &config.display().to_string(),
+            "--audit",
+            &dir.join("audit.jsonl").display().to_string(),
+            "doctor",
+        ],
+    );
+    assert!(
+        !stdout_of(&output).contains('\x1b'),
+        "NO_COLOR was overruled: {:?}",
+        stdout_of(&output)
+    );
+}
+
+#[test]
+fn the_marks_degrade_to_ascii_on_a_terminal_that_cannot_render_them() {
+    let dir = scratch("e2e-doctor-ascii");
+    let config = config_with_stub(&dir, &Stub::Returns(DECOY_VALUE));
+    let args = [
+        "--config",
+        &config.display().to_string(),
+        "--audit",
+        &dir.join("audit.jsonl").display().to_string(),
+        "doctor",
+    ];
+    let ascii = stdout_of(&keyless_env(&[("KEYLESS_ASCII", "1")], &args));
+    // Total, because every string this crate writes is ASCII already and the
+    // fixture's store contributes no message of its own. The one thing the
+    // fallback cannot cover is text `keyless` did not author — a vendor's
+    // stderr, a note somebody typed — and rewriting that would be editing
+    // evidence rather than degrading a glyph.
+    assert!(
+        ascii.is_ascii(),
+        "the fallback rendering is not ASCII:\n{ascii}"
+    );
+    // Still a report, not a blank one: the degrade must lose the glyphs and
+    // nothing else.
+    assert!(ascii.contains("STORES"), "{ascii}");
+    assert!(ascii.contains("keychain"), "{ascii}");
+    // The control, so this is a statement about the degrade rather than about a
+    // build that never emitted a glyph.
+    let utf8 = stdout_of(&keyless_env(&[("LC_ALL", "en_US.UTF-8")], &args));
+    assert!(
+        !utf8.is_ascii(),
+        "no build ever renders the Unicode marks:\n{utf8}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// `init`.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn init_never_waits_for_input_it_cannot_get() {
+    // The hazard this verb introduces and the one it is allowed to have exactly
+    // one of. A setup command that blocks on a prompt in a pipeline reads as a
+    // hang, and a watchdog kills it with no evidence of what it wanted.
+    let dir = scratch("e2e-init-no-tty");
+    let config = dir.join("config.json");
+    let output = keyless(&[
+        "--config",
+        &config.display().to_string(),
+        "--audit",
+        &dir.join("audit.jsonl").display().to_string(),
+        "init",
+    ]);
+    // Whatever it decided, it decided. `Command::output` would never return
+    // from a process sitting on a read of an inherited stdin.
+    assert!(
+        output.status.code().is_some(),
+        "init did not exit: {output:?}"
+    );
+}
+
+#[test]
+fn init_writes_a_config_that_the_tool_can_then_read() {
+    let dir = scratch("e2e-init-writes");
+    let config = dir.join("config.json");
+    let path = config.display().to_string();
+    let audit = dir.join("audit.jsonl").display().to_string();
+
+    let written = keyless(&[
+        "--config", &path, "--audit", &audit, "init", "--store", "keychain",
+    ]);
+    assert_eq!(written.status.code(), Some(0), "{written:?}");
+    assert!(config.exists(), "init reported success and wrote nothing");
+
+    // The property that makes the verb worth having: `doctor` reads what `init`
+    // wrote. A hand-built JSON string is exactly the kind of output that looks
+    // right and does not parse.
+    let report = stdout_of(&keyless(&["--config", &path, "--audit", &audit, "doctor"]));
+    assert!(
+        !report.contains("broken") && !report.contains("cannot parse"),
+        "doctor could not read the config init wrote:\n{report}"
+    );
+    assert!(report.contains("keychain"), "{report}");
+}
+
+#[test]
+fn a_second_init_leaves_the_first_config_alone() {
+    let dir = scratch("e2e-init-twice");
+    let config = dir.join("config.json");
+    let path = config.display().to_string();
+    let audit = dir.join("audit.jsonl").display().to_string();
+    std::fs::write(&config, "{\"secrets\":{\"MINE\":{}}}").expect("write");
+
+    let output = keyless(&["--config", &path, "--audit", &audit, "init"]);
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert_eq!(
+        std::fs::read_to_string(&config).expect("read"),
+        "{\"secrets\":{\"MINE\":{}}}",
+        "a second init overwrote a config it was not asked to touch"
+    );
+    assert!(stdout_of(&output).contains("--force"), "{output:?}");
+}
+
+#[test]
+fn init_has_no_way_to_be_handed_a_value() {
+    // The standing constraint, aimed at the newest verb. `init` writes a file,
+    // and the moment it accepts a credential it becomes the shortest path to
+    // putting one in a shell history.
+    for flag in ["--value", "--secret", "--password", "--token", "--set"] {
+        let output = keyless(&["init", flag, "anything"]);
+        assert!(
+            !output.status.success(),
+            "`init {flag}` was accepted; nothing in this verb may take a value"
         );
     }
 }

@@ -1,10 +1,39 @@
-//! `keyless doctor` — is anything wrong, and which layer.
+//! `keyless doctor` — what is proven, what is not, and what to do about it.
 //!
 //! Answers the questions a degraded run raises: does the config parse, is the
 //! backend reachable, does the audit log still chain. With `--probe` it also
-//! asks each declared name whether it resolves — and prints only `resolves`,
-//! `missing` or the backend's error. Never a value, never a length, because a
-//! length is still information about a secret.
+//! asks each declared name whether it resolves — and prints only that it
+//! resolved, that it is absent, or the backend's error. Never a value, never a
+//! length, because a length is still information about a secret.
+//!
+//! # `ok` was a lie about a measurement, and this report no longer has the word
+//!
+//! `store keychain ok` was printed after running `security list-keychains`, a
+//! command that proves a binary answered and touches no item. Every name under
+//! that store could fail and the line stayed green. That is the failure class
+//! this whole crate is about — a check that reports on itself rather than on the
+//! thing — arriving in the one command a person runs precisely when something is
+//! already wrong.
+//!
+//! So the report has one green and it means one thing: **something came back
+//! through the whole path.** See [`crate::cmd::status`] for the vocabulary and
+//! for why the axis is depth of proof rather than "connected". Two subjects,
+//! two depths:
+//!
+//! - a **store** is proven when a read path answered — for the keychain, a
+//!   search that reached the item database; for Infisical, a fetch of a
+//!   non-credential key; for Proton, a vault listing as this session. None of
+//!   the three reads a credential of yours.
+//! - a **name** is proven only under `--probe`, which reads the real credential.
+//!
+//! # Why a name whose store failed is not asked
+//!
+//! A store that is down makes every name under it fail, identically, for the
+//! same reason. Printing that reason once per name buries the one row that
+//! matters underneath its own consequences — and asking would spend a doomed
+//! vendor call per name, plus one permanent off-machine audit entry per item
+//! against Proton. So the store rows are computed first, and a name routed to a
+//! failing store is marked `blocked` and points up. Nothing is asked.
 //!
 //! # Why there is no capability check, and why the report says so out loud
 //!
@@ -46,144 +75,578 @@
 //! to guarantee that is to have no passing check to mistake, and to print the
 //! absence rather than leave a hole a hand-written note drifts into.
 
+use std::collections::BTreeMap;
 use std::io::{self, Write};
 
 use crate::audit::AuditLog;
-use crate::config::ConfigLoad;
+use crate::config::{Config, ConfigLoad};
+use crate::error::StoreError;
 use crate::paths::Paths;
-use crate::store::{Registry, Resolution};
+use crate::store::{self, Registry, Resolution, Store};
+
+use super::status::{Mark, Style, action, heading, note, row};
+
+/// Every backend this build knows about, in the order a report lists them.
+///
+/// Named here rather than taken from the registry, because a store that is
+/// **switched off** is invisible to the registry and is exactly what a reader
+/// came to check. `"keychain": {"enabled": false}` in a config used to produce
+/// no line at all, which reads identically to a build that has no keychain
+/// support.
+const KNOWN_STORES: [&str; 4] = [
+    "keychain",
+    crate::store::infisical::STORE_ID,
+    "proton",
+    crate::store::daemon::DAEMON_STORE_ID,
+];
+
+/// What one store row says.
+struct StoreRow {
+    id: String,
+    mark: Mark,
+    state: &'static str,
+    detail: String,
+    /// The next action, for every row that is not proven. Never empty on a
+    /// failing row: a diagnosis with no next action is the shape this report
+    /// used to have.
+    action: Option<String>,
+}
+
+/// Everything one report is about.
+///
+/// A struct rather than eight parameters, for the reason
+/// [`crate::cmd::run::RunRequest`] is one: a ninth fact added by widening a call
+/// signature is a change nobody reads, and two of these — `probe` and `style` —
+/// are bare `bool`-shaped things whose meaning is invisible at a call site.
+pub struct DoctorRequest<'a> {
+    /// Where the config and the audit log live.
+    pub paths: &'a Paths,
+    /// The config, and whatever went wrong reading it.
+    pub load: &'a ConfigLoad,
+    /// The backends the config turned on.
+    pub registry: &'a Registry,
+    /// The log to verify.
+    pub audit: &'a AuditLog,
+    /// How the registry was assembled, for someone who came to ask.
+    pub notes: &'a [String],
+    /// Also ask each declared name whether it resolves. READS each credential.
+    pub probe: bool,
+    /// Colour and character set.
+    ///
+    /// A field rather than something detected inside, for the reason
+    /// [`crate::cmd::ls::ls`] takes `interactive`: the caller already knows which
+    /// stream it is writing to, and a function that guesses cannot be driven
+    /// down both paths by a test.
+    pub style: Style,
+}
 
 /// Run every check, writing a report to `out`.
 ///
 /// Returns the process exit code: 0 when everything checked out, 1 when
 /// anything did not. `doctor` is the one verb allowed to be judgemental,
 /// because nothing depends on it succeeding.
-pub fn doctor(
-    paths: &Paths,
-    load: &ConfigLoad,
-    registry: &Registry,
-    audit: &AuditLog,
-    notes: &[String],
-    probe: bool,
-    out: &mut dyn Write,
-) -> io::Result<i32> {
+///
+/// # Errors
+///
+/// Only a write failure on `out`.
+pub fn doctor(request: &DoctorRequest<'_>, out: &mut dyn Write) -> io::Result<i32> {
+    let DoctorRequest {
+        paths,
+        load,
+        registry,
+        audit,
+        notes,
+        probe,
+        style,
+    } = *request;
     let mut problems = 0;
 
-    for note in notes {
-        writeln!(out, "note     {note}")?;
-    }
+    header(paths, load, style, out)?;
 
-    writeln!(out, "config   {}", paths.config.display())?;
-    match &load.problem {
-        Some(problem) => {
-            problems += 1;
-            writeln!(out, "         PROBLEM {problem}")?;
-            writeln!(out, "         running with defaults; commands still run")?;
-        }
-        None if load.loaded => writeln!(
-            out,
-            "         ok, {} names declared",
-            load.config.secrets.len()
-        )?,
-        None => writeln!(out, "         absent, using defaults")?,
-    }
-
-    writeln!(out, "audit    {}", audit.path().display())?;
-    match audit.verify() {
-        Ok(0) => writeln!(out, "         empty")?,
-        Ok(rows) => writeln!(out, "         ok, {rows} rows, chain intact")?,
-        Err(error) => {
-            problems += 1;
-            writeln!(out, "         PROBLEM {error}")?;
+    if !notes.is_empty() {
+        heading(out, style, "NOTES")?;
+        for text in notes {
+            note(out, style, text)?;
         }
     }
 
-    if registry.is_empty() {
+    if let Some(problem) = &load.problem {
         problems += 1;
-        writeln!(out, "stores   none configured")?;
-    }
-    for store in registry.stores() {
-        match store.health() {
-            Ok(()) => writeln!(out, "store    {} ok", store.id())?,
-            Err(error) => {
-                problems += 1;
-                writeln!(out, "store    {} PROBLEM {error}", store.id())?;
-            }
-        }
-    }
-
-    report_daemon(load, out)?;
-
-    if probe {
-        for name in load.config.secrets.keys() {
-            match registry.resolve(name) {
-                // `resolves`, never `ok`. `ok` is a verdict on the credential
-                // and this is a verdict on the lookup: a store answered. What
-                // came back may be an expired token, an account-wide one, or
-                // somebody else's — all three resolve identically.
-                Resolution::Found { .. } => writeln!(out, "name     {name} resolves")?,
-                Resolution::NotFound => {
-                    problems += 1;
-                    writeln!(out, "name     {name} missing")?;
-                }
-                Resolution::Failed(errors) => {
-                    problems += 1;
-                    let detail = errors
-                        .iter()
-                        .map(ToString::to_string)
-                        .collect::<Vec<_>>()
-                        .join("; ");
-                    writeln!(out, "name     {name} PROBLEM {detail}")?;
-                }
-                // Reported as a problem rather than as "missing": nothing was
-                // asked, so nothing is known about whether the name exists.
-                // Saying `missing` here would send the reader to the vault
-                // instead of to the one line of config that fixes it.
-                ambiguous @ Resolution::Ambiguous { .. } => {
-                    problems += 1;
-                    writeln!(out, "name     {name} AMBIGUOUS {}", ambiguous.reason())?;
-                }
-            }
-        }
-    } else if !load.config.secrets.is_empty() {
-        // Say what was NOT checked, and say what it costs, in the one place
-        // somebody is looking when something is broken.
-        //
-        // The flag has existed all along and the README documents it; this
-        // report never mentioned it, so it was reached by people who had
-        // already read the manual for a different reason. A capability nothing
-        // points at is one nobody runs.
-        //
-        // The cost is stated because it is the answer to "why is this not the
-        // default": `--probe` resolves each name, and resolving a name READS
-        // that credential out of the store — for Proton, one vendor `run` per
-        // name and one permanent off-machine audit entry per item. A health
-        // command that reads every credential you own on every invocation is a
-        // worse default than one that checks less. Whether each STORE is alive
-        // is checked above either way, and that costs no credential at all.
-        writeln!(
+        heading(out, style, "CONFIG")?;
+        row(
             out,
-            "names    {} declared, not probed",
-            load.config.secrets.len()
+            style,
+            Mark::Broken,
+            "config",
+            6,
+            "broken",
+            &problem.to_string(),
         )?;
-        writeln!(
+        action(
             out,
-            "         `{} doctor --probe` asks each one; it READS each credential to do so",
-            crate::NAME
+            style,
+            "fix the file, or move it aside; commands still run, with defaults",
         )?;
     }
+
+    let rows = store_rows(&load.config, registry);
+    problems += report_stores(&rows, style, out)?;
+    problems += report_names(&load.config, registry, &rows, probe, style, out)?;
+    problems += report_audit(audit, style, out)?;
 
     if !load.config.secrets.is_empty() {
-        report_capability_boundary(out)?;
+        report_capability_boundary(style, out)?;
     }
 
     writeln!(
         out,
-        "\n{} problem(s). A problem here degrades a run; it never blocks one.",
-        problems
+        "\n{problems} problem(s). A problem here degrades a run; it never blocks one."
     )?;
 
     Ok(i32::from(problems > 0))
+}
+
+/// The orienting line: which build, which file, how many names.
+fn header(paths: &Paths, load: &ConfigLoad, style: Style, out: &mut dyn Write) -> io::Result<()> {
+    let names = load.config.secrets.len();
+    let summary = if load.problem.is_some() {
+        "unreadable; see CONFIG below".to_owned()
+    } else if load.loaded {
+        format!("{names} name(s) declared")
+    } else {
+        "no config file yet".to_owned()
+    };
+    writeln!(
+        out,
+        "{} {}   {}   {summary}",
+        crate::NAME,
+        env!("CARGO_PKG_VERSION"),
+        paths.config.display()
+    )?;
+    if !load.loaded && load.problem.is_none() {
+        action(
+            out,
+            style,
+            &format!("{} init detects your stores and writes one", crate::NAME),
+        )?;
+    }
+    Ok(())
+}
+
+/// One row per backend this build knows about, live or not.
+fn store_rows(config: &Config, registry: &Registry) -> Vec<StoreRow> {
+    let live: BTreeMap<&str, &dyn Store> = registry
+        .stores()
+        .iter()
+        .map(|store| (store.id(), store.as_ref()))
+        .collect();
+
+    // Known first, then anything live this list has not heard of. Dropping an
+    // unknown backend would be the same defect as dropping a disabled one: a
+    // store that is answering, absent from the report that exists to list them.
+    let ids: Vec<&str> = KNOWN_STORES
+        .iter()
+        .copied()
+        .chain(live.keys().copied().filter(|id| !KNOWN_STORES.contains(id)))
+        .collect();
+
+    ids.iter()
+        .map(|id| match live.get(id) {
+            Some(store) => match store.health() {
+                Ok(()) => StoreRow {
+                    id: (*id).to_owned(),
+                    mark: Mark::Proven,
+                    state: "proven",
+                    detail: points_at(config, id),
+                    action: None,
+                },
+                Err(error) => failing_row(id, &error),
+            },
+            None => dormant_row(config, id),
+        })
+        .collect()
+}
+
+/// Where a live store points, for the detail column of a proven row.
+///
+/// A proven row still has to say WHAT was proven against, or two machines with
+/// wildly different configurations produce the same green line. The state word
+/// says how far the proof reached; this says where it reached to.
+fn points_at(config: &Config, id: &str) -> String {
+    match id {
+        "keychain" => format!("service \"{}\"", config.stores.keychain.service),
+        "infisical" => {
+            let path = &config.stores.infisical.path;
+            match &config.stores.infisical.project_id {
+                Some(project) => format!("path {path}, project {project}"),
+                None => format!("path {path}, project from the working directory"),
+            }
+        }
+        "proton" => match &config.stores.proton.session_dir {
+            Some(dir) => format!("session {}", dir.as_path().display()),
+            None => "session directory unset".to_owned(),
+        },
+        "daemon" => config.stores.daemon.socket_path().display().to_string(),
+        // A backend this build does not have settings for. It answered, which
+        // is the whole claim the row makes; inventing coordinates for it would
+        // be worse than saying nothing.
+        other => format!("backend `{other}`"),
+    }
+}
+
+/// A live store that could not answer.
+///
+/// The three [`StoreError`] variants already separate the three places a reader
+/// has to be sent — the install, their own config file, and the store itself —
+/// so the mark and the action are read off the variant rather than sniffed out
+/// of a message.
+fn failing_row(id: &str, error: &StoreError) -> StoreRow {
+    let (mark, state) = match error {
+        // Not there yet: no binary, no login, no network. A step nobody took,
+        // which is amber rather than red — but still a problem, because a store
+        // that was ENABLED and cannot answer is a store that cannot serve.
+        StoreError::Unavailable { .. } => (Mark::NotSetUp, "absent"),
+        // One line of the config file, and nothing was contacted.
+        StoreError::Misconfigured { .. } => (Mark::NotSetUp, "config"),
+        // Installed, reached, and saying no.
+        StoreError::Backend { .. } => (Mark::Broken, "broken"),
+    };
+    StoreRow {
+        id: id.to_owned(),
+        mark,
+        state,
+        // The vendor's own words, so a reader knows which of the many ways this
+        // backend fails they are looking at. Never its stdout; see
+        // `crate::error`.
+        detail: detail_of(error),
+        action: Some(remedy(id, error)),
+    }
+}
+
+/// The cause, without the `store `x`` prefix `Display` adds for a log line.
+fn detail_of(error: &StoreError) -> String {
+    match error {
+        StoreError::Unavailable { detail, .. }
+        | StoreError::Backend { detail, .. }
+        | StoreError::Misconfigured { detail, .. } => detail.clone(),
+    }
+}
+
+/// What to type next, per backend and per kind of failure.
+///
+/// Written here rather than inside each adapter because it is advice about this
+/// MACHINE, not about the lookup that failed — and because a `Misconfigured`
+/// error already carries the config fix in its own detail, so repeating it would
+/// give a reader two sentences to reconcile.
+fn remedy(id: &str, error: &StoreError) -> String {
+    if matches!(error, StoreError::Misconfigured { .. }) {
+        return format!(
+            "the fix is one line of {}'s config file, not anything in the store",
+            crate::NAME
+        );
+    }
+    match id {
+        "keychain" => "unlock the login keychain in Keychain Access, \
+                       or check `stores.keychain.binary`"
+            .to_owned(),
+        "infisical" => "`infisical login`, then check `stores.infisical.project_id` \
+                        and the `env` on each name"
+            .to_owned(),
+        "proton" => "`pass-cli login` into `stores.proton.session_dir`, \
+                     or re-issue the agent token"
+            .to_owned(),
+        "daemon" => "start `keylessd`, or set `stores.daemon.enabled` to false so \
+                     this machine reads its own stores"
+            .to_owned(),
+        other => format!("check the settings for `stores.{other}`"),
+    }
+}
+
+/// A backend that is not in the registry, and why.
+///
+/// Three different silences that used to look the same — the store is off, the
+/// daemon suppressed it, or a daemon is listening that nothing is routed to.
+fn dormant_row(config: &Config, id: &str) -> StoreRow {
+    let daemon_on = config.stores.daemon.enabled;
+    if id == crate::store::daemon::DAEMON_STORE_ID {
+        let socket = config.stores.daemon.socket_path();
+        let listening = std::fs::symlink_metadata(&socket)
+            .map(|meta| {
+                use std::os::unix::fs::FileTypeExt;
+                meta.file_type().is_socket()
+            })
+            .unwrap_or(false);
+        // The case worth catching: a socket that exists while the config does
+        // not mention it. The daemon is installed and running, and every
+        // session is quietly still reading the local stores directly. Nothing
+        // else in the tool would ever say so, because from `run`'s point of
+        // view everything is working.
+        return StoreRow {
+            id: id.to_owned(),
+            mark: Mark::Off,
+            state: "off",
+            detail: if listening {
+                format!(
+                    "{} is listening, and nothing is routed to it",
+                    socket.display()
+                )
+            } else {
+                "not enabled in this config".to_owned()
+            },
+            action: listening.then(|| {
+                "set `stores.daemon.enabled` to route through it; until then \
+                 secrets are read directly by this user"
+                    .to_owned()
+            }),
+        };
+    }
+    let enabled = match id {
+        "keychain" => config.stores.keychain.enabled,
+        "infisical" => config.stores.infisical.enabled,
+        "proton" => config.stores.proton.enabled,
+        // Not a backend this build has a flag for, and not in the registry
+        // either. There is nothing here to have switched off.
+        _ => false,
+    };
+    StoreRow {
+        id: id.to_owned(),
+        mark: Mark::Off,
+        state: "off",
+        // Three different silences, and the row says which. Reading the flag
+        // rather than assuming it is what stops the last arm being a lie: a
+        // store can be absent from the registry for a reason the config does
+        // not show, and "you switched it off" would then be wrong in the one
+        // direction that sends a reader to edit a line that is already correct.
+        detail: if daemon_on {
+            "suppressed: the daemon serves every name on this machine".to_owned()
+        } else if enabled {
+            "enabled here, but this registry did not construct it".to_owned()
+        } else {
+            format!("\"enabled\": false under `stores.{id}`")
+        },
+        action: None,
+    }
+}
+
+/// The STORES section. Returns how many rows are problems.
+fn report_stores(rows: &[StoreRow], style: Style, out: &mut dyn Write) -> io::Result<i32> {
+    heading(out, style, "STORES")?;
+
+    if rows.iter().all(|row| row.mark == Mark::Off) {
+        row(
+            out,
+            style,
+            Mark::NotSetUp,
+            "(none)",
+            subject_width(rows),
+            "absent",
+            "none configured, so no name can resolve",
+        )?;
+        action(
+            out,
+            style,
+            &format!(
+                "{} init detects what is installed and enables it",
+                crate::NAME
+            ),
+        )?;
+        return Ok(1);
+    }
+
+    let width = subject_width(rows);
+    let mut problems = 0;
+    for entry in rows {
+        row(
+            out,
+            style,
+            entry.mark,
+            &entry.id,
+            width,
+            entry.state,
+            &entry.detail,
+        )?;
+        if let Some(text) = &entry.action {
+            action(out, style, text)?;
+        }
+        problems += i32::from(entry.mark.is_problem());
+    }
+    Ok(problems)
+}
+
+fn subject_width(rows: &[StoreRow]) -> usize {
+    rows.iter()
+        .map(|row| row.id.len())
+        .max()
+        .unwrap_or(6)
+        .max(6)
+}
+
+/// The NAMES section. Returns how many rows are problems.
+fn report_names(
+    config: &Config,
+    registry: &Registry,
+    stores: &[StoreRow],
+    probe: bool,
+    style: Style,
+    out: &mut dyn Write,
+) -> io::Result<i32> {
+    if config.secrets.is_empty() {
+        return Ok(0);
+    }
+    heading(out, style, "NAMES")?;
+
+    if !probe {
+        // Say what was NOT checked, and say what it costs, in the one place
+        // somebody is looking when something is broken. The flag has existed all
+        // along and the README documents it; this report never mentioned it, so
+        // it was reached only by people who had already read the manual for a
+        // different reason. A capability nothing points at is one nobody runs.
+        //
+        // The cost is stated because it is the answer to "why is this not the
+        // default": resolving a name READS that credential out of the store —
+        // for Proton, one vendor call per name and one permanent off-machine
+        // audit entry per item. A health command that reads every credential you
+        // own on every invocation is a worse default than one that checks less.
+        // Its own width. Padding a one-row summary out to the longest DECLARED
+        // name indents the detail past the line budget and wraps a sentence
+        // that fits — the alignment was serving rows that this branch never
+        // prints.
+        row(
+            out,
+            style,
+            Mark::Unproven,
+            "(all)",
+            "(all)".len(),
+            "unproven",
+            &format!(
+                "{} declared, not probed; nothing has been read back",
+                config.secrets.len()
+            ),
+        )?;
+        action(
+            out,
+            style,
+            &format!(
+                "{} doctor --probe asks each one; it READS each credential to do so",
+                crate::NAME
+            ),
+        )?;
+        return Ok(0);
+    }
+
+    let width = config
+        .secrets
+        .keys()
+        .map(String::len)
+        .max()
+        .unwrap_or(6)
+        .max(6);
+
+    let failed: BTreeMap<&str, &StoreRow> = stores
+        .iter()
+        .filter(|row| row.mark != Mark::Proven)
+        .map(|row| (row.id.as_str(), row))
+        .collect();
+
+    let mut problems = 0;
+    for name in config.secrets.keys() {
+        // The store this name would use, by exactly the rule a lookup applies.
+        // A name whose store is already down is not asked: see this module's
+        // documentation for why that is a saving rather than a shortcut.
+        if let Ok(id) = store::choose_store(config, Some(name), None)
+            && let Some(store) = failed.get(id.as_str())
+        {
+            row(
+                out,
+                style,
+                Mark::Unproven,
+                name,
+                width,
+                "blocked",
+                &format!("nothing asked; store `{id}` is `{}` above", store.state),
+            )?;
+            continue;
+        }
+
+        let (mark, state, detail, next) = match registry.resolve(name) {
+            // Never `ok`. `ok` is a verdict on the credential and this is a
+            // verdict on the lookup: an expired token, an account-wide one, and
+            // somebody else's all resolve identically.
+            Resolution::Found { store, .. } => (
+                Mark::Proven,
+                "proven",
+                format!("read back from {store}"),
+                None,
+            ),
+            Resolution::NotFound => (
+                Mark::NotSetUp,
+                "absent",
+                "declared here, and no store holds it".to_owned(),
+                Some(format!(
+                    "{} put {name}   (reads the value on stdin, and never echoes it)",
+                    crate::NAME
+                )),
+            ),
+            Resolution::Failed(errors) => (
+                Mark::Broken,
+                "broken",
+                errors
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join("; "),
+                Some("the store answered and refused this name".to_owned()),
+            ),
+            // Nothing was asked, so nothing is known about whether the name
+            // exists. Saying `absent` here would send the reader to the vault
+            // instead of to the one line of config that fixes it.
+            ambiguous @ Resolution::Ambiguous { .. } => (
+                Mark::NotSetUp,
+                "ambiguous",
+                ambiguous.reason(),
+                Some(format!(
+                    "add \"store\" to \"{name}\", or set \"stores.default\""
+                )),
+            ),
+        };
+        row(out, style, mark, name, width, state, &detail)?;
+        if let Some(text) = next {
+            action(out, style, &text)?;
+        }
+        problems += i32::from(mark.is_problem());
+    }
+    Ok(problems)
+}
+
+/// The AUDIT section. Returns how many rows are problems.
+fn report_audit(audit: &AuditLog, style: Style, out: &mut dyn Write) -> io::Result<i32> {
+    heading(out, style, "AUDIT")?;
+    let path = audit.path().display().to_string();
+    match audit.verify() {
+        Ok(0) => {
+            row(out, style, Mark::Unproven, "audit", 6, "unproven", &path)?;
+            note(out, style, "no rows yet, so there is no chain to check")?;
+            Ok(0)
+        }
+        Ok(rows) => {
+            row(out, style, Mark::Proven, "audit", 6, "proven", &path)?;
+            note(out, style, &format!("{rows} rows, chain intact"))?;
+            Ok(0)
+        }
+        Err(error) => {
+            row(
+                out,
+                style,
+                Mark::Broken,
+                "audit",
+                6,
+                "broken",
+                &error.to_string(),
+            )?;
+            action(out, style, &format!("the log is at {path}"))?;
+            Ok(1)
+        }
+    }
 }
 
 /// State the one thing this report can never establish, every time it runs.
@@ -197,65 +660,39 @@ pub fn doctor(
 /// and the somewhere is a note in `ls` that nothing has re-read since the day it
 /// was typed. Saying "not checked here, ask the provider" costs five lines and
 /// removes the vacancy.
-fn report_capability_boundary(out: &mut dyn Write) -> io::Result<()> {
-    writeln!(out, "scope    not checked, and never will be")?;
-    writeln!(
+fn report_capability_boundary(style: Style, out: &mut dyn Write) -> io::Result<()> {
+    heading(out, style, "SCOPE")?;
+    row(
         out,
-        "         a name that resolves proves a store answered. It proves nothing"
+        style,
+        Mark::Unproven,
+        "scope",
+        6,
+        "unproven",
+        "not checked, and never will be",
     )?;
-    writeln!(
+    note(
         out,
-        "         about what the credential may DO or WHOSE it is. An `ls` note"
+        style,
+        "a name that resolves proves a store answered. It proves nothing about",
     )?;
-    writeln!(
+    note(
         out,
-        "         claiming a scope is prose; ask the provider to enumerate its own"
+        style,
+        "what the credential may DO or WHOSE it is. An `ls` note claiming a scope",
     )?;
-    writeln!(out, "         grant, and read that.")
-}
-
-/// Say something about the daemon even when it is not configured.
-///
-/// The case worth catching is a socket that exists while the config does not
-/// mention it: the daemon is installed and running, and every session is
-/// quietly still reading the keychain directly. Nothing else in the tool would
-/// ever mention that, because from `run`'s point of view everything is working.
-///
-/// It is not counted as a problem. `doctor`'s exit code is about whether this
-/// machine can serve secrets, and it can.
-fn report_daemon(load: &ConfigLoad, out: &mut dyn Write) -> io::Result<()> {
-    let daemon = &load.config.stores.daemon;
-    let socket = daemon.socket_path();
-    let present = std::fs::symlink_metadata(&socket)
-        .map(|meta| {
-            use std::os::unix::fs::FileTypeExt;
-            meta.file_type().is_socket()
-        })
-        .unwrap_or(false);
-
-    match (daemon.enabled, present) {
-        (true, true) => writeln!(out, "daemon   {} in use", socket.display()),
-        (true, false) => writeln!(
-            out,
-            "daemon   {} enabled but absent; every name degrades",
-            socket.display()
-        ),
-        (false, true) => {
-            writeln!(out, "daemon   {} is listening, unused", socket.display())?;
-            writeln!(
-                out,
-                "         set stores.daemon.enabled to route through it; \
-                 until then secrets are read directly by this user"
-            )
-        }
-        (false, false) => Ok(()),
-    }
+    note(
+        out,
+        style,
+        "is prose; ask the provider to enumerate its own grant, and read that.",
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::doctor;
     use crate::audit::AuditLog;
+    use crate::cmd::status::Style;
     use crate::config::Config;
     use crate::error::StoreError;
     use crate::paths::Paths;
@@ -276,47 +713,87 @@ mod tests {
         }
     }
 
+    /// A registry whose one store carries a real backend id, so the NAMES
+    /// section can route to it the way a real config would.
+    struct Named(&'static str);
+    impl Store for Named {
+        fn id(&self) -> &str {
+            self.0
+        }
+        fn resolve(&self, _name: &str) -> Result<Option<Secret>, StoreError> {
+            Ok(Some(Secret::new("decoy-doctor-value".to_owned())))
+        }
+        fn health(&self) -> Result<(), StoreError> {
+            Ok(())
+        }
+    }
+
+    fn loaded(json: &str) -> crate::config::ConfigLoad {
+        let paths = Paths::under(Path::new("/nonexistent/keyless-doctor"));
+        let mut load = Config::load(&paths.config);
+        load.config = serde_json::from_str(json).expect("valid");
+        load.loaded = true;
+        load
+    }
+
+    fn report(load: &crate::config::ConfigLoad, registry: Registry, probe: bool) -> (String, i32) {
+        let paths = Paths::under(Path::new("/nonexistent/keyless-doctor"));
+        let audit = AuditLog::new(PathBuf::from("/nonexistent/keyless-doctor/audit.jsonl"));
+        render(&paths, load, &registry, &audit, probe)
+    }
+
+    /// One report, rendered plain. `Style::PLAIN` on purpose: every assertion
+    /// here is about WORDS, and a coloured render wraps each one in escapes a
+    /// `contains` cannot see through.
+    fn render(
+        paths: &Paths,
+        load: &crate::config::ConfigLoad,
+        registry: &Registry,
+        audit: &AuditLog,
+        probe: bool,
+    ) -> (String, i32) {
+        let mut out: Vec<u8> = Vec::new();
+        let code = doctor(
+            &super::DoctorRequest {
+                paths,
+                load,
+                registry,
+                audit,
+                notes: &[],
+                probe,
+                style: Style::PLAIN,
+            },
+            &mut out,
+        )
+        .expect("write");
+        (String::from_utf8(out).expect("utf-8"), code)
+    }
+
     #[test]
     fn probe_reports_presence_and_never_a_value() {
-        let paths = Paths::under(Path::new("/nonexistent/keyless-doctor"));
-        let load = Config::load(&paths.config);
-        let mut load = load;
-        load.config = serde_json::from_str(r#"{"secrets":{"DECOY":{}}}"#).expect("valid");
-        load.loaded = true;
-        let registry = Registry::new(vec![Box::new(Healthy)]);
-        let audit = AuditLog::new(PathBuf::from("/nonexistent/keyless-doctor/audit.jsonl"));
+        let load = loaded(r#"{"secrets":{"DECOY":{}}}"#);
+        let (text, code) = report(&load, Registry::new(vec![Box::new(Healthy)]), true);
 
-        let mut out: Vec<u8> = Vec::new();
-        let code = doctor(&paths, &load, &registry, &audit, &[], true, &mut out).expect("write");
-        let report = String::from_utf8(out).expect("utf-8");
-
-        assert!(report.contains("name     DECOY resolves"));
+        assert!(text.contains("DECOY"), "{text}");
+        assert!(text.contains("proven"), "{text}");
         assert!(
-            !report.contains("decoy-doctor-value"),
+            !text.contains("decoy-doctor-value"),
             "doctor leaked a value"
         );
-        assert_eq!(code, 0);
+        assert_eq!(code, 0, "{text}");
     }
 
     #[test]
     fn a_resolving_name_is_never_reported_as_a_verdict_on_the_credential() {
-        // `ok` was a verdict on the credential and this is a verdict on the
-        // lookup. An expired token, an account-wide one and somebody else's all
-        // resolve identically, so the word has to name what was actually
-        // observed: a store answered.
-        let paths = Paths::under(Path::new("/nonexistent/keyless-doctor"));
-        let mut load = Config::load(&paths.config);
-        load.config = serde_json::from_str(r#"{"secrets":{"DECOY":{}}}"#).expect("valid");
-        load.loaded = true;
-        let registry = Registry::new(vec![Box::new(Healthy)]);
-        let audit = AuditLog::new(PathBuf::from("/nonexistent/keyless-doctor/audit.jsonl"));
-
-        let mut out: Vec<u8> = Vec::new();
-        doctor(&paths, &load, &registry, &audit, &[], true, &mut out).expect("write");
-        let report = String::from_utf8(out).expect("utf-8");
+        // `ok` was a verdict on the credential; every state word in this report
+        // is a verdict on a MEASUREMENT. An expired token, an account-wide one
+        // and somebody else's all resolve identically, so the word has to name
+        // what was actually observed.
+        let load = loaded(r#"{"secrets":{"DECOY":{}}}"#);
+        let (text, _) = report(&load, Registry::new(vec![Box::new(Healthy)]), true);
         assert!(
-            !report.contains("DECOY ok"),
-            "a lookup was reported as a verdict on the credential: {report}"
+            !text.contains(" ok"),
+            "the report used `ok`, which is the word that was false: {text}"
         );
     }
 
@@ -326,23 +803,15 @@ mod tests {
         // hole is what a hand-written `ls` note drifts into, and a note nothing
         // re-reads is how a token carrying 383 permission groups travelled as
         // `Zone:Read` + `DNS:Edit` through three briefs.
-        let paths = Paths::under(Path::new("/nonexistent/keyless-doctor"));
-        let mut load = Config::load(&paths.config);
-        load.config = serde_json::from_str(r#"{"secrets":{"DECOY":{}}}"#).expect("valid");
-        load.loaded = true;
-        let registry = Registry::new(vec![Box::new(Healthy)]);
-        let audit = AuditLog::new(PathBuf::from("/nonexistent/keyless-doctor/audit.jsonl"));
-
+        let load = loaded(r#"{"secrets":{"DECOY":{}}}"#);
         for probe in [false, true] {
-            let mut out: Vec<u8> = Vec::new();
-            let code =
-                doctor(&paths, &load, &registry, &audit, &[], probe, &mut out).expect("write");
-            let report = String::from_utf8(out).expect("utf-8");
-            assert!(report.contains("scope    not checked"), "{report}");
-            assert!(report.contains("WHOSE it is"), "{report}");
+            let (text, code) = report(&load, Registry::new(vec![Box::new(Healthy)]), probe);
+            assert!(text.contains("SCOPE"), "{text}");
+            assert!(text.contains("not checked, and never will be"), "{text}");
+            assert!(text.contains("WHOSE it is"), "{text}");
             // Never counted as a problem: it is a standing boundary, not a
             // finding, and a health command that always exits 1 gets ignored.
-            assert_eq!(code, 0, "the boundary was counted as a problem: {report}");
+            assert_eq!(code, 0, "the boundary was counted as a problem: {text}");
         }
     }
 
@@ -353,13 +822,8 @@ mod tests {
         // declared no names at all, where there is no scope to be wrong about.
         let paths = Paths::under(Path::new("/nonexistent/keyless-doctor"));
         let load = Config::load(&paths.config);
-        let registry = Registry::new(vec![Box::new(Healthy)]);
-        let audit = AuditLog::new(PathBuf::from("/nonexistent/keyless-doctor/audit.jsonl"));
-
-        let mut out: Vec<u8> = Vec::new();
-        doctor(&paths, &load, &registry, &audit, &[], false, &mut out).expect("write");
-        let report = String::from_utf8(out).expect("utf-8");
-        assert!(!report.contains("scope    not checked"), "{report}");
+        let (text, _) = report(&load, Registry::new(vec![Box::new(Healthy)]), false);
+        assert!(!text.contains("SCOPE"), "{text}");
     }
 
     #[test]
@@ -368,16 +832,8 @@ mod tests {
         // existed and the README has always documented it; nothing in the
         // report a person actually reads ever mentioned it, so it was found
         // only by people who had already gone looking elsewhere.
-        let paths = Paths::under(Path::new("/nonexistent/keyless-doctor"));
-        let mut load = Config::load(&paths.config);
-        load.config = serde_json::from_str(r#"{"secrets":{"DECOY":{}}}"#).expect("valid");
-        load.loaded = true;
-        let registry = Registry::new(vec![Box::new(Healthy)]);
-        let audit = AuditLog::new(PathBuf::from("/nonexistent/keyless-doctor/audit.jsonl"));
-
-        let mut out: Vec<u8> = Vec::new();
-        doctor(&paths, &load, &registry, &audit, &[], false, &mut out).expect("write");
-        let unprobed = String::from_utf8(out).expect("utf-8");
+        let load = loaded(r#"{"secrets":{"DECOY":{}}}"#);
+        let (unprobed, _) = report(&load, Registry::new(vec![Box::new(Healthy)]), false);
         assert!(unprobed.contains("not probed"), "{unprobed}");
         assert!(unprobed.contains("--probe"), "{unprobed}");
         // The cost, so the reader can tell why it is not the default rather than
@@ -385,13 +841,95 @@ mod tests {
         assert!(unprobed.contains("READS each credential"), "{unprobed}");
 
         // And the line is absent when the names WERE probed, so it can never
-        // describe a report that does not match it. Without this the assertions
-        // above pass on an implementation that prints the line unconditionally.
-        let mut out: Vec<u8> = Vec::new();
-        doctor(&paths, &load, &registry, &audit, &[], true, &mut out).expect("write");
-        let probed = String::from_utf8(out).expect("utf-8");
+        // describe a report that does not match it.
+        let (probed, _) = report(&load, Registry::new(vec![Box::new(Healthy)]), true);
         assert!(!probed.contains("not probed"), "{probed}");
-        assert!(probed.contains("name     DECOY resolves"), "{probed}");
+    }
+
+    #[test]
+    fn a_store_that_is_switched_off_gets_a_row_and_is_not_a_problem() {
+        // A config with `"enabled": false` used to produce no line at all, which
+        // reads exactly like a build with no support for that backend. The row
+        // is the whole point of the section: a reader came to see the stores,
+        // including the ones they turned off.
+        let load = loaded(r#"{"stores":{"keychain":{"enabled":false}},"secrets":{}}"#);
+        let (text, code) = report(
+            &load,
+            Registry::new(vec![Box::new(Named("infisical"))]),
+            false,
+        );
+        assert!(text.contains("keychain"), "{text}");
+        assert!(text.contains("off"), "{text}");
+        assert!(text.contains("proton"), "{text}");
+        // A store nobody enabled is not an error, so it must not raise the
+        // exit code.
+        assert_eq!(
+            code, 0,
+            "an unenabled store was counted as a problem: {text}"
+        );
+    }
+
+    #[test]
+    fn a_name_whose_store_is_down_is_marked_blocked_and_never_asked() {
+        // The relationship rule. A store that is down makes every name under it
+        // fail for the same reason; printing that reason once per name buries
+        // the one row that matters. Asking would also spend a doomed vendor call
+        // per name — and against Proton, one permanent off-machine audit entry
+        // per item.
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct Counting(Arc<AtomicUsize>);
+        impl Store for Counting {
+            fn id(&self) -> &str {
+                "proton"
+            }
+            fn resolve(&self, _name: &str) -> Result<Option<Secret>, StoreError> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Ok(None)
+            }
+            fn health(&self) -> Result<(), StoreError> {
+                Err(StoreError::Unavailable {
+                    store: "proton".to_owned(),
+                    detail: "no session".to_owned(),
+                })
+            }
+        }
+
+        let asked = Arc::new(AtomicUsize::new(0));
+        let load = loaded(
+            r#"{"stores":{"keychain":{"enabled":false},"proton":{"enabled":true}},
+                "secrets":{"A":{"store":"proton"},"B":{"store":"proton"}}}"#,
+        );
+        let registry = Registry::new(vec![Box::new(Counting(asked.clone()))]).with_routes(
+            [
+                ("A".to_owned(), "proton".to_owned()),
+                ("B".to_owned(), "proton".to_owned()),
+            ]
+            .into_iter()
+            .collect(),
+        );
+        let (text, code) = report(&load, registry, true);
+
+        assert!(text.contains("blocked"), "{text}");
+        assert_eq!(
+            asked.load(Ordering::SeqCst),
+            0,
+            "a name was asked through a store already known to be down:\n{text}"
+        );
+        // The store row is still the problem, and it is counted once rather
+        // than once per name it took down with it.
+        assert_eq!(code, 1, "{text}");
+        assert!(text.contains("\n1 problem(s)"), "{text}");
+    }
+
+    #[test]
+    fn no_stores_is_reported_as_a_problem() {
+        let paths = Paths::under(Path::new("/nonexistent/keyless-doctor"));
+        let load = Config::load(&paths.config);
+        let (text, code) = report(&load, Registry::new(Vec::new()), false);
+        assert_eq!(code, 1, "{text}");
+        assert!(text.contains("none configured"), "{text}");
     }
 
     #[test]
@@ -436,9 +974,7 @@ mod tests {
         // The control: with the log intact, this exact call is clean. Without
         // it, an assertion below would pass for a `doctor` that reports a
         // problem no matter what it is given.
-        let mut out: Vec<u8> = Vec::new();
-        let code = doctor(&paths, &load, &registry, &audit, &[], false, &mut out).expect("write");
-        let intact = String::from_utf8(out).expect("utf-8");
+        let (intact, code) = render(&paths, &load, &registry, &audit, false);
         assert!(intact.contains("chain intact"), "{intact}");
         assert_eq!(code, 0, "an intact log must not be a problem: {intact}");
 
@@ -446,31 +982,26 @@ mod tests {
         let lines: Vec<&str> = raw.lines().collect();
         std::fs::write(&log_path, format!("{}\n{}\n", lines[0], lines[1])).expect("drop the last");
 
-        let mut out: Vec<u8> = Vec::new();
-        let code = doctor(&paths, &load, &registry, &audit, &[], false, &mut out).expect("write");
-        let report = String::from_utf8(out).expect("utf-8");
+        let (text, code) = render(&paths, &load, &registry, &audit, false);
         assert!(
-            report.contains("PROBLEM") && report.contains("truncated or replaced"),
-            "a log with its last row removed was not reported: {report}"
+            text.contains("truncated or replaced"),
+            "a log with its last row removed was not reported: {text}"
         );
         assert!(
-            !report.contains("chain intact"),
-            "a truncated log must not also be described as intact: {report}"
+            !text.contains("chain intact"),
+            "a truncated log must not also be described as intact: {text}"
         );
-        assert_eq!(code, 1, "{report}");
+        assert_eq!(code, 1, "{text}");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn no_stores_is_reported_as_a_problem() {
-        let paths = Paths::under(Path::new("/nonexistent/keyless-doctor"));
-        let load = Config::load(&paths.config);
-        let registry = Registry::new(Vec::new());
-        let audit = AuditLog::new(PathBuf::from("/nonexistent/keyless-doctor/audit.jsonl"));
-        let mut out: Vec<u8> = Vec::new();
-        let code = doctor(&paths, &load, &registry, &audit, &[], false, &mut out).expect("write");
-        assert_eq!(code, 1);
-        assert!(String::from_utf8_lossy(&out).contains("none configured"));
+    fn a_redirected_report_carries_no_escape_sequence() {
+        // The rule the whole rendering rests on, asserted at the layer that
+        // actually writes to stdout rather than only in the styling module.
+        let load = loaded(r#"{"secrets":{"DECOY":{}}}"#);
+        let (text, _) = report(&load, Registry::new(vec![Box::new(Healthy)]), true);
+        assert!(!text.contains('\x1b'), "a redirected report was coloured");
     }
 }

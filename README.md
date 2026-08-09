@@ -202,17 +202,34 @@ There *is* a way to ask whether a name resolves. It just never answers with a
 value — and it only knows about names you have **declared**, which is what the
 config file is for.
 
-**5. Write the config file. This is the only hand-written step.**
+**5. Write the config file. `init` does the store half for you.**
 
 Everything above worked without one, because an undeclared name is looked up as
 its own account in the default store. What a config buys is that `keyless` now
 knows the name exists — so it can list it, and check it.
 
-`~/.config/keyless/config.json`, in full:
+```console
+$ keyless init
+```
+
+`init` detects which backends are installed, proves the ones it can prove, writes
+`~/.config/keyless/config.json` with the provable one as the default, and says
+what each of the others is waiting for. It never asks for a credential and there
+is no field in what it writes that one would fit in.
+
+It writes **stores**, not **secrets** — deliberately. Which vault, which item,
+which field, which environment are facts about your account, and a setup command
+that guessed one would point a name at the wrong tenant. `items` and `fields`
+discover those without ever reading a value; see [Discovery](#discovery).
+
+Running it twice is safe: an existing config is reported, never replaced, unless
+you pass `--force`.
+
+Add the name by hand, so `~/.config/keyless/config.json` reads:
 
 ```json
 {
-  "stores": { "keychain": { "service": "keyless" } },
+  "stores": { "keychain": { "enabled": true }, "default": "keychain" },
   "secrets": { "FIRST_SECRET": { "note": "throwaway, delete me" } }
 }
 ```
@@ -222,12 +239,41 @@ $ keyless ls
 FIRST_SECRET	*	-	throwaway, delete me
 
 $ keyless doctor --probe
-store    keychain ok
-name     FIRST_SECRET resolves
+keyless 0.1.0   /Users/you/.config/keyless/config.json   1 name(s) declared
+
+STORES
+  ✔ keychain   proven     service "keyless"
+  – infisical  off        "enabled": false under `stores.infisical`
+  – proton     off        "enabled": false under `stores.proton`
+  – daemon     off        not enabled in this config
+
+NAMES
+  ✔ FIRST_SECRET  proven     read back from keychain
+
+AUDIT
+  ~ audit   unproven   /Users/you/.local/state/keyless/audit.jsonl
+      no rows yet, so there is no chain to check
+
+SCOPE
+  ~ scope   unproven   not checked, and never will be
+      a name that resolves proves a store answered. It proves nothing about
+      what the credential may DO or WHOSE it is. An `ls` note claiming a scope
+      is prose; ask the provider to enumerate its own grant, and read that.
+
+0 problem(s). A problem here degrades a run; it never blocks one.
 ```
 
-`resolves`, never the value, and never its length — a length is still
-information about a secret.
+`proven` means a value came back through the whole path. It never means the
+value was shown, and never its length — a length is still information about a
+secret.
+
+**There is exactly one green here and it means one thing.** A `proven` store had
+a read path answer; a `proven` name was actually read back. Everything short of
+that gets its own mark and its own word — `absent` for a step nobody has taken,
+`config` for a coordinate only you can supply, `broken` for a store that was
+reached and said no, `off` for one you switched off, `blocked` for a name whose
+store failed above it. Colour is a third signal on top of the glyph and the word,
+so `NO_COLOR`, a pipe and a monochrome terminal lose nothing.
 
 **6. Read the one failure that does not look like a failure.**
 
@@ -295,21 +341,28 @@ point somewhere other than the default:
 }
 ```
 
-`doctor --probe` asks each declared name whether it **resolves**, printing
-`resolves` or `missing` — never a value, and never a length, because a length is
-still information about a secret. It may trigger a keychain access prompt, which
-a plain `doctor` does not.
+`doctor --probe` asks each declared name whether it resolves, marking it `proven`
+or `absent` — never a value, and never a length, because a length is still
+information about a secret. It READS each credential to do so, which is why it is
+not the default: against Proton that is one vendor call and one permanent
+off-machine audit entry per name. It may also trigger a keychain access prompt,
+which a plain `doctor` does not.
 
-`resolves` is deliberately not `ok`. It is a verdict on the lookup, not on the
-credential: an expired token, an account-wide one and somebody else's all
-resolve identically. Every report therefore carries the boundary, probed or not:
+A plain `doctor` still checks every **store**, and that costs no credential at
+all. A store is `proven` when a read path answered — for the keychain, a search
+that reached the item database; for Infisical, a fetch of a non-credential key;
+for Proton, a vault listing as this session.
+
+`proven` is deliberately not `ok`. It is a verdict on a measurement, not on the
+credential: an expired token, an account-wide one and somebody else's all resolve
+identically. Every report therefore carries the boundary, probed or not:
 
 ```console
-scope    not checked, and never will be
-         a name that resolves proves a store answered. It proves nothing
-         about what the credential may DO or WHOSE it is. An `ls` note
-         claiming a scope is prose; ask the provider to enumerate its own
-         grant, and read that.
+SCOPE
+  ~ scope   unproven   not checked, and never will be
+      a name that resolves proves a store answered. It proves nothing about
+      what the credential may DO or WHOSE it is. An `ls` note claiming a scope
+      is prose; ask the provider to enumerate its own grant, and read that.
 ```
 
 See [Why there is no capability check](#why-there-is-no-capability-check).
