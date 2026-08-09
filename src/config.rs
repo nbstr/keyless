@@ -788,6 +788,6 @@ mod tests {
                 .expect("valid config parses");
         let route = parsed.route("GH");
         assert_eq!(route.account.as_deref(), Some("demo-token"));
-        assert_eq!(route.service.as_deref(), Some("work"));
+        assert_eq!(route.service.as_deref(), Some("demo"));
     }
 }

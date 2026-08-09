@@ -204,9 +204,10 @@ static PROBE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 ///   session — with a **new share id for the same vault**, which is why a
 ///   reference is written against the session that will resolve it and not
 ///   copied from anywhere else.
-/// - A **web-login** session does not. It is gone, and the only way back is
-///   `pass-cli login`. That happened to the default session on the machine this
-///   was written on, and nothing on disk brought it back.
+/// - A **web-login** session does not. It is gone, the only way back is
+///   `pass-cli login`, and nothing on disk restores it. That is not a
+///   hypothetical: stripping the environment of a probe is enough to destroy a
+///   web-login session that took a browser round trip to create.
 ///
 /// The rule that follows is unconditional and applies to any future change
 /// here: **`pass-cli` may rewrite its session store on any invocation, so never

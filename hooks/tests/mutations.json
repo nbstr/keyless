@@ -444,8 +444,22 @@
     "id": "M64-a-ratio-is-not-a-claim",
     "why": "Drops the rule that a ratio written in figures is a census claim on its own. One real site described its mechanism well enough that no provenance word appeared in the sentence at all, and only the ratio rule sees that shape.",
     "file": "tests/test_publication.py",
-    "find": "    for m in _RATIO.finditer(text):\n        if not _is_exempt(m):\n            found.append((m.group(0), \"a ratio in figures\"))",
+    "find": "    for m in _RATIO.finditer(text) if ratios else []:\n        if not _is_exempt(m):\n            found.append((m.group(0), \"a ratio in figures\"))",
     "replace": "    pass"
+  },
+  {
+    "id": "M66-the-ratio-rule-is-forced-on-for-commit-messages",
+    "why": "Ignores the `ratios=False` argument that commit-message scanning passes, so the bare-ratio rule runs over commit bodies as well. That rule is right for hooks/ prose and wrong for a commit body, which naturally reports what a change did to a test suite as a ratio of two product counts: measured over this history it fired five times and every one was a product count. The mutation is caught by the message-exemption control, which is the only assertion that distinguishes a gate people keep from one they delete.",
+    "file": "tests/test_publication.py",
+    "find": "    return claims_in(body.split(\"\\n\\n\"), ratios=False)",
+    "replace": "    return claims_in(body.split(\"\\n\\n\"), ratios=True)"
+  },
+  {
+    "id": "M66b-a-commit-body-is-read-as-one-paragraph",
+    "why": "Joins a whole commit body into one search scope instead of paragraph by paragraph. A number in the subject line then stands within the window of a provenance word four paragraphs below, and the gate reports a claim nobody wrote. This is the same failure `prose_of` documents for source files, and a gate that invents refusals is one that gets removed.",
+    "file": "tests/test_publication.py",
+    "find": "    return claims_in(body.split(\"\\n\\n\"), ratios=False)",
+    "replace": "    return claims_in([body], ratios=False)"
   },
   {
     "id": "M65-a-qualifier-does-not-save-a-corpus",

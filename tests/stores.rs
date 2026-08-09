@@ -1112,7 +1112,7 @@ fn only_the_names_that_were_asked_for_reach_the_child() {
 // ---------------------------------------------------------------------------
 // Property: discovery reports structure, and only structure.
 //
-// Against a stub rather than the live account, so the trash column, the value
+// Against a stub rather than a live account, so the trash column, the value
 // exclusion and the failure paths are all exercised on every run rather than only
 // where somebody has a vault configured. The live suite covers the half a stub
 // cannot: that the shape is the CLI's.
