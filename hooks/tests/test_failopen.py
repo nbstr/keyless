@@ -75,6 +75,29 @@ WRONG_TYPES = [
                        "tool_input": {"command": "ls"}, "cwd": 5}),
     ("content is a list", {"hook_event_name": "PreToolUse", "tool_name": "Write",
                            "tool_input": {"file_path": "/tmp/x", "content": [1, 2]}}),
+    # A bulk edit's text lives in a nested LIST, which is new surface for the
+    # coercion boundary: every one of these reaches a walk that indexes into
+    # structures the sender controls.
+    ("edits is a string", {"hook_event_name": "PreToolUse", "tool_name": "MultiEdit",
+                           "tool_input": {"file_path": "/tmp/x.conf", "edits": "nope"}}),
+    ("edits is a dict", {"hook_event_name": "PreToolUse", "tool_name": "MultiEdit",
+                         "tool_input": {"file_path": "/tmp/x.conf", "edits": {"a": 1}}}),
+    ("an edit entry is a list", {"hook_event_name": "PreToolUse", "tool_name": "MultiEdit",
+                                 "tool_input": {"file_path": "/tmp/x.conf",
+                                                "edits": [["old", "new"]]}}),
+    ("an edit entry is a string", {"hook_event_name": "PreToolUse", "tool_name": "MultiEdit",
+                                   "tool_input": {"file_path": "/tmp/x.conf",
+                                                  "edits": ["just a string"]}}),
+    ("an edit entry is null", {"hook_event_name": "PreToolUse", "tool_name": "MultiEdit",
+                               "tool_input": {"file_path": "/tmp/x.conf",
+                                              "edits": [None, {"new_string": "ok"}]}}),
+    ("new_string is a dict", {"hook_event_name": "PreToolUse", "tool_name": "MultiEdit",
+                              "tool_input": {"file_path": "/tmp/x.conf",
+                                             "edits": [{"new_string": {"a": 1}}]}}),
+    ("edits is deeply nested", {"hook_event_name": "PreToolUse", "tool_name": "MultiEdit",
+                                "tool_input": {"file_path": "/tmp/x.conf",
+                                               "edits": [{"new_string": "x",
+                                                          "old_string": [[[[1]]]]}]}}),
     ("event missing", {"tool_name": "Bash", "tool_input": {"command": "cat .env"}}),
     ("unknown event", {"hook_event_name": "SomethingNew", "tool_name": "Bash",
                        "tool_input": {"command": "cat .env"}}),
@@ -93,6 +116,39 @@ def run():
         v = drive(payload)
         s.check("wrong type exits 0: %s" % label, v.exit_code, 0)
         s.check("wrong type never malformed: %s" % label, v.kind == "malformed", False)
+
+    # ── exit 0 is NOT evidence that nothing broke ───────────────────────────
+    #
+    # The engine isolates each check: a handler that raises is recorded and the
+    # others still run, so the process exits 0 and prints nothing — exactly what
+    # a correctly silent verdict looks like. Every case above would therefore
+    # stay green against a check that crashed on every single one of them.
+    #
+    # The decision log is the only surface that tells the two apart. It carries a
+    # row per verdict, and `error` is one of them.
+    import json as _json
+    import tempfile as _tempfile
+    state = _tempfile.mkdtemp(prefix="keyless-failopen-errors-")
+    for _label, payload in WRONG_TYPES:
+        drive(payload, state=state)
+    for _label, raw in HOSTILE_RAW:
+        drive(None, raw_stdin=raw, state=state)
+    rows = []
+    log = os.path.join(state, "hook-decisions.jsonl")
+    if os.path.exists(log):
+        with open(log) as fh:
+            for line in fh:
+                try:
+                    rows.append(_json.loads(line))
+                except ValueError:
+                    pass
+    s.check("no check CRASHED on a hostile payload",
+            sorted(set(r.get("check", "?") for r in rows
+                       if r.get("verdict") == "error")), [])
+    # ...and the reader is not looking at an empty file, which would satisfy the
+    # assertion above whatever happened. At least one of those payloads is a real
+    # verdict, so the log must have rows in it.
+    s.check("the decision log was actually written and read", bool(rows), True)
 
     # A wrongly-typed field must not DISABLE a guard whose own field is fine.
     # Without coercion, `cwd` as an int reaches os.path.isabs(), the check

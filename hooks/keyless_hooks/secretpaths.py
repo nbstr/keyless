@@ -13,7 +13,7 @@ import os
 import re
 from fnmatch import fnmatch
 
-__all__ = ["is_protected", "names_in", "expansions", "resolve"]
+__all__ = ["is_protected", "is_allowed", "names_in", "expansions", "resolve"]
 
 # A key in an env / ini / JSON / YAML file. Bounded at 64 characters and anchored
 # whole: the bound is what stops a base64 line ending in `=` from being read as a
@@ -207,6 +207,24 @@ def _matches(path, pattern):
     return fnmatch(os.path.basename(path), pattern)
 
 
+def is_allowed(candidate, cwd, cfg, expand_globs=True):
+    """The `allowed` pattern that exempts this candidate, or None.
+
+    Public because two checks need the SAME answer for different reasons. A read
+    of `.env.example` is not a credential read, and a credential-shaped literal
+    written into one is an example rather than a leak — one list, one meaning:
+    *this path is not treated as holding a real secret*. Deriving a second list
+    for the second question would let the two drift, and the message both checks
+    print names this one.
+    """
+    forms = expansions(candidate, cwd, expand_globs)
+    for form in forms:
+        for allowed in cfg.allowed:
+            if _matches(form, allowed):
+                return allowed
+    return None
+
+
 def is_protected(candidate, cwd, cfg, expand_globs=True):
     """The pattern that protects this candidate, or None.
 
@@ -217,10 +235,8 @@ def is_protected(candidate, cwd, cfg, expand_globs=True):
     forms = expansions(candidate, cwd, expand_globs)
     if not forms:
         return None
-    for form in forms:
-        for allowed in cfg.allowed:
-            if _matches(form, allowed):
-                return None
+    if is_allowed(candidate, cwd, cfg, expand_globs) is not None:
+        return None
     for form in forms:
         for pattern in cfg.protected:
             if _matches(form, pattern):

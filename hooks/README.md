@@ -21,7 +21,7 @@ backup: ~/.claude/settings.json.keyless-backup-20260806T212412
 
 ## What it does
 
-Seven checks, one process per event. Each names the working alternative in the
+Eight checks, one process per event. Each names the working alternative in the
 same breath as the refusal, so the agent's next action is the right one rather
 than a retry or a question.
 
@@ -32,19 +32,74 @@ than a retry or a question.
 | `KL-ENV` | an environment dump — `env`, `printenv`, `set`, `export -p`, and the whole-environment object reaching a printer or serialiser inside an interpreter | **rewrite** when bare, **deny** when it captures |
 | `KL-ENVVAR` | a credential-named variable being echoed | **warn** |
 | `KL-ASSIGN` | a credential literal typed into a shell assignment — `export X=…`, `X=… cmd` | **deny** |
-| `KL-WRITE` | a credential literal in a `Write` or `Edit` | **rewrite** |
+| `KL-HEREDOC` | a credential literal written into a file through a here-document — `cat > f <<EOF` | **deny**, **warn** when no file is named |
+| `KL-WRITE` | a credential literal in a `Write`, `Edit`, `MultiEdit` or `NotebookEdit` | **rewrite**, **deny** or **warn** — see below |
 | `KL-SEEN` | a credential shape in tool output | **warn** |
 
-### It prefers rewriting to refusing
+### It prefers rewriting to refusing — where the rewrite is a repair
 
 A block costs a turn and teaches nothing; the second attempt writes the same
-literal into a different file. Three of the seven checks substitute instead.
+literal into a different file. So the pack substitutes wherever substituting
+actually helps.
 
-`KL-ASSIGN` is the deliberate exception, and the reason is worth stating: the
-substitution that is right for a file is dangerous for a command. Rewriting
+**What makes `${NAME}` a repair is that the file's own reader resolves it.** A
+`.env`, a shell script, a compose file, a CI job: each expands the reference, so
+the corrected file is one `keyless run` away from working. A `.ts` file expands
+nothing. `const key = ${STRIPE_KEY}` is a syntax error, and the author is handed
+a broken file and told it was repaired — including inside a test fixture, where
+a decoy silently turned into `${NAME}` is a control that no longer controls
+anything and still looks like one.
+
+Source files are the large majority of what a write check sees, so `KL-WRITE`
+reads the destination and picks its instrument:
+
+| the destination | the finding | what happens |
+|---|---|---|
+| its reader expands `${NAME}` — `.env`, `.sh`, `.yml`, `.conf`, `.toml`, a `Dockerfile` | any | **rewrite** — the write proceeds without the secret |
+| prose or plain data — `.md`, `.txt`, `.csv` | any | **rewrite** — there is no grammar to break |
+| anything else — a program, a manifest, a data document, an unknown type | a **vendor** shape (`AKIA…`, `ghp_…`, a private-key header) | **deny** — the shape is proof on its own |
+| anything else | only a **name-keyed** match (`password: <opaque>`) | **warn**, and the write goes through UNTOUCHED |
+
+The last row is the one worth defending. That rule cannot separate a literal from
+an identifier that merely looks opaque — `password`: `E2E_LOGIN_PASSWORD` — so
+refusing would refuse ordinary source edits and substituting would corrupt them.
+Reporting it is the only act that is right whichever of the two it was.
+
+An unknown extension is treated as *not* expanding. That is the direction that
+fails safe: the worst outcome of guessing wrong is a message instead of a
+substitution.
+
+**The refusal's escape hatch is real.** A path on the `allowed` list — where
+examples live — downgrades a deny to a note rather than silencing it. The message
+has always named `allowed`; until now it named a remedy that did nothing.
+
+`KL-ASSIGN` and `KL-HEREDOC` never substitute, and the reason is worth stating:
+the substitution that is right for a file is dangerous for a command. Rewriting
 `STRIPE_SECRET_KEY=<literal> ./deploy.sh` into `${STRIPE_SECRET_KEY}` runs the
 deploy against production with an EMPTY credential, immediately, with nobody
-looking. A file is read before it is used; a command is not.
+looking. A file is read before it is used; a command is not — and inside an
+unquoted here-document the shell expands `${NAME}` *before* it reaches the file,
+so the same rewrite writes a reference in one spelling and an empty value in the
+other.
+
+### The bulk-edit tool keeps its text in a list
+
+`MultiEdit` was named in the write check's tool set while every field the check
+read sat at the top level, so a bulk edit was scanned for nothing at all —
+coverage that looks exactly like coverage and is not. The walk reaches
+`edits[].new_string` now, and the rewrite returns the **same list**: same length,
+same order, every other key of every entry carried over, entries that are not
+mappings passed through untouched, and `old_string` never rewritten (it has to
+keep matching what is on disk). Those are assertions in the contract suite, not
+claims here.
+
+**The Claude Code build this was measured against does not offer that tool at
+all** — replayed over every tool call in the transcript tree, `MultiEdit` was
+named in settings and in prose and never once invoked. So this closes no leak
+that has happened here; it makes a coverage claim TRUE that was false, on a tool
+name the pack advertises, that other harnesses do offer and that this one has
+shipped before. An unexercised name in a tool set is the same shape as an
+untested control: it looks like cover and answers nothing.
 
 **A `Read` of a protected file is redirected to a names-only view.** The agent
 gets what it was actually after:
@@ -92,7 +147,9 @@ is the two-statement spelling, caught by one hop of dataflow within the single
 command string; two hops is out of reach and stays out of reach, because a hook
 holds no model of interpreter state.
 
-**A credential literal being written becomes a reference.**
+**A credential literal being written into a file whose reader expands a
+reference becomes one.** Where the reader does not, the tier table above applies
+instead and nothing is substituted.
 
 ```
 GITHUB_TOKEN=ghp_DECOYNOTAREALTOKENDECOYNOTAREALTOKEN
@@ -360,7 +417,13 @@ Five kinds of proof, because a green contract suite is a hypothesis:
 
 - **contract** — every gate × {fires, silent, look-alike}, plus every vendor
   pattern asserted by *kind* against a decoy of the real length.
-- **fail-open** — every malformed, hostile and broken input allows.
+- **fail-open** — every malformed, hostile and broken input allows, *and no check
+  crashed while allowing it*. The second half is not decoration: the engine
+  isolates a handler that raises, so the process exits 0 and prints nothing —
+  byte-for-byte what a correctly silent verdict looks like. A whole check could
+  have been dead on every hostile payload in this layer and the layer would have
+  stayed green. The decision log carries an `error` verdict, and that is what is
+  asserted.
 - **adversarial** — the attack corpus driven against the block list, printed as a
   table with an honest survivor row.
 - **publication** — no comment or docstring in `hooks/` carries a measurement of
@@ -387,10 +450,19 @@ other direction.
 | `cat $ENVFILE`, where the variable was set by an **earlier** call | the hook sees one command at a time and holds no model of shell state, so that name cannot be resolved to a path |
 | `printf 'cat .env' > s.sh; bash s.sh` | writing a script is not reading a file, and running it names no protected path. The read happens inside a process no hook is shown |
 | a value the agent already holds in context | nothing here can un-see something. `KL-SEEN` reports it and cannot redact it — `PostToolUse` has no redaction channel |
+| `cat <<'EOF' \| tee f` | the body reaches a file, but the file is named as an ARGUMENT to another program rather than as a redirect operand. Resolving it means modelling what every filter in a pipeline does with its arguments — `tee`, `sponge`, `dd of=`, a script of your own |
+| `node <<'EOF'` carrying a literal | the body is a program, a query or a manifest on standard input, and no file is named at all. Reported rather than refused: refusing a body fed to an interpreter would refuse ordinary work, and there is no file to remove the value from |
+| a name-keyed match written into source | reported rather than refused or rewritten, for the reason in the tier table above — neither act is right when the rule cannot say which of the two it is looking at |
 
-The first three are rows in the attack corpus, not prose: the suite drives them
-on every run and fails if one becomes blocked, so the list cannot quietly go
-stale in either direction.
+Those are rows in the attack corpus, not prose: the suite drives them on every
+run and fails if one becomes blocked, so the list cannot quietly go stale in
+either direction.
+
+`cat > .env <<EOF` used to be on this list. It is not any more — `KL-HEREDOC`
+reads the body through the same walk that blanks it for every other check, and
+the blanking is untouched. Reading a body for CONTENT is not act detection: a
+body redirected into a file is not text about a command, it is the bytes of the
+file being written.
 
 The attacks that are blocked include `sh -c`, `bash -c`, `eval`,
 `$(echo cat) .env`, `cat $(echo .env)`, `echo "$(cat .env)"`, backticks,
@@ -435,16 +507,17 @@ Measured on Claude Code 2.1.223, not inferred:
   reach it — an entropy floor, a `:` versus `=` separator, "the same word
   appears elsewhere in this file" — were each measured dropping a real
   credential.
-- **`${NAME}` is only a resolvable reference in a file whose reader resolves
-  it.** Replayed over real `Write` and `Edit` payloads, the files this check acts
-  on are overwhelmingly SOURCE — `.ts` outnumbers `.env` by a wide margin — and
-  across every extension whose reader does expand `${NAME}` (`.env`,
-  `.env.example`, `.yml`, `.sh`, `.conf`, `.zshrc`) the total is a small minority
-  of what the check rewrites. In the rest the substitution is not a reference
-  anything resolves, and the remediation the message prints does not apply. The
-  rewrite is right about the secret and wrong about the repair. Re-run the replay
-  over your own payloads; the ratio is a property of what you write, not of this
-  pack.
+- **The file-type table is a table, and a table is never complete.** `targets.py`
+  enumerates the readers that expand `${NAME}` and the file types that have no
+  grammar to break; everything else is treated as a program. A type missing from
+  the first list gets a message where a substitution would have worked, which is
+  the cheap direction — but a type wrongly IN it gets a substitution into
+  something that had to parse. Read that file before adding a row.
+- **A rewrite in a file whose reader expands is still only a repair if the value
+  is a secret.** A decoy or a public identifier in a `.env` is substituted away
+  exactly like a live key, and the write proceeds, so nothing announces the loss
+  beyond the message. Spell such a value so it is not credential-shaped, or put
+  its file on the `allowed` list.
 - **`settings.json` is writable by a session**, so a gate configured there sits
   inside its own blast radius. Closing that needs a privilege boundary the
   harness does not currently expose. Managed policy settings are the nearest
@@ -486,8 +559,9 @@ hooks/
 │   ├── registry.py            every check, its event, its tier
 │   ├── payload.py             the coercion boundary
 │   ├── config.py              every list the pack blocks on
-│   ├── shellview.py           three views of a command; statements and heads
+│   ├── shellview.py           three views of a command; statements, heads, here-docs
 │   ├── secretpaths.py         is this a secret file, and what names does it declare
+│   ├── targets.py             what a file's own reader does with ${NAME}
 │   ├── fingerprint.py         credential shapes, and the rewrite
 │   ├── decisions.py           the log, which never holds a value
 │   └── checks/

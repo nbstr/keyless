@@ -495,5 +495,82 @@
     "file": "keyless_hooks/checks/env_dump.py",
     "find": "    r\"|\\$_ENV\\b\"\n    r\"|\\bgetenv\\(\\s*\\)\"",
     "replace": ""
+  },
+  {
+    "id": "M73-every-reader-expands",
+    "why": "The whole tier table rests on what the destination's reader does with a reference. Declaring every file rewritable restores the behaviour this change removed: a substitution into source, which is a syntax error presented as a repair.",
+    "file": "keyless_hooks/targets.py",
+    "find": "    return reader_class(path) in (EXPANDS, INERT)",
+    "replace": "    return True"
+  },
+  {
+    "id": "M74-no-shape-is-self-evident",
+    "why": "The refusal fires only on a VENDOR shape, which is the one class that proves itself. Emptying the set collapses every deny into a warn and lets a live vendor credential reach disk.",
+    "file": "keyless_hooks/fingerprint.py",
+    "find": "VENDOR_KINDS = frozenset(_VENDOR.groupindex)",
+    "replace": "VENDOR_KINDS = frozenset()"
+  },
+  {
+    "id": "M75-a-bulk-edit-carries-no-text",
+    "why": "MultiEdit keeps its text in a LIST. Stopping the walk at the top level restores the original defect exactly: a tool named in the check's tool set, scanning nothing, indistinguishable from cover.",
+    "file": "keyless_hooks/payload.py",
+    "find": "        edits = self.tool_input.get(\"edits\")\n        if not isinstance(edits, list):\n            return out",
+    "replace": "        edits = None\n        if not isinstance(edits, list):\n            return out"
+  },
+  {
+    "id": "M76-a-rewrite-drops-untouched-entries",
+    "why": "The rewrite must return the SAME list. Dropping the entries it did not change is the corruption a rewrite into a nested structure is feared for — the edit list still parses, and half the edits are gone.",
+    "file": "keyless_hooks/payload.py",
+    "find": "                    else:\n                        rebuilt.append(entry)",
+    "replace": "                    else:\n                        continue"
+  },
+  {
+    "id": "M77-a-heredoc-never-names-a-file",
+    "why": "The destination test is what separates a file write from a body fed to an interpreter. Blinding it turns every refusal into an advisory and lets `cat > .env <<EOF` through.",
+    "file": "keyless_hooks/checks/heredoc_write.py",
+    "find": "        match = _REDIRECT_TOKEN.match(token)",
+    "replace": "        match = None"
+  },
+  {
+    "id": "M78-a-heredoc-body-is-empty",
+    "why": "The body is the file's content. Accumulating none leaves the blanking intact — so every other check still passes — while this one silently judges an empty string.",
+    "file": "keyless_hooks/shellview.py",
+    "find": "                current.body.append(line)",
+    "replace": "                pass"
+  },
+  {
+    "id": "M79-the-allow-list-is-decorative",
+    "why": "The refusal names `allowed` as its escape hatch. This restores the state the message was already in before this change: a remedy printed, and a remedy that does nothing.",
+    "file": "keyless_hooks/checks/literal_write.py",
+    "find": "        allowed = secretpaths.is_allowed(target, payload.cwd, cfg)",
+    "replace": "        allowed = None"
+  },
+  {
+    "id": "M80-a-refusal-degraded-to-advice",
+    "why": "The tier IS the decision. A REWRITE-tier check returning `deny` is downgraded to an advisory by the engine, which is correct treatment of a registry error and silent loss of the gate.",
+    "file": "keyless_hooks/registry.py",
+    "find": "        (\"KL-WRITE\",  \"PreToolUse\", BLOCK,   literal_write.run),",
+    "replace": "        (\"KL-WRITE\",  \"PreToolUse\", REWRITE, literal_write.run),"
+  },
+  {
+    "id": "M81-old-string-is-rewritten-too",
+    "why": "`old_string` must keep matching what is on disk. Rewriting it makes every edit that touches a credential fail to apply — a refusal wearing the face of a repair.",
+    "file": "keyless_hooks/checks/literal_write.py",
+    "find": "        if _slot_key(addr) == \"old_string\":",
+    "replace": "        if False:"
+  },
+  {
+    "id": "M82-a-heredoc-gate-that-never-runs",
+    "why": "The whole check, unregistered. A table with no discovery means a row removed is a gate removed, and nothing else reports it.",
+    "file": "keyless_hooks/registry.py",
+    "find": "        (\"KL-HEREDOC\", \"PreToolUse\", BLOCK,  heredoc_write.run),",
+    "replace": ""
+  },
+  {
+    "id": "M83-a-nested-entry-is-assumed-to-be-a-mapping",
+    "why": "The bulk-edit walk indexes into structures the SENDER controls. Dropping the entry-type guard makes it raise on a hostile list — and a check that raises is isolated by the engine, so the process still exits 0 and prints nothing. Only the decision log tells that apart from a correct silence.",
+    "file": "keyless_hooks/payload.py",
+    "find": "            if not isinstance(entry, dict):\n                continue",
+    "replace": "            if False:\n                continue"
   }
 ]

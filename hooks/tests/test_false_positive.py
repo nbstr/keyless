@@ -573,14 +573,84 @@ ASSIGN_NAME_COLLAPSE = [
 ]
 
 # The residual class, asserted so it cannot drift silently in either direction.
-# A bare identifier that ends on whitespace is STILL rewritten, because nothing
-# but the value's own randomness separates a constant's name from a credential,
-# and every discriminator that reaches this shape was measured dropping a real
-# one. This row is a LIMIT, not a target: it says what the check does today, so
-# a later change to it is a decision somebody makes rather than a side effect.
+# A bare identifier that ends on whitespace still MATCHES: nothing but the
+# value's own randomness separates a constant's name from a credential, and
+# every discriminator that reaches this shape was measured dropping a real one.
+#
+# What changed is what the check DOES about it in a source file. It used to
+# substitute `${PASSWORD}`, which removed a secret that was not there and left a
+# syntax error where working code had been. In a file whose reader expands
+# nothing, a match this rule cannot stand behind is now reported and the write
+# goes through UNTOUCHED. This row is a LIMIT, not a target: it says what the
+# check does today, so a later change to it is a decision somebody makes rather
+# than a side effect.
 WRITE_REFERENCE_RESIDUAL = (
     "unqualified identifier at end of line",
     "await login({\n  password" + _REF_CO + "E2E_LOGIN_PASSWORD\n});\n")
+
+# ── source files that must not be REFUSED ───────────────────────────────────
+#
+# The refusal fires on a VENDOR shape in a file whose reader expands nothing, and
+# a refusal costs a turn. Every row below is a near-miss aimed at that rule: text
+# a program legitimately contains that a looser vendor pattern would read as a
+# credential. Each is asserted silent, and the pair below it asserts the rule is
+# reachable at all — a near-miss list proves nothing without something that hits.
+WRITE_SOURCE_NEAR_MISSES = [
+    ("a git sha", "const rev = \"7b0e85d1f4a2c9e8b3d6f0a1c2e5b8d4f7a0c3e6\";\n"),
+    ("a uuid", "const id = \"550e8400-e29b-41d4-a716-446655440000\";\n"),
+    ("a base64 blob", "const b = \"aGVsbG8gd29ybGQgdGhpcyBpcyBub3QgYSBzZWNyZXQ=\";\n"),
+    ("a public key file name", "const p = \"~/.ssh/id_ed25519.pub\";\n"),
+    ("an import path", "import { sign } from \"@scope/private-key-utils\";\n"),
+    ("a registry url", "const r = \"https://registry.npmjs.org/x/-/x-1.0.0.tgz\";\n"),
+    ("a docstring about keys", "# Set STRIPE_KEY in the environment before running\n"),
+]
+
+# ── here-documents that must stay silent ────────────────────────────────────
+#
+# KL-HEREDOC reads a body that every other check blanks, so its false-positive
+# surface is the one the blanking exists to protect: prose, runbooks, generated
+# scripts, and programs that REFERENCE a credential rather than holding one. A
+# gate that refuses a runbook is a gate that gets uninstalled.
+HEREDOC_FALSE_POSITIVES = [
+    ("a runbook mentioning a command",
+     "cat > runbook.md <<'EOF'\nRun the deploy script on the box.\nEOF"),
+    ("a generated script that reads the environment",
+     "cat > run.sh <<'EOF'\nexport TOKEN=\"$TOKEN\"\nexec ./serve\nEOF"),
+    ("a reference written into a config",
+     "cat > app.conf <<'EOF'\napi_key = ${API_KEY}\nEOF"),
+    ("a placeholder in an example",
+     "cat > sample.conf <<'EOF'\npassword = changeme\nEOF"),
+    ("a program that reads a secret at run time",
+     "cat > app.py <<'EOF'\ntoken = os.environ['GITHUB_TOKEN']\nEOF"),
+    ("a version string",
+     "cat > app.conf <<'EOF'\nversion = 3.11.4\nEOF"),
+    ("a here-STRING, which carries no body",
+     "grep token <<< \"$LINE\""),
+    ("a command with no here-document at all", "echo shift left"),
+]
+
+# The reachability control for the list above: the SAME command shape, with a
+# value that really is credential-shaped, must be refused. Without this every
+# row above would stay green if the check stopped running entirely.
+HEREDOC_TRUE_POSITIVES = [
+    ("a vendor literal into a config",
+     "cat > app.conf <<'EOF'\nSTRIPE_KEY=%s\nEOF" % DECOY["stripe"]),
+    ("a vendor literal into a script",
+     "cat > run.sh <<'EOF'\nexport NPM_TOKEN=%s\nEOF" % DECOY["npm"]),
+]
+
+# ── a bulk edit that touches nothing credential-shaped ──────────────────────
+#
+# The list walk is new, and a walk that is too eager is a rewrite reaching into a
+# structure it does not own. Each row is asserted silent AND byte-identical.
+MULTIEDIT_FALSE_POSITIVES = [
+    ("references only",
+     [{"old_string": "a", "new_string": "const t" + _REF_SP + "process.env.TOKEN\n"},
+      {"old_string": "b", "new_string": "this.secret" + _REF_SP + "config.secret;\n"}]),
+    ("an empty edit list", []),
+    ("ordinary code",
+     [{"old_string": "x", "new_string": "return items.map(toRow);\n"}]),
+]
 
 
 # ── the two controls, and they prove OPPOSITE things ────────────────────────
@@ -622,8 +692,14 @@ EXPECTED_CHECKS = (len(SAFE) + len(PREFIX_REFUSES) + 1 + 3 * len(HELP_CONTROL)
                    + len(ASSIGN_FALSE_POSITIVES) + len(ASSIGN_FALSE_POSITIVES_ARGV)
                    + len(ASSIGN_TRUE_POSITIVES)
                    + 2 * len(ASSIGN_VALUE_CONTROL) + 2 * len(ASSIGN_POSITION_CONTROL)
-                   + 2 * len(WRITE_REFERENCE_FALSE_POSITIVES) + 2
+                   + 2 * len(WRITE_REFERENCE_FALSE_POSITIVES) + 3
                    + 2 * len(ASSIGN_NAME_COLLAPSE)
+                   # source near-misses: silent, plus one reachability control
+                   + len(WRITE_SOURCE_NEAR_MISSES) + 2
+                   # here-documents: silent rows, then the reachability controls
+                   + len(HEREDOC_FALSE_POSITIVES) + 2 * len(HEREDOC_TRUE_POSITIVES)
+                   # bulk edits: silent AND unchanged, per row
+                   + 2 * len(MULTIEDIT_FALSE_POSITIVES)
                    + 1)
 
 
@@ -758,12 +834,53 @@ def run():
         s.check("KL-WRITE changed nothing: %s" % label,
                 (v.updated or {}).get("content", content), content)
 
-    # And the limit, stated as an assertion rather than as a comment.
+    # And the limit, stated as an assertion rather than as a comment. The shape
+    # still MATCHES — that is the limit — and in a source file the check now
+    # reports it instead of substituting into code that has to parse. Both halves
+    # are asserted: a check that had simply stopped matching would satisfy the
+    # "unchanged" assertion and fail the "warn" one.
     label, content = WRITE_REFERENCE_RESIDUAL
     v = drive(write(os.path.join(root, "src.ts"), content))
-    s.check("KL-WRITE still rewrites the residual shape: %s" % label, v.kind, "rewrite")
-    s.check("KL-WRITE residual substitutes the field name",
+    s.check("KL-WRITE reports the residual shape in source: %s" % label,
+            v.kind, "warn")
+    s.check("KL-WRITE leaves the source file untouched", v.updated, None)
+    # ...and the same text where a reference DOES resolve is still substituted,
+    # so the row above is about the destination and not about the pattern.
+    v = drive(write(os.path.join(root, "residual.env"), content))
+    s.check("KL-WRITE control: the residual shape still rewrites where it resolves",
             "${" + "PASSWORD}" in (v.updated or {}).get("content", ""), True)
+
+    # ── the refusal must not reach ordinary source ──────────────────────────
+    for label, content in WRITE_SOURCE_NEAR_MISSES:
+        s.check("KL-WRITE does not refuse source: %s" % label,
+                drive(write(os.path.join(root, "near.ts"), content)).kind, "silent")
+    # The control the list above cannot supply: the rule is reachable, and it is
+    # reachable in THIS file, so the silence is the content's doing.
+    v = drive(write(os.path.join(root, "near.ts"),
+                    "const k = \"%s\";\n" % DECOY["aws_key"]))
+    s.check("KL-WRITE control: a vendor literal in that same file IS refused",
+            v.kind, "deny")
+    s.check_in("KL-WRITE control: and the refusal is this check's",
+               "[KL-WRITE]", v.message)
+
+    # ── here-documents: prose, scripts and references stay silent ───────────
+    for label, cmd in HEREDOC_FALSE_POSITIVES:
+        s.check("KL-HEREDOC allows: %s" % label,
+                drive(bash(cmd, cwd=root)).kind, "silent")
+    for label, cmd in HEREDOC_TRUE_POSITIVES:
+        v = drive(bash(cmd, cwd=root))
+        s.check("KL-HEREDOC still refuses: %s" % label, v.kind, "deny")
+        s.check_in("KL-HEREDOC owns that refusal: %s" % label,
+                   "[KL-HEREDOC]", v.message)
+
+    # ── a bulk edit that touches nothing must come back untouched ───────────
+    for label, edits in MULTIEDIT_FALSE_POSITIVES:
+        v = drive({"hook_event_name": "PreToolUse", "tool_name": "MultiEdit",
+                   "tool_input": {"file_path": os.path.join(root, "bulk.ts"),
+                                  "edits": edits},
+                   "cwd": root, "session_id": "test-session"})
+        s.check("KL-WRITE leaves a bulk edit alone: %s" % label, v.kind, "silent")
+        s.check("KL-WRITE changed no edit entry: %s" % label, v.updated, None)
 
     # ── the name collapse is positional, and both halves are load-bearing ────
     from keyless_hooks.shellview import assignment_split

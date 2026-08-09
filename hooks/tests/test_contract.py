@@ -381,6 +381,233 @@ def run():
     s.check("KL-WRITE edit leaves old_string alone",
             (v.updated or {}).get("old_string"), "TOKEN=%s" % DECOY["github_pat"])
 
+    # ── the instrument follows the FILE, not the finding ────────────────────
+    #
+    # `${NAME}` is a repair only where the file's own reader resolves it. Each
+    # row below is the SAME literal in a different destination, so the verdict
+    # cannot be coming from the value.
+    for path, kind, why in (
+            ("out.env", "rewrite", "dotenv expands it"),
+            ("deploy.sh", "rewrite", "a shell expands it"),
+            ("compose.yml", "rewrite", "compose expands it"),
+            ("app.conf", "rewrite", "an ini reader expands it"),
+            ("Dockerfile", "rewrite", "a build arg expands it"),
+            ("NOTES.md", "rewrite", "prose has no grammar to break"),
+            ("notes.txt", "rewrite", "plain text has none either"),
+            ("src.ts", "deny", "a program does not expand it"),
+            ("main.py", "deny", "nor does this one"),
+            ("data.json", "deny", "a data document carries it verbatim"),
+            ("cert.pem", "deny", "an unknown reader is assumed not to expand"),
+            ("noextension", "deny", "and so is a file with no extension")):
+        v = drive(write(os.path.join(root, path), "AWS_KEY=%s\n" % DECOY["aws_key"]))
+        s.check("KL-WRITE %s -> %s (%s)" % (path, kind, why), v.kind, kind)
+
+    # A DENY leaves the payload alone. The point of refusing rather than
+    # substituting is that nobody is handed a broken file, so a deny that also
+    # carried an `updatedInput` would defeat its own reason for existing.
+    v = drive(write(os.path.join(root, "src.ts"), "AWS_KEY=%s\n" % DECOY["aws_key"]))
+    s.check("KL-WRITE deny carries no rewrite", v.updated, None)
+    # `keyless run` appears in the REWRITE message too, so asserting it here is
+    # green whether or not the refusal exists. Assert a word only the refusal
+    # says.
+    s.check_in("KL-WRITE deny says it refused", "Refused.", v.message)
+    s.check_in("KL-WRITE deny still names the working alternative",
+               "keyless run", v.message)
+
+    # The third rung. A NAME-keyed match in a file that expands nothing is the
+    # class `fingerprint` documents as inseparable from a reference, so it is
+    # neither refused nor substituted — and the content must come through
+    # BYTE-IDENTICAL, which is the whole difference from what this check used to
+    # do to a source file.
+    warned = "const password = \"%s\";\n" % DECOY["generic"]
+    v = drive(write(os.path.join(root, "src.ts"), warned))
+    s.check("KL-WRITE warns on a name-keyed match in source", v.kind, "warn")
+    s.check("KL-WRITE warn substitutes nothing", v.updated, None)
+
+    # ...and the same literal in a file that DOES expand is still rewritten, so
+    # the row above is the destination's doing and not the value's.
+    v = drive(write(os.path.join(root, "w.env"), warned))
+    s.check("KL-WRITE control: the same value rewrites in a .env", v.kind, "rewrite")
+
+    # ── the allow list is real, and it downgrades rather than silences ───────
+    #
+    # The refusal has always named `allowed`; until this was wired it named a
+    # remedy that changed nothing. `*.lock` is on the default allow list and is
+    # not a file type whose reader expands, so it reaches the deny branch and is
+    # let through it.
+    v = drive(write(os.path.join(root, "deps.lock"), "AWS_KEY=%s\n" % DECOY["aws_key"]))
+    s.check("KL-WRITE allowed path is not refused", v.kind, "warn")
+    s.check_in("KL-WRITE allowed path says which pattern spared it", "*.lock", v.message)
+    v = drive(write(os.path.join(root, "deps.locked"), "AWS_KEY=%s\n" % DECOY["aws_key"]))
+    s.check("KL-WRITE control: a near-miss name is still refused", v.kind, "deny")
+
+    # ── MultiEdit: the text lives in a LIST, and it must be reached ──────────
+    #
+    # The tool was named in this check's tool set while every field it reads sat
+    # at the top level, so a bulk edit was scanned for nothing at all — coverage
+    # that looks exactly like coverage and is not. These rows assert the walk
+    # reaches the list AND that what comes back is the same list.
+    def multiedit(path, edits):
+        return {"hook_event_name": "PreToolUse", "tool_name": "MultiEdit",
+                "tool_input": {"file_path": os.path.join(root, path), "edits": edits},
+                "cwd": root, "session_id": "test-session"}
+
+    edits = [
+        {"old_string": "A=1", "new_string": "A=2", "replace_all": False},
+        {"old_string": "TOKEN=old", "new_string": "TOKEN=%s" % DECOY["github_pat"]},
+        {"old_string": "B=1", "new_string": "B=2"},
+    ]
+    v = drive(multiedit("bulk.env", edits))
+    s.check("KL-WRITE reaches a MultiEdit edit list", v.kind, "rewrite")
+    got = (v.updated or {}).get("edits")
+    s.check("MultiEdit rewrite returns a list", isinstance(got, list), True)
+    s.check("MultiEdit rewrite preserves the list LENGTH", len(got or []), len(edits))
+    s.check("MultiEdit rewrite preserves entry ORDER and untouched entries",
+            [got[0], got[2]] if isinstance(got, list) and len(got) == 3 else None,
+            [edits[0], edits[2]])
+    s.check("MultiEdit rewrite preserves every OTHER key of the touched entry",
+            sorted((got[1] if isinstance(got, list) and len(got) > 1 else {}).keys()),
+            sorted(edits[1].keys()))
+    s.check("MultiEdit rewrite leaves the touched entry's old_string alone",
+            (got[1] if isinstance(got, list) and len(got) > 1 else {}).get("old_string"),
+            "TOKEN=old")
+    # Asserted as the EXACT replacement, not as "the literal is absent". The
+    # absence form is satisfied by a rewrite that never happened — `got` is None,
+    # the lookup yields "", and the literal is not in "" — which is the vacuous
+    # shape this suite exists to refuse. This form can only pass if the walk
+    # reached the list AND substituted the file's own key.
+    s.check("MultiEdit rewrite substitutes the file's key into new_string",
+            (got[1] if isinstance(got, list) and len(got) > 1 else {}).get("new_string"),
+            "TOKEN=${" + "TOKEN}")
+
+    # An entry that is not a mapping is not addressable. It must survive whole
+    # rather than being coerced into one — a rewrite that reshapes a structure it
+    # does not understand is worse than one that never ran.
+    odd = ["not-a-mapping", {"old_string": "x", "new_string": "K=%s" % DECOY["aws_key"]}]
+    v = drive(multiedit("odd.env", odd))
+    got = (v.updated or {}).get("edits")
+    s.check("MultiEdit passes a non-mapping entry through untouched",
+            (got or [None])[0], "not-a-mapping")
+
+    # The tier table applies to a bulk edit exactly as it does to a Write: the
+    # destination decides, and a bulk edit names one destination for every entry.
+    v = drive(multiedit("bulk.ts", [{"old_string": "x",
+                                     "new_string": "K=%s" % DECOY["aws_key"]}]))
+    s.check("MultiEdit into source is refused", v.kind, "deny")
+    v = drive(multiedit("bulk.ts", [{"old_string": "x", "new_string": "y"}]))
+    s.check("MultiEdit with nothing credential-shaped is silent", v.kind, "silent")
+
+    # A MultiEdit whose only match is in `old_string` is silent. The text is
+    # already on disk and already in the transcript; refusing the edit that
+    # REMOVES it would refuse the repair.
+    v = drive(multiedit("bulk.ts", [{"old_string": "K=%s" % DECOY["aws_key"],
+                                     "new_string": "K=process.env.K"}]))
+    s.check("MultiEdit ignores a match confined to old_string", v.kind, "silent")
+
+    # ── KL-HEREDOC: the KL-WRITE act, spelled as a command ──────────────────
+    #
+    # Every destination here is deliberately NOT a protected name. `cat > x.env
+    # <<EOF` is refused by KL-FILE — which reads `cat` plus a `.env` operand as a
+    # credential read — so a row written that way is green whatever this check
+    # does. Each row asserts the CHECK ID in the message for the same reason: a
+    # verdict alone cannot say which gate produced it.
+    for cmd, kind, why in (
+            ("cat > app.conf <<'EOF'\nSTRIPE_KEY=%s\nEOF" % DECOY["stripe"],
+             "deny", "redirect before the opener"),
+            ("cat <<'EOF' > app.conf\nSTRIPE_KEY=%s\nEOF" % DECOY["stripe"],
+             "deny", "redirect after the opener"),
+            ("cat >> app.conf <<'EOF'\nSTRIPE_KEY=%s\nEOF" % DECOY["stripe"],
+             "deny", "an append redirect"),
+            ("cat <<-EOF > app.conf\nSTRIPE_KEY=%s\nEOF" % DECOY["stripe"],
+             "deny", "the tab-stripping opener"),
+            ("cat <<EOF > app.conf\nSTRIPE_KEY=%s\nEOF" % DECOY["stripe"],
+             "deny", "an unquoted delimiter"),
+            ("cat > deploy.sh <<'EOF'\nexport STRIPE_KEY=%s\nEOF" % DECOY["stripe"],
+             "deny", "a shell script destination"),
+            ("cat > app.ts <<'EOF'\nconst k = \"%s\";\nEOF" % DECOY["aws_key"],
+             "deny", "a vendor shape into source"),
+            ("cat > app.ts <<'EOF'\nconst password = \"%s\";\nEOF" % DECOY["generic"],
+             "warn", "a name-keyed match into source"),
+            ("node <<'EOF'\nconst k = \"%s\";\nEOF" % DECOY["aws_key"],
+             "warn", "no redirect, so the destination is stdin"),
+            ("cat > notes.md <<'EOF'\nSTRIPE_KEY=%s\nEOF" % DECOY["stripe"],
+             "warn", "an allowed destination downgrades the refusal"),
+            ("cat > app.conf <<'EOF'\nSTRIPE_KEY=${STRIPE_KEY}\nEOF",
+             "silent", "a reference is not a literal"),
+            ("cat > app.conf <<'EOF'\nDEBUG=true\nEOF",
+             "silent", "nothing credential-shaped"),
+            ("cat > runbook.txt <<'EOF'\nRun the deploy on the box.\nEOF",
+             "silent", "prose is not a credential")):
+        v = drive(bash(cmd, cwd=root))
+        s.check("KL-HEREDOC %s (%s)" % (kind, why), v.kind, kind)
+        if kind != "silent":
+            s.check_in("KL-HEREDOC owns that verdict (%s)" % why,
+                       "[KL-HEREDOC]", v.message)
+
+    # A heredoc body must reach the check WHOLE. Truncating it at the first line
+    # would keep every row above green while missing a literal further down.
+    v = drive(bash("cat > app.conf <<'EOF'\nA=1\nB=2\nC=3\nSTRIPE_KEY=%s\nEOF"
+                   % DECOY["stripe"], cwd=root))
+    s.check("KL-HEREDOC reads past the first body line", v.kind, "deny")
+
+    # An UNTERMINATED heredoc still carries its body into the tool call.
+    v = drive(bash("cat > app.conf <<'EOF'\nSTRIPE_KEY=%s" % DECOY["stripe"], cwd=root))
+    s.check("KL-HEREDOC reads an unterminated body", v.kind, "deny")
+
+    # ── reading the DESTINATION off the opener ──────────────────────────────
+    #
+    # Every row is the same body into the same kind of file, spelled differently.
+    # A destination read wrongly is silent in both directions: the wrong file's
+    # reader class picks the wrong tier, and no failure says so.
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    from keyless_hooks.checks.heredoc_write import _destination
+    for opener, want, why in (
+            ("cat > app.conf <<'EOF'", "app.conf", "operator and operand apart"),
+            ("cat >app.conf <<'EOF'", "app.conf", "operand glued to the operator"),
+            ("cat >> app.conf <<'EOF'", "app.conf", "an append"),
+            ("cat 1> app.conf <<'EOF'", "app.conf", "an explicit stdout descriptor"),
+            ("cat <<'EOF' > app.conf", "app.conf", "the redirect after the opener"),
+            ("cat > 'my file.conf' <<'EOF'", "my file.conf", "a quoted path with a space"),
+            ("cat 2> err.log > app.conf <<'EOF'", "app.conf",
+             "stderr first — it names where ERRORS go, not the body"),
+            ("cat <<'EOF' >&2", "", "a descriptor duplication names no file"),
+            ("cat <<'EOF' &> all.log", "",
+             "and neither does the both-streams form"),
+            ("cat <<'EOF' >>&1", "", "nor a malformed one, by backtracking"),
+            ("node <<'EOF'", "", "no redirect at all"),
+            ("cat <<'EOF' | tee app.conf", "",
+             "a destination named by a program is not a redirect")):
+        s.check("KL-HEREDOC destination: %s" % why, _destination(opener), want)
+
+    # And the tier really follows what that read returned: stderr going to a
+    # `.log` must not decide the verdict for a body landing in a `.conf`.
+    v = drive(bash("cat 2> err.log > app.conf <<'EOF'\nSTRIPE_KEY=%s\nEOF"
+                   % DECOY["stripe"], cwd=root))
+    s.check("KL-HEREDOC judges the stdout destination, not the stderr one",
+            v.kind, "deny")
+
+    # The BODY is what is judged, not the command line around it. The same
+    # literal outside a heredoc is KL-ASSIGN's, and the same command with the
+    # literal removed is nobody's — so a row that passed because the text merely
+    # appeared somewhere would fail one of these two.
+    v = drive(bash("cat > app.conf <<'EOF'\nnothing here\nEOF\n# %s" % DECOY["stripe"],
+                   cwd=root))
+    s.check("KL-HEREDOC judges the body, not the surrounding text", v.kind, "silent")
+
+    # The two views of a heredoc must stay the same set. `strip_heredocs` blanks
+    # exactly the spans `heredocs()` reports, so a body can never become visible
+    # to an act-detection trigger by accident.
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    from keyless_hooks import shellview as _sv
+    _cmd = "cat > x <<'EOF'\ncat .env\nEOF\necho done"
+    _blanked = _sv.strip_heredocs(_cmd)
+    s.check("strip_heredocs preserves length", len(_blanked), len(_cmd))
+    s.check("strip_heredocs blanks exactly what heredocs() reports",
+            [_blanked[a:b].strip() for doc in _sv.heredocs(_cmd) for a, b in doc.spans],
+            [""])
+    s.check("heredocs() reports the body it blanked",
+            [doc.body for doc in _sv.heredocs(_cmd)], ["cat .env"])
+
     # ── every vendor pattern must match ITS OWN instance ────────────────────
     # By KIND, and through `scan` rather than through a rewrite: a rewrite can be
     # produced by the generic NAME=<opaque> rule while the vendor pattern matches
