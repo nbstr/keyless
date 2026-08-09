@@ -67,8 +67,8 @@ _VENDOR = re.compile(
 # value shorter than 8 characters has them — so the two floors have to be read
 # together, and a relaxation that moves one alone is a no-op.
 #
-# Below 8 the shapes are `postgres` against a dev database (23 in the corpus)
-# and `([^:]+):([^@]+)@` — a regex fragment, not a URL (7 more).
+# Below 8 the shapes stop being credentials at all: `postgres` against a dev
+# database, and `([^:]+):([^@]+)@` — a regex fragment, not a URL.
 _URL_AUTH = re.compile(r"[a-zA-Z][a-zA-Z0-9+.-]{1,15}://[^\s/:@]{1,64}:([^\s/@\"']{8,128})@")
 
 # `Authorization: Bearer …` and its siblings, in a header, a curl flag, or a
@@ -89,19 +89,19 @@ _FLAG = re.compile(
 # The keyword must END the identifier — `["']?\s*[:=]` follows it immediately —
 # and that is a precision rule, not an oversight. A credential word with more
 # identifier after it usually NAMES a credential rather than holding one:
-# measured over 86,125 real agent commands, letting any bounded suffix through
-# admits `AWS_ACCESS_KEY_ID` (30, the public half of the pair), `apiKeyConnectionId`
-# (22), `secretRef` (11), `secretsManager`, `secretName`, `credentialsFullUri` and
-# `TOKEN_DOCS` (a URL) — 142 new findings, almost none of them a secret.
+# replayed over real agent commands, letting any bounded suffix through admits
+# `AWS_ACCESS_KEY_ID` (the public half of the pair), `apiKeyConnectionId`,
+# `secretRef`, `secretsManager`, `secretName`, `credentialsFullUri` and
+# `TOKEN_DOCS` (a URL) — a large new class, almost none of it a secret.
 #
 # So the tail is ENUMERATED instead. `key` alone is far too generic to be a
-# keyword — `cacheKey`, `sortKey`, `objectKey`, `partitionKey`, and 121 bare
-# `key=` assignments in the same corpus — but a `key` qualified as secret,
-# signing or encryption is a credential every time it appears. `pgpassword` is
-# listed whole because the lookbehind blocks a keyword glued to a preceding word,
-# and libpq's variable is the one name where that costs real coverage: 33
-# occurrences in the corpus, against 51 for every other glued spelling combined
-# (`nextPageToken`, `isPersonalToken`, `attributeKey`) — all of them code.
+# keyword — `cacheKey`, `sortKey`, `objectKey`, `partitionKey`, and every bare
+# `key=` in ordinary configuration — but a `key` qualified as secret, signing or
+# encryption is a credential every time it appears. `pgpassword` is listed whole
+# because the lookbehind blocks a keyword glued to a preceding word, and libpq's
+# variable is the one name where that costs real coverage: every other glued
+# spelling that turned up (`nextPageToken`, `isPersonalToken`, `attributeKey`) is
+# code, and admitting them to save `PGPASSWORD` would be a bad trade.
 _ASSIGN = re.compile(
     r"(?i)(?<![A-Za-z0-9])"
     r"(?P<kw>token|secret_key|secret-key|secret|pgpassword|password|passwd|apikey|"
@@ -181,19 +181,19 @@ _SEGMENT = re.compile(r"^[A-Za-z_$][A-Za-z0-9_$]*$")
 # inside a credential, and every character left out was left out for a reason a
 # measurement produced:
 #
-#   `:`  a composite token carries one — `<token>::<scope>` in the corpus, and a
-#        Telegram bot token is `<digits>:<body>`. Reading it as code punctuation
-#        dropped one real credential out of 466 on the command corpus. Measured,
-#        not predicted.
+#   `:`  a composite token carries one — `<token>::<scope>`, and a Telegram bot
+#        token is `<digits>:<body>`. Reading it as code punctuation was tried and
+#        it dropped a real credential. Measured, not predicted.
 #   `;`  `SECRET=<literal>; ./deploy.sh` is an ordinary shell line.
 #   `!` `#` `$` `%` `&` `?` `*`
 #        a generated password is made of these. The value class stops at the
 #        first one, so the character AFTER a real password is routinely one of
 #        them.
 #
-# Leaving them out costs 62 exemptions of 217 on the write corpus. 48 are dotted
-# member paths, which `_is_member_path` withholds anyway; the other 14 are a bare
-# identifier standing before a `;`, and those stay rewritten. That is the price
+# Leaving them out costs exemptions this closed list would otherwise grant. Most
+# of those are dotted member paths, which `_is_member_path` withholds anyway; the
+# rest are a bare identifier standing before a `;`, and those stay rewritten,
+# which is a false positive this module accepts on purpose. That is the price
 # of not reading a shell statement separator as code punctuation, paid in full
 # rather than rounded away.
 _CODE_END = frozenset(["(", ",", ")"])
@@ -227,8 +227,8 @@ def _is_reference(text, start, end):
     more than a claim of completeness: a bare identifier that ends on whitespace
     or on end of line. `password`: `E2E_LOGIN_PASSWORD` and `PGPASSWORD`=<a real
     literal> are the same three tokens in the same order, and only the value's
-    own randomness tells them apart. Measured over 51,384 write payloads that
-    class is 102 of the 259 name-keyed findings that still survive this test.
+    own randomness tells them apart, and that class is a large minority of the
+    name-keyed findings that still survive this test.
 
     Three discriminators reach it and none is here, each for a measured reason:
     an ENTROPY floor, which no pattern in this module tests and which moves with

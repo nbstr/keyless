@@ -92,8 +92,9 @@ def strip_heredocs(cmd):
     """Blank here-document bodies, preserving length.
 
     A runbook, a README or a generated script written through a heredoc is text
-    ABOUT commands. Seven advisory checks in one estate fired on heredoc bodies
-    because they read the raw command; this is that class closed once.
+    ABOUT commands. A check that reads the raw command fires on the prose inside
+    the body instead of on the command that carries it; this is that class closed
+    once, for every check, rather than per check.
     """
     if not cmd or "<<" not in cmd:
         return cmd or ""

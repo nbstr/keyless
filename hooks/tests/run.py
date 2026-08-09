@@ -21,6 +21,7 @@ import test_failopen  # noqa: E402
 import test_false_positive  # noqa: E402
 import test_install  # noqa: E402
 import test_latency  # noqa: E402
+import test_publication  # noqa: E402
 
 
 # The floor each layer must clear. Deliberately well under the current counts —
@@ -31,14 +32,17 @@ MIN_CHECKS = {
     "test_failopen": 60,
     "test_adversarial": 60,
     "test_install": 8,
-    "test_latency": 3,
+    "test_latency": 4,
+    "test_latency_controls": 10,
+    "test_publication": 18,
 }
 
 
 def main():
     fast = "--fast" in sys.argv
     layers = [test_contract, test_false_positive, test_failopen,
-              test_adversarial, test_install]
+              test_adversarial, test_install, test_publication,
+              test_latency.CONTROLS]
     if not fast:
         layers.append(test_latency)
 

@@ -21,7 +21,8 @@ the data path. Those are denied.
 
 import re
 
-from ..shellview import head_or_wrapper, statement_spans, statements, words
+from ..shellview import (head_or_wrapper, interpreter_payloads, statement_spans,
+                         statements, words)
 
 CHECK = "KL-ENV"
 CHECK_VAR = "KL-ENVVAR"
@@ -45,6 +46,20 @@ _REDIRECT = re.compile(r"^\d*(?:>>|>&|>\||&>>|&>|>|<<<|<<|<&|<)")
 # Whole-environment expressions inside an interpreter's argument. Each excludes
 # the single-key form: `process.env.FOO` is one variable and is the same act as
 # `echo $FOO`, which is KL-ENVVAR's business, not this gate's.
+#
+# ⚠️ MATCHING ONE OF THESE IS NOT THE ACT. Naming the environment object is not
+# reading it out loud, and this gate used to deny on the mention alone:
+#
+#     env = dict(os.environ)          denied
+#     env = os.environ.copy()         denied
+#     const env = { ...process.env }  denied
+#
+# All three are the standard way a program builds an environment for a CHILD
+# process — the very thing `keyless run` does — and refusing them taxed ordinary
+# work every day while protecting nothing, because nothing was printed. The
+# dangerous act is the environment being PRINTED, SERIALISED or SENT.
+#
+# So the gate is aimed one step later now: see `_dump_position`.
 _WHOLE_ENV = re.compile(
     r"process\.env(?!\s*[.\[])"
     r"|os\.environ(?!\s*[.\[(])"
@@ -52,6 +67,13 @@ _WHOLE_ENV = re.compile(
     r"|dict\(os\.environ\)"
     r"|\bENV\.(?:to_h|to_a|inspect|each)"
     r"|%ENV\b"
+    # PHP. `php` has been in `_INTERPRETER_HEADS` from the start with no pattern
+    # to match, so a PHP environment dump was never seen by this gate at all —
+    # the head was recognised and then nothing looked for the act. `$_ENV` and a
+    # bare `getenv()` are the whole-environment forms; `getenv("NAME")` is the
+    # single-key read this gate deliberately ignores.
+    r"|\$_ENV\b"
+    r"|\bgetenv\(\s*\)"
     r"|System\.getenv\(\s*\)")
 
 _INTERPRETER_HEADS = frozenset([
@@ -138,16 +160,161 @@ def run(payload, cfg):
     return None
 
 
+# ── where a whole-environment expression is a DUMP, and where it is a copy ──
+#
+# Words that put their argument somewhere a human or another program can read it.
+# The list is the OPEN side, and that is deliberate: the default below is still to
+# deny, so a sink nobody enumerated is denied anyway. Only the narrow, provably
+# inert shape — assignment, with the name never reaching a sink — is exempt.
+_SINK_WORDS = frozenset([
+    "print", "pprint", "puts", "pp", "echo", "warn", "die", "raise",
+    "log", "table", "dump", "dumps", "stringify", "inspect", "format",
+    "write", "writelines", "str", "repr", "send", "post", "put", "output",
+    "stdout", "stderr", "console", "json", "util", "marshal", "pickle",
+    "printf", "sprintf", "var_dump", "print_r", "json_encode", "var_export",
+])
+
+# Sinks that are a printer in ONE language and an ordinary variable name in every
+# other, so they are scoped to the interpreter that makes them an act.
+#
+# Ruby's `p` is the case that forced this. It is a full printer — `p env` dumps
+# the object — and a bare `p` is also the most ordinary variable name there is.
+# Listed globally it would refuse `e = dict(os.environ); p = subprocess.run(c,
+# env=e)`, an inert Python line, on the strength of a one-letter coincidence.
+#
+# Found by an adversarial sweep, not by review: moving this gate from the
+# EXPRESSION to the ACT quietly reopened `ruby -e "env = ENV.to_h; p env"`, which
+# the old mention-based rule had refused. A loosening has to be swept for what it
+# lets out, and the sweep is the only thing that finds a hole this shape.
+_SINKS_BY_LANGUAGE = {
+    "ruby": frozenset(["p"]),
+    "irb": frozenset(["p"]),
+    "perl": frozenset(["say"]),
+}
+
+_WORD = re.compile(r"[A-Za-z_$][A-Za-z0-9_$]*")
+
+# `NAME = <the expression>` or `NAME: <the expression>`, reading the text that
+# ENDS at the expression.
+#
+# `:` is in there because the JavaScript idiom is not an assignment at all —
+# `spawn(cmd, { env: { ...process.env } })` binds the copy to an option KEY, and
+# a rule that only knew `=` refused exactly the call the whole exemption exists
+# to allow. It is safe to admit only because `_has_sink` has already run on the
+# same prefix: `console.log({ env: process.env })` and `res.json({ env: ... })`
+# are refused by the sink standing in front of the key, not by this pattern.
+#
+# The lookbehind keeps `myenv` from being read as `env`. `(?![=~:])` keeps `==`,
+# `=~` and `::` out — a comparison and a namespace are not a binding.
+_COPY_LHS = re.compile(
+    r"(?<![A-Za-z0-9_$])(?:const|let|var|my|our)?\s*"
+    r"([A-Za-z_$][A-Za-z0-9_$]*)\s*[=:]\s*(?![=~:])[^;&\n]*$")
+
+# Statement separators inside an interpreter's own code. Crude on purpose: a
+# python/node payload is not parsed here, and a window that is too wide only ever
+# makes this gate deny more.
+_CODE_SEP = re.compile(r"[;\n]")
+
+
+def _segments(code):
+    """(start, end) of each `;`/newline-delimited chunk of an interpreter payload."""
+    out = []
+    pos = 0
+    for m in _CODE_SEP.finditer(code):
+        out.append((pos, m.start()))
+        pos = m.end()
+    out.append((pos, len(code)))
+    return out
+
+
+def _has_sink(text, lang=""):
+    extra = _SINKS_BY_LANGUAGE.get(lang, frozenset())
+    for m in _WORD.finditer(text):
+        w = m.group(0).lower()
+        if w in _SINK_WORDS or w in extra:
+            return True
+    return False
+
+
+def _dump_position(code, lang=""):
+    """The whole-environment expression that is actually DUMPED, or None.
+
+    Three questions per match, in order, and the order is the design:
+
+    1. **Is a sink already open around it?** `print(dict(os.environ))`,
+       `json.dumps(os.environ)`, `console.log(process.env)`. Deny.
+    2. **Is it the right-hand side of an assignment?** Then it is a COPY. Hold the
+       name and keep looking; a copy is not an act.
+    3. **Anything else.** Deny. The default stays deny, so a sink that nobody
+       thought to enumerate costs nothing — it is only the enumerated *copy* shape
+       that is let through.
+
+    Then one hop of dataflow, and exactly one: a name that held a copy and later
+    turns up beside a sink in the same payload is a dump written in two statements.
+    `e = dict(os.environ); print(e)` is caught by this and by nothing else.
+
+    Two hops (`e = dict(os.environ); f = e; print(f)`) is out of reach and stays
+    out of reach; a hook sees one command string and holds no model of shell or
+    interpreter state. That limit is cheap to accept because it was never the
+    boundary: this gate is a guard against the shortcut, not against an agent that
+    has decided to exfiltrate.
+    """
+    copies = []
+    for seg_start, seg_end in _segments(code):
+        seg = code[seg_start:seg_end]
+        for m in _WHOLE_ENV.finditer(seg):
+            if _has_sink(seg[:m.start()], lang):
+                return m.group(0)
+            lhs = _COPY_LHS.search(seg[:m.start()])
+            if lhs is None:
+                return m.group(0)
+            copies.append((lhs.group(1), seg_end, m.group(0)))
+    for name, after, expr in copies:
+        pattern = re.compile(r"(?<![A-Za-z0-9_$])%s(?![A-Za-z0-9_$])"
+                             % re.escape(name))
+        for seg_start, seg_end in _segments(code):
+            if seg_start < after:
+                continue
+            seg = code[seg_start:seg_end]
+            if _has_sink(seg, lang) and pattern.search(seg):
+                # Report the EXPRESSION, not the variable. The refusal has to
+                # name the act the author will recognise; `e` names nothing.
+                #
+                # No backticks in here: the caller already wraps this whole
+                # string in a pair, and nesting them renders as a broken span in
+                # the one message an agent reads to decide what to do next.
+                return "%s, held in %s" % (expr, name)
+    return None
+
+
 def _interpreter_dump(cmd, cfg):
-    for stmt in statements(cmd):
-        first, _s, _e = _first_word(stmt)
-        if first not in _INTERPRETER_HEADS:
+    """Every view of the command, because an interpreter can be nested in a shell.
+
+    `bash -c 'python3 -c "import os; print(os.environ)"'` was SILENT — the outer
+    head is `bash`, which is not an interpreter this gate reads, and nothing
+    looked inside the quoted argument. KL-VAULT and KL-ASSIGN have both re-scanned
+    interpreter payloads from the start; this check simply never did, so the
+    cheapest wrapper in existence walked past it.
+
+    Measured on the pre-branch pack, so this is a hole being closed rather than
+    one being introduced: `bash -c` and `sh -c` both got through before and after
+    the gate was re-aimed.
+    """
+    texts = [cmd] + interpreter_payloads(cmd, cfg.interpreters)
+    seen = set()
+    for text in texts:
+        if not text or text in seen:
             continue
-        m = _WHOLE_ENV.search(stmt)
-        if not m:
-            continue
-        return ("deny", _whole_env_message(first, m.group(0)),
-                {"verb": first, "expr": m.group(0)})
+        seen.add(text)
+        for stmt in statements(text):
+            first, _s, _e = _first_word(stmt)
+            if first not in _INTERPRETER_HEADS:
+                continue
+            expr = _dump_position(stmt, first)
+            if not expr:
+                continue
+            return ("deny", _whole_env_message(first, expr),
+                    {"verb": first, "expr": expr})
     return None
 
 
@@ -186,7 +353,11 @@ def _whole_env_message(binary, expr):
         "For one value, without printing it:\n"
         "    keyless run -s <NAME> -- <the command you were going to run>\n\n"
         "Reading a single key — `process.env.FOO`, `os.environ.get(\"FOO\")` — is "
-        "not blocked; only the whole-object form is."
+        "not blocked, and neither is COPYING the environment for a child process: "
+        "`env = dict(os.environ)`, `{ ...process.env }` and `ENV.to_h` all pass, "
+        "including when the copy is handed straight to `subprocess.run(..., "
+        "env=env)`. What is refused is the whole environment reaching something "
+        "that prints, serialises or sends it."
         % (CHECK, binary, expr, _MASK))
 
 
@@ -194,15 +365,15 @@ def _whole_env_message(binary, expr):
 
 def _is_secret_name(name, cfg):
     # An environment variable holding a credential is spelled in upper case. That
-    # is not a style preference here, it is the discrimination the check rests on:
-    # measured on the pack's own decision log, 6 of 9 organic KL-ENVVAR warns
-    # fired on a lower-case `pat`, which was a PATTERN variable in a session doing
-    # 167 `re.*` calls. A real token is `GITHUB_PAT` or `GH_PAT`.
+    # is not a style preference here, it is the discrimination the check rests on.
+    # Before the case test, most of what this check warned on was a lower-case
+    # `pat` — a PATTERN variable in a session writing regular expressions, not a
+    # personal access token. A real token is `GITHUB_PAT` or `GH_PAT`.
     #
-    # This is the same `pat` substring class that the original forensic scan had
-    # to exclude to stop its counts inflating from 2,096 to 8,752. Dropping the
-    # segment would fix `pat` alone; requiring upper case fixes the whole class,
-    # including the next English word somebody adds to the list.
+    # `pat` is one member of a class, and that is why the case test is the fix:
+    # several entries in the secret-segment list are also ordinary lower-case
+    # words. Dropping `pat` from the list fixes `pat` alone; requiring upper case
+    # fixes the whole class, including the next English word somebody adds.
     #
     # The cost is a lower-case assignment of a genuine credential, which loses one
     # ADVISORY nudge and blocks nothing. That is the cheap direction.

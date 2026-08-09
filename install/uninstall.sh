@@ -58,8 +58,13 @@ cat <<KEPT
 
 # Left in place on purpose:
 #
-#   $LOG_DIR/audit.jsonl   the record of what was asked for, and by what
-#   $LIB_DIR/secrets.json  possibly your only copy of migrated credentials
+#   $LOG_DIR/audit.jsonl          the record of what was asked for, and by what
+#   $LOG_DIR/audit.jsonl.anchor   which row that record ends on
+#   $LIB_DIR/secrets.json         possibly your only copy of migrated credentials
+#
+# Keep the anchor with the log or drop both. It is the only thing that says how
+# long the log is supposed to be, so a log kept without it can lose rows from
+# the end and still verify clean.
 #
 # Deal with each deliberately. Before deleting the store, put its contents
 # somewhere you can still reach:

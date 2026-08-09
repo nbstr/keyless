@@ -70,6 +70,14 @@ DEFAULT_ALLOWED = [
     # should have refused. See the note in `secretpaths.py`.
     "process.env",
     "import.meta.env",
+    # The object-spread spelling of the same idiom. `{ ...process.env }` is how
+    # every Node program builds an environment for a child, and the tokenizer
+    # hands the spread over as the operand `...process.env`, which `process.env`
+    # above does not cover and `*.env` does. The spelling without spaces —
+    # `{...process.env}` — never matched, because the trailing brace defeats
+    # `*.env`; only the spaced form was refused, every time it was written.
+    "...process.env",
+    "...import.meta.env",
 ]
 
 # Commands that cannot put a file's CONTENT on stdout: metadata readers,
@@ -94,7 +102,8 @@ DEFAULT_NON_READERS = [
 #
 # Only the GLOB EXPANSION is withheld for these heads. A literal path is still
 # matched, so `grep TOKEN .env` and `jq -r .k ~/.cckeys.json` are refused exactly
-# as before — measured, those two shapes are 20 of the pack's 27 genuine saves.
+# as before — and those two shapes are the bulk of what this pack genuinely
+# catches, so the exemption below had to be surgical rather than a blanket rule.
 DEFAULT_PATTERN_TOOLS = [
     "grep", "egrep", "fgrep", "rg", "ag", "ack", "sed", "awk", "jq", "yq",
     "python", "python2", "python3", "perl", "ruby", "node",
@@ -137,7 +146,7 @@ DEFAULT_INTERPRETERS = [
 # are absent by design. A gate that also blocks the working path gets
 # uninstalled, and what comes back is the plaintext literal on the command line.
 #
-# `measured` below means the tool's own `--help` was read on this machine.
+# `measured` below means the tool's own `--help` was read, at the version named.
 # `documented` means the vendor's documentation, with no local binary to check.
 DEFAULT_VAULT_VERBS = [
     # ── Infisical 0.43.114 — measured ───────────────────────────────────────
@@ -221,8 +230,10 @@ DEFAULT_VAULT_VERBS = [
     # `.data` map is plaintext with extra steps — base64 is an encoding, not a
     # mask. Enumerating the safe formats rather than the dangerous ones is the
     # closed side of the allowlist: `-o custom-columns='KEYS:.data'` is a format
-    # nobody would think to enumerate, and it put 74 live production credentials
-    # into one transcript. `kubectl describe secret` prints sizes only and never
+    # nobody would think to enumerate, and one such command puts every value in
+    # the secret into the transcript at once — which is what makes a missing row
+    # here expensive rather than merely untidy.
+    # `kubectl describe secret` prints sizes only and never
     # matches this row, and bare `kubectl get secret` prints a name/type/age
     # table with no values.
     #
