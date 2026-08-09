@@ -341,6 +341,52 @@ def run():
         s.check("name-keyed leaves %s alone" % name,
                 fingerprint.scan("%s=%s" % (name, DECOY["generic"])), [])
 
+    # ── the VALUE/REFERENCE line, from the VALUE side ───────────────────────
+    #
+    # `fingerprint` withholds a name-keyed finding when the value is a reference
+    # rather than a literal — a member path, a call, an expression ending on code
+    # punctuation, a run-time substitution. Every row below sits ONE CHARACTER
+    # from one of those exemptions and must still be caught, because an exemption
+    # that also swallows the literal beside it is a hole, not a fix.
+    #
+    # Each is written as `%s` against a decoy rather than spelled out: this file
+    # is itself written through KL-WRITE, and a spelled literal arrives on disk
+    # as `${NAME}`.
+    for label, text in (
+            # a data grammar terminates a bare value on whitespace or end of line
+            ("end of line", "GITHUB_TOKEN=%s\n" % DECOY["generic"]),
+            ("space", "PGPASSWORD=%s psql -h db" % DECOY["generic"]),
+            # `;` ends a shell statement, so it is NOT code punctuation here
+            ("shell semicolon", "SECRET_KEY=%s; ./deploy.sh" % DECOY["generic"]),
+            # `:` sits INSIDE composite tokens. Reading it as code punctuation
+            # dropped one real credential out of 466 on the command corpus.
+            ("colon inside a composite token",
+             "ACCESS_TOKEN=%s::readonly" % DECOY["generic"]),
+            ("yaml mapping", "secret: %s\n" % DECOY["generic"]),
+            ("http header", "X-Hook-Token: %s\n" % DECOY["generic"]),
+            # a generated password truncates the value class at its first symbol
+            ("password with punctuation", "DB_PASSWORD=%s!aQ\n" % DECOY["generic"]),
+            # QUOTED beats every exemption: someone spelled it, whatever it looks
+            # like. This is the row that keeps `TOKEN = "a.b.c"` — a JWT — caught.
+            ("quoted, dotted like a member path",
+             'const TOKEN = "%s";' % ("abcdefgh" + ".ijklmnop" + ".qrstuvwx")),
+            ("quoted, ends on code punctuation",
+             'client({ apiKey: "%s", region: "eu" });' % DECOY["generic"]),
+    ):
+        s.check("still a literal: %s" % label,
+                [f.kind for f in fingerprint.scan(text)], ["named_credential"])
+
+    # A vendor pattern is never reachable by the exemption, because the exemption
+    # withholds only the name-keyed finding. Asserted by KIND on the exact shapes
+    # a reference test could otherwise swallow.
+    for kind, text in (
+            ("jwt", "TOKEN=%s" % DECOY["jwt"]),
+            ("openai_key", "TOKEN=%s," % DECOY["openai"]),
+            ("aws_access_key", "client(SECRET=%s)" % DECOY["aws_key"]),
+    ):
+        s.check("vendor pattern survives the exemption: %s" % kind,
+                [f.kind for f in fingerprint.scan(text)], [kind])
+
     # ── the never-allow invariant ───────────────────────────────────────────
     for payload in (bash("cat .env"), bash("env"), read(os.path.join(root, ".env")),
                     write(os.path.join(root, "o.env"), "T=%s" % DECOY["github_pat"]),

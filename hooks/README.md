@@ -354,6 +354,25 @@ Measured on Claude Code 2.1.223, not inferred:
 
 ### Known limits
 
+- **`KL-WRITE` still rewrites one shape of credential REFERENCE**, and it is the
+  only one left: a bare identifier that ends on whitespace or on end of line —
+  `password`: `E2E_LOGIN_PASSWORD`. A member path, a call, an expression ending
+  on `(`, `,` or `)`, and a run-time `$( … )` are all withheld now, each with a
+  false-positive row driving it in `tests/test_false_positive.py`. The residual
+  shape has a row of its own asserting that it IS still rewritten, so a change
+  to it is a decision rather than a side effect. Nothing separates it from a
+  literal but the value's own randomness, and the three discriminators that
+  reach it — an entropy floor, a `:` versus `=` separator, "the same word
+  appears elsewhere in this file" — were each measured dropping a real
+  credential.
+- **`${NAME}` is only a resolvable reference in a file whose reader resolves
+  it.** Measured over 51,384 real `Write` and `Edit` payloads, the files this
+  check acts on are overwhelmingly SOURCE: 137 of the 259 name-keyed findings it
+  still makes are in `.ts`, against 3 in `.env`. Counting every extension whose
+  reader does expand `${NAME}` — `.env`, `.env.example`, `.yml`, `.sh`,
+  `.conf`, `.zshrc` — 34 of 259. In the other 87% the substitution is not a reference anything
+  resolves, and the remediation the message prints does not apply. The rewrite
+  is right about the secret and wrong about the repair.
 - **`settings.json` is writable by a session**, so a gate configured there sits
   inside its own blast radius. Closing that needs a privilege boundary the
   harness does not currently expose. Managed policy settings are the nearest

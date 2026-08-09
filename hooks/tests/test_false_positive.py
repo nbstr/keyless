@@ -50,7 +50,7 @@ import tempfile
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import harness
-from harness import DECOY, Suite, bash, drive
+from harness import DECOY, Suite, bash, drive, write
 
 # Verbs that print no credential value. Grouped by store, with how each was
 # established. `measured` means the tool's own help output was read on this
@@ -480,6 +480,75 @@ ASSIGN_TRUE_POSITIVES = [
     "PGPASSWORD=%s psql -h db.example.com -U app" % DECOY["generic"],
 ]
 
+# ── KL-WRITE: a credential REFERENCE is the correct usage, not a leak ───────
+#
+# This check REWRITES, and a rewrite that is wrong changes a file on disk with
+# nothing refused and nothing to notice. Measured over 51,384 real Write and Edit
+# payloads, 378 of the 540 name-keyed findings were a reference of one of the
+# shapes below — a member expression, a call, a constant, a runtime fetch — so
+# the check was damaging correct source in the majority of the files it touched.
+#
+# Every row here is spelled in fragments, and that is not decoration. Spelled
+# whole, this pack's own live KL-WRITE rewrites the fixture on its way to disk
+# and the row then asserts the opposite of what it was written to assert, with
+# the suite still green. `ASSIGN_RUNTIME_FETCH` above carries the same scar.
+#
+# Every row was checked to FIRE before the discriminator existed. A row that is
+# silent for some unrelated reason — a floor, a placeholder, a character class —
+# is a control that passes whether the rule under test is there or not, and this
+# file has already lost one that way.
+_REF_EQ, _REF_CO, _REF_SP = "=", ": ", " = "
+
+WRITE_REFERENCE_FALSE_POSITIVES = [
+    ("member path", "this.secret" + _REF_SP + "config.secret;\n"),
+    ("env read", "const token" + _REF_SP + "process.env.GITHUB_TOKEN\n"),
+    ("env read, python", "password" + _REF_SP + "os.environ.get('PGPASSWORD')\n"),
+    ("snake member path", "secret_key" + _REF_SP + "settings.secret_key\n"),
+    ("call", "const token" + _REF_SP + "getAuthToken();\n"),
+    ("call on a member", "const apiKey" + _REF_SP + "config.getSecret();\n"),
+    ("type annotation, comma",
+     "export function send(\n  credentials" + _REF_CO + "PushCredentialConfig,\n) {}\n"),
+    ("type annotation, paren",
+     "export function read(credentials" + _REF_CO + "PushCredentialConfig) {}\n"),
+    ("constant reference",
+     "await login({ password" + _REF_CO + "E2E_LOGIN_PASSWORD, mfa" + _REF_CO
+     + "false });\n"),
+    ("runtime fetch written into a file",
+     "AUTH_TOKEN" + _REF_EQ + '"' + "$(cat ~/.token)" + '"' + "\n"),
+]
+
+# ── the assignment NAME, and why the collapse is positional ─────────────────
+#
+# A quote or a backslash inside a variable NAME is removed by the shell before
+# the variable is set — but only where the word is an ARGUMENT. Measured by
+# running all three shells, not inferred:
+#
+#     FOO""_BAR=hello              bash/zsh/sh: command not found, FOO_BAR UNSET
+#     export FOO""_BAR=hello       bash/zsh:    FOO_BAR is hello
+#     env FOO""_BAR=hello sh -c …  bash/zsh:    FOO_BAR is hello
+#
+# So collapsing unconditionally would invent an assignment the shell never
+# makes, and collapsing nowhere leaves the bypass the adversarial table now
+# drives. Each half is asserted, because a rule that is right for one reason and
+# wrong for the other reads identically from its call sites.
+ASSIGN_NAME_COLLAPSE = [
+    ("SECRET''_KEY=x", "SECRET_KEY"),
+    ('PG""PASSWORD=x', "PGPASSWORD"),
+    ("GITHUB\\_TOKEN=x", "GITHUB_TOKEN"),
+    ('"NPM_TOKEN=x"', "NPM_TOKEN"),
+]
+
+# The residual class, asserted so it cannot drift silently in either direction.
+# A bare identifier that ends on whitespace is STILL rewritten, because nothing
+# but the value's own randomness separates a constant's name from a credential,
+# and every discriminator that reaches this shape was measured dropping a real
+# one. This row is a LIMIT, not a target: it says what the check does today, so
+# a later change to it is a decision somebody makes rather than a side effect.
+WRITE_REFERENCE_RESIDUAL = (
+    "unqualified identifier at end of line",
+    "await login({\n  password" + _REF_CO + "E2E_LOGIN_PASSWORD\n});\n")
+
+
 # ── the two controls, and they prove OPPOSITE things ────────────────────────
 #
 # Asserting only "it is silent" is worth nothing: a walk that stopped finding
@@ -517,6 +586,8 @@ EXPECTED_CHECKS = (len(SAFE) + len(PREFIX_REFUSES) + 1 + 3 * len(HELP_CONTROL)
                    + len(ASSIGN_FALSE_POSITIVES) + len(ASSIGN_FALSE_POSITIVES_ARGV)
                    + len(ASSIGN_TRUE_POSITIVES)
                    + 2 * len(ASSIGN_VALUE_CONTROL) + 2 * len(ASSIGN_POSITION_CONTROL)
+                   + 2 * len(WRITE_REFERENCE_FALSE_POSITIVES) + 2
+                   + 2 * len(ASSIGN_NAME_COLLAPSE)
                    + 1)
 
 
@@ -622,6 +693,34 @@ def run():
                 [n for n, _v in _assignments_in(cmd) if n == name], [])
         s.check("assign control: but that value would fire: %s" % name,
                 bool(credential_findings(name, value)), True)
+
+    # ── KL-WRITE: a reference is not a literal ───────────────────────────────
+    #
+    # Driven through the real hook, so this asserts the FILE is left alone rather
+    # than asserting something about a function. Each row is asserted twice: the
+    # verdict is silent, AND the content the hook would have passed on is byte-
+    # identical to what was handed in. A rewrite that produced identical bytes
+    # would satisfy the first assertion and fail the second.
+    for label, content in WRITE_REFERENCE_FALSE_POSITIVES:
+        v = drive(write(os.path.join(root, "src.ts"), content))
+        s.check("KL-WRITE leaves a reference alone: %s" % label, v.kind, "silent")
+        s.check("KL-WRITE changed nothing: %s" % label,
+                (v.updated or {}).get("content", content), content)
+
+    # And the limit, stated as an assertion rather than as a comment.
+    label, content = WRITE_REFERENCE_RESIDUAL
+    v = drive(write(os.path.join(root, "src.ts"), content))
+    s.check("KL-WRITE still rewrites the residual shape: %s" % label, v.kind, "rewrite")
+    s.check("KL-WRITE residual substitutes the field name",
+            "${" + "PASSWORD}" in (v.updated or {}).get("content", ""), True)
+
+    # ── the name collapse is positional, and both halves are load-bearing ────
+    from keyless_hooks.shellview import assignment_split
+    for token, name in ASSIGN_NAME_COLLAPSE:
+        s.check("a spliced NAME in argument position is an assignment: %s" % name,
+                (assignment_split(token, declared=True) or ("", ""))[0], name)
+        s.check("a spliced NAME in PREFIX position is a command, not an assignment: "
+                "%s" % name, assignment_split(token), None)
 
     # ── the count itself ─────────────────────────────────────────────────────
     # A suite that runs nothing exits 0. Asserted last so it counts itself.
