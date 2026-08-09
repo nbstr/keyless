@@ -1,0 +1,13 @@
+# Response headers for every path.
+# style-src needs unsafe-inline: the document carries inline style attributes,
+# and neither a nonce nor a hash can cover a style attribute.
+# script-src needs it too: the scripts are inline, and a hash would break
+# silently on the next edit to the document.
+/*
+  Content-Security-Policy: default-src 'none'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'
+  Strict-Transport-Security: max-age=31536000; includeSubDomains
+  X-Content-Type-Options: nosniff
+  X-Frame-Options: DENY
+  Referrer-Policy: no-referrer
+  Cross-Origin-Opener-Policy: same-origin
+  Permissions-Policy: accelerometer=(), camera=(), geolocation=(), gyroscope=(), microphone=(), payment=(), usb=()
