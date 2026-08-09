@@ -17,6 +17,14 @@ mod within;
 #[allow(unused_imports)]
 pub use within::{PATIENCE, within};
 
+/// A socket path that fits in `sockaddr_un`. Its own file for the same reason
+/// as `within` above: the unit tests in `src/` bind sockets too, they cannot
+/// see `tests/`, and a second copy of this would be free to drift from this one
+/// — which is how three of them ended up depending on `TMPDIR` being short.
+mod short_socket;
+#[allow(unused_imports)]
+pub use short_socket::short_socket_path;
+
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
@@ -588,24 +596,6 @@ pub fn write_secrets(path: &Path, entries: &[(&str, &str)]) {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).expect("chmod");
     }
-}
-
-/// A short, unique socket path for a scratch directory.
-///
-/// `sockaddr_un.sun_path` is 104 bytes on macOS, and the platform temp
-/// directory is already about half of that. A socket named inside a scratch
-/// directory therefore binds fine for a short test name and fails with
-/// `path must be shorter than SUN_LEN` for a long one — a limit that shows up
-/// as a test-naming problem rather than as the platform constraint it is.
-///
-/// So the socket goes somewhere short and is named by a hash of the directory
-/// it belongs to. The daemon removes it on shutdown.
-pub fn short_socket_path(dir: &Path) -> PathBuf {
-    use std::hash::{Hash, Hasher};
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    dir.hash(&mut hasher);
-    std::process::id().hash(&mut hasher);
-    PathBuf::from("/tmp").join(format!("kl{:x}.sock", hasher.finish()))
 }
 
 /// A daemon config rooted in `dir`, backed by a file store.

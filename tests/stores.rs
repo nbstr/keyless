@@ -101,6 +101,22 @@ fn infisical_config_for(binary: &Path, extra: &str, secrets: &str) -> String {
 /// degrades before it spawns anything and every property below would be
 /// exercised against a store that never ran. The tests that are *about* an
 /// unset session directory build their own config.
+/// The stub timeout every success-path fixture uses, in milliseconds, spelled
+/// into the config strings below as `"timeout_ms":60000`.
+///
+/// It is a ceiling, never a measurement: a fixture that asserts a SUCCESS has
+/// no opinion about how long the stub took, and the tests that actually measure
+/// the timeout set 300 ms and assert on the message. So the only thing this
+/// number decides is how loaded this machine has to be before a passing test
+/// reports a failure.
+///
+/// It was 5000, which encoded "no build is ever slower than five seconds".
+/// Measured 2026-08-09: with a `cargo mutants` campaign running beside it at
+/// `--jobs 2`, six of these tests failed with `no answer within 5000 ms`, and
+/// all forty-one passed the moment the suite ran alone. That is a false RED,
+/// and mutation testing turns a false red into a wrong baseline — a mutant that
+/// a flake killed is recorded as caught, and the next clean run reports it as a
+/// new survivor.
 fn proton_config(binary: &Path, extra: &str) -> String {
     format!(
         r#"{{"stores":{{"keychain":{{"enabled":false}},
@@ -212,7 +228,7 @@ fn an_unset_session_directory_degrades_the_name_and_still_spawns_the_child() {
     let registry = registry_from(
         &format!(
             r#"{{"stores":{{"keychain":{{"enabled":false}},
-                 "proton":{{"enabled":true,"binary":"{}","timeout_ms":5000}}}},
+                 "proton":{{"enabled":true,"binary":"{}","timeout_ms":60000}}}},
                 "secrets":{{"DECOY":{{"reference":"{PROTON_REFERENCE}"}}}}}}"#,
             stub.display()
         ),
@@ -254,7 +270,7 @@ fn an_absent_pass_cli_binary_still_spawns_the_child() {
     let registry = registry_from(
         &proton_config(
             &dir.join("there-is-no-pass-cli-here"),
-            r#""timeout_ms":5000"#,
+            r#""timeout_ms":60000"#,
         ),
         &Reason::default(),
     );
@@ -324,7 +340,7 @@ fn a_proton_value_reaches_the_child_and_nothing_else() {
     let marker = dir.join("witness");
     let stub = stub_pass_cli(&dir, &Backend::Injects(PROTON_DECOY));
     let registry = registry_from(
-        &proton_config(&stub, r#""timeout_ms":5000"#),
+        &proton_config(&stub, r#""timeout_ms":60000"#),
         &Reason::default(),
     );
 
@@ -578,7 +594,7 @@ fn every_proton_read_carries_a_reason_that_names_the_command() {
     let marker = dir.join("witness");
     let stub = stub_pass_cli(&dir, &Backend::Injects(PROTON_DECOY));
     let registry = registry_from(
-        &proton_config(&stub, r#""timeout_ms":5000"#),
+        &proton_config(&stub, r#""timeout_ms":60000"#),
         &Reason::for_run(&witness(&marker, "DECOY", 0)),
     );
     let _ = run_with(&registry, &["DECOY"], &witness(&marker, "DECOY", 0), &[]);
@@ -609,7 +625,7 @@ fn the_proton_reason_never_carries_an_argument_value() {
         .map(OsString::from)
         .collect();
     let registry = registry_from(
-        &proton_config(&stub, r#""timeout_ms":5000"#),
+        &proton_config(&stub, r#""timeout_ms":60000"#),
         &Reason::for_run(&argv),
     );
     let _ = run_with(&registry, &["DECOY"], &argv, &[]);
@@ -634,7 +650,7 @@ fn a_concealed_value_is_refused_rather_than_injected() {
     let marker = dir.join("witness");
     let stub = stub_pass_cli(&dir, &Backend::Concealed);
     let registry = registry_from(
-        &proton_config(&stub, r#""timeout_ms":5000"#),
+        &proton_config(&stub, r#""timeout_ms":60000"#),
         &Reason::default(),
     );
 
@@ -695,7 +711,7 @@ fn named_config(binary: &Path, secrets: &str) -> String {
     format!(
         r#"{{"stores":{{"keychain":{{"enabled":false}},
              "proton":{{"enabled":true,"binary":"{}","session_dir":"{SCOPED_SESSION_DIR}",
-                        "timeout_ms":5000}}}},
+                        "timeout_ms":60000}}}},
             "secrets":{secrets}}}"#,
         binary.display()
     )
@@ -927,8 +943,8 @@ fn several_names_from_one_vault_cost_exactly_one_listing() {
 fn two_stores_config(infisical: &Path, proton: &Path, secrets: &str, stores_extra: &str) -> String {
     format!(
         r#"{{"stores":{{"keychain":{{"enabled":false}},
-             "infisical":{{"enabled":true,"binary":"{}","timeout_ms":5000}},
-             "proton":{{"enabled":true,"binary":"{}","timeout_ms":5000,
+             "infisical":{{"enabled":true,"binary":"{}","timeout_ms":60000}},
+             "proton":{{"enabled":true,"binary":"{}","timeout_ms":60000,
                         "session_dir":"{SCOPED_SESSION_DIR}"}}{stores_extra}}},
             "secrets":{secrets}}}"#,
         infisical.display(),
@@ -1023,7 +1039,7 @@ fn a_name_pinned_to_a_disabled_store_degrades_rather_than_falling_through() {
     let infisical = stub_infisical(&dir, &Backend::Injects(INFISICAL_DECOY));
     let config = format!(
         r#"{{"stores":{{"keychain":{{"enabled":false}},
-             "infisical":{{"enabled":true,"binary":"{}","timeout_ms":5000}},
+             "infisical":{{"enabled":true,"binary":"{}","timeout_ms":60000}},
              "proton":{{"enabled":false}}}},
             "secrets":{{"DECOY":{{"store":"proton","reference":"pass://P/I/f"}}}}}}"#,
         infisical.display()
@@ -1137,7 +1153,7 @@ fn discoverer_for(stub: &Path) -> Box<dyn keyless::store::discover::Discover> {
     let config: keyless::config::Config = serde_json::from_str(&format!(
         r#"{{"stores":{{"keychain":{{"enabled":false}},
              "proton":{{"enabled":true,"binary":"{}","session_dir":"{SCOPED_SESSION_DIR}",
-                        "timeout_ms":5000}}}}}}"#,
+                        "timeout_ms":60000}}}}}}"#,
         stub.display()
     ))
     .expect("valid config");
@@ -1381,7 +1397,7 @@ fn doctor_report(dir: &Path, config: &str) -> (String, i32) {
 fn doctor_reports_an_expired_proton_session_as_a_problem() {
     let dir = scratch("doctor-dead-session");
     let stub = support::stub_pass_cli_dead_session(&dir);
-    let (report, code) = doctor_report(&dir, &proton_config(&stub, r#""timeout_ms":5000"#));
+    let (report, code) = doctor_report(&dir, &proton_config(&stub, r#""timeout_ms":60000"#));
 
     assert!(
         report.contains("store    proton PROBLEM"),
@@ -1421,7 +1437,7 @@ fn doctor_reports_a_live_proton_session_as_ok() {
     // gets a health check deleted.
     let dir = scratch("doctor-live-session");
     let stub = stub_pass_cli_discovery(&dir, ONE_VAULT, LIVE_AND_TRASHED, "{}");
-    let (report, code) = doctor_report(&dir, &proton_config(&stub, r#""timeout_ms":5000"#));
+    let (report, code) = doctor_report(&dir, &proton_config(&stub, r#""timeout_ms":60000"#));
 
     assert!(report.contains("store    proton ok"), "{report}");
     assert_eq!(code, 0, "{report}");
@@ -1455,7 +1471,7 @@ fn a_proton_store_with_no_session_directory_is_unhealthy_without_spawning_anythi
     let stub = stub_pass_cli_discovery(&dir, ONE_VAULT, LIVE_AND_TRASHED, "{}");
     let config = format!(
         r#"{{"stores":{{"keychain":{{"enabled":false}},
-             "proton":{{"enabled":true,"binary":"{}","timeout_ms":5000}}}}}}"#,
+             "proton":{{"enabled":true,"binary":"{}","timeout_ms":60000}}}}}}"#,
         stub.display()
     );
     let (report, code) = doctor_report(&dir, &config);
