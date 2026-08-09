@@ -16,11 +16,20 @@
 //!
 //! **Its integrity is bounded by who can write the file.** A process that can
 //! append can also rewrite the whole file and recompute every hash. The chain
-//! therefore detects accidental truncation, partial writes, and tampering by
-//! anything that cannot rewrite the file — and does not detect tampering by the
-//! session itself. Making it detect that requires the writer to be a process
-//! the session cannot impersonate, which is the privilege-boundary daemon's
-//! job. The verifier here is what that daemon will use unchanged.
+//! therefore detects a row edited or removed from the middle, a partial write,
+//! and tampering by anything that cannot rewrite the file — and does not detect
+//! tampering by the session itself. Making it detect that requires the writer
+//! to be a process the session cannot impersonate, which is the
+//! privilege-boundary daemon's job. The verifier here is what that daemon will
+//! use unchanged.
+//!
+//! **The chain does not detect a short tail, and no chain can.** Removing rows
+//! from the end leaves a chain that is internally perfect; nothing inside a
+//! file can say how long the file was supposed to be. That fact lives in the
+//! [`anchor`] beside the log, and [`AuditLog::verify`] checks it. Read that
+//! module for exactly what it does and does not defend against — in one line,
+//! it names accident and a rewrite confined to the log, and it does not move
+//! the adversary bound above by one inch.
 //!
 //! # Concurrency
 //!
@@ -30,6 +39,7 @@
 //! atomic even where the lock is not honoured. Long argv is truncated rather
 //! than allowed to interleave with another session's row.
 
+pub mod anchor;
 pub mod sha256;
 
 use std::fs::{self, File, OpenOptions};
@@ -396,17 +406,43 @@ impl AuditLog {
             .map_err(|source| AuditError::Io {
                 path: self.path.clone(),
                 source,
-            })
+            })?;
+
+        // The row is durable before the anchor moves, so the anchor can only
+        // ever lag. See `anchor` for why that direction is the safe one and the
+        // reverse is the only thing worth reporting.
+        let hash = line
+            .get(9..9 + 64)
+            .ok_or_else(|| AuditError::Encode("rendered row carries no hash".to_owned()))?;
+        anchor::write(&self.path, self.mode, hash)
     }
 
-    /// Recompute every chain link. Returns the number of rows verified.
+    /// Recompute every chain link, and check the log still ends where the
+    /// writer last said it ended. Returns the number of rows verified.
     ///
-    /// A missing file verifies as zero rows: nothing has happened yet, which is
-    /// consistent rather than broken.
+    /// A missing file with no anchor beside it verifies as zero rows: nothing
+    /// has happened yet, which is consistent rather than broken. A missing file
+    /// with an anchor is the opposite claim — rows were written and are gone —
+    /// and is reported.
     pub fn verify(&self) -> Result<usize, AuditError> {
+        // Read before the log, so a corrupt or future-versioned anchor is
+        // reported rather than quietly skipped by an early return below.
+        let anchor = anchor::read(&self.path)?;
+
         let raw = match fs::read_to_string(&self.path) {
             Ok(raw) => raw,
-            Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+                return match anchor {
+                    None => Ok(0),
+                    Some(anchor) => Err(AuditError::Anchor {
+                        detail: format!(
+                            "the log is absent, and the anchor beside it records row {}; \
+                             rows that were written are no longer there",
+                            short(&anchor.hash)
+                        ),
+                    }),
+                };
+            }
             Err(source) => {
                 return Err(AuditError::Io {
                     path: self.path.clone(),
@@ -417,15 +453,23 @@ impl AuditLog {
 
         let mut prev = GENESIS.to_owned();
         let mut count = 0usize;
+        let mut anchored_row_is_present = false;
         for (index, line) in raw.lines().enumerate() {
             if line.trim().is_empty() {
                 continue;
             }
             let number = index + 1;
-            if line.len() < PAYLOAD_OFFSET || !line.starts_with("{\"hash\":\"") {
+            // `<=`, not `<`. A line of exactly `PAYLOAD_OFFSET` bytes is a hash
+            // and a comma with NOTHING after it, and `render` cannot produce
+            // one — the payload always carries at least a schema version. Under
+            // `<` such a line was accepted as a row and counted, because the
+            // empty payload hashes to something and that something can be
+            // written into the line by hand. A row with no contents is not a
+            // row.
+            if line.len() <= PAYLOAD_OFFSET || !line.starts_with("{\"hash\":\"") {
                 return Err(AuditError::Chain {
                     line: number,
-                    detail: "row does not start with its hash".to_owned(),
+                    detail: "row does not begin with a hash and a payload".to_owned(),
                 });
             }
             let recorded = &line[9..9 + 64];
@@ -437,11 +481,35 @@ impl AuditLog {
                     detail: "hash does not match the row contents".to_owned(),
                 });
             }
+            if let Some(anchor) = &anchor
+                && recorded == anchor.hash
+            {
+                anchored_row_is_present = true;
+            }
             prev = recorded.to_owned();
             count += 1;
         }
+
+        if let Some(anchor) = &anchor
+            && !anchored_row_is_present
+        {
+            return Err(AuditError::Anchor {
+                detail: format!(
+                    "the log holds {count} row(s) and none of them is row {}, which the anchor \
+                     beside it records as written; rows were removed from the end, or the file \
+                     was rewritten",
+                    short(&anchor.hash)
+                ),
+            });
+        }
+
         Ok(count)
     }
+}
+
+/// Enough of a chain hash to identify a row in a message, and no more.
+fn short(hash: &str) -> &str {
+    hash.get(..12).unwrap_or(hash)
 }
 
 /// The variable-length fields of a row, so the size fallback can shrink them
@@ -619,9 +687,182 @@ mod tests {
             .expect("append");
         }
         let raw = std::fs::read_to_string(&path).expect("read");
-        std::fs::write(&path, raw.replace("\"exit_code\":null", "\"exit_code\":0")).expect("write");
+        // Edit the SECOND row specifically, and assert the reported line
+        // number. Rewriting every row at once would land the failure on line 1,
+        // where an off-by-one in the counter is invisible — and the line number
+        // is the whole of what this error tells a person to go and look at.
+        let lines: Vec<&str> = raw.lines().collect();
+        let tampered = lines[1].replace("\"exit_code\":null", "\"exit_code\":0");
+        assert_ne!(tampered, lines[1], "the fixture edited nothing");
+        std::fs::write(&path, format!("{}\n{}\n{}\n", lines[0], tampered, lines[2]))
+            .expect("write");
         let error = log.verify().expect_err("a tampered row must not verify");
-        assert!(error.to_string().contains("chain broken"));
+        assert_eq!(
+            error.to_string(),
+            "audit chain broken at line 2: hash does not match the row contents",
+            "the second row was edited and the report must say so"
+        );
+    }
+
+    #[test]
+    fn a_row_at_the_size_cap_is_still_found_by_the_next_append() {
+        // `read_last_hash` reads a WINDOW off the end rather than the whole
+        // file, and the window has to be wide enough to contain the longest row
+        // the writer can produce. Shrink that window and the last row falls
+        // outside it, `read_last_hash` finds no row, silently returns the
+        // genesis value, and the next append writes a row whose `prev` points
+        // at nothing. The log then holds two chains and the file that was
+        // supposed to be tamper-evident is broken by ordinary use.
+        //
+        // Nothing exercised this. One test builds a row exactly at the cap, but
+        // it never appends a SECOND row, so the window is never asked to find
+        // anything. The append after a large row is the whole mechanism.
+        let path = temp_path("wide-window");
+        let log = AuditLog::new(path.clone());
+        let masker = Masker::new();
+
+        let big = Event::new("run", State::Injected, vec![], &[] as &[String], &masker)
+            .with_cwd("d".repeat(3000));
+        log.append(&big).expect("append the wide row");
+        let first = std::fs::read_to_string(&path).expect("read");
+        let first_line = first.lines().next().expect("one row");
+        assert!(
+            first_line.len() > MAX_LINE_BYTES / 2,
+            "the fixture row is {} bytes, which is not wide enough to test the window",
+            first_line.len()
+        );
+
+        log.append(&Event::new(
+            "run",
+            State::Injected,
+            vec![],
+            &["after"],
+            &masker,
+        ))
+        .expect("append after the wide row");
+
+        assert_eq!(
+            log.verify().expect("a wide row must not break the chain"),
+            2
+        );
+    }
+
+    #[test]
+    fn a_row_left_half_written_by_a_crash_does_not_break_the_next_append() {
+        // A process killed mid-append leaves a fragment at the end of the file:
+        // the start of a row, no newline, no hash to read. The next append must
+        // walk past it to the last COMPLETE row, and must not read the fragment
+        // as if it were a row — slicing 64 bytes of hash out of a 12-byte line
+        // is a panic, and a panic here takes down a command that had nothing to
+        // do with the audit log.
+        //
+        // The complete row sits EXACTLY on the size cap, and the length is
+        // solved for rather than guessed. The window `read_last_hash` reads has
+        // to hold a whole maximal row plus whatever fragment follows it; a
+        // comfortable fixture is satisfied by a window far narrower than the
+        // real worst case, and every arithmetic change to that window then goes
+        // unnoticed. Guessing a length instead of solving for one lands either
+        // short — testing nothing — or over the cap, where the writer clips the
+        // working directory and hands back a 300-byte row.
+        let masker = Masker::new();
+        let render_with = |tag: &str, cwd_len: usize| -> String {
+            let path = temp_path(tag);
+            let log = AuditLog::new(path.clone());
+            log.append(
+                &Event::new("run", State::Injected, vec![], &[] as &[String], &masker)
+                    .with_cwd("d".repeat(cwd_len)),
+            )
+            .expect("append");
+            std::fs::read_to_string(&path).expect("read")
+        };
+        // `d` needs no JSON escaping, so one byte of working directory is one
+        // byte of row and a single measurement gives the offset to the cap.
+        const PROBE: usize = 200;
+        let probe = render_with("half-written-probe", PROBE);
+        let wanted = PROBE + MAX_LINE_BYTES - probe.trim_end().len();
+
+        let path = temp_path("half-written");
+        let log = AuditLog::new(path.clone());
+        log.append(
+            &Event::new("run", State::Injected, vec![], &[] as &[String], &masker)
+                .with_cwd("d".repeat(wanted)),
+        )
+        .expect("append");
+        let complete = std::fs::read_to_string(&path).expect("read");
+        assert_eq!(
+            complete.trim_end().len(),
+            MAX_LINE_BYTES,
+            "the fixture did not land on the cap, so the window is never stressed"
+        );
+        let first_hash = complete[9..9 + 64].to_owned();
+
+        // Shorter than a hash, and beginning exactly like a real row: the two
+        // properties that together turn a length check into a panic.
+        std::fs::write(&path, format!("{complete}{{\"hash\":\"abc\n")).expect("write a fragment");
+
+        log.append(&Event::new(
+            "run",
+            State::Injected,
+            vec![],
+            &["second"],
+            &masker,
+        ))
+        .expect("appending after a fragment must not fail");
+
+        let raw = std::fs::read_to_string(&path).expect("read");
+        let last = raw.lines().last().expect("three lines");
+        assert!(
+            last.contains(&format!("\"prev\":\"{first_hash}\"")),
+            "the append chained onto the fragment instead of the last whole row: {last}"
+        );
+    }
+
+    #[test]
+    fn a_row_too_short_to_hold_a_hash_is_reported_rather_than_panicking() {
+        // The reading half of the case above. `verify` slices a fixed 64-byte
+        // hash out of every line, so the length check in front of that slice is
+        // load-bearing: widen it by one comparison and a truncated row panics
+        // the verifier instead of being reported as a broken row.
+        //
+        // Written by hand rather than appended, so there is no anchor beside it
+        // and this tests the row check alone.
+        let path = temp_path("short-row");
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("dir");
+        std::fs::write(&path, "{\"hash\":\"abc\n").expect("write a short row");
+        let log = AuditLog::new(path.clone());
+        let error = log
+            .verify()
+            .expect_err("a row too short to hold a hash must not verify");
+        assert_eq!(
+            error.to_string(),
+            "audit chain broken at line 1: row does not begin with a hash and a payload"
+        );
+    }
+
+    #[test]
+    fn a_line_that_is_a_hash_and_nothing_else_is_not_a_row() {
+        // Exactly `PAYLOAD_OFFSET` bytes: the hash, the comma, and no contents.
+        // `render` cannot produce this — every payload carries at least a
+        // schema version — so the only way one appears is by hand. The empty
+        // payload still hashes to something, and that something can be written
+        // into the line, so a length check that admits this length admits a row
+        // that says nothing and chains anyway.
+        let path = temp_path("empty-payload");
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("dir");
+        let line = format!("{{\"hash\":\"{}\",", "0".repeat(64));
+        assert_eq!(
+            line.len(),
+            super::PAYLOAD_OFFSET,
+            "the fixture must land exactly on the boundary being tested"
+        );
+        std::fs::write(&path, format!("{line}\n")).expect("write");
+        let error = AuditLog::new(path)
+            .verify()
+            .expect_err("a hash with no payload is not a row");
+        assert_eq!(
+            error.to_string(),
+            "audit chain broken at line 1: row does not begin with a hash and a payload"
+        );
     }
 
     #[test]
@@ -645,6 +886,255 @@ mod tests {
         let kept = format!("{}\n{}\n{}\n", lines[0], lines[2], lines[3]);
         std::fs::write(&path, kept).expect("write");
         assert!(log.verify().is_err());
+    }
+
+    #[test]
+    fn dropping_the_last_row_breaks_verification() {
+        // The case the chain alone cannot see, and the most common one in
+        // practice: a crash mid-rotation, a naive `head -n -1`, a restore from
+        // a stale copy. Removing rows from the END leaves a chain that is
+        // internally perfect and simply shorter, because nothing inside the
+        // file says how long the file was supposed to be.
+        //
+        // The sibling test above drops a MIDDLE row, which the chain does
+        // catch. Both existing tamper tests did that, so the hole sat exactly
+        // where the tests were not looking.
+        let path = temp_path("tail-truncate");
+        let log = AuditLog::new(path.clone());
+        let masker = Masker::new();
+        for i in 0..4 {
+            log.append(&Event::new(
+                "run",
+                State::Injected,
+                vec![],
+                &[format!("c{i}")],
+                &masker,
+            ))
+            .expect("append");
+        }
+        // The control: the fixture verifies before anything is removed, so a
+        // failure below is the truncation and not a broken fixture.
+        assert_eq!(log.verify().expect("verify"), 4);
+
+        let raw = std::fs::read_to_string(&path).expect("read");
+        let lines: Vec<&str> = raw.lines().collect();
+        let dropped = &lines[3][9..9 + 64];
+        let kept = format!("{}\n{}\n{}\n", lines[0], lines[1], lines[2]);
+        std::fs::write(&path, kept).expect("write");
+
+        let error = log
+            .verify()
+            .expect_err("dropping the last row must not verify");
+        assert!(
+            matches!(error, super::AuditError::Anchor { .. }),
+            "a short tail must be reported as a tail-anchor failure, not as {error}"
+        );
+        // The message has to name the row that went missing and how many are
+        // left, or it tells an operator that something is wrong without telling
+        // them what to go and look for.
+        let text = error.to_string();
+        assert!(
+            text.contains(&dropped[..12]),
+            "the report does not name the row the anchor recorded: {text}"
+        );
+        assert!(
+            text.contains("3 row(s)"),
+            "the report does not say how many rows survived: {text}"
+        );
+    }
+
+    #[test]
+    fn emptying_the_log_entirely_is_detected() {
+        // Truncation to zero rows is the extreme of the case above, and it is
+        // what a naive rotation (`mv log log.1; touch log`) produces. Without
+        // the anchor this reads as "nothing has happened yet", which is the
+        // single most misleading answer this function can give.
+        let path = temp_path("tail-empty");
+        let log = AuditLog::new(path.clone());
+        let masker = Masker::new();
+        for i in 0..3 {
+            log.append(&Event::new(
+                "run",
+                State::Injected,
+                vec![],
+                &[format!("c{i}")],
+                &masker,
+            ))
+            .expect("append");
+        }
+        std::fs::write(&path, "").expect("truncate to nothing");
+        let error = log.verify().expect_err("an emptied log must not verify");
+        assert!(
+            matches!(error, super::AuditError::Anchor { .. }),
+            "an emptied log must be reported as a tail-anchor failure, not as {error}"
+        );
+
+        // And the same again with the file removed rather than emptied, since
+        // `verify` has a deliberate early return for a missing file.
+        std::fs::remove_file(&path).expect("remove");
+        let error = log.verify().expect_err("a deleted log must not verify");
+        assert!(
+            matches!(error, super::AuditError::Anchor { .. }),
+            "a deleted log must be reported as a tail-anchor failure, not as {error}"
+        );
+    }
+
+    #[test]
+    fn rewriting_every_row_with_a_valid_chain_is_detected() {
+        // The attack the chain provably cannot see: recompute every hash from
+        // genesis and the file verifies. The anchor catches it, because the
+        // anchor names a row the rewritten file no longer contains. This is a
+        // detection the chain alone does not have, and it is bounded by exactly
+        // one thing — whoever rewrote the log could rewrite the anchor too.
+        let masker = Masker::new();
+        let victim = temp_path("rewrite-victim");
+        let log = AuditLog::new(victim.clone());
+        for i in 0..3 {
+            log.append(&Event::new(
+                "run",
+                State::Injected,
+                vec![],
+                &[format!("real{i}")],
+                &masker,
+            ))
+            .expect("append");
+        }
+
+        // A separate, internally perfect log, standing in for the forgery.
+        let forgery = temp_path("rewrite-forgery");
+        let other = AuditLog::new(forgery.clone());
+        for i in 0..3 {
+            other
+                .append(&Event::new(
+                    "run",
+                    State::Injected,
+                    vec![],
+                    &[format!("forged{i}")],
+                    &masker,
+                ))
+                .expect("append");
+        }
+        assert_eq!(other.verify().expect("the forgery chains"), 3);
+
+        let forged = std::fs::read_to_string(&forgery).expect("read");
+        std::fs::write(&victim, forged).expect("swap the contents in");
+
+        let error = log
+            .verify()
+            .expect_err("a wholesale rewrite must not verify");
+        assert!(
+            matches!(error, super::AuditError::Anchor { .. }),
+            "a rewritten log must be reported as a tail-anchor failure, not as {error}"
+        );
+    }
+
+    #[test]
+    fn an_anchor_left_behind_by_a_crash_is_not_a_problem() {
+        // The control for all three tests above, and the one that decides
+        // whether this mechanism is usable. The row is written before the
+        // anchor, so a crash between the two leaves the anchor pointing at an
+        // EARLIER row. That direction is normal and must stay silent — an
+        // anchor can only ever legitimately lag, never lead.
+        //
+        // Without this test, "always report a problem" passes every assertion
+        // above and `doctor` cries wolf after every hard kill.
+        let path = temp_path("anchor-behind");
+        let log = AuditLog::new(path.clone());
+        let masker = Masker::new();
+        for i in 0..4 {
+            log.append(&Event::new(
+                "run",
+                State::Injected,
+                vec![],
+                &[format!("c{i}")],
+                &masker,
+            ))
+            .expect("append");
+        }
+        let raw = std::fs::read_to_string(&path).expect("read");
+        let second = raw.lines().nth(1).expect("four rows");
+        let stale = second[9..9 + 64].to_owned();
+        super::anchor::write(&path, super::MODE_PRIVATE, &stale).expect("stale anchor");
+
+        assert_eq!(
+            log.verify().expect("an anchor that lags must verify"),
+            4,
+            "a crash between the row write and the anchor write must not read as tampering"
+        );
+    }
+
+    #[test]
+    fn a_log_with_no_anchor_verifies_exactly_as_it_did_before() {
+        // Every log written before this mechanism existed has no anchor beside
+        // it. Those must keep verifying, or an upgrade turns every existing
+        // install into a reported problem on the day it lands.
+        let path = temp_path("no-anchor");
+        let log = AuditLog::new(path.clone());
+        let masker = Masker::new();
+        for i in 0..3 {
+            log.append(&Event::new(
+                "run",
+                State::Injected,
+                vec![],
+                &[format!("c{i}")],
+                &masker,
+            ))
+            .expect("append");
+        }
+        std::fs::remove_file(super::anchor::path_for(&path)).expect("stand in for a legacy log");
+        assert_eq!(log.verify().expect("a legacy log still verifies"), 3);
+
+        // And the chain still does the job it always did on such a log: a
+        // middle row removed is still caught with no anchor present.
+        let raw = std::fs::read_to_string(&path).expect("read");
+        let lines: Vec<&str> = raw.lines().collect();
+        std::fs::write(&path, format!("{}\n{}\n", lines[0], lines[2])).expect("write");
+        assert!(log.verify().is_err(), "the chain still catches a gap");
+    }
+
+    #[test]
+    fn a_corrupt_anchor_is_reported_rather_than_ignored() {
+        // A half-written anchor must not silently disable the check. Ignoring
+        // an unparsable anchor would mean a single stray byte turns the
+        // detection off with nothing said about it.
+        let path = temp_path("anchor-corrupt");
+        let log = AuditLog::new(path.clone());
+        log.append(&Event::new(
+            "run",
+            State::Injected,
+            vec![],
+            &["true"],
+            &Masker::new(),
+        ))
+        .expect("append");
+        std::fs::write(super::anchor::path_for(&path), "{\"v\":1,\"hash\":").expect("corrupt it");
+        let error = log.verify().expect_err("a corrupt anchor must be reported");
+        assert!(
+            matches!(error, super::AuditError::Anchor { .. }),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn the_anchor_is_no_more_readable_than_the_log_it_guards() {
+        use std::os::unix::fs::PermissionsExt;
+        let path = temp_path("anchor-mode");
+        let log = AuditLog::new(path.clone()).with_mode(super::MODE_GROUP_READABLE);
+        log.append(&Event::new(
+            "resolve",
+            State::Injected,
+            vec![],
+            &[] as &[String],
+            &Masker::new(),
+        ))
+        .expect("append");
+        let mode = std::fs::metadata(super::anchor::path_for(&path))
+            .expect("stat the anchor")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o640, "anchor mode was {mode:04o}");
+        assert_eq!(mode & 0o022, 0, "nobody but the owner may write the anchor");
     }
 
     #[test]
