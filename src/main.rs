@@ -311,7 +311,8 @@ struct InitArgs {
     /// Without this, `init` only REPORTS whether the pack is registered. The
     /// settings file belongs to another program, so the write is a step you ask
     /// for. `hooks/install.py` performs it: it merges rather than overwrites,
-    /// backs the file up first, and takes itself back out with `--uninstall`.
+    /// replaces the file atomically, and takes itself back out with
+    /// `--uninstall`.
     #[arg(long)]
     hooks: bool,
 }

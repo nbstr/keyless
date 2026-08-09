@@ -14,7 +14,6 @@ Proton Pass, the macOS Keychain, Vault, Doppler, or a `.env` file.
 ```console
 $ keyless setup
 ~/.claude/settings.json: added a PreToolUse handler; added a PostToolUse handler; added 4 permission allow rule(s); added 8 permission deny rule(s)
-backup: ~/.claude/settings.json.keyless-backup-20260806T212412
 ```
 
 `keyless setup` installs this pack along with everything else, which is the point
@@ -254,21 +253,28 @@ $ ./install.sh                     # ~/.claude/settings.json
 $ ./install.sh --scope project     # ./.claude/settings.json, committable
 $ ./install.sh --dry-run           # print the merge, write nothing
 $ ./uninstall.sh                   # take it back out
-$ ./install.sh --list-backups
 ```
 
 Requires Python 3.8+ and nothing else — stdlib only, no toolchain, no install
 step for the pack itself.
 
 The installer **never blindly overwrites**. It parses your existing settings,
-merges only its own entries, takes a timestamped backup, writes to a temporary
-file, re-parses those bytes as JSON, and only then replaces the original
-atomically. A settings file that does not parse disables every hook you have,
-which is the one outcome worse than not installing. It refuses outright to touch
-a settings file it cannot already parse.
+merges only its own entries, writes to a temporary file beside the original,
+flushes it to disk, re-parses those bytes as JSON, and only then replaces the
+original through an atomic rename. A settings file that does not parse disables
+every hook you have, which is the one outcome worse than not installing. It
+refuses outright to touch a settings file it cannot already parse.
 
 Idempotent in both directions. Your own hooks and deny rules come through
 byte-identical.
+
+**No backup file is written, and the reason is that every job one would do is
+already done in the write itself.** An input it cannot parse is refused before
+anything is opened; an output that does not parse is discarded before the
+original is touched; the replace is atomic, so the file is the old bytes or the
+new bytes and never a half of either; and the receipt below makes removal exact.
+A copy beside the original adds none of that, and it leaves files behind in a
+directory this pack does not own.
 
 ### About the permission deny rules
 
