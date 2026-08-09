@@ -6,7 +6,6 @@
     python3 install.py --claude-dir DIR     into DIR/settings.json
     python3 install.py --dry-run            print the merged file, write nothing
     python3 install.py --uninstall          take it back out
-    python3 install.py --list-backups       every backup this script has written
 
 Usually reached as `keyless setup`, which resolves the directory, keeps the
 receipt and reports the result alongside everything else it did. This runs
@@ -18,12 +17,25 @@ Three properties, each because the alternative loses a user's configuration:
 merged into it, and everything else is carried through untouched. A settings file
 holds work nobody wants to re-do.
 
-**A backup before every write**, named with a timestamp, next to the original.
+**A file this script cannot parse is REFUSED, not rewritten.** `load_settings`
+exits 2 and writes nothing. Merging into a file that will not parse means
+reconstructing it from the fragment, and everything already in it is gone.
 
 **A re-parse before the file is replaced.** The merged text is written to a
-temporary file, read back, and parsed as JSON; only then does it replace the
-original, atomically. A settings file that does not parse disables every hook the
-user has, which is the one failure mode worse than not installing.
+temporary file in the same directory, flushed to disk, read back, and parsed as
+JSON; only then does it replace the original, through `os.replace`. A settings
+file that does not parse disables every hook the user has, which is the one
+failure mode worse than not installing.
+
+🚨 **This script writes no backup, and adding one is a step backwards.** The
+conventional defence for editing another program's config is a timestamped copy
+beside it, and every property above is that defence built into the write instead:
+an unparseable input is refused before anything is opened, an unparseable OUTPUT
+is discarded before the original is touched, and `os.replace` is atomic on POSIX
+— so the settings file is the old bytes or the new bytes and never a half of
+either. The receipt makes removal exact on top of that. A backup adds nothing to
+any of it, and it accumulates files in a directory this script does not own,
+which is the same overreach as editing a config nobody asked us to.
 
 Idempotent in both directions: installing twice changes nothing the second time,
 and uninstalling something that is not installed is a no-op that says so.
@@ -58,9 +70,7 @@ import argparse
 import json
 import os
 import shlex
-import shutil
 import sys
-import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 FRAGMENT = os.path.join(HERE, "settings-fragment.json")
@@ -112,7 +122,13 @@ def load_receipt(path):
 
 
 def save_receipt(path, whole, mine):
-    """Write the receipt back with `claude` replaced. Never raises."""
+    """Write the receipt back with `claude` replaced. Never raises.
+
+    Synced the same way the settings file is, and for a sharper reason: the
+    receipt is what makes `--uninstall` exact. A receipt lost to a crash does
+    not lose an install, it downgrades the removal to the shipped list — which
+    is the one path that can delete a rule the user wrote themselves.
+    """
     whole = dict(whole)
     whole.setdefault("version", 1)
     if mine is None:
@@ -126,7 +142,10 @@ def save_receipt(path, whole, mine):
         tmp = "%s.keyless-tmp.%d" % (path, os.getpid())
         with open(tmp, "w") as fh:
             fh.write(json.dumps(whole, indent=2) + "\n")
+            fh.flush()
+            os.fsync(fh.fileno())
         os.replace(tmp, path)
+        _sync_directory(directory)
     except OSError as exc:
         # A receipt that cannot be written is worth saying out loud and is not
         # worth failing an install over: the merge already happened, and the
@@ -413,52 +432,65 @@ def unmerge(settings, record):
 
 
 def write_atomically(path, data):
-    """Write, re-parse the written bytes, and only then replace the original."""
+    """Write, re-parse the written bytes, and only then replace the original.
+
+    This is the whole reason no copy of the original is kept beside it. Three
+    things have to hold, and each one is a line here rather than a hope:
+
+    - the temporary file is in the SAME directory, so `os.replace` is a rename
+      within one filesystem and therefore atomic. A temporary file in `/tmp` is
+      a cross-device copy, which is not.
+    - the bytes are flushed and `fsync`ed BEFORE the rename. Without that the
+      rename can reach the disk ahead of the contents, and a machine that loses
+      power between the two comes back to an empty settings file — the exact
+      truncation a backup is imagined to cover, except a backup written the same
+      unsynced way is lost in the same instant.
+    - the written bytes are read back and parsed before anything is replaced. A
+      failure here leaves the original untouched and takes the temporary file
+      with it, so a failed run leaves nothing behind either.
+    """
     os.makedirs(os.path.dirname(path), exist_ok=True)
     text = json.dumps(data, indent=2, ensure_ascii=False) + "\n"
     tmp = "%s.keyless-tmp.%d" % (path, os.getpid())
-    with open(tmp, "w") as fh:
-        fh.write(text)
     try:
-        with open(tmp) as fh:
-            json.loads(fh.read())
-    except ValueError as exc:
-        os.unlink(tmp)
-        sys.stderr.write("ABORTED: the merged settings did not re-parse (%s). "
-                         "Your file is untouched.\n" % exc)
-        raise SystemExit(3)
-    os.replace(tmp, path)
+        with open(tmp, "w") as fh:
+            fh.write(text)
+            fh.flush()
+            os.fsync(fh.fileno())
+        try:
+            with open(tmp) as fh:
+                json.loads(fh.read())
+        except ValueError as exc:
+            sys.stderr.write("ABORTED: the merged settings did not re-parse (%s). "
+                             "Your file is untouched.\n" % exc)
+            raise SystemExit(3)
+        os.replace(tmp, path)
+    except BaseException:
+        # Anything that got here left `tmp` on disk — a disk-full write, an
+        # interrupt, the re-parse above. The original is still the original;
+        # the only thing to do is not litter the directory on the way out.
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+        raise
+    _sync_directory(os.path.dirname(path))
 
 
-def backup(path):
-    if not os.path.exists(path):
-        return None
-    stamp = time.strftime("%Y%m%dT%H%M%S")
-    dest = "%s.keyless-backup-%s" % (path, stamp)
-    # Two writes in the same second must not collide: an install immediately
-    # followed by an uninstall would otherwise overwrite the only copy of the
-    # user's original file with the copy taken after it was modified.
-    n = 1
-    while os.path.exists(dest):
-        dest = "%s.keyless-backup-%s.%d" % (path, stamp, n)
-        n += 1
-    shutil.copy2(path, dest)
-    return dest
+def _sync_directory(directory):
+    """Make the rename itself durable, not just the bytes it renamed.
 
-
-def list_backups(path):
-    directory = os.path.dirname(path) or "."
-    base = os.path.basename(path) + ".keyless-backup-"
+    Best effort: a directory that cannot be opened for reading is not a reason
+    to fail a write that already succeeded.
+    """
     try:
-        names = sorted(n for n in os.listdir(directory) if n.startswith(base))
+        fd = os.open(directory, os.O_RDONLY)
     except OSError:
-        names = []
-    if not names:
-        print("no backups next to %s" % path)
-        return 0
-    for name in names:
-        print(os.path.join(directory, name))
-    return 0
+        return
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
 
 
 def main():
@@ -472,7 +504,6 @@ def main():
     ap.add_argument("--dry-run", action="store_true",
                     help="print the merged file and write nothing")
     ap.add_argument("--uninstall", action="store_true")
-    ap.add_argument("--list-backups", action="store_true")
     ap.add_argument("--hard-deny", action="store_true",
                     help="also deny .env, .npmrc, .netrc, .pgpass and *.pem at the "
                          "permission layer. Stronger, and it COSTS the names view: a "
@@ -500,9 +531,6 @@ def main():
     args = ap.parse_args()
 
     path = settings_path(args.scope, args.claude_dir)
-    if args.list_backups:
-        return list_backups(path)
-
     directory = os.path.dirname(path)
     if directory and not os.path.isdir(directory) and not args.create_dir:
         # `keyless` is a general tool and most machines running it have no agent
@@ -551,12 +579,9 @@ def main():
         sys.stderr.write("\n(dry run — %s would change: %s)\n" % (path, "; ".join(changes)))
         return 0
 
-    saved = backup(path) if existed else None
     write_atomically(path, merged)
     save_receipt(receipt_file, whole, new_record)
     print("%s: %s" % (path, "; ".join(changes)))
-    if saved:
-        print("backup: %s" % saved)
     if not args.uninstall and not args.report:
         print("\nThe harness re-reads this file while a session is running, so the pack")
         print("is live now. Run `/hooks` to confirm it loaded. Two levers, both out of")

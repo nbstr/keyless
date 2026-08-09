@@ -60,10 +60,11 @@
 //!
 //! So `init` REPORTS the pack as a row — present, absent, or unreachable — and
 //! installs it when `--hooks` says to. `hooks/install.py` does the write, and it
-//! already refuses to overwrite blindly, backs up before every write, re-parses
-//! the merged file before replacing the original, and is idempotent in both
-//! directions. Nothing here re-implements any of that; this verb finds the
-//! script, runs it, and prints what it said, verbatim.
+//! already refuses to overwrite blindly, refuses outright to touch a settings
+//! file it cannot parse, re-parses the merged file before replacing the original
+//! through an atomic rename, and is idempotent in both directions. Nothing here
+//! re-implements any of that; this verb finds the script, runs it, and prints
+//! what it said, verbatim.
 //!
 //! # Never a GUI dialog
 //!
@@ -322,16 +323,16 @@ fn report_hooks(
             out,
             style,
             &format!(
-                "{} init --hooks   merges it in, after backing the file up",
+                "{} init --hooks   merges it in, keeping everything already there",
                 crate::NAME
             ),
         )?;
         return Ok(());
     }
 
-    // The write itself belongs to the installer. It backs up, re-parses before
-    // replacing, and is idempotent — so this runs it and repeats what it said
-    // rather than deciding anything about a file it does not own.
+    // The write itself belongs to the installer. It re-parses before replacing,
+    // replaces atomically, and is idempotent — so this runs it and repeats what
+    // it said rather than deciding anything about a file it does not own.
     let output = std::process::Command::new("python3")
         .arg(&installer)
         .output();

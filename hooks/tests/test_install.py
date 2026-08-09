@@ -24,6 +24,7 @@ forwarder alone` case is the one that fails if anyone tries it.
 
 import json
 import os
+import subprocess
 import sys
 import tempfile
 
@@ -31,6 +32,9 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import install  # noqa: E402
 from harness import Suite  # noqa: E402
+
+INSTALLER = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                         "install.py")
 
 
 def _forwarder(body):
@@ -225,7 +229,95 @@ def run():
     s.check("a handler you removed is not re-registered",
             "hooks" in again_h, False)
 
+    _no_litter(s)
+    _write_survives_a_failure(s)
+
     return s
+
+
+# ── THE SETTINGS DIRECTORY BELONGS TO ANOTHER PROGRAM ──────────────────────────
+# This pack writes one file there and leaves nothing else behind — no timestamped
+# copy of the original, no temporary file from a run that failed. The assertion
+# is on the DIRECTORY LISTING rather than on a filename, because the failure is
+# "a file this pack does not own appeared" and naming the file under suspicion
+# only catches the spelling somebody already thought of.
+#
+# The install's own guarantees are what make a copy of the original unnecessary,
+# and each is pinned above or below: an unparseable input is refused, the merge
+# carries everything else through, the replace is atomic, and the receipt makes
+# the removal exact.
+
+
+def _install_run(claude_dir, receipt, *extra):
+    """One real `install.py` run, as a subprocess. Returns (rc, stdout)."""
+    done = subprocess.run(
+        [sys.executable, INSTALLER, "--claude-dir", claude_dir,
+         "--receipt", receipt, "--report"] + list(extra),
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    return done.returncode, done.stdout.decode()
+
+
+def _no_litter(s):
+    root = tempfile.mkdtemp(prefix="keyless-litter-")
+    claude_dir = os.path.join(root, "claude")
+    os.makedirs(claude_dir)
+    settings = os.path.join(claude_dir, "settings.json")
+    receipt = os.path.join(root, "receipt.json")
+    with open(settings, "w") as fh:
+        json.dump({"model": "opus"}, fh)
+
+    rc_in, said_in = _install_run(claude_dir, receipt)
+    rc_out, _ = _install_run(claude_dir, receipt, "--uninstall")
+    rc_again, _ = _install_run(claude_dir, receipt)
+
+    # THE CONTROL. Every listing check below passes just as well on three runs
+    # that did nothing at all, so prove the first run actually wrote something.
+    s.check("the install run succeeded", (rc_in, rc_out, rc_again), (0, 0, 0))
+    s.check("and it reported a change rather than no-opping",
+            "added" in said_in, True)
+
+    s.check("setup, uninstall and setup again leave one file in that directory",
+            sorted(os.listdir(claude_dir)), ["settings.json"])
+    s.check("and the user's own key is still in it",
+            json.load(open(settings)).get("model"), "opus")
+
+    # A pin on the mechanism, not only on its effect: the effect above is also
+    # produced by a copy written somewhere else, which is not the fix.
+    s.check("no function writes a copy of the settings file",
+            [n for n in dir(install) if "backup" in n.lower()], [])
+
+
+def _write_survives_a_failure(s):
+    """An interrupted replace leaves the original whole and leaves no scrap.
+
+    `os.replace` is the last act of the write, so failing it is the closest
+    reachable stand-in for losing the process mid-write. The original must be
+    exactly what it was, and the temporary file must not survive — a scrap left
+    in another program's directory is the same defect as a backup left there.
+    """
+    root = tempfile.mkdtemp(prefix="keyless-atomic-")
+    path = os.path.join(root, "settings.json")
+    original = '{\n  "model": "opus"\n}\n'
+    with open(path, "w") as fh:
+        fh.write(original)
+
+    def refuse(*_args, **_kwargs):
+        raise OSError("simulated interruption")
+
+    real_replace = os.replace
+    os.replace = refuse
+    try:
+        install.write_atomically(path, {"model": "sonnet"})
+        failed = False
+    except OSError:
+        failed = True
+    finally:
+        os.replace = real_replace
+
+    s.check("the interrupted write is not reported as success", failed, True)
+    s.check("the original file is byte-identical", open(path).read(), original)
+    s.check("and no temporary file is left behind",
+            sorted(os.listdir(root)), ["settings.json"])
 
 
 if __name__ == "__main__":

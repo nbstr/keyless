@@ -6,8 +6,8 @@
 #   ./install.sh --dry-run          print the merge, write nothing
 #
 # Every flag is passed through to install.py, which does the work: it parses the
-# existing file, merges rather than overwrites, takes a timestamped backup, and
-# re-parses the merged text before replacing anything.
+# existing file, merges rather than overwrites, and re-parses the merged text
+# before replacing anything through an atomic rename.
 set -eu
 DIR="$(cd "$(dirname "$0")" && pwd)"
 exec python3 "$DIR/install.py" "$@"
