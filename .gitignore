@@ -8,3 +8,20 @@
 # green suite against code it did not actually run.
 __pycache__/
 *.py[cod]
+
+# cargo-mutants campaign output. `tests/publication.rs` reads the working tree
+# through `git ls-files --cached --others --exclude-standard`, so an un-ignored
+# campaign is PUBLISHED as far as every grammar in that file is concerned — and
+# its logs carry real wall-clock instants, which is exactly what the timestamp
+# gate exists to refuse. Measured: one scoped run left 307 files under the root
+# and `every_record_timestamp_is_an_allowlisted_fixture` failed.
+#
+# The gate is right and the artefact is simply not publishable, so the fix
+# belongs here rather than in an allowlist. Narrow on purpose: three names this
+# one tool writes, never a pattern that could swallow a real file. `mutants.out`
+# is unanchored because it is the directory cargo-mutants creates inside
+# whatever `--output` it is given; the other two are the repository-root paths
+# `.github/workflows/mutants.yml` writes.
+/mutants-run/
+/mutants.log
+mutants.out/

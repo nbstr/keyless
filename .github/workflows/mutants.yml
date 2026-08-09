@@ -38,6 +38,30 @@
 # linear extrapolation from the first few is always pessimistic. Re-measure with
 # a full run, and expect a shared runner to be slower than this Mac either way.
 #
+# ---------------------------------------------------------------------------
+# WHERE THE CAMPAIGN RUNS, and what a local one costs
+# ---------------------------------------------------------------------------
+#
+# THIS workflow is the campaign of record. `.github/mutants-baseline.txt` used
+# to open with a local `cargo mutants` line, and people ran it, because that is
+# what the file told them to do.
+#
+# The timings above are wall-clock on an idle machine and they are not what a
+# shared workstation experiences. Measured while three sessions ran campaigns
+# locally: one held the machine's job queue for eighty minutes producing no
+# output, another drove it to critical memory pressure and was killed, and two
+# unrelated sessions never got a slot for their own typecheck. A runner is
+# waiting on nobody, which is the whole argument.
+#
+# A local run is still the right tool for debugging THIS FILE — the invocation
+# is right below and `--copy-vcs true` is part of it. Nothing in the repository
+# can refuse a `cargo mutants` typed into a shell, and pretending otherwise
+# would be a rule that gets ignored. What the repository CAN do, and now does,
+# is stop telling people to run one, and make the output harmless when somebody
+# does: `.gitignore` drops this tool's artefacts, because an un-ignored campaign
+# lands in the published corpus `tests/publication.rs` reads and reds the
+# timestamp gate with its own logs.
+#
 # So a per-push gate on the whole crate is out of the question, and even the
 # scoped run is too slow to sit in front of every merge. There is a second
 # reason, and it is the one that would eventually get a gate switched off: a
@@ -218,8 +242,18 @@ jobs:
           # The exit code is read on its own line. cargo-mutants exits non-zero
           # when mutants survive, and survivors are the NORMAL state here --
           # what decides this job is the diff below, never this status.
+          # `--copy-vcs true` is load-bearing, not tidiness. cargo-mutants
+          # copies the source tree WITHOUT `.git`, and `tests/publication.rs`
+          # walks the published history — a walk that fails rather than skips
+          # outside a checkout, deliberately, because a walk that read nothing
+          # and a clean history are the same empty result. Without this flag the
+          # UNMUTATED baseline fails, cargo-mutants tests zero mutants, and the
+          # step below reports no outcomes.json at all. Measured on this repo:
+          # exit 4, `total_mutants` 0, seven history cases red in the baseline.
+          #
           # shellcheck disable=SC2086
           cargo mutants $files \
+            --copy-vcs true \
             --jobs 2 \
             --timeout-multiplier 8 \
             --output mutants-run \
@@ -252,6 +286,14 @@ jobs:
           missed=$(field missed)
           timeout=$(field timeout)
           unviable=$(field unviable)
+          # The scope is printed beside the numbers on purpose. There are two
+          # mutation gates on this project and both get called "the mutation
+          # gate": this one, over the RUST crate, and `hooks/tests/mutate.py`
+          # over the python hook pack. A count from one has already been quoted
+          # as coverage of the other. Neither number means anything without the
+          # scope attached, so neither is ever printed without it.
+          echo "gate: cargo-mutants over the RUST crate — scope $SCOPE"
+          echo "      (the python hook pack is a separate campaign: hooks/tests/mutate.py)"
           echo "tested=$total caught=$caught missed=$missed timeout=$timeout unviable=$unviable"
 
           # A glob that stopped matching tests nothing, finds nothing, and looks
