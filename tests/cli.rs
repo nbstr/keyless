@@ -406,7 +406,7 @@ fn a_value_from_a_network_store_is_masked_exactly_like_a_local_one() {
         &config,
         format!(
             r#"{{"stores":{{"keychain":{{"enabled":false}},
-                 "infisical":{{"enabled":true,"binary":"{}","timeout_ms":5000}}}},
+                 "infisical":{{"enabled":true,"binary":"{}","timeout_ms":60000}}}},
                 "secrets":{{"DECOY":{{"env":"dev"}}}}}}"#,
             stub.display()
         ),
@@ -594,7 +594,7 @@ fn run_env_covers_a_name_that_declares_none_and_never_outranks_one_that_does() {
         &config,
         format!(
             r#"{{"stores":{{"keychain":{{"enabled":false}},
-                 "infisical":{{"enabled":true,"binary":"{}","timeout_ms":5000}}}},
+                 "infisical":{{"enabled":true,"binary":"{}","timeout_ms":60000}}}},
                 "secrets":{{"LOOSE":{{}},"PINNED":{{"env":"prod"}}}}}}"#,
             stub.display()
         ),

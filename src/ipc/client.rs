@@ -198,10 +198,20 @@ mod tests {
     use std::io::BufRead;
     use std::time::Duration;
 
+    // Both cases below name a socket, so neither may name one under `TMPDIR`.
+    // `connect(2)` refuses an over-long path with the SAME `InvalidInput` these
+    // tests expect for their own reasons, so under a long `TMPDIR` they pass
+    // without ever reaching the absent socket or the regular file — green, and
+    // measuring the length of a directory name. Read the file for the numbers.
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/support/short_socket.rs"
+    ));
+
     #[test]
     fn an_absent_socket_is_unreachable_rather_than_a_hang() {
         let client = Client::new(
-            std::env::temp_dir().join("keyless-no-such-daemon.sock"),
+            short_socket_path(std::path::Path::new("ipc-client-absent")),
             Duration::from_millis(200),
         );
         let error = client
@@ -212,8 +222,7 @@ mod tests {
 
     #[test]
     fn a_path_that_is_a_regular_file_is_unreachable_rather_than_a_panic() {
-        let path =
-            std::env::temp_dir().join(format!("keyless-not-a-socket-{}", std::process::id()));
+        let path = short_socket_path(std::path::Path::new("ipc-client-regular-file"));
         std::fs::write(&path, b"not a socket").expect("write");
         let client = Client::new(path.clone(), Duration::from_millis(200));
         assert!(matches!(

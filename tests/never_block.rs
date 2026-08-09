@@ -250,7 +250,7 @@ fn a_name_with_no_infisical_environment_still_spawns_the_child() {
     let stub = stub_infisical(&dir, &Backend::Injects(DECOY_VALUE));
     let config: Config = serde_json::from_str(&format!(
         r#"{{"stores":{{"keychain":{{"enabled":false}},
-             "infisical":{{"enabled":true,"binary":"{}","timeout_ms":5000}}}},
+             "infisical":{{"enabled":true,"binary":"{}","timeout_ms":60000}}}},
             "secrets":{{"DECOY":{{}}}}}}"#,
         stub.display()
     ))

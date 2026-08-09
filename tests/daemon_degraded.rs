@@ -41,7 +41,7 @@ use keyless::cmd::run::{Binding, RunRequest, TtyPolicy, run};
 use keyless::store;
 use keyless::store::Invocation;
 
-use support::{DECOY_VALUE, client_config, scratch, witness, witnessed};
+use support::{DECOY_VALUE, client_config, scratch, short_socket_path, witness, witnessed};
 
 /// How long a client waits before giving up on a wedged daemon. Short, so the
 /// timeout tests do not dominate the suite.
@@ -132,7 +132,9 @@ struct FakeDaemon {
 
 impl FakeDaemon {
     fn start(dir: &Path, behaviour: Misbehaviour) -> Self {
-        let socket = dir.join("fake.sock");
+        // NOT `dir.join(...)`: `dir` is under `TMPDIR`, and a socket named
+        // there is a bet that `TMPDIR` is short. See `support::short_socket_path`.
+        let socket = short_socket_path(dir);
         let _ = std::fs::remove_file(&socket);
         let listener = UnixListener::bind(&socket).expect("bind the stand-in daemon");
         listener.set_nonblocking(true).expect("nonblocking");
@@ -223,7 +225,13 @@ fn against_fake(tag: &str, behaviour: Misbehaviour) {
 fn an_absent_socket_degrades_and_the_child_still_runs() {
     let dir = scratch("daemon-absent");
     let marker = dir.join("marker");
-    assert_degraded_but_ran("absent", &dir.join("nothing-here.sock"), &marker);
+    // Short even though nothing is bound here: `connect(2)` refuses an
+    // over-long path with `InvalidInput` before it ever looks for the socket,
+    // so under a long `TMPDIR` this would degrade for a reason that has nothing
+    // to do with the socket being absent — and stay green while doing it.
+    let absent = short_socket_path(&dir);
+    let _ = std::fs::remove_file(&absent);
+    assert_degraded_but_ran("absent", &absent, &marker);
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -253,7 +261,8 @@ fn a_stale_socket_with_nothing_listening_degrades() {
     // ECONNREFUSED rather than ENOENT — a different code path from an absent
     // socket, and the one a crashed daemon actually leaves behind.
     let dir = scratch("daemon-stale");
-    let path = dir.join("stale.sock");
+    let path = short_socket_path(&dir);
+    let _ = std::fs::remove_file(&path);
     {
         let listener = UnixListener::bind(&path).expect("bind");
         drop(listener);
@@ -261,13 +270,15 @@ fn a_stale_socket_with_nothing_listening_degrades() {
     assert!(path.exists(), "the socket inode must survive the listener");
     let marker = dir.join("marker");
     assert_degraded_but_ran("stale", &path, &marker);
+    let _ = std::fs::remove_file(&path);
     let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
 fn a_socket_we_may_not_connect_to_degrades() {
     let dir = scratch("daemon-forbidden");
-    let path = dir.join("forbidden.sock");
+    let path = short_socket_path(&dir);
+    let _ = std::fs::remove_file(&path);
     let _listener = UnixListener::bind(&path).expect("bind");
     #[cfg(unix)]
     {
@@ -279,6 +290,7 @@ fn a_socket_we_may_not_connect_to_degrades() {
     // permission check on connect, which is exactly the case an install with
     // the wrong group produces.
     assert_degraded_but_ran("forbidden", &path, &marker);
+    let _ = std::fs::remove_file(&path);
     let _ = std::fs::remove_dir_all(&dir);
 }
 
