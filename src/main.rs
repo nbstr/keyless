@@ -14,10 +14,12 @@ use clap::{Args, Parser, Subcommand};
 use keyless::State;
 use keyless::audit::AuditLog;
 use keyless::cmd::discover::{fields, items};
-use keyless::cmd::doctor::doctor;
+use keyless::cmd::doctor::{DoctorRequest, doctor};
+use keyless::cmd::init::{InitRequest, init};
 use keyless::cmd::ls::ls;
 use keyless::cmd::refuse;
 use keyless::cmd::run::{Binding, RunRequest, TtyPolicy, run};
+use keyless::cmd::status::Style;
 use keyless::cmd::write::{new, put};
 use keyless::config::Config;
 use keyless::paths::Paths;
@@ -34,19 +36,32 @@ use keyless::{NAME, store};
     name = NAME,
     version,
     about = "Use a secret without ever holding one: name it, and it reaches the child process and nothing else.",
-    long_about = "keyless resolves named credentials and hands them to a child process's \
-                  environment. The value never appears in your shell history, your transcript, \
-                  or this tool's output.\n\n\
-                  There is deliberately no verb that prints a value. If a command needs a \
-                  credential, run the command under `keyless run`.\n\n\
-                  `keyless run` never refuses to run your command. If a secret cannot be \
-                  resolved it warns, runs the command with an unmodified environment, and \
-                  forwards the exit code.\n\n\
-                  `items` and `fields` say what a store holds — titles, states and field \
-                  names — so a config entry can be written without ever reading a value. \
-                  `new` and `put` store one: `new` generates it with the kernel's random \
-                  source and `put` reads it from stdin. Neither shows it to you, and there \
-                  is no flag that passes a value as an argument.",
+    long_about = "keyless puts a named credential into one child process's environment, and \
+                  nowhere else. The value never reaches your shell history, your scrollback, \
+                  an agent's transcript, or this tool's own output.\n\n\
+                  THE ONE RULE\n\
+                  \x20 There is deliberately no verb that prints a value, and there never will \
+                  be. That absence is the product. To use a secret, run the command that needs \
+                  it under `keyless run`.\n\n\
+                  IT NEVER BLOCKS YOUR COMMAND\n\
+                  \x20 If a name cannot be resolved, `keyless run` says so on stderr, runs your \
+                  command with that variable unset, and forwards the command's own exit code. \
+                  So a missing credential is your program's error, at your program's exit code \
+                  — never a refusal from this tool.\n\n\
+                  WHAT EACH VERB IS FOR\n\
+                  \x20 init     detect your stores, write a config, and prove one works\n\
+                  \x20 doctor   what is proven right now, what is not, and what to do next\n\
+                  \x20 ls       the names you have declared, and where each one points\n\
+                  \x20 items    what a store holds — titles and states, never a value\n\
+                  \x20 fields   the field names on one item — never a value, never a length\n\
+                  \x20 new      generate a credential and store it, showing it to nobody\n\
+                  \x20 put      read a credential on stdin and store it, echoing nothing\n\
+                  \x20 run      run a command with named secrets in its environment",
+    after_help = "START HERE\n\
+                  \x20 keyless init                    detect, configure, prove\n\
+                  \x20 keyless doctor                  is anything wrong, and where\n\
+                  \x20 keyless run -s NAME -- cmd      the only way a value leaves a store\n\n\
+                  Run `keyless <verb> --help` for one verb in full.",
     disable_help_subcommand = true
 )]
 struct Cli {
@@ -80,8 +95,10 @@ enum Verb {
     New(NewArgs),
     /// Read a value from stdin and store it. Never echoes it.
     Put(PutArgs),
-    /// Check the config, the stores and the audit log.
+    /// Say what is proven right now, what is not, and what to do next.
     Doctor(DoctorArgs),
+    /// Detect your stores, write a config, and prove one works.
+    Init(InitArgs),
 
     /// The words people reach for when they want to see a value.
     ///
@@ -215,10 +232,40 @@ struct RunArgs {
 
 #[derive(Args)]
 struct DoctorArgs {
-    /// Also ask each declared name whether it resolves. Prints ok or missing,
-    /// never a value. May trigger a keychain access prompt.
+    /// Also ask each declared name whether it resolves.
+    ///
+    /// Prints only that it resolved, that it is absent, or the store's error —
+    /// never a value and never a length. This READS each credential out of its
+    /// store, which is why it is not the default: against Proton that is one
+    /// vendor call and one permanent audit entry per name. It may also trigger
+    /// a keychain access prompt.
     #[arg(long)]
     probe: bool,
+}
+
+/// `init` writes a config file and nothing else. It never accepts a value.
+///
+/// There is no `--secret`, no `--value` and no prompt for one: the file it
+/// writes holds names, store kinds and paths, and there is no field a credential
+/// fits in. Adding one would be a change to [`keyless::config`], not to this
+/// verb.
+#[derive(Args)]
+struct InitArgs {
+    /// Write this backend as the default, instead of deciding.
+    ///
+    /// Accepted even for a backend that has not proved yet — writing the config
+    /// before the login is a normal order to do things in.
+    #[arg(long, value_name = "BACKEND")]
+    store: Option<String>,
+
+    /// Take the detected answer without asking anything.
+    #[arg(long)]
+    yes: bool,
+
+    /// Replace an existing config file. Without it, an existing file is left
+    /// exactly as it is and the run reports what it found.
+    #[arg(long)]
+    force: bool,
 }
 
 fn main() {
@@ -268,7 +315,14 @@ fn dispatch() -> i32 {
             let mut unusable = Vec::new();
             for spec in &args.secret {
                 let printable = spec.to_string_lossy().into_owned();
-                match spec.to_str().map(Binding::parse) {
+                // `declared`, not `parse`: a bare `-s NAME` also lands in the
+                // variables that name's own declaration says it answers to, so
+                // the label and the variable never have to be reconciled by
+                // hand. See `config::SecretRoute::aliases`.
+                match spec
+                    .to_str()
+                    .map(|spec| Binding::declared(spec, &load.config))
+                {
                     Some(Ok(binding)) => bindings.push(binding),
                     Some(Err(reason)) => {
                         warnings.push(reason);
@@ -473,21 +527,53 @@ fn dispatch() -> i32 {
             };
             let built = store::build(&load.config, &Invocation::for_verb(verb));
             let log = AuditLog::new(paths.audit.clone());
-            match doctor(
-                &paths,
-                &load,
-                &built.registry,
-                &log,
+            let notes = built
+                .warnings
+                .iter()
+                .chain(built.notes.iter())
+                .cloned()
+                .collect::<Vec<_>>();
+            let request = DoctorRequest {
+                paths: &paths,
+                load: &load,
+                registry: &built.registry,
+                audit: &log,
                 // Both channels: `doctor` is exactly the place the routine
                 // consequences of a configuration are worth spelling out.
-                &built
-                    .warnings
-                    .iter()
-                    .chain(built.notes.iter())
-                    .cloned()
-                    .collect::<Vec<_>>(),
-                args.probe,
+                notes: &notes,
+                probe: args.probe,
+                // The stream being decorated is the one asked about, exactly as
+                // `ls` asks about its own. A redirected report gets clean text.
+                style: Style::detect(io::stdout().is_terminal()),
+            };
+            match doctor(&request, &mut io::stdout()) {
+                Ok(code) => code,
+                Err(error) => {
+                    eprintln!("{NAME}: {error}");
+                    1
+                }
+            }
+        }
+
+        Verb::Init(args) => {
+            // Both streams, because the question is written to one and read from
+            // the other. A terminal on only one side is a pipeline, and a
+            // pipeline is never prompted.
+            let interactive = io::stdin().is_terminal() && io::stdout().is_terminal();
+            let request = InitRequest {
+                paths: &paths,
+                force: args.force,
+                assume_yes: args.yes,
+                only: args.store.as_deref(),
+                interactive,
+                style: Style::detect(io::stdout().is_terminal()),
+            };
+            let stdin = io::stdin();
+            match init(
+                &request,
+                &mut stdin.lock(),
                 &mut io::stdout(),
+                &mut io::stderr(),
             ) {
                 Ok(code) => code,
                 Err(error) => {

@@ -1465,6 +1465,18 @@ fn a_vault_whose_name_begins_with_a_dash_is_still_enumerable() {
 // could have said it.
 // ---------------------------------------------------------------------------
 
+/// The one report line about the Proton store.
+///
+/// By subject rather than by an exact prefix: the row carries a mark, a state
+/// word and a detail, and pinning the whole spelling here would make every
+/// assertion below a test of the layout rather than of the finding.
+fn proton_row(report: &str) -> &str {
+    report
+        .lines()
+        .find(|line| line.split_whitespace().nth(1) == Some("proton"))
+        .unwrap_or_else(|| panic!("the report has no `proton` row:\n{report}"))
+}
+
 /// `doctor`'s report and its exit code, against a registry built from `config`.
 fn doctor_report(dir: &Path, config: &str) -> (String, i32) {
     let paths = keyless::paths::Paths::under(dir);
@@ -1482,8 +1494,22 @@ fn doctor_report(dir: &Path, config: &str) -> (String, i32) {
     let audit = keyless::audit::AuditLog::new(paths.audit.clone());
 
     let mut out: Vec<u8> = Vec::new();
-    let code = keyless::cmd::doctor::doctor(&paths, &load, &registry, &audit, &[], false, &mut out)
-        .expect("the report must be writable");
+    // `Style::PLAIN` on purpose: these assertions are about WORDS, and a
+    // coloured render would wrap every one of them in escape sequences that a
+    // `contains` cannot see through.
+    let code = keyless::cmd::doctor::doctor(
+        &keyless::cmd::doctor::DoctorRequest {
+            paths: &paths,
+            load: &load,
+            registry: &registry,
+            audit: &audit,
+            notes: &[],
+            probe: false,
+            style: keyless::cmd::status::Style::PLAIN,
+        },
+        &mut out,
+    )
+    .expect("the report must be writable");
     (String::from_utf8(out).expect("utf-8"), code)
 }
 
@@ -1493,20 +1519,32 @@ fn doctor_reports_an_expired_proton_session_as_a_problem() {
     let stub = support::stub_pass_cli_dead_session(&dir);
     let (report, code) = doctor_report(&dir, &proton_config(&stub));
 
+    // Not proven, and the row says which kind of not-proven it is. A dead
+    // session is `absent` rather than `broken`: the store is installed and
+    // reachable, and the identity it needs has expired — so the reader is sent
+    // to a login, not to the vault.
     assert!(
-        report.contains("store    proton PROBLEM"),
-        "a dead session was not reported as a problem:\n{report}"
+        !proton_row(&report).contains("proven"),
+        "a dead session was reported as proven:\n{report}"
     );
+    assert!(proton_row(&report).contains("absent"), "{report}");
     // The vendor's own words, so the reader knows which of the many ways this
     // backend fails they are looking at.
+    //
+    // Read against a whitespace-collapsed copy: the report wraps a long detail
+    // across lines for a person to read, so a phrase can straddle a newline.
+    // `doctor` is the human surface and `ls` is the parseable one — see
+    // `crate::cmd::ls` for the four tab-separated fields a program should read
+    // instead of this.
+    let flat = report.split_whitespace().collect::<Vec<_>>().join(" ");
     assert!(
-        report.contains("authenticated client"),
+        flat.contains("authenticated client"),
         "the report did not say what the vendor said:\n{report}"
     );
     // And the fix, because "requires an authenticated client" does not tell
     // anybody which session directory to re-mint.
-    assert!(report.contains("pass-cli login"), "{report}");
-    assert!(report.contains(SCOPED_SESSION_DIR), "{report}");
+    assert!(flat.contains("pass-cli login"), "{report}");
+    assert!(flat.contains(SCOPED_SESSION_DIR), "{report}");
     assert_eq!(code, 1, "{report}");
     assert!(!report.contains("0 problem(s)"), "{report}");
 
@@ -1533,7 +1571,11 @@ fn doctor_reports_a_live_proton_session_as_ok() {
     let stub = stub_pass_cli_discovery(&dir, ONE_VAULT, LIVE_AND_TRASHED, "{}");
     let (report, code) = doctor_report(&dir, &proton_config(&stub));
 
-    assert!(report.contains("store    proton ok"), "{report}");
+    assert!(proton_row(&report).contains("proven"), "{report}");
+    // And never the word that was false. `ok` said "the binary answered" while
+    // reading as "your secrets are reachable"; a row is green here only because
+    // a read path came back.
+    assert!(!proton_row(&report).contains(" ok"), "{report}");
     assert_eq!(code, 0, "{report}");
     assert!(report.contains("0 problem(s)"), "{report}");
 
@@ -1570,7 +1612,10 @@ fn a_proton_store_with_no_session_directory_is_unhealthy_without_spawning_anythi
     );
     let (report, code) = doctor_report(&dir, &config);
 
-    assert!(report.contains("store    proton PROBLEM"), "{report}");
+    assert!(
+        proton_row(&report).contains("config") || proton_row(&report).contains("absent"),
+        "{report}"
+    );
     assert!(report.contains("session_dir"), "{report}");
     assert_eq!(code, 1, "{report}");
     assert!(

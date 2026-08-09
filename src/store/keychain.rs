@@ -181,21 +181,107 @@ impl Store for KeychainStore {
     }
 
     fn health(&self) -> Result<(), StoreError> {
-        // Read-only, prompts for nothing, and touches no item. Under the same
-        // deadline as a lookup: `doctor` is the verb people run when something
-        // is already wrong, so it is the last place that may hang.
+        // The guard comes before the spawn, and it is a `stat` rather than a
+        // process, because the failure it prevents is not an error — it is a
+        // MODAL DIALOG. See `default_keychain_is_reachable`.
+        self.default_keychain_is_reachable()?;
+
+        // A search for an item that is not there. This is the whole fix: the
+        // old check ran `security list-keychains`, which proves the binary
+        // answered and touches no item, and then printed `ok` — so a locked
+        // keychain and a working one were the same report. Measured with the
+        // suite's own `Stub::Errors`, which exits 0 for `list-keychains` and 51
+        // for every lookup: the store was reported healthy while every name
+        // under it failed.
+        //
+        // `errSecItemNotFound` is the SUCCESS case here. It is what a keychain
+        // says when the search reached the item database and the item is
+        // genuinely absent, so it proves the whole read path — the binary, the
+        // default keychain list, and the search itself — with no item touched,
+        // no value read and no access prompt, because an item that does not
+        // exist has no ACL to consult.
+        //
+        // No `-w` and no `-g`. Without them `security` prints ATTRIBUTES and
+        // never a password, so there is no path by which this check can hold a
+        // value; `stdout` is therefore never read here, on any branch.
         let mut command = Command::new(&self.binary);
-        command.arg("list-keychains");
+        command
+            .arg("find-generic-password")
+            .arg("-s")
+            .arg(&self.default_service)
+            .arg(HEALTH_ACCOUNT);
+        if let Some(keychain) = &self.keychain {
+            command.arg(keychain);
+        }
         let output = capture(command, self.timeout)
             .map_err(|error| unavailable(self.id(), &self.binary, &error))?;
 
-        if output.status.success() {
-            Ok(())
-        } else {
-            Err(self.unavailable(first_line(&output.stderr)))
+        match output.status.code() {
+            // The item is absent: the read path answered. Proven.
+            Some(EXIT_ITEM_NOT_FOUND) => Ok(()),
+            // Someone really has an item at the probe's coordinates. Still a
+            // proof of the read path, and still no value read — this branch
+            // does not look at stdout either.
+            Some(0) => Ok(()),
+            // Reached and refused: a locked keychain, a denied ACL, a keychain
+            // that cannot be opened. `Backend`, so `doctor` paints it red and
+            // sends the reader to the keychain rather than to an install.
+            _ => Err(self.backend(first_line(&output.stderr))),
         }
     }
 }
+
+/// The account the health probe searches for, and deliberately never creates.
+///
+/// A sentinel rather than a real item, because the check must not WRITE. The
+/// name is improbable enough that a collision is a curiosity rather than a bug —
+/// and a collision is harmless anyway, since the probe reads no value either
+/// way.
+const HEALTH_ACCOUNT: &str = "keyless-health-probe-never-created";
+
+impl KeychainStore {
+    /// Refuse to spawn `security` when this HOME has no keychain to search.
+    ///
+    /// 🚨 **This is not politeness, it is the guard against a GUI dialog.** With
+    /// `HOME` pointed at a directory holding no keychain, macOS cannot resolve a
+    /// default keychain and the Security framework puts a MODAL window on the
+    /// user's screen — one whose buttons include **Reset To Defaults**. That
+    /// happened during a cold-start test on this machine, from a command nobody
+    /// thought could do anything but print.
+    ///
+    /// A `stat` cannot open a window. So the check is a filesystem test that
+    /// runs BEFORE any process exists, and the report degrades to "not set up"
+    /// with a sentence naming HOME — which is the true answer in that state
+    /// anyway.
+    ///
+    /// It applies only to the stock `/usr/bin/security`. A config that points
+    /// `binary` somewhere else is a stub or an unusual install, and its owner —
+    /// not this guard — decides what reaching it means.
+    fn default_keychain_is_reachable(&self) -> Result<(), StoreError> {
+        if self.binary.as_path() != std::path::Path::new(STOCK_SECURITY) {
+            return Ok(());
+        }
+        let Some(home) = crate::paths::home() else {
+            return Err(self.unavailable(
+                "HOME is not set, so there is no login keychain to search. \
+                 The keychain backend needs a real home directory",
+            ));
+        };
+        let keychains = home.join("Library").join("Keychains");
+        if keychains.is_dir() {
+            return Ok(());
+        }
+        Err(self.unavailable(format!(
+            "{} does not exist, so this HOME has no login keychain. \
+             `keyless` will not run `security` against it, because macOS answers \
+             a missing default keychain with a modal dialog rather than an error",
+            keychains.display()
+        )))
+    }
+}
+
+/// The stock macOS `security`, and the only binary the HOME guard applies to.
+const STOCK_SECURITY: &str = "/usr/bin/security";
 
 /// Writes generic passwords into the keychain, on stdin.
 ///

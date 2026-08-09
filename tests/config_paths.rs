@@ -322,9 +322,12 @@ fn doctor_never_calls_a_relative_session_dir_ok() {
     let output = fixture.keyless(&config, Some(&fixture.home), &["doctor"]);
     let report = stdout_of(&output);
 
-    assert!(report.contains("store    proton PROBLEM"), "{report}");
+    let proton = report
+        .lines()
+        .find(|line| line.split_whitespace().nth(1) == Some("proton"))
+        .unwrap_or_else(|| panic!("the report has no `proton` row:\n{report}"));
+    assert!(!proton.contains("proven"), "{report}");
     assert!(report.contains("relative path"), "{report}");
-    assert!(!report.contains("store    proton ok"), "{report}");
     assert!(!report.contains("\n0 problem(s)"), "{report}");
     assert_eq!(output.status.code(), Some(1), "{report}");
 }
