@@ -139,6 +139,15 @@ pub enum AuditError {
     /// A row's chain hash does not match its contents, or the file is not
     /// shaped like an audit log.
     Chain { line: usize, detail: String },
+    /// The log no longer ends where the writer last recorded that it ended, or
+    /// the record of that fact is itself unreadable.
+    ///
+    /// Kept apart from [`AuditError::Chain`] because it answers a different
+    /// question and points somewhere else. `Chain` says a row was altered and
+    /// names the line. This says rows the writer wrote are absent — from the
+    /// end of the file, which no chain can detect, or because the whole file
+    /// was replaced. See [`crate::audit::anchor`] for the exact bound.
+    Anchor { detail: String },
 }
 
 impl fmt::Display for AuditError {
@@ -150,6 +159,9 @@ impl fmt::Display for AuditError {
             AuditError::Encode(detail) => write!(f, "cannot encode audit row: {detail}"),
             AuditError::Chain { line, detail } => {
                 write!(f, "audit chain broken at line {line}: {detail}")
+            }
+            AuditError::Anchor { detail } => {
+                write!(f, "audit log truncated or replaced: {detail}")
             }
         }
     }

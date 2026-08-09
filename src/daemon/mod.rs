@@ -495,6 +495,13 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
 
+    // The socket cannot live in the scratch directory below: read the file for
+    // the measurement, and for why `TMPDIR` decided whether these tests passed.
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/support/short_socket.rs"
+    ));
+
     fn scratch(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
             "keyless-daemon-{tag}-{}-{:?}",
@@ -512,8 +519,9 @@ mod tests {
         // unreachable by the very group it was created for, and a `0666` one
         // would let any user on the machine talk to the daemon.
         let dir = scratch("mode");
+        let socket = short_socket_path(&dir);
         let config = DaemonConfig {
-            socket: dir.join("d.sock").into(),
+            socket: socket.clone().into(),
             audit: dir.join("audit.jsonl").into(),
             ..DaemonConfig::default()
         };
@@ -526,14 +534,16 @@ mod tests {
         assert_eq!(mode, SOCKET_MODE, "mode was {mode:04o}");
         assert_eq!(mode & 0o007, 0, "other must not be able to connect");
         drop(daemon);
+        let _ = std::fs::remove_file(&socket);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn a_stale_socket_is_replaced() {
         let dir = scratch("stale");
+        let socket = short_socket_path(&dir);
         let config = DaemonConfig {
-            socket: dir.join("d.sock").into(),
+            socket: socket.clone().into(),
             audit: dir.join("audit.jsonl").into(),
             ..DaemonConfig::default()
         };
@@ -542,6 +552,7 @@ mod tests {
         // The inode is still there; binding again must work.
         let second = Daemon::bind(&config, Policy::new()).expect("second bind over a stale socket");
         drop(second);
+        let _ = std::fs::remove_file(&socket);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

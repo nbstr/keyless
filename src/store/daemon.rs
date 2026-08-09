@@ -123,6 +123,13 @@ mod tests {
     use std::path::PathBuf;
     use std::time::Duration;
 
+    // This module BINDS a socket, so it cannot name one under `TMPDIR`: read
+    // the file for the measurement.
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/support/short_socket.rs"
+    ));
+
     #[test]
     fn an_absent_daemon_is_an_error_and_never_a_value() {
         let store = DaemonStore::new(
@@ -138,7 +145,7 @@ mod tests {
     fn a_stale_socket_file_is_an_error_and_never_a_value() {
         // A leftover socket inode with nothing listening: connect fails with
         // ECONNREFUSED rather than ENOENT, which is a different code path.
-        let path = std::env::temp_dir().join(format!("keyless-stale-{}.sock", std::process::id()));
+        let path = short_socket_path(&PathBuf::from("store-daemon-stale"));
         let _ = std::fs::remove_file(&path);
         {
             let listener = std::os::unix::net::UnixListener::bind(&path).expect("bind");

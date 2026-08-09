@@ -255,6 +255,74 @@ mod tests {
     }
 
     #[test]
+    fn a_log_with_rows_removed_from_the_end_is_reported_as_a_problem() {
+        // The measured defect this closes, at the layer a person actually
+        // reads. Before the tail anchor existed, `doctor` printed
+        // "ok, N rows, chain intact" and exited 0 for a log whose last row had
+        // been deleted, while the same log missing a MIDDLE row was reported as
+        // "audit chain broken at line 2". The undetected half is the common
+        // one: a naive rotation, a stale restore, a stray `head -n -1`.
+        //
+        // A PROBLEM, not a refusal: `doctor` degrades a run and never blocks
+        // one, which is why the assertion below is on the report and the exit
+        // code, and there is nothing here about stopping anything.
+        let dir = std::env::temp_dir().join(format!(
+            "keyless-doctor-tail-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let log_path = dir.join("audit.jsonl");
+
+        let audit = AuditLog::new(log_path.clone());
+        let masker = crate::mask::Masker::new();
+        for i in 0..3 {
+            audit
+                .append(&crate::audit::Event::new(
+                    "run",
+                    crate::State::Injected,
+                    vec![],
+                    &[format!("c{i}")],
+                    &masker,
+                ))
+                .expect("append");
+        }
+
+        let paths = Paths::under(Path::new("/nonexistent/keyless-doctor"));
+        let load = crate::config::Config::load(&paths.config);
+        let registry = Registry::new(vec![Box::new(Healthy)]);
+
+        // The control: with the log intact, this exact call is clean. Without
+        // it, an assertion below would pass for a `doctor` that reports a
+        // problem no matter what it is given.
+        let mut out: Vec<u8> = Vec::new();
+        let code = doctor(&paths, &load, &registry, &audit, &[], false, &mut out).expect("write");
+        let intact = String::from_utf8(out).expect("utf-8");
+        assert!(intact.contains("chain intact"), "{intact}");
+        assert_eq!(code, 0, "an intact log must not be a problem: {intact}");
+
+        let raw = std::fs::read_to_string(&log_path).expect("read");
+        let lines: Vec<&str> = raw.lines().collect();
+        std::fs::write(&log_path, format!("{}\n{}\n", lines[0], lines[1])).expect("drop the last");
+
+        let mut out: Vec<u8> = Vec::new();
+        let code = doctor(&paths, &load, &registry, &audit, &[], false, &mut out).expect("write");
+        let report = String::from_utf8(out).expect("utf-8");
+        assert!(
+            report.contains("PROBLEM") && report.contains("truncated or replaced"),
+            "a log with its last row removed was not reported: {report}"
+        );
+        assert!(
+            !report.contains("chain intact"),
+            "a truncated log must not also be described as intact: {report}"
+        );
+        assert_eq!(code, 1, "{report}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn no_stores_is_reported_as_a_problem() {
         let paths = Paths::under(Path::new("/nonexistent/keyless-doctor"));
         let load = Config::load(&paths.config);

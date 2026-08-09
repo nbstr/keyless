@@ -154,18 +154,6 @@ impl Masker {
         self.needles.is_empty()
     }
 
-    /// Number of compiled needles. Metadata only — safe to print.
-    #[must_use]
-    pub fn len(&self) -> usize {
-        self.needles.len()
-    }
-
-    /// Length of the longest needle, which is how much the writer must hold back.
-    #[must_use]
-    pub fn max_needle_len(&self) -> usize {
-        self.max_len
-    }
-
     /// How many leading bytes of `buf` it is safe to emit mid-stream.
     ///
     /// The blunt answer is `buf.len() - (max_needle_len - 1)`: hold back a whole
@@ -288,16 +276,34 @@ impl Masker {
 /// split across writes is still caught.
 pub struct MaskingWriter<W: Write> {
     masker: Arc<Masker>,
-    carry: Vec<u8>,
+    /// Bytes held back from the stream, and therefore a live fragment of
+    /// whatever the child is printing — including the part of a secret that
+    /// arrived just before a write boundary.
+    ///
+    /// Scrubbed by the **type**, for the reason spelled out on [`Needle`]: this
+    /// used to be a plain `Vec<u8>` with a hand-written `Drop` calling
+    /// `zeroize`, and emptying that body is invisible. The observable behaviour
+    /// of this writer is identical whether the destructor scrubs or does
+    /// nothing at all, so no test can see the difference and mutating the
+    /// destructor to `()` left the whole suite green while deleting the
+    /// guarantee. Declaring the field as a type that cannot exist without the
+    /// scrub puts it out of reach of an edit to this file.
+    carry: Zeroizing<Vec<u8>>,
     inner: W,
 }
+
+/// Compile-time proof of the paragraph above, bound to the actual field.
+const _: fn(&MaskingWriter<io::Sink>) = |writer| {
+    fn scrubs_on_drop<T: zeroize::ZeroizeOnDrop + ?Sized>(_: &T) {}
+    scrubs_on_drop(&writer.carry);
+};
 
 impl<W: Write> MaskingWriter<W> {
     /// Wrap `inner`.
     pub fn new(masker: Arc<Masker>, inner: W) -> Self {
         MaskingWriter {
             masker,
-            carry: Vec::new(),
+            carry: Zeroizing::new(Vec::new()),
             inner,
         }
     }
@@ -315,7 +321,9 @@ impl<W: Write> MaskingWriter<W> {
 
     fn push(&mut self, chunk: &[u8], end_of_stream: bool) -> io::Result<()> {
         self.carry.extend_from_slice(chunk);
-        let mut buf = std::mem::take(&mut self.carry);
+        // Moved out and put back through the same type, so the intermediate
+        // is scrubbed on drop exactly like the field it came from.
+        let buf = std::mem::replace(&mut self.carry, Zeroizing::new(Vec::new()));
         let masker = Arc::clone(&self.masker);
         let emit_limit = if end_of_stream {
             buf.len()
@@ -323,8 +331,8 @@ impl<W: Write> MaskingWriter<W> {
             masker.carry_point(&buf)
         };
         let (out, consumed) = masker.scan(&buf, emit_limit);
-        self.carry = buf[consumed..].to_vec();
-        buf.zeroize();
+        // The previous carry is dropped here, which scrubs it.
+        self.carry = Zeroizing::new(buf[consumed..].to_vec());
         self.inner.write_all(&out)
     }
 }
@@ -343,12 +351,6 @@ impl<W: Write> Write for MaskingWriter<W> {
     /// matters. Use [`MaskingWriter::finish`] to end the stream.
     fn flush(&mut self) -> io::Result<()> {
         self.inner.flush()
-    }
-}
-
-impl<W: Write> Drop for MaskingWriter<W> {
-    fn drop(&mut self) {
-        self.carry.zeroize();
     }
 }
 
@@ -392,7 +394,7 @@ pub fn pump<R: Read, W: Write>(mut reader: R, writer: W, masker: Arc<Masker>) ->
 mod tests {
     use super::{Masker, MaskingWriter};
     use crate::secret::Secret;
-    use std::io::Write;
+    use std::io::{self, ErrorKind, Read, Write};
     use std::sync::Arc;
 
     fn masker_for(value: &str) -> Arc<Masker> {
@@ -416,6 +418,48 @@ mod tests {
     fn a_short_secret_produces_no_needles() {
         let masker = masker_for("abc");
         assert!(masker.is_empty(), "3-byte values must not become needles");
+    }
+
+    #[test]
+    fn a_secret_of_exactly_the_minimum_length_is_still_redacted() {
+        // The other half of the boundary above, and the half that leaks. The
+        // test above pins the REJECT side of `len < MIN_NEEDLE_LEN`; nothing
+        // pinned the ACCEPT side, so moving that comparison one place — to
+        // `<=`, or to `==` — dropped every four-byte secret on the floor and
+        // the whole suite stayed green. `MIN_NEEDLE_LEN` is the smallest length
+        // that IS a secret, not the largest that is not.
+        //
+        // Both filters in `add` are pinned here, and they are separate lines
+        // guarding different things: one rejects the SECRET, one rejects each
+        // derived ENCODING. Widening either one leaves the raw four-byte value
+        // in the output, so this asserts on the raw form specifically.
+        let value = "ab7Z";
+        assert_eq!(
+            value.len(),
+            super::MIN_NEEDLE_LEN,
+            "the fixture must sit exactly on the boundary"
+        );
+        let masker = masker_for(value);
+        assert!(
+            !masker.is_empty(),
+            "a secret of exactly MIN_NEEDLE_LEN must produce needles"
+        );
+        assert_eq!(
+            masker.mask_str(&format!("token={value} end")),
+            "token=[keyless:DECOY] end",
+            "a secret of exactly MIN_NEEDLE_LEN was printed in clear"
+        );
+    }
+
+    #[test]
+    fn a_secret_one_byte_over_the_minimum_is_redacted() {
+        // The control that keeps the test above from passing for an
+        // implementation that masks nothing but four-byte values.
+        let masker = masker_for("ab7Zq");
+        assert_eq!(
+            masker.mask_str("token=ab7Zq end"),
+            "token=[keyless:DECOY] end"
+        );
     }
 
     #[test]
@@ -461,6 +505,89 @@ mod tests {
             !masked.contains("-and-the-tail-in-clear"),
             "the longer secret's tail survived masking: {masked:?}"
         );
+    }
+
+    /// A reader that hands back a scripted sequence of results, then EOF.
+    ///
+    /// `pump`'s three error arms are the whole of its control flow and none of
+    /// them needed a pty to reach — they only needed a `Read` that fails on
+    /// purpose. Every script here is finite and ends in `Ok(0)`, so a mutation
+    /// that turns an arm into "retry" cannot spin: it reaches the end of the
+    /// script and stops.
+    struct ScriptedReader {
+        steps: std::cell::RefCell<std::collections::VecDeque<io::Result<&'static [u8]>>>,
+    }
+
+    impl ScriptedReader {
+        fn new(steps: Vec<io::Result<&'static [u8]>>) -> Self {
+            ScriptedReader {
+                steps: std::cell::RefCell::new(steps.into_iter().collect()),
+            }
+        }
+    }
+
+    impl Read for ScriptedReader {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            match self.steps.borrow_mut().pop_front() {
+                None | Some(Ok(b"")) => Ok(0),
+                Some(Ok(bytes)) => {
+                    buf[..bytes.len()].copy_from_slice(bytes);
+                    Ok(bytes.len())
+                }
+                Some(Err(error)) => Err(error),
+            }
+        }
+    }
+
+    fn pump_script(steps: Vec<io::Result<&'static [u8]>>) -> io::Result<String> {
+        let masker = masker_for("decoy-pump-error-arm-value-2468");
+        let mut sink: Vec<u8> = Vec::new();
+        super::pump(ScriptedReader::new(steps), &mut sink, masker)?;
+        Ok(String::from_utf8(sink).expect("output stays valid utf-8"))
+    }
+
+    #[test]
+    fn pump_retries_an_interrupted_read_instead_of_losing_the_stream() {
+        // `EINTR` is not a failure; it means a signal arrived mid-syscall and
+        // the read must be reissued. Treat it as a real error and every command
+        // that happens to be running when a signal lands loses its output and
+        // reports a failure that never happened.
+        let out = pump_script(vec![
+            Err(io::Error::from(ErrorKind::Interrupted)),
+            Ok(b"after the signal"),
+        ])
+        .expect("an interrupted read must not end the stream");
+        assert_eq!(out, "after the signal");
+    }
+
+    #[test]
+    fn pump_treats_eio_as_the_end_of_the_stream() {
+        // A pty master reports the death of the last slave as `EIO` on Linux
+        // where macOS returns 0 for the same event. Both mean nothing will ever
+        // be readable again, so both must end the stream cleanly. Reported as
+        // an error instead, every Linux pty session would end by printing a
+        // failure for a child that exited normally.
+        let out = pump_script(vec![
+            Ok(b"before the slave died"),
+            Err(io::Error::from_raw_os_error(nix::libc::EIO)),
+        ])
+        .expect("EIO must end the stream rather than fail it");
+        assert_eq!(out, "before the slave died");
+    }
+
+    #[test]
+    fn pump_still_reports_an_error_that_is_neither_of_those() {
+        // The control for both tests above, and the one that keeps them honest.
+        // Widen either guard to "any error" and the two tests still pass while
+        // every genuine read failure is silently swallowed as a clean end of
+        // stream — output truncated, exit status zero, nothing said.
+        let error = pump_script(vec![
+            Ok(b"partial"),
+            Err(io::Error::from(ErrorKind::PermissionDenied)),
+            Ok(b"never reached"),
+        ])
+        .expect_err("a real read failure must be reported");
+        assert_eq!(error.kind(), ErrorKind::PermissionDenied);
     }
 
     #[test]

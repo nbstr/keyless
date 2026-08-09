@@ -1,0 +1,133 @@
+# Mutants that survive the test suite, and why each one is allowed to.
+#
+# `.github/workflows/mutants.yml` diffs this file against the survivors of a
+# real campaign, in both directions. A survivor missing from here is a guard
+# somebody lost. An entry here that no longer survives is a gap somebody closed
+# while this file still claimed it was open. Both are red.
+#
+# FORMAT — one line per surviving mutation:
+#
+#     <count><TAB><path>: <the mutation cargo-mutants applied>
+#
+# The line and column are stripped on purpose and the count is what replaces
+# them. `mutants.yml` explains that choice in full; the short version is that a
+# key carrying a line number reds on a comment, and a gate that reds on a
+# comment gets deleted.
+#
+# REGENERATE (about 38 minutes; do not hand-edit a line, re-derive it):
+#
+#     cargo mutants -f 'src/mask/**' -f 'src/secret.rs' -f 'src/audit/**' \
+#       --jobs 2 --timeout-multiplier 8 --output /tmp/mutants-run
+#
+# then normalise `/tmp/mutants-run/mutants.out/missed.txt` with the same three
+# lines the workflow uses. Run it through the workflow's own normaliser rather
+# than by hand: a baseline produced by different code from the one that checks
+# it is a baseline that reds on the day it lands.
+#
+# ---------------------------------------------------------------------------
+# WHAT MAY BE ADDED HERE, AND WHAT MAY NOT
+# ---------------------------------------------------------------------------
+#
+# An entry is a claim that no test can observe this mutation, with the reason
+# stated. There are exactly three admissible reasons, and every line below
+# carries one:
+#
+#   EQUIVALENT   The mutated program computes the same function as the original.
+#                No test can ever kill it, because there is nothing to observe.
+#                A claim of equivalence must come with its PROOF, not with an
+#                assurance.
+#   UNREACHABLE  The mutated code has no caller, so no test reaches it. This is
+#                dead code wearing a survivor's clothes, and the correct fix is
+#                deletion. An entry of this kind is a debt, not a resting place.
+#   COSMETIC     The mutation changes only a diagnostic that no contract depends
+#                on. Narrow, and easy to abuse — prefer asserting the message.
+#
+# **A mutation that a test COULD observe is not admissible here.** "Nobody has
+# written that test yet" is the one reason this file must never record, because
+# recording it converts a missing guard into a documented feature.
+#
+# **Nor is a known weakness.** If a survivor ever turns out to describe an
+# exploitable defect rather than a coverage gap, it does not belong in a
+# baseline at all: it belongs fixed, or embargoed. Writing it here would publish
+# it and bless it in the same commit.
+#
+# ---------------------------------------------------------------------------
+# ON PUBLISHING THIS FILE AT ALL
+# ---------------------------------------------------------------------------
+#
+# This is a list of places the tests do not look, checked into a public
+# repository for a security tool. That deserves an argument rather than a
+# shrug, and the argument is this:
+#
+#   * It is precomputed, not secret. Anyone can `cargo install cargo-mutants`
+#     and derive the same list in under an hour. Withholding it buys time
+#     against nobody who is actually looking.
+#   * A surviving mutant is a statement about the TESTS, not about the shipped
+#     binary. "No test notices if this `<` becomes `<=`" tells an attacker
+#     nothing about the program they can run, which contains the unmutated
+#     comparison.
+#   * The reasons are the part worth reviewing, and a reason can be wrong. A
+#     wrong reason is the real risk in this file, and it is a risk that hiding
+#     the file makes worse rather than better: an unreviewable justification is
+#     how a hole becomes permanent.
+#   * Counts alone would not do. A gate that knows only that the number moved
+#     cannot tell a closed gap from a new hole, and it names nothing for a
+#     person to go and read. That is a gate nobody can act on.
+#
+# The honest cost: a reader learns which comparisons are unguarded before the
+# maintainers necessarily do. That is accepted, and it is why the admission
+# rules above are narrow.
+#
+# ---------------------------------------------------------------------------
+# MUTANTS THAT TIMED OUT, AND ARE THEREFORE IN NEITHER COLUMN
+# ---------------------------------------------------------------------------
+#
+# A mutant that makes a loop run forever is classified by the clock, not by the
+# tests. It is not a survivor and it is not caught, so it appears nowhere below
+# — and if it ever stops timing out it arrives as a brand new survivor and reds
+# a gate that nobody changed. Naming them here is the only way that red is
+# recognisable rather than alarming.
+#
+# The run that produced this file timed out on four, all of them in the two
+# loops that count:
+#
+#   src/audit/mod.rs:  replace -= with /= in AuditLog::write_locked
+#   src/mask/mod.rs:   replace += with -= in Masker::scan
+#   src/mask/mod.rs:   replace += with *= in Masker::scan   (two lines)
+#
+# The first is `argv_len -= 1` in the loop that shrinks an oversized row; the
+# rest are the scan cursor. Under `/=`, `*=` or a decrement the counter never
+# reaches its bound and the loop does not end. These are real infinite loops
+# rather than a slow machine, so they time out anywhere, and no test can turn
+# one into a normal failure.
+#
+# ---------------------------------------------------------------------------
+# EQUIVALENT. The SHA-256 `Ch` and `Maj` functions, whose operands are chosen so
+# that XOR and OR agree on every input.
+#
+#   Ch  = (e & f) ^ ((!e) & g)
+#
+# A bit set in `e & f` needs e = 1; a bit set in `(!e) & g` needs e = 0. The two
+# operands are DISJOINT, and XOR and OR are the same function on disjoint bits.
+#
+#   Maj = (a & b) ^ (a & c) ^ (b & c)
+#
+# Not disjoint, but still equal: both spellings compute the majority of three
+# bits. Enumerate all eight assignments and the two columns match — which is why
+# the `^` at two separate columns on that one line both survive.
+#
+# The suite pins SHA-256 against NIST vectors, including the one-million-byte
+# one, so anything that changed the digest would die instantly. These do not
+# change the digest. There is no test to write.
+3	src/audit/sha256.rs: replace ^ with | in compress
+# EQUIVALENT. Base64 packs three bytes into one integer:
+#
+#   let n = (buf[0] << 16) | (buf[1] << 8) | buf[2];
+#
+# Each operand occupies its own eight bits — 16..23, 8..15, 0..7 — so no bit is
+# ever set by more than one of them. On disjoint operands `|`, `^` and `+` are
+# all the same function, and both `|` on that line survive for the same reason.
+#
+# Base64 output is asserted against fixed strings elsewhere in the suite, so a
+# mutation that actually changed a byte would be caught. This one cannot.
+2	src/mask/encodings.rs: replace | with ^ in base64
