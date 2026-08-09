@@ -440,8 +440,22 @@ pub struct SecretRoute {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
     /// Infisical secret key override. Defaults to the name itself.
+    ///
+    /// **This field is also read by [`SecretRoute::aliases`]**, because an
+    /// Infisical key IS an environment variable name: `infisical run` injects a
+    /// project's secrets into a child under their keys. So a name declaring
+    /// `"key": "DATABASE_URL"` has already said, in the only vocabulary the
+    /// store has, that this credential is the variable `DATABASE_URL`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub key: Option<String>,
+    /// Another environment variable this credential answers to.
+    ///
+    /// For stores whose coordinates name an ITEM rather than a variable — a
+    /// keychain account, a Proton vault and item — nothing about the route says
+    /// which variable a program reads, so there is nothing to derive and this is
+    /// where it is said. See [`SecretRoute::aliases`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub var: Option<String>,
     /// Proton Pass vault NAME, e.g. `personal`. Part of the name form.
     ///
     /// Names are what a person types and what stays true; the ids underneath
@@ -476,6 +490,62 @@ pub struct SecretRoute {
     /// Free-text note shown by `ls`. Never a value.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
+}
+
+impl SecretRoute {
+    /// The other environment variables this credential answers to, besides the
+    /// declared name itself.
+    ///
+    /// # The wall this removes
+    ///
+    /// **A name labels a secret. It is not the variable a program reads.** The
+    /// two are routinely different — a store holds one credential per
+    /// environment and needs distinct labels for them, while every program in
+    /// every environment reads the same variable. So a declaration says
+    /// `"NAME_FOR_STAGING": {"key": "THE_VARIABLE"}` and the two halves are
+    /// written down side by side.
+    ///
+    /// `keyless` held both halves and injected only the literal one, so a bare
+    /// `-s NAME_FOR_STAGING` set a variable nothing reads. The command then
+    /// fails for a reason that looks nothing like a naming problem: the variable
+    /// it wanted was simply never set, so it reports a missing credential, or an
+    /// unauthenticated call, or nothing at all at exit 0.
+    ///
+    /// Reconciling those two halves was left to whoever typed the command, every
+    /// time, from knowledge that appears nowhere in it. This method is that
+    /// reconciliation, done by the tool that already has both.
+    ///
+    /// # Why both, and not instead
+    ///
+    /// The value is injected under the declared name AND under each of these.
+    /// Substituting one for the other would be a second silent variable-name
+    /// failure aimed the other way — every script that reads `$NAME` today would
+    /// find it unset — and trading one invisible unset variable for another is
+    /// not a fix. Under both, nothing that works today stops working, and the
+    /// case that used to need a person stops needing one.
+    ///
+    /// # What is NOT derived, and why the omission is deliberate
+    ///
+    /// A keychain `account`, a Proton `vault`/`item`/`field`: those coordinates
+    /// name an item in a store, and no rule turns `Router` + `password` into the
+    /// variable a program reads. Guessing would inject a variable nobody named,
+    /// from a word that was never an environment variable. Those declarations
+    /// say it with [`SecretRoute::var`] instead.
+    ///
+    /// The caller's own `ENV=NAME` is not routed through here at all: a spelled
+    /// target is an instruction, and it stays exactly as narrow as it was typed.
+    #[must_use]
+    pub fn aliases(&self, name: &str) -> Vec<String> {
+        // `var` is a statement; `key` is evidence. An explicit statement is not
+        // added to, because a route that says which variable it means has
+        // answered the question this method exists to ask.
+        let candidate = self.var.as_ref().or(self.key.as_ref());
+        candidate
+            .filter(|variable| variable.as_str() != name)
+            .into_iter()
+            .cloned()
+            .collect()
+    }
 }
 
 fn default_service() -> String {
@@ -779,6 +849,53 @@ mod tests {
         let route = parsed.route("DB");
         assert_eq!(route.env.as_deref(), Some("staging"));
         assert_eq!(route.path.as_deref(), Some("/backend"));
+    }
+
+    #[test]
+    fn a_store_side_key_is_a_variable_the_credential_answers_to() {
+        // The whole of the fix, at the layer that holds both halves: the label
+        // and the variable are written down side by side, and reconciling them
+        // stops being somebody's job.
+        let parsed: Config =
+            serde_json::from_str(r#"{"secrets":{"LABEL":{"key":"THE_VARIABLE"}}}"#)
+                .expect("valid config");
+        assert_eq!(parsed.route("LABEL").aliases("LABEL"), ["THE_VARIABLE"]);
+    }
+
+    #[test]
+    fn a_statement_outranks_the_evidence() {
+        // `var` is somebody saying which variable they mean; `key` is a store
+        // coordinate that usually happens to be one. A route carrying both has
+        // already answered the question, so nothing is added to the answer.
+        let parsed: Config =
+            serde_json::from_str(r#"{"secrets":{"LABEL":{"key":"FROM_KEY","var":"FROM_VAR"}}}"#)
+                .expect("valid config");
+        assert_eq!(parsed.route("LABEL").aliases("LABEL"), ["FROM_VAR"]);
+    }
+
+    #[test]
+    fn a_key_that_is_already_the_name_adds_nothing() {
+        let parsed: Config =
+            serde_json::from_str(r#"{"secrets":{"SAME":{"key":"SAME"}}}"#).expect("valid config");
+        assert!(parsed.route("SAME").aliases("SAME").is_empty());
+    }
+
+    #[test]
+    fn a_route_naming_no_variable_answers_to_nothing_else() {
+        // Coordinates that name an ITEM — a keychain account, a Proton vault and
+        // item — say nothing about which variable a program reads, and guessing
+        // from them would inject a variable nobody named.
+        let parsed: Config = serde_json::from_str(
+            r#"{"secrets":{"WIFI":{"vault":"Personal","item":"Router","field":"password",
+                                   "account":"acct","service":"svc","note":"n"}}}"#,
+        )
+        .expect("valid config");
+        assert!(parsed.route("WIFI").aliases("WIFI").is_empty());
+    }
+
+    #[test]
+    fn an_undeclared_name_answers_to_nothing_but_itself() {
+        assert!(Config::default().route("ANY").aliases("ANY").is_empty());
     }
 
     #[test]

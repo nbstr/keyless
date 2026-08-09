@@ -94,13 +94,18 @@ impl TtyPolicy {
     }
 }
 
-/// One `--secret` request: which name to look up, and which variable to put it in.
+/// One `--secret` request: which name to look up, and which variables to put it in.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Binding {
     /// The environment variable the child will see.
     pub env: String,
     /// The name to look up in the stores.
     pub name: String,
+    /// The other variables this credential answers to, from its declaration.
+    ///
+    /// Empty when the caller spelled `ENV=NAME`, and empty for a name no config
+    /// declares. See [`Binding::declared`] and [`crate::config::SecretRoute::aliases`].
+    pub also: Vec<String>,
 }
 
 impl Binding {
@@ -109,6 +114,11 @@ impl Binding {
     /// The two-part form exists because the store's name for a credential and
     /// the variable a tool reads are often different — `gh` wants
     /// `GITHUB_TOKEN` whatever the item is called.
+    ///
+    /// Syntax only: this reads the spec and nothing else, so a request parsed
+    /// here lands in exactly the one variable the spec spells. Use
+    /// [`Binding::declared`] to also give the credential the variables its
+    /// declaration says it answers to.
     pub fn parse(spec: &str) -> Result<Self, String> {
         let (env, name) = match spec.split_once('=') {
             Some((env, name)) => (env.trim(), name.trim()),
@@ -131,7 +141,53 @@ impl Binding {
         Ok(Binding {
             env: env.to_owned(),
             name: name.to_owned(),
+            also: Vec::new(),
         })
+    }
+
+    /// Parse a spec, and give the credential every variable its declaration says
+    /// it answers to.
+    ///
+    /// This is what the binary calls, and the difference between it and
+    /// [`Binding::parse`] is the whole of the fix described in
+    /// [`crate::config::SecretRoute::aliases`]: a bare `-s NAME` reaches the
+    /// child under the variable the program actually reads, without anybody
+    /// having to know that the label and the variable were different.
+    ///
+    /// # A config is not a trusted input
+    ///
+    /// It arrives by `--config` or `KEYLESS_CONFIG`, so a declaration can name
+    /// any variable at all — including the ones in [`hijacks_the_child`], where
+    /// the stored VALUE would choose which program the child runs while masking
+    /// hid it doing so. Every derived variable therefore goes through the same
+    /// two checks a typed one does, and a rejected one is dropped rather than
+    /// failing the run: the caller asked for a name, not for an alias, and the
+    /// name still resolves and still lands in its own variable.
+    pub fn declared(spec: &str, config: &crate::config::Config) -> Result<Self, String> {
+        let mut binding = Binding::parse(spec)?;
+        // A spelled `ENV=NAME` is an instruction about where the value goes. It
+        // is not widened, because the caller has already answered the question.
+        if binding.env != binding.name {
+            return Ok(binding);
+        }
+        binding.also = config
+            .route(&binding.name)
+            .aliases(&binding.name)
+            .into_iter()
+            .filter(|variable| {
+                variable != &binding.env
+                    && is_valid_env_name(variable)
+                    && hijacks_the_child(variable).is_none()
+            })
+            .collect();
+        Ok(binding)
+    }
+
+    /// Every variable this request would set, the spelled one first.
+    fn targets(&self) -> Vec<String> {
+        std::iter::once(self.env.clone())
+            .chain(self.also.iter().cloned())
+            .collect()
     }
 }
 
@@ -260,7 +316,12 @@ pub fn run(request: RunRequest<'_>, notes: &mut dyn Write) -> Result<Outcome, Ru
         let _ = writeln!(notes, "{NAME}: warning: {warning}");
     }
 
-    let mut resolved: Vec<(String, Secret)> = Vec::new();
+    // Which variables each request may set, after two requests that would have
+    // landed in the same one have been separated. Computed before anything is
+    // resolved, because it is a property of what was asked for.
+    let plans = deconflict(request.bindings, notes);
+
+    let mut resolved: Vec<(Vec<String>, Secret)> = Vec::new();
     let mut injected_names: Vec<String> = Vec::new();
     let mut unresolved: Vec<String> = request.unusable.to_vec();
     let mut reasons: Vec<String> = Vec::new();
@@ -270,12 +331,11 @@ pub fn run(request: RunRequest<'_>, notes: &mut dyn Write) -> Result<Outcome, Ru
     // could not have come from here.
     let mut identities: Vec<String> = Vec::new();
 
-    for (binding, resolution) in
-        request
-            .bindings
-            .iter()
-            .zip(resolve_all(request.registry, request.bindings, notes))
-    {
+    for ((binding, plan), resolution) in request.bindings.iter().zip(plans).zip(resolve_all(
+        request.registry,
+        request.bindings,
+        notes,
+    )) {
         match resolution {
             Resolution::Found { store, secret } => {
                 let usable = !secret.expose().as_bytes().contains(&0);
@@ -283,7 +343,7 @@ pub fn run(request: RunRequest<'_>, notes: &mut dyn Write) -> Result<Outcome, Ru
                 // masker is compiled from and a value that resolved is a value
                 // worth redacting whether or not it can be injected.
                 injected_names.push(binding.name.clone());
-                resolved.push((binding.env.clone(), secret));
+                resolved.push((plan, secret));
                 if usable {
                     let identity = format!("{store} (reader)");
                     if !identities.contains(&identity) {
@@ -536,6 +596,84 @@ pub fn run(request: RunRequest<'_>, notes: &mut dyn Write) -> Result<Outcome, Ru
     })
 }
 
+/// Which variables each request may set, once two requests that would have
+/// landed in the same one have been separated.
+///
+/// # The one case the tool cannot decide, and therefore does not
+///
+/// A declaration says which variable its credential answers to, so two
+/// declarations can name the SAME variable — which is the ordinary shape of one
+/// credential per environment, all read by the same program under one name. Ask
+/// for both in one run and something has to give, and "the last one wins" is
+/// decided by the order the flags happen to be in. That is the failure this
+/// whole area exists to remove, aimed at a target where it would be far worse:
+/// the value that arrives is a real, working credential from the wrong side of a
+/// boundary, and nothing anywhere reports it.
+///
+/// So a variable two requests both derive is set from NEITHER. Each value is
+/// still injected under its own declared name, which is unique by construction —
+/// nothing is lost, and the run is not blocked. This is the one place a message
+/// is written, because it is the one case where the right answer is genuinely
+/// not knowable from what was asked.
+///
+/// A variable the caller SPELLED is never displaced either. `-s VAR=NAME` is an
+/// instruction, and a derived variable is an inference; an inference that
+/// overwrote an instruction would make the typed form unreliable, and the typed
+/// form is the escape hatch everything else here depends on.
+fn deconflict(bindings: &[Binding], notes: &mut dyn Write) -> Vec<Vec<String>> {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    let spelled: BTreeSet<&str> = bindings
+        .iter()
+        .map(|binding| binding.env.as_str())
+        .collect();
+
+    // Names rather than a count: two `-s NAME` for the same name are one
+    // credential asked for twice, which collides with nothing.
+    let mut claimants: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
+    for binding in bindings {
+        for variable in &binding.also {
+            claimants
+                .entry(variable.as_str())
+                .or_default()
+                .insert(binding.name.as_str());
+        }
+    }
+
+    for (variable, names) in &claimants {
+        if spelled.contains(variable) {
+            let _ = writeln!(
+                notes,
+                "{NAME}: `{variable}` was named on the command line, so it keeps that value; \
+                 {} also answers to it and is in its own variable instead",
+                names.iter().cloned().collect::<Vec<_>>().join(", ")
+            );
+        } else if names.len() > 1 {
+            let _ = writeln!(
+                notes,
+                "{NAME}: {} all answer to `{variable}`, so nothing sets it — which one you \
+                 meant is not in the command. Each value is in its own variable; spell the \
+                 one you want with `-s {variable}=<name>`",
+                names.iter().cloned().collect::<Vec<_>>().join(", ")
+            );
+        }
+    }
+
+    bindings
+        .iter()
+        .map(|binding| {
+            let mut targets = binding.targets();
+            targets.retain(|variable| {
+                variable == &binding.env
+                    || claimants.get(variable.as_str()).is_some_and(|names| {
+                        names.len() == 1 && !spelled.contains(variable.as_str())
+                    })
+            });
+            targets
+        })
+        .collect()
+}
+
 /// Ask every backend for every name at once.
 ///
 /// # Why this is not a loop
@@ -712,7 +850,7 @@ impl StdioPlan {
 }
 
 /// What actually goes into the child's environment, given the state.
-fn injection(state: State, resolved: &[(String, Secret)]) -> &[(String, Secret)] {
+fn injection(state: State, resolved: &[(Vec<String>, Secret)]) -> &[(Vec<String>, Secret)] {
     if state == State::Injected {
         resolved
     } else {
@@ -724,14 +862,16 @@ fn injection(state: State, resolved: &[(String, Secret)]) -> &[(String, Secret)]
 fn assemble(
     program: &std::ffi::OsStr,
     args: &[OsString],
-    injected: &[(String, Secret)],
+    injected: &[(Vec<String>, Secret)],
     plan: &mut StdioPlan,
     notes: &mut dyn Write,
 ) -> Command {
     let mut command = Command::new(program);
     command.args(args);
-    for (env, secret) in injected {
-        command.env(env, secret.expose());
+    for (variables, secret) in injected {
+        for env in variables {
+            command.env(env, secret.expose());
+        }
     }
     match plan {
         StdioPlan::Inherit => {}
@@ -891,15 +1031,150 @@ mod tests {
 
     use super::Binding;
 
+    use crate::config::Config;
+
+    fn config_of(json: &str) -> Config {
+        serde_json::from_str(json).expect("valid config")
+    }
+
     #[test]
     fn a_bare_name_binds_to_itself() {
         assert_eq!(
             Binding::parse("GITHUB_TOKEN").expect("valid"),
             Binding {
                 env: "GITHUB_TOKEN".to_owned(),
-                name: "GITHUB_TOKEN".to_owned()
+                name: "GITHUB_TOKEN".to_owned(),
+                also: Vec::new(),
             }
         );
+    }
+
+    /// The seam. `parse` is syntax and must stay so: every existing caller of it
+    /// binds exactly one variable, and a `parse` that started consulting a
+    /// config would change what those callers do without any of them being
+    /// touched.
+    #[test]
+    fn parse_alone_never_widens_a_request() {
+        let binding = Binding::parse("LABEL").expect("valid");
+        assert!(binding.also.is_empty());
+        assert_eq!(binding.targets(), ["LABEL"]);
+    }
+
+    #[test]
+    fn a_declared_name_also_lands_in_the_variable_its_route_names() {
+        let config = config_of(r#"{"secrets":{"LABEL":{"key":"THE_VARIABLE"}}}"#);
+        let binding = Binding::declared("LABEL", &config).expect("valid");
+        assert_eq!(binding.env, "LABEL");
+        assert_eq!(binding.targets(), ["LABEL", "THE_VARIABLE"]);
+    }
+
+    #[test]
+    fn a_spelled_request_is_never_widened() {
+        let config = config_of(r#"{"secrets":{"LABEL":{"key":"THE_VARIABLE"}}}"#);
+        let binding = Binding::declared("CHOSEN=LABEL", &config).expect("valid");
+        assert_eq!(binding.targets(), ["CHOSEN"]);
+    }
+
+    #[test]
+    fn a_declaration_that_would_hijack_the_child_is_dropped_not_obeyed() {
+        // A config is not a trusted input. Every derived variable meets the same
+        // two refusals a typed one does, and a refused one costs the alias
+        // rather than the run.
+        for hostile in ["PATH", "LD_PRELOAD", "DYLD_INSERT_LIBRARIES", "IFS"] {
+            let config = config_of(&format!(
+                r#"{{"secrets":{{"LABEL":{{"var":"{hostile}"}}}}}}"#
+            ));
+            let binding = Binding::declared("LABEL", &config).expect("valid");
+            assert_eq!(binding.targets(), ["LABEL"], "{hostile} was injected");
+        }
+    }
+
+    #[test]
+    fn a_declaration_naming_something_no_environment_can_hold_is_dropped() {
+        let config = config_of(r#"{"secrets":{"LABEL":{"var":"not a variable"}}}"#);
+        assert_eq!(
+            Binding::declared("LABEL", &config)
+                .expect("valid")
+                .targets(),
+            ["LABEL"]
+        );
+    }
+
+    #[test]
+    fn an_undeclared_name_answers_to_itself_alone() {
+        let config = config_of(r#"{"secrets":{"OTHER":{"key":"THE_VARIABLE"}}}"#);
+        assert_eq!(
+            Binding::declared("LABEL", &config)
+                .expect("valid")
+                .targets(),
+            ["LABEL"]
+        );
+    }
+
+    /// Two labels for one variable is the ordinary shape of one credential per
+    /// environment. Asked for together, ordering must not pick the winner.
+    #[test]
+    fn a_variable_two_names_answer_to_is_set_by_neither() {
+        let config = config_of(r#"{"secrets":{"A":{"key":"SHARED"},"B":{"key":"SHARED"}}}"#);
+        let bindings = [
+            Binding::declared("A", &config).expect("valid"),
+            Binding::declared("B", &config).expect("valid"),
+        ];
+        let mut notes: Vec<u8> = Vec::new();
+        let plans = super::deconflict(&bindings, &mut notes);
+        assert_eq!(plans, [["A"], ["B"]]);
+        let said = String::from_utf8_lossy(&notes);
+        assert!(said.contains("SHARED"), "{said}");
+    }
+
+    /// Reversing the flags must not reverse the outcome — which is the property
+    /// the test above cannot see on its own.
+    #[test]
+    fn the_undecidable_case_does_not_depend_on_flag_order() {
+        let config = config_of(r#"{"secrets":{"A":{"key":"SHARED"},"B":{"key":"SHARED"}}}"#);
+        let forwards = [
+            Binding::declared("A", &config).expect("valid"),
+            Binding::declared("B", &config).expect("valid"),
+        ];
+        let backwards = [
+            Binding::declared("B", &config).expect("valid"),
+            Binding::declared("A", &config).expect("valid"),
+        ];
+        let mut sink: Vec<u8> = Vec::new();
+        let one = super::deconflict(&forwards, &mut sink);
+        let other = super::deconflict(&backwards, &mut sink);
+        assert_eq!(one, [["A"], ["B"]]);
+        assert_eq!(other, [["B"], ["A"]]);
+    }
+
+    #[test]
+    fn one_name_asked_for_twice_collides_with_nothing() {
+        // Two `-s LABEL` are one credential requested twice, not two claimants.
+        let config = config_of(r#"{"secrets":{"LABEL":{"key":"THE_VARIABLE"}}}"#);
+        let bindings = [
+            Binding::declared("LABEL", &config).expect("valid"),
+            Binding::declared("LABEL", &config).expect("valid"),
+        ];
+        let mut notes: Vec<u8> = Vec::new();
+        let plans = super::deconflict(&bindings, &mut notes);
+        assert_eq!(
+            plans,
+            [["LABEL", "THE_VARIABLE"], ["LABEL", "THE_VARIABLE"]]
+        );
+        assert_eq!(String::from_utf8_lossy(&notes), "");
+    }
+
+    #[test]
+    fn an_inference_never_overwrites_an_instruction() {
+        let config = config_of(r#"{"secrets":{"OTHER":{"key":"TARGET"}}}"#);
+        let bindings = [
+            Binding::declared("TARGET=CHOSEN", &config).expect("valid"),
+            Binding::declared("OTHER", &config).expect("valid"),
+        ];
+        let mut notes: Vec<u8> = Vec::new();
+        let plans = super::deconflict(&bindings, &mut notes);
+        assert_eq!(plans, [["TARGET"], ["OTHER"]]);
+        assert!(String::from_utf8_lossy(&notes).contains("TARGET"));
     }
 
     #[test]
