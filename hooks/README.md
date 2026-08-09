@@ -29,7 +29,7 @@ than a retry or a question.
 |---|---|---|
 | `KL-FILE` | a file whose content is a credential — `.env`, `~/.aws/credentials`, `~/.ssh/id_*`, `.npmrc`, `.claude.json`, … | **rewrite** on `Read`, **deny** on `Bash`/`Grep` |
 | `KL-VAULT` | a vault CLI verb that prints plaintext, across 16 stores | **deny** |
-| `KL-ENV` | an environment dump — `env`, `printenv`, `set`, `export -p`, `process.env`, `os.environ` | **rewrite** when bare, **deny** when it captures |
+| `KL-ENV` | an environment dump — `env`, `printenv`, `set`, `export -p`, and the whole-environment object reaching a printer or serialiser inside an interpreter | **rewrite** when bare, **deny** when it captures |
 | `KL-ENVVAR` | a credential-named variable being echoed | **warn** |
 | `KL-ASSIGN` | a credential literal typed into a shell assignment — `export X=…`, `X=… cmd` | **deny** |
 | `KL-WRITE` | a credential literal in a `Write` or `Edit` | **rewrite** |
@@ -72,6 +72,26 @@ env | grep -i token  ->  env | sed -E 's/=.*/=[keyless:redacted]/' | grep -i tok
 The filter still filters, the names still print, no value crosses the boundary,
 and the call is never refused.
 
+**Copying the environment for a child process is not a dump, and is not
+touched.** This gate is aimed at the act, not at the expression:
+
+```
+env = dict(os.environ)                     allowed
+const env = { ...process.env }             allowed
+spawn(cmd, { env: { ...process.env } })    allowed
+subprocess.run(cmd, env=os.environ.copy()) allowed
+
+print(os.environ)                          denied
+console.log(JSON.stringify(process.env))   denied
+e = dict(os.environ); print(e)             denied
+```
+
+Building a child's environment is the same act `keyless run` performs, and a
+gate that refuses it is a tax on ordinary work rather than a guard. The last row
+is the two-statement spelling, caught by one hop of dataflow within the single
+command string; two hops is out of reach and stays out of reach, because a hook
+holds no model of interpreter state.
+
 **A credential literal being written becomes a reference.**
 
 ```
@@ -104,7 +124,7 @@ crashes, so the discipline is layered:
 - **No blanket `try/except` around the checks.** That converts a crash into a
   silent skip — the same absence wearing a disguise — and you cannot write an
   assertion about a swallowed exception.
-- **The battery drives it.** 16 hostile stdin shapes, 15 wrong-typed fields, a
+- **The battery drives it.** Hostile stdin shapes, wrong-typed fields, a
   raising check, five broken environments, an unwritable state directory, three
   corrupt configs, and a physically truncated module. Every one exits 0.
 - **A broken environment must still DENY.** Losing state is not a reason to stop
@@ -250,28 +270,70 @@ directory. Only the first positional, and only when no `-e`/`-f`/`--regexp`/
 ## Latency
 
 The number that decides whether this stays installed. Measured interleaved
-against `python3 -c pass` in the same loop, 25 rounds, so the figure is the
+against two baselines in the same loop, 25 rounds each, so the figure is the
 pack's and not the machine's:
 
-| case | median | p90 | over a bare interpreter |
-|---|---:|---:|---:|
-| bare `python3 -c pass` | 17.2 ms | 25.1 ms | — |
-| unmatched `Bash` call | 23.5 ms | 24.9 ms | **+6.3 ms** |
-| unmatched `Write` (4 KB) | 22.9 ms | 32.0 ms | +5.7 ms |
-| a firing `Bash` deny | 23.1 ms | 27.8 ms | +5.9 ms |
-| a `Read` rewrite (reads the file, writes the view) | 24.6 ms | 30.7 ms | +7.4 ms |
-| a 100 KB `Write` scan | 49.7 ms | 58.0 ms | +32.5 ms |
+| case | median | p90 | over a bare interpreter | over deps |
+|---|---:|---:|---:|---:|
+| bare `python3 -c pass` | 18.2 ms | 19.4 ms | — | — |
+| `python3 -c "import json, re"` | 19.1 ms | 20.2 ms | +0.9 ms | — |
+| unmatched `Bash` call | 25.2 ms | 26.2 ms | **+7.0 ms** | **+6.1 ms** |
+| unmatched `Write` (4 KB) | 24.9 ms | 26.1 ms | +6.6 ms | +5.7 ms |
+| a firing `Bash` deny | 25.3 ms | 26.5 ms | +7.0 ms | +6.1 ms |
+| a `Read` rewrite (reads the file, writes the view) | 26.7 ms | 27.6 ms | +8.4 ms | +7.6 ms |
+| a 100 KB `Write` scan | 52.8 ms | 54.1 ms | +34.6 ms | +33.7 ms |
 
-**About +6 ms is what a session pays on every tool call.** Measured 2026-08-08
-on a busy machine; the same rig read +5.2 ms on a quiet one. The *absolute*
-column moves with load and is worth nothing on its own — the delta is the
-number, because it is measured against a bare interpreter interleaved in the
-same loop. Quote the range, or re-run the rig; do not quote one figure to one
-decimal place as though it were a constant.
+**Single figures, on one machine, on one interpreter. Do not quote them — run
+the rig.** The absolute column moves with load and the deltas move with the
+interpreter, and this section carried a single decimal figure as though it were a
+constant until it was run somewhere else.
 
-It was +16.3 ms until `-X importtime` showed `traceback` pulling
-`_colorize → dataclasses → inspect` at module scope: 8.1 ms on every call in
-every session, for a path reachable only when a check is already broken. It and
+### Two baselines, because the first one lies across interpreters
+
+`re` and `json` are stdlib this pack cannot exist without: it parses JSON on
+stdin and every check is a compiled pattern. Whether the interpreter's own `site`
+already imported them decides who is billed for that work — and it moves the
+headline number by more than a factor of two with no change to any code here:
+
+| interpreter | over a bare interpreter | over `import json, re` |
+|---|---:|---:|
+| 3.9 | +21.2 ms | +12.8 ms |
+| 3.13 | +10.8 ms | +9.8 ms |
+| 3.14 | +9.6 ms | +7.1 ms |
+
+Same machine, same pack, same payload, all three loaded identically. **A test
+asserting a RATIO against interpreter start time is measuring the operating
+system**, which is why this suite was red on Linux on every Python from 3.6 to
+3.13 while nothing here was wrong. The assertions read the delta over the second
+baseline; the first stays in the table because it is the honest answer to *what
+does a session pay*, which is a different question from *did this pack regress*.
+
+### The table reports medians. The assertions read minima.
+
+Noise only ever *adds* time, so across 25 interleaved rounds the minimum is the
+closest estimate of what the work costs and the median is what a user waits.
+Those are different questions and this suite needs both.
+
+It used to assert `a firing check costs under 2x the floor` on medians, and the
+two "worked" rows are the only ones that touch the filesystem. Measured with the
+machine deliberately saturated, five consecutive runs, **that assertion failed
+four times** — the worked median moved between 30 ms and 200 ms while the floor
+sat at 24 ms, because I/O contention inflates a file read and does not inflate an
+import. In the same five runs the CPU-bound assertions never moved: 5.6–6.4 ms
+against a 25 ms limit, 27.7–30.6 ms against 60 ms. On minima, under that same
+saturation, the worked cases sit **+1.3 ms and +4.6 ms** above the floor.
+
+The thresholds come from the one regression this suite has actually had — a
+module-scope `traceback` import worth +8.1 ms — with room for a slow runner. They
+do **not** catch an 8 ms creep, because 8 ms of regression on 3.14 lands inside
+3.9's healthy band. Catching that needs a recorded per-interpreter baseline,
+committed and refreshed deliberately; there is nowhere in this suite to keep one,
+and saying so beats a tighter number that goes red on a slow runner and gets
+loosened by whoever sees it first.
+
+It was far worse until `-X importtime` showed `traceback` pulling
+`_colorize → dataclasses → inspect` at module scope — on every call in every
+session, for a path reachable only when a check is already broken. It and
 `hashlib` are imported at their use sites now.
 
 The scanner is a small number of compiled alternations in-process — no
@@ -285,21 +347,29 @@ Reproduce: `python3 tests/test_latency.py`.
 ## Proving it
 
 ```console
-$ python3 tests/run.py        # 613 checks: contract, false-positive,
-                              #   fail-open, adversarial, install, latency
-$ python3 tests/mutate.py     # 41 deliberate breakages; every one must be caught
+$ python3 tests/run.py        # contract, false-positive, fail-open, adversarial,
+                              #   install, publication, latency
+$ python3 tests/mutate.py     # every check broken on purpose; each must be caught
 ```
 
-Four kinds of proof, because a green contract suite is a hypothesis:
+Both commands print their own counts, and this document deliberately does not
+restate one: a number copied into prose goes stale the next time a check is added,
+and this section carried three that were wrong by the time anyone read them.
 
-- **contract** — every gate × {fires, silent, look-alike}, plus all 20 vendor
-  patterns asserted by *kind* against a decoy of the real length.
+Five kinds of proof, because a green contract suite is a hypothesis:
+
+- **contract** — every gate × {fires, silent, look-alike}, plus every vendor
+  pattern asserted by *kind* against a decoy of the real length.
 - **fail-open** — every malformed, hostile and broken input allows.
-- **adversarial** — 87 attacks on the block list, printed as a table with an
-  honest survivor row.
+- **adversarial** — the attack corpus driven against the block list, printed as a
+  table with an honest survivor row.
+- **publication** — no comment or docstring in `hooks/` carries a measurement of
+  one person's machine or accounts, and no commit message does either. A grammar
+  rather than a list of forbidden values, so it catches the next one and names
+  none of the last ones.
 - **mutation** — each check broken on purpose, with the patched file diffed to
   prove the mutation *landed*, and a baseline control in the same copied tree so
-  a broken invocation can never read as thirty-three successful mutations.
+  a broken invocation can never read as a run of successful mutations.
 
 Every fixture value is invented in the suite. No test reads a real `.env`, a
 real keychain item, or a real token.
@@ -322,7 +392,7 @@ The first three are rows in the attack corpus, not prose: the suite drives them
 on every run and fails if one becomes blocked, so the list cannot quietly go
 stale in either direction.
 
-The 68 attacks that are blocked include `sh -c`, `bash -c`, `eval`,
+The attacks that are blocked include `sh -c`, `bash -c`, `eval`,
 `$(echo cat) .env`, `cat $(echo .env)`, `echo "$(cat .env)"`, backticks,
 `python3 -c`, `node -e`, `perl`, `while read … < .env`, `cat < .env`,
 `cat <.env`, `.en''v`, `.e*v`, `.en[vw]`, `dd if=.env`, `\cat`, `/bin/cat`,
@@ -366,13 +436,15 @@ Measured on Claude Code 2.1.223, not inferred:
   appears elsewhere in this file" — were each measured dropping a real
   credential.
 - **`${NAME}` is only a resolvable reference in a file whose reader resolves
-  it.** Measured over 51,384 real `Write` and `Edit` payloads, the files this
-  check acts on are overwhelmingly SOURCE: 137 of the 259 name-keyed findings it
-  still makes are in `.ts`, against 3 in `.env`. Counting every extension whose
-  reader does expand `${NAME}` — `.env`, `.env.example`, `.yml`, `.sh`,
-  `.conf`, `.zshrc` — 34 of 259. In the other 87% the substitution is not a reference anything
-  resolves, and the remediation the message prints does not apply. The rewrite
-  is right about the secret and wrong about the repair.
+  it.** Replayed over real `Write` and `Edit` payloads, the files this check acts
+  on are overwhelmingly SOURCE — `.ts` outnumbers `.env` by a wide margin — and
+  across every extension whose reader does expand `${NAME}` (`.env`,
+  `.env.example`, `.yml`, `.sh`, `.conf`, `.zshrc`) the total is a small minority
+  of what the check rewrites. In the rest the substitution is not a reference
+  anything resolves, and the remediation the message prints does not apply. The
+  rewrite is right about the secret and wrong about the repair. Re-run the replay
+  over your own payloads; the ratio is a property of what you write, not of this
+  pack.
 - **`settings.json` is writable by a session**, so a gate configured there sits
   inside its own blast radius. Closing that needs a privilege boundary the
   harness does not currently expose. Managed policy settings are the nearest

@@ -21,7 +21,7 @@ spellings walk straight past a `Bash(cat:*)` deny.
 import os
 import time
 
-from ..secretpaths import is_protected, names_in
+from ..secretpaths import is_protected, names_in, resolve
 from ..shellview import (expand_local_assignments, file_operands,
                          first_positional, flatten_substitutions, head_of,
                          statements, strip_heredocs, substitution_payloads)
@@ -124,8 +124,16 @@ def _read_rewrite(payload, cfg):
     if not pattern:
         return None
 
-    resolved = path if os.path.isabs(path) else os.path.join(
-        payload.cwd or os.getcwd(), path)
+    resolved = resolve(path, payload.cwd)
+    if resolved is None:
+        # Protected, and this process cannot say which file it is. Refuse.
+        #
+        # The old spelling joined the raw string onto the cwd, so `~/.cckeys.json`
+        # became `<cwd>/~/.cckeys.json`, `isfile` said no, and the read was
+        # ALLOWED. "The file is not there" and "I could not look" are the same
+        # empty answer from a filesystem test, and only one of them is safe.
+        return ("deny", _deny_text(path, pattern, [], "unresolvable path", "Read"),
+                {"path": path[:120], "pattern": pattern, "names": 0})
     if not os.path.isfile(resolved):
         # Nothing to redact and nothing to leak. No opinion.
         return None
@@ -186,8 +194,11 @@ def _grep_deny(payload, cfg):
     pattern = is_protected(path, payload.cwd, cfg)
     if not pattern:
         return None
-    resolved = path if os.path.isabs(path) else os.path.join(
-        payload.cwd or os.getcwd(), path)
+    resolved = resolve(path, payload.cwd)
+    if resolved is None:
+        # Same trap as the Read path above: unresolvable is not absent.
+        return ("deny", _deny_text(path, pattern, [], "unresolvable path", "Grep"),
+                {"path": path[:120], "pattern": pattern, "names": 0})
     if not os.path.isfile(resolved):
         # A directory is not a protected file; the per-file gate covers whatever
         # inside it is protected when it is actually read.
@@ -253,7 +264,8 @@ def _scan_statements(text, payload, cfg):
         # For a tool whose first argument is a PATTERN, that one operand is not a
         # path and its metacharacters are not a glob. `grep -rn '.*' src/` is a
         # regex; expanding it against the real directory matched every dotfile
-        # there and made the largest block category in the pack refuse 12 of 38.
+        # there, which made this — the pack's largest block category — refuse a
+        # large fraction of the commands it saw for no reason at all.
         #
         # Positional rather than a blanket rule for the whole command, because the
         # blanket version fails in both directions: `grep TOKEN prod.*` is a real
@@ -276,11 +288,12 @@ def _scan_statements(text, payload, cfg):
                                    expand_globs=(not in_code and cand != skip_glob))
             if not pattern:
                 continue
-            resolved = cand
-            if not os.path.isabs(cand):
-                resolved = os.path.normpath(
-                    os.path.join(payload.cwd or os.getcwd(), cand.lstrip("'\"")))
-            names, note = _names_for(resolved)
+            # The deny fires either way — a Bash operand is refused on the
+            # STRING. Resolution only decides whether the refusal can also name
+            # what is configured in the file, which is the half that makes the
+            # block useful instead of merely obstructive.
+            resolved = resolve(cand, payload.cwd)
+            names, note = _names_for(resolved) if resolved else ([], "unresolvable path")
             return ("deny",
                     _deny_text(cand, pattern, names, note,
                                "command (`%s`)" % (head or "unrecognised")),

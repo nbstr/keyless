@@ -12,8 +12,8 @@ hash is excluded on purpose — a hash of a low-entropy secret is a value with a
 delay, and this pack is not allowed to create a read path of its own.
 
 Writes are appended under an exclusive advisory lock and capped below PIPE_BUF,
-because ~20 agent sessions append to this file concurrently and a torn row is
-indistinguishable from a forged one.
+because many agent sessions can append to this file concurrently and a torn row
+is indistinguishable from a forged one.
 """
 
 import json

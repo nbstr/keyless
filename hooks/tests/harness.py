@@ -180,6 +180,20 @@ def fixtures():
            "//registry.npmjs.org/:_authToken=%s\n" % DECOY["npm"])
     _write(os.path.join(root, ".claude.json"),
            '{"apiKey": "%s"}\n' % DECOY["generic"])
+    # The SAME store, pretty-printed. Both shapes are needed and neither covers
+    # the other: a compact document is one line holding many pairs, and a nested
+    # one is mostly brace lines. Each broke the names-only view in its own way,
+    # and a suite carrying only the compact form stayed green while every
+    # pretty-printed `.json` in the protected list reported no names at all.
+    _write(os.path.join(root, ".credentials.json"),
+           '{\n'
+           '  "aws": {\n'
+           '    "access_key": "%s"\n'
+           '  },\n'
+           '  "gcp": {\n'
+           '    "refresh_token": "%s"\n'
+           '  }\n'
+           '}\n' % (DECOY["aws_key"], DECOY["generic"]))
     for name in ("prod.env", "dev.env", "peg-prod.env"):
         _write(os.path.join(root, name), "STRIPE_KEY=%s\n" % DECOY["stripe"])
     _write(os.path.join(root, "packages", "prisma-db", ".env"),

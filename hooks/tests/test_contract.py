@@ -35,6 +35,59 @@ def run():
                 "cat id_ed25519"):
         s.check("KL-FILE fires: %s" % cmd, drive(bash(cmd)).kind, "deny")
 
+    # ── KL-FILE: a path spelled with a leading tilde ────────────────────────
+    #
+    # A config file is not a shell, and neither is a tool payload: nothing expands
+    # `~` unless something is written to. Joining the raw string onto the working
+    # directory produced `<cwd>/~/.cckeys.json`, which no filesystem test will ever
+    # find — so `isfile` said no, and BOTH the Read rewrite and the Grep deny read
+    # that as "no file here, nothing to protect" and allowed the read outright.
+    # The block was lost, not merely its list of names.
+    #
+    # HOME points at the fixture tree, so `~/...` resolves to a decoy and no test
+    # reads a real credential.
+    home = {"HOME": root}
+    s.check("KL-FILE Read on ~ does not silently allow",
+            drive(read("~/.cckeys.json", cwd=root), env=home).kind, "rewrite")
+    s.check("KL-FILE Grep on ~ does not silently allow",
+            drive({"hook_event_name": "PreToolUse", "tool_name": "Grep",
+                   "tool_input": {"pattern": "key", "path": "~/.cckeys.json"},
+                   "cwd": root, "session_id": "test-session"}, env=home).kind, "deny")
+
+    # An unresolvable path is not an absent one. A hook holds no model of shell
+    # state, so `$SOMEWHERE/.env` cannot be resolved — and "I could not look" must
+    # not be reported as "there is nothing here".
+    s.check("KL-FILE Read on an unresolvable path denies",
+            drive(read("$SECRETS_DIR/.env", cwd=root), env=home).kind, "deny")
+
+    # The courtesy half: the refusal says WHICH credentials the session was
+    # reaching for. Both halves had to be fixed for this to work — the tilde, and
+    # a key/value ratio that counted a JSON file's brace lines against it and so
+    # produced `names: 0` for every `.json` in the protected list.
+    v = drive(bash("jq -r '.github.key' ~/.cckeys.json", cwd=root), env=home)
+    s.check("KL-FILE ~ deny still fires", v.kind, "deny")
+    s.check_in("KL-FILE ~ deny names the credential", "github", v.message)
+    s.check("KL-FILE ~ deny leaks no value", DECOY["github_pat"] in v.message, False)
+    # EVERY name on the line, not just the first. A credential store written on
+    # one line declares several, and reading one key per line named the first
+    # service and stayed silent about the rest.
+    s.check_in("KL-FILE compact JSON names every key", "github, scope, key", v.message)
+
+    # The pretty-printed shape of the same store. Its brace lines used to count
+    # against the key/value ratio and take the whole file under the threshold, so
+    # a nested `.json` — most of the protected list — reported no names at all.
+    v = drive(bash("cat .credentials.json", cwd=root), env=home)
+    s.check("KL-FILE nested JSON deny fires", v.kind, "deny")
+    s.check_in("KL-FILE nested JSON names its keys", "aws, access_key, gcp", v.message)
+    s.check("KL-FILE nested JSON leaks no value", DECOY["aws_key"] in v.message, False)
+
+    # And the property the ratio exists to protect, asserted rather than assumed:
+    # a private key yields NO names, because a plausible-looking fragment of key
+    # material is worse than an honest refusal to describe the file.
+    v = drive(bash("cat id_ed25519", cwd=root), env=home)
+    s.check("KL-FILE private key deny fires", v.kind, "deny")
+    s.check_in("KL-FILE private key yields no names", "(none readable", v.message)
+
     # ── KL-FILE: silent when the act is elsewhere ───────────────────────────
     for cmd in ("cat .env.example",
                 "cat README.md",
@@ -162,6 +215,54 @@ def run():
             drive(bash('node -e "console.log(process.env)"')).kind, "deny")
     s.check("KL-ENV python whole-env denies",
             drive(bash('python3 -c "import os; print(dict(os.environ))"')).kind, "deny")
+
+    # The whole environment reaching a SINK. This gate used to fire on the
+    # expression alone, which denied the copy idiom every language uses to build
+    # a child's environment; it now fires on where the expression GOES. These are
+    # the shapes that must still be refused, and the last three are the exact
+    # bypasses the assignment exemption would otherwise have opened.
+    for label, cmd in (
+            ("print", 'python3 -c "import os; print(os.environ)"'),
+            ("json.dumps", 'python3 -c "import os,json; print(json.dumps(os.environ))"'),
+            ("JSON.stringify", 'node -e "console.log(JSON.stringify(process.env))"'),
+            ("ruby puts", 'ruby -e "puts ENV.to_h"'),
+            ("perl", 'perl -e "print %ENV"'),
+            # A serialisation ASSIGNED to a name. `_COPY_LHS` matches here — the
+            # match really is the right-hand side of an assignment — so the ONLY
+            # thing refusing it is the sink word standing in front of it.
+            ("serialise into a variable",
+             'node -e "const s = JSON.stringify(process.env); post(s)"'),
+            ("py serialise into a variable",
+             'python3 -c "import os,json; s = json.dumps(os.environ)"'),
+            # One hop: copied in one statement, printed in the next. Nothing but
+            # the dataflow pass reaches these two.
+            ("copy then print",
+             'python3 -c "import os; e = dict(os.environ); print(e)"'),
+            ("copy then log",
+             'node -e "const e = { ...process.env }; console.log(e)"'),
+            # A printer that is a printer in ONE language only. Ruby's `p` is a
+            # full dump and an ordinary variable name everywhere else, so it is
+            # scoped to ruby — and re-aiming this gate at the act had quietly
+            # reopened it until an adversarial sweep found it.
+            ("ruby p", 'ruby -e "env = ENV.to_h; p env"'),
+            ("ruby p direct", 'ruby -e "p ENV.to_h"'),
+            ("perl say", 'perl -e "say %ENV"'),
+            # An interpreter nested in a shell. The outer head is `bash`, which
+            # this gate does not read, and nothing looked inside the quoted
+            # argument — so the cheapest wrapper in existence walked past it.
+            # This one predates the re-aiming; it was silent on both sides.
+            ("bash -c wrapper",
+             'bash -c \'python3 -c "import os; print(os.environ)"\''),
+            ("sh -c wrapper",
+             'sh -c \'node -e "console.log(process.env)"\''),
+            ("bash -c copy then print",
+             'bash -c \'python3 -c "import os; e=dict(os.environ); print(e)"\''),
+            # PHP was an interpreter head with no pattern behind it, so a PHP
+            # dump was never seen at all.
+            ("php superglobal", 'php -r "print_r($_ENV);"'),
+            ("php bare getenv", 'php -r "var_dump(getenv());"'),
+    ):
+        s.check("KL-ENV dump denies (%s)" % label, drive(bash(cmd)).kind, "deny")
 
     for cmd in ("set -e",
                 "set -euo pipefail",
@@ -359,7 +460,7 @@ def run():
             # `;` ends a shell statement, so it is NOT code punctuation here
             ("shell semicolon", "SECRET_KEY=%s; ./deploy.sh" % DECOY["generic"]),
             # `:` sits INSIDE composite tokens. Reading it as code punctuation
-            # dropped one real credential out of 466 on the command corpus.
+            # was tried and it dropped a real credential.
             ("colon inside a composite token",
              "ACCESS_TOKEN=%s::readonly" % DECOY["generic"]),
             ("yaml mapping", "secret: %s\n" % DECOY["generic"]),

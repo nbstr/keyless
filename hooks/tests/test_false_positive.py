@@ -50,11 +50,12 @@ import tempfile
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import harness
-from harness import DECOY, Suite, bash, drive, write
+from harness import DECOY, Suite, bash, drive, read, write
 
 # Verbs that print no credential value. Grouped by store, with how each was
-# established. `measured` means the tool's own help output was read on this
-# machine; `documented` means the vendor's documentation, with no local binary.
+# established. `measured` means the tool's own help output was read, at the
+# version named; `documented` means the vendor's documentation, with no local
+# binary to check.
 #
 # Deliberately absent, because asserting them PASSES would assert they are safe
 # and they are not: `vault login`, `infisical login`, `pass-cli login`,
@@ -236,14 +237,14 @@ ARGV_SECRET = ["pass-cli totp generate " + DECOY["generic"]]
 # ── KL-FILE and KL-ENVVAR, from the pack's own decision log ─────────────────
 #
 # Every command below is built from an operand the deployed pack was MEASURED
-# acting on. 66 organic decisions, after excluding 315 rows from the synthetic
-# `test-session` id and the 122 `KL-BOOM: RuntimeError: deliberate` rows the
-# fail-open suite produces. Of 38 organic KL-FILE denies, 11 had an operand that
-# was not a file path — a 29% false-positive rate on the pack's largest block
-# category, which is how sessions learn to route around a gate.
+# acting on, with the suite's own synthetic `test-session` rows and the
+# fail-open suite's deliberate `KL-BOOM` rows excluded. Close to a THIRD of the
+# real KL-FILE denies had an operand that was not a file path at all — a false
+# positive rate on the pack's largest block category, and that is how sessions
+# learn to route around a gate.
 #
-# These are the real strings, not synthetic stand-ins. `.*` handed to `grep` was
-# 8 of the 11 on its own.
+# These are the real strings, not synthetic stand-ins, and `.*` handed to `grep`
+# was most of the class on its own.
 # These run in `regex-cwd`, which holds a protected dotfile and no allowed
 # look-alike. In the fixture ROOT, `.*` also globs onto `.env.example` and one
 # allowed form clears the candidate — so the assertion would pass without the
@@ -276,8 +277,8 @@ FILE_FALSE_POSITIVES = [
     #
     # Honest scope: the two logged rows for this operand came from the test
     # battery and from the session writing this fix, not from an organic session.
-    # It is a real defect in the same class, and it is not one of the 11 counted
-    # against production below.
+    # It is a real defect in the same class, and it is not one of the organic
+    # false positives counted against the deployed pack.
     "grep -rn 'process.env' src/",
     # A heredoc body is text ABOUT commands. This shape refused a real `git
     # commit` while this branch was being written: markdown back-quotes in the
@@ -290,8 +291,8 @@ FILE_FALSE_POSITIVES = [
     # every value and KL-ENV refuses it correctly.
 ]
 
-# The genuine saves, by measured operand. 27 of the 38 organic denies, and every
-# one must stay refused: a fix for the `.*` class that quietly opens these has
+# The genuine saves, by measured operand — the majority of the real denies, and
+# every one must stay refused: a fix for the `.*` class that quietly opens these has
 # traded a credibility problem for a leak. Driven with HOME pointed at the fixture
 # tree, so `~/...` resolves to a decoy and no test reads a real credential.
 FILE_TRUE_POSITIVES = [
@@ -328,15 +329,49 @@ FILE_TRUE_POSITIVES = [
     "python3 -c \"open('$d/.claude.json')\"",
 ]
 
-# The `pat` class. All 6 organic KL-ENVVAR warns fired on a lower-case `pat` in a
-# session doing 167 `re.*` calls — a PATTERN variable. The uppercase spellings
-# below are the 3 that were genuine and must still warn.
+# The `pat` class. Every organic KL-ENVVAR warn this check produced before the
+# case test fired on a lower-case `pat` in a session writing regular expressions
+# — a PATTERN variable. The upper-case spellings below are the genuine act and
+# must still warn.
 ENVVAR_FALSE_POSITIVES = [
     "pat = re.compile(r'x')",
     "echo $pat",
     "echo $path",
     "echo ${pat}",
     "printenv pat",
+]
+
+# ── KL-ENV: copying the environment for a CHILD is not dumping it ───────────
+#
+# Every one of these is the ordinary way a program in that language builds an
+# environment for a child process — the same act `keyless run` performs — and
+# every one was DENIED, on every call, because the gate fired on the whole-env
+# expression rather than on where it went. That is a tax on daily work paid in
+# exchange for nothing: not one of these prints, serialises or sends anything.
+#
+# The last two are not KL-ENV's doing at all and belong here for the same reason:
+# `{ ...process.env }` reaches the path matcher as the operand `...process.env`,
+# which `*.env` matches and the exact `process.env` exclusion does not cover. The
+# node idiom was refused by KL-FILE while KL-ENV was being blamed for it.
+ENV_COPY_FALSE_POSITIVES = [
+    'python3 -c "import os; env = dict(os.environ)"',
+    'python3 -c "import os; env = os.environ.copy()"',
+    'python3 -c "import os,subprocess; e = dict(os.environ); e[\'A\']=\'1\'; '
+    'subprocess.run([\'ls\'], env=e)"',
+    'python3 -c "import os,subprocess; subprocess.run([\'ls\'], env=dict(os.environ))"',
+    'ruby -e "env = ENV.to_h; system(cmd)"',
+    'node -e "const e = Object.assign({}, process.env); execFile(b, {env: e})"',
+    'node -e "const env = { ...process.env }; spawn(c, {env})"',
+    'bun -e "spawn(c, { env: { ...process.env } })"',
+    # `p` is Ruby's printer and an ordinary Python variable. Scoping the sink to
+    # the interpreter is what keeps this line silent while `ruby -e "p env"` is
+    # refused — assert both halves or the scoping is untested in one direction.
+    'python3 -c "import os,subprocess; e=dict(os.environ); p = subprocess.run(c, env=e)"',
+    # The same copy through the shell wrapper this gate now looks inside. Looking
+    # inside must not turn the inert case into a block.
+    'bash -c \'python3 -c "import os,subprocess; e=dict(os.environ); subprocess.run(cmd, env=e)"\'',
+    # PHP's single-key read, the counter-half of the two whole-environment forms.
+    'php -r "echo getenv(\'PATH\');"',
 ]
 
 ENVVAR_TRUE_POSITIVES = [
@@ -350,16 +385,15 @@ ENVVAR_TRUE_POSITIVES = [
 # ── KL-ASSIGN ───────────────────────────────────────────────────────────────
 #
 # This check denies on `Bash`, which is the most-used tool there is, so its
-# false-positive floor decides whether the pack survives at all. Measured before
-# it was registered, over commands that were really run rather than invented:
-# 86,117 agent `Bash` calls from the local transcript corpus and 1,791
-# interactive shell commands. 50,638 of them contain an `=`. 326 denied, and
-# every one was a real credential assignment — 201 connection-string passwords,
-# 114 credential-named opaque values, 9 JWTs, 2 AWS access keys. Zero denials on
-# anything else.
+# false-positive floor decides whether the pack survives at all. Before it was
+# registered it was replayed over a large body of commands that were really run
+# rather than invented — agent `Bash` calls and interactive shell history. Of the
+# many thousands carrying an `=`, everything it denied was a real credential
+# assignment: connection-string passwords, credential-named opaque values, JWTs
+# and AWS access keys. It denied nothing else.
 #
-# The cases below are the shapes that corpus is MADE of. Re-derive the numbers
-# rather than trusting this paragraph; the corpus grows every day.
+# The cases below are the shapes that traffic is MADE of. Run the same replay
+# over your own history rather than trusting this paragraph.
 
 # Two fixtures spelled in halves, because this pack's own KL-WRITE rewrites the
 # file it is being written into. `TOKEN="<12+ opaque characters>"` is exactly the
@@ -433,18 +467,18 @@ ASSIGN_FALSE_POSITIVES = [
     # The counter-half of the qualified-`*_KEY` keywords. `secret_key`,
     # `signing_key` and `encryption_key` are keywords; a credential word followed
     # by any OTHER identifier is not, because such a name refers to a credential
-    # instead of holding one. Measured over 86,125 real commands: admitting a
-    # bounded suffix generally adds `AWS_ACCESS_KEY_ID` (30 — the public half of
-    # the pair), `apiKeyConnectionId` (22), `secretRef` (11) and `secretsManager`.
-    # These are the shapes that decide it, so they must stay silent.
+    # instead of holding one. Replayed over real commands, admitting a bounded
+    # suffix generally adds `AWS_ACCESS_KEY_ID` (the public half of the pair),
+    # `apiKeyConnectionId`, `secretRef` and `secretsManager`. These are the shapes
+    # that decide it, so they must stay silent.
     "export CACHE_KEY=%s" % DECOY["generic"],
     "export IDEMPOTENCY_KEY=%s" % DECOY["generic"],
     "export SECRET_NAME=%s" % DECOY["generic"],
     "export SECRET_ARN=%s" % DECOY["generic"],
     "export AWS_ACCESS_KEY_ID=%s" % DECOY["generic"],
     "export KEY=%s" % DECOY["generic"],
-    # Bare `key=` is 121 assignments in the same corpus and none of them is a
-    # credential, which is why `key` is not a keyword on its own.
+    # Bare `key=` is an ordinary configuration assignment far more often than it
+    # is a credential, which is why `key` is not a keyword on its own.
     "export SORT_KEY=%s" % DECOY["generic"],
 ]
 
@@ -483,10 +517,10 @@ ASSIGN_TRUE_POSITIVES = [
 # ── KL-WRITE: a credential REFERENCE is the correct usage, not a leak ───────
 #
 # This check REWRITES, and a rewrite that is wrong changes a file on disk with
-# nothing refused and nothing to notice. Measured over 51,384 real Write and Edit
-# payloads, 378 of the 540 name-keyed findings were a reference of one of the
-# shapes below — a member expression, a call, a constant, a runtime fetch — so
-# the check was damaging correct source in the majority of the files it touched.
+# nothing refused and nothing to notice. Replayed over real Write and Edit
+# payloads, the MAJORITY of this check's name-keyed findings were a reference of
+# one of the shapes below — a member expression, a call, a constant, a runtime
+# fetch — so the check was damaging correct source in most files it touched.
 #
 # Every row here is spelled in fragments, and that is not decoration. Spelled
 # whole, this pack's own live KL-WRITE rewrites the fixture on its way to disk
@@ -582,6 +616,8 @@ EXPECTED_CHECKS = (len(SAFE) + len(PREFIX_REFUSES) + 1 + 3 * len(HELP_CONTROL)
                    + 2 * len(ARGV_SECRET)
                    + len(FILE_FALSE_POSITIVES_REGEX_CWD)
                    + len(FILE_FALSE_POSITIVES) + len(FILE_TRUE_POSITIVES)
+                   # the two `~` allow/control assertions, then the copy idioms
+                   + 2 + len(ENV_COPY_FALSE_POSITIVES)
                    + len(ENVVAR_FALSE_POSITIVES) + len(ENVVAR_TRUE_POSITIVES)
                    + len(ASSIGN_FALSE_POSITIVES) + len(ASSIGN_FALSE_POSITIVES_ARGV)
                    + len(ASSIGN_TRUE_POSITIVES)
@@ -661,6 +697,21 @@ def run():
     for cmd in FILE_TRUE_POSITIVES:
         s.check("KL-FILE still denies: %s" % cmd[:48],
                 drive(bash(cmd, cwd=root), env=home).kind, "deny")
+
+    # ── KL-FILE: a protected name that is READ, but whose file is elsewhere ──
+    #
+    # The tilde fix must not turn every `~` path into a block. A `.md` under the
+    # home directory is on the allow list and stays silent; the credential file
+    # beside it does not.
+    s.check("KL-FILE allows: Read ~/README.md",
+            drive(read("~/README.md", cwd=root), env=home).kind, "silent")
+    s.check("KL-FILE control: Read ~/.npmrc is not silent",
+            drive(read("~/.npmrc", cwd=root), env=home).kind, "rewrite")
+
+    # ── KL-ENV: the copy idiom, in four languages ────────────────────────────
+    for cmd in ENV_COPY_FALSE_POSITIVES:
+        s.check("KL-ENV allows: %s" % cmd[:52],
+                drive(bash(cmd, cwd=root), env=home).kind, "silent")
 
     # ── KL-ENVVAR: a lower-case name is not a credential name ────────────────
     for cmd in ENVVAR_FALSE_POSITIVES:

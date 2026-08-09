@@ -7,10 +7,11 @@ host parses as a decision, a coercion gap that raises after the emit, a broken
 config that disables the pack silently, a state directory that cannot be written
 and takes the verdict down with it.
 
-Measured elsewhere: 8 of 9 hook scripts in one estate crashed on VALID JSON
-carrying an unexpected field type, and the scripts holding the destructive
-guards were among them. There existed payload shapes for which those guards
-simply did not exist, and nothing said so.
+This is not a theoretical worry. A hook layer audited before this pack was
+written had almost every script crashing on VALID JSON that carried an unexpected
+field type, and the scripts holding the destructive guards were among them. There
+existed payload shapes for which those guards simply did not exist, and nothing
+said so.
 """
 
 import json
