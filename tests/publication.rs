@@ -75,12 +75,14 @@
 //!   that refuses correct work gets deleted, so this file does not carry one;
 //!   the same grammar stays where it measured clean, over `hooks/` prose.
 //! - **What is already in the history.** The walk NAMES it and stops it growing;
-//!   it cannot remove it. Three lists carry that residue —
+//!   it cannot remove it. Three lists exist to carry that residue —
 //!   [`HISTORICAL_COORDINATES`], [`HISTORICAL_INSTANTS`] and
-//!   [`HISTORY_DEIXIS_RATCHET`], the last of which holds 25 blobs across 8 paths
-//!   whose prose describes one machine. Every one of them empties only when the
-//!   history is rewritten a third time. Reading this file as "the repository is
-//!   clean" would be reading a green ratchet as an empty one.
+//!   [`HISTORY_DEIXIS_RATCHET`]. Two of the three are EMPTY: the rewrite that
+//!   removes a class empties its list, and the both-direction check then makes
+//!   the walk assert the class is gone rather than forgiven. The one remaining
+//!   entry is an instant that no longer appears in any published file. Read a
+//!   green walk as "nothing outside these lists", never as "the lists are
+//!   empty" — check them.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -300,16 +302,19 @@ const DECOY_COORDINATES: &[&str] = &[
 /// published file, present in the history — so the list can neither license a
 /// new fixture nor outlive the rewrite that would empty it.
 ///
-/// **Both entries are field LABELS, and they are already written out in the
-/// docstring above**, which quotes them as the worked example of a label copied
-/// from a real item surviving a scrub that had already replaced the item's
-/// title. Naming them here discloses nothing that the tree does not already
-/// disclose; what it adds is that they are now forbidden in a fixture rather
-/// than merely absent from one.
+/// **It is EMPTY, and empty is the state to keep it in.** It held two field
+/// labels copied from a real item, which had survived a scrub that already
+/// replaced the item's title. A history rewrite replaced the blobs that carried
+/// them, so there is nothing left to forgive — and with the list empty, the
+/// coordinate walk asserts outright that every coordinate in every reachable
+/// blob is a decoy.
 ///
-/// They are NOT in [`DECOY_COORDINATES`], and that is the whole point of a
-/// second list: a decoy is invented, and these were not.
-const HISTORICAL_COORDINATES: &[&str] = &["my api key", "second secret"];
+/// An entry here is NEVER in [`DECOY_COORDINATES`], and that is the whole point
+/// of a second list: a decoy is invented, and anything landing here was not.
+/// Adding one is a statement that a real coordinate is now permanent in the
+/// published history, so it belongs to whoever can prove a rewrite is
+/// impossible — not to whoever is trying to get a red gate green.
+const HISTORICAL_COORDINATES: &[&str] = &[];
 
 /// A decoy item id has to keep this property, because a test depends on it.
 ///
@@ -902,10 +907,12 @@ const FIXTURE_INSTANTS: &[&str] = &[
 /// **This list names an instant in order to forgive it, which is the thing the
 /// scanners here otherwise refuse to do — so read why it is the only honest
 /// spelling available.** The value below is in this repository's published
-/// history, in blobs of `README.md` that predate the tree fix. History is
-/// append-only from here: the only way to unpublish it is a third rewrite of
-/// every sha, and until that happens a history walk that greened without naming
-/// it would be a walk that was not looking.
+/// history, in blobs of `README.md` that predate the tree fix. A history
+/// rewrite could reach those blobs and deliberately has not: the value is
+/// INVENTED, checked against the live audit log, which holds no row on that
+/// date. It is not an observation of anything, so removing it would buy nothing
+/// and cost every sha in the repository. A walk that greened without naming it
+/// would be a walk that was not looking.
 ///
 /// So the choice is not "name it or not". It is "name it in a list that is
 /// scoped, asserted and shrinking, or do not scan the history at all". This is
@@ -1511,16 +1518,17 @@ const GUARD_PLANTS: &[&str] = &[
 
 /// Blobs that carry machine deixis, and that only a history rewrite can remove.
 ///
-/// **This is the third instance of the defect at the top of this section, and
-/// it is the one nobody has remediated.** Both earlier rounds ended in a
-/// history rewrite. The deixis class was scrubbed by an ordinary commit
-/// instead, so the tree is clean and the blobs behind it are not: 25 blobs
-/// across 8 paths, in prose that says what one machine did.
+/// **It is EMPTY.** Scrubbing a class with an ordinary commit cleans the TREE
+/// and leaves every earlier blob intact, so the class survives in the history
+/// with nothing on the tree surface to show it. That mechanism has produced a
+/// residue three times on this repository, and it is the reason this walk reads
+/// blobs rather than files. A history rewrite has replaced the blobs behind
+/// this class, so the list has nothing left to point at.
 ///
-/// A gate that went red on all 25 would be deleted within the week, and a gate
-/// that ignored them would be the hole this whole section exists to close. So
-/// they are a RATCHET, spelled the way `KNOWN_UNSCRUBBED` is spelled next door,
-/// and checked in both directions by
+/// Keep it empty. With no entries, the first assertion below stops being "no
+/// NEW blob offends" and becomes "NO blob offends", which is the property this
+/// file is for. A non-empty list is a RATCHET, spelled the way
+/// `KNOWN_UNSCRUBBED` is spelled next door, and checked in both directions by
 /// [`historical_machine_deixis_is_confined_to_a_shrinking_ratchet`]:
 ///
 /// - a blob that offends and is NOT on this list fails the gate; and
@@ -1537,36 +1545,12 @@ const GUARD_PLANTS: &[&str] = &[
 /// forbids the phrases in order to name the class, which is the deliberate
 /// exception the header of this file states.
 ///
-/// The only way to empty it is a third rewrite of every sha in this repository.
-/// If that is done, this whole list goes unreachable at once and the test says
-/// so.
-const HISTORY_DEIXIS_RATCHET: &[&str] = &[
-    "8e00f0bb4eb9aa90e9094cbef8082e34a5a2f10f", // README.md
-    "aa83f9bb1d4c527da1fe4fc842c9a0aba0177b5b", // hooks/README.md
-    "cf915ec5ffae3f2d01210501aedf8e0a49f1ff4a", // hooks/README.md
-    "40dce12fa8e353a619ef9ed4ead63eefa2dd8ea5", // src/config.rs
-    "88e46832f216dd1183cab64ac8e1d817908bcaaf", // src/config.rs
-    "de174c8b0a8ac7e02e5173eaed5ba2269090c5d6", // src/config.rs
-    "14a3162c4a84189ca3d7ca99a98fd66ed6c15120", // src/daemon/mod.rs
-    "8757f82e60b53ddd1441d70ef97a37050843ed64", // src/daemon/mod.rs
-    "af169490eda5f1f21175eccf80f613685a3255ad", // src/daemon/mod.rs
-    "b2e3e1d3f990aac374f02adfc150551524c7b00c", // src/daemon/mod.rs
-    "edb7825b999c759701f505653e0ad81465a73df0", // src/daemon/mod.rs
-    "08b1e46d993c4f45c895200c466a00947766d0fd", // tests/cli.rs
-    "0fedc1c5585d53c6fe883a2e2d08c2ed92af5152", // tests/cli.rs
-    "92fb3cbbfea5604529403e4a7fd7ff941ec93f55", // tests/never_block.rs
-    "c164020b6edec941728f4db27cf2d12e77ed142f", // tests/never_block.rs
-    "fa74f5fb61de42980af85034381230bb8df581e4", // tests/never_block.rs
-    "8ff9a8c9e5abb30aa0ea43d0ecdc7d9386fa8259", // tests/stores.rs
-    "b5d5b12e7b173588b6f275187514a08e866d404c", // tests/stores.rs
-    "c9ff9ff885c3d3acea9e2c67a568c5feea993680", // tests/stores.rs
-    "24df2c8ce273c00209a5c44974957b87c2d2c219", // tests/support/mod.rs
-    "2dc2f0a8311f4e194c690466b17fc494f1cacbf0", // tests/support/mod.rs
-    "499c1b714e082924e19e9e1d20877463f5d16dc7", // tests/support/mod.rs
-    "7529bb41df80a5e185c01160ede326f26e9e000b", // tests/support/mod.rs
-    "9df884b6da1fa4da3b64724d19f40f1574d2c358", // tests/support/mod.rs
-    "ddbe5be13de4d3b2cbc9068b37c9e67c26bc40dc", // tests/support/mod.rs
-];
+/// Emptying it takes a rewrite of every sha in this repository, because a blob
+/// is immutable and there is no smaller edit that reaches one. That rewrite has
+/// run. Refilling this list is therefore never the fix for a red gate: a NEW
+/// offending blob is one you can still delete from the working tree, and the
+/// assertion below says so in its own failure message.
+const HISTORY_DEIXIS_RATCHET: &[&str] = &[];
 
 /// What the history walk found, and how much of it there was to find.
 struct HistoryFindings {

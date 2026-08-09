@@ -463,11 +463,11 @@ def claims_in_message(body):
 # engineering records. A machine cannot choose which figure is a property of
 # the check and which is a census of the machine that ran it.
 KNOWN_UNSCRUBBED = [
-    "d84887ebf06e5beb39fdcfc27d899c3e1ab1b716",
-    "e1f3492f0e8191367c9cd18e1934113132fecfd6",
-    "0215905c87c0bbc7ccd386dd226bf3430e92baa7",
-    "cc9f653c7716d53ad3c035a196eb47c17d0c4add",
-    "a39d0a368ab9bf454a56166fa7ea9beb0e1c01ce",
+    "a40c37c0a65fcda37879393e71206ca2807a539c",
+    "3bb7c07ce850a0740b4b6610bb45dc14e4d6e701",
+    "801de39bd6279073f708933a4fb1f7a6c93d5492",
+    "a77db6a39a6309bda186b608ccbc5f8fdd7ff03c",
+    "d244c42ab946415dcf6d3929be27e918136c8816",
 ]
 
 # One planted message per shape that was really written into this history.
