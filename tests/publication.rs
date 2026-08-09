@@ -36,6 +36,24 @@
 //! [`the_history_walk_sees_a_leak_that_is_only_in_history`] for the control that
 //! proves it catches what a tree scanner structurally cannot.
 //!
+//! # What a scanner is pointed AT, which is where this went wrong
+//!
+//! The grammars were never the weak half. The CORPUS was: the tree scan
+//! admitted a file if its extension was on a list of ten, so `site/_headers`
+//! and `.gitignore` were read by nothing, while the history walk — which has
+//! never had a name filter — read both. A gate silent on the working tree and
+//! loud on the history is not a gap, it is a trapdoor: it says nothing while a
+//! leak is one `git checkout` from gone, and speaks only once the blob is
+//! permanent and its own failure text says a rewrite is the remedy.
+//!
+//! So the corpus is no longer a name test. [`publishable_paths`] asks GIT what
+//! this repository publishes and [`as_text`] decides what is readable from the
+//! BYTES, which makes binary the excluded thing rather than the admitted one: a
+//! file type nobody anticipated is scanned by default, and a mistake
+//! over-scans. Both surfaces answer to that one rule, and
+//! [`the_tree_corpus_covers_every_path_in_the_published_commit`] is the
+//! equality that stops them narrowing independently again.
+//!
 //! # Why an allowlist and not a denylist
 //!
 //! A denylist would catch the two strings that already came back and nothing
@@ -92,39 +110,6 @@ use std::process::{Command, Stdio};
 // The corpus
 // ───────────────────────────────────────────────────────────────────────────
 
-/// Every directory this repository publishes.
-///
-/// `hooks/` and `site/` are here because they are published from this
-/// repository too, and for a long time they were not scanned at all. Adding a
-/// root is not enough on its own: the walk used to filter on `ext == "rs"`, so
-/// a new root contributed zero files and the scan reported clean. Both halves
-/// have to move together, which is what [`TEXT_EXTENSIONS`] and
-/// [`no_published_file_type_is_left_unscanned`] exist to force.
-const SCANNED_ROOTS: &[&str] = &[
-    ".cargo", ".github", "examples", "hooks", "install", "site", "src", "tests",
-];
-
-/// Published files that sit at the repository root rather than under one.
-///
-/// `LICENSE` is named here because it carries no extension, so the walk above
-/// cannot reach it. It was in [`DEIXIS_EXEMPT`] before it was in this list,
-/// which made that exemption vacuous — the file it excused was never scanned,
-/// so removing the excuse would have changed nothing and nobody would have
-/// found out. An exemption that excuses a file nobody reads is indistinguishable
-/// from a working one.
-const SCANNED_FILES: &[&str] = &["Cargo.lock", "Cargo.toml", "LICENSE", "README.md"];
-
-/// Every text file type the published tree contains.
-///
-/// Asserted against what the tree ACTUALLY holds, so a `.toml` or a `.txt`
-/// appearing for the first time fails loudly instead of being silently exempt.
-const TEXT_EXTENSIONS: &[&str] = &[
-    "html", "json", "md", "plist", "py", "rs", "sh", "toml", "txt", "yml",
-];
-
-/// Directories that hold build output or version-control state.
-const SKIPPED_DIRS: &[&str] = &[".git", "__pycache__", "target"];
-
 fn manifest_dir() -> &'static Path {
     Path::new(env!("CARGO_MANIFEST_DIR"))
 }
@@ -140,44 +125,123 @@ fn guard_path() -> PathBuf {
     manifest_dir().join(file!())
 }
 
-fn is_text(path: &Path) -> bool {
-    path.extension()
-        .and_then(|ext| ext.to_str())
-        .is_some_and(|ext| TEXT_EXTENSIONS.contains(&ext))
+/// Is this content text? Answered from the BYTES, never from the name.
+///
+/// The name was the wrong question, and asking it is the whole of the defect
+/// this replaced. A NUL byte is git's own binary test, and it is the one signal
+/// an extension cannot fake in either direction: `site/_headers` carries no
+/// extension and no NUL, and a PNG copied to `notes.md` carries a NUL in its
+/// first line.
+///
+/// **Failing this is never "skip it".** Both corpora record what they could not
+/// read and both assert that record is EMPTY — see
+/// [`nothing_published_is_beyond_the_reach_of_the_grammars`] — so a file that
+/// stops being scannable is a red gate rather than a quiet subtraction. That is
+/// the inversion: a file type nobody anticipated is scanned by default, and the
+/// cost of being wrong is over-scanning rather than under-scanning.
+fn as_text(bytes: Vec<u8>) -> Option<String> {
+    if bytes.contains(&0) {
+        return None;
+    }
+    String::from_utf8(bytes).ok()
 }
 
-fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
-    let entries = std::fs::read_dir(dir).unwrap_or_else(|e| panic!("read {}: {e}", dir.display()));
-    for entry in entries {
-        let path = entry.expect("a directory entry").path();
-        let name = path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or_default();
-        if path.is_dir() {
-            if !SKIPPED_DIRS.contains(&name) {
-                walk(&path, out);
+/// Every path this repository publishes, as git itself lists them.
+///
+/// Tracked files, plus files that are neither tracked nor ignored — the set the
+/// next commit would carry, which is the set a clone receives. There is no name
+/// pattern in it, so there is no list here that can narrow.
+///
+/// **This replaced four hand-written lists, and each one was a narrowing.** A
+/// directory allow-list, a root-file list, a skipped-directory list and an
+/// extension allow-list. The extension list is the one that was measured:
+/// `site/_headers` and `.gitignore` carry no extension, so they entered no tree
+/// scan at all — while the history walk below, which has never had a name
+/// filter, read both. The gate was therefore SILENT while a leak was still one
+/// `git checkout` away from gone, and spoke only once the blob was permanent.
+/// That is worse than a gap. It converts a one-second fix into a history
+/// rewrite, and this repository has already paid for three of those.
+///
+/// Asking git also puts both corpora under one authority. They cannot be one
+/// enumeration — this one is keyed by working-tree path, the history walk is
+/// keyed by blob object, and no single function returns both — so what is
+/// shared is the AUTHORITY and the admission rule ([`as_text`]), and
+/// [`the_tree_corpus_covers_every_path_in_the_published_commit`] is the
+/// reconciliation that stops the two drifting apart again.
+///
+/// It fails rather than skipping outside a git checkout, for the same reason
+/// [`is_shallow`] does: a corpus that read nothing and a clean repository are
+/// the same empty result.
+///
+/// **So every case in this file now needs a checkout, not only the history
+/// half, and `cargo mutants` does not copy `.git` unless it is told to.**
+/// Without `--copy-vcs true` the UNMUTATED baseline fails, the campaign tests
+/// zero mutants and reports no outcomes — a dead gate that reads like a quiet
+/// one. `.github/workflows/mutants.yml` passes the flag and says why. Keep it:
+/// the alternative is to skip when `.git` is absent, which is the empty-result
+/// trap this whole file exists to close.
+fn publishable_paths(repo: &Path) -> Vec<PathBuf> {
+    let listing = git_must(
+        repo,
+        &[
+            "ls-files",
+            "-z",
+            "--cached",
+            "--others",
+            "--exclude-standard",
+        ],
+    );
+    let mut paths: BTreeSet<PathBuf> = listing
+        .split('\0')
+        .filter(|entry| !entry.is_empty())
+        .map(|entry| repo.join(entry))
+        .collect();
+    paths.remove(&guard_path());
+    paths.into_iter().collect()
+}
+
+/// The working tree, read once and classified once.
+struct TreeCorpus {
+    /// Every published text file, with the exact bytes the grammars read. The
+    /// content is carried rather than re-read, so the file that was classified
+    /// and the file that is scanned cannot be two different reads.
+    text: Vec<(PathBuf, String)>,
+    /// Every published file [`as_text`] refused. Asserted empty: a binary that
+    /// has to be published is a decision somebody makes out loud.
+    binary: Vec<PathBuf>,
+}
+
+/// The one read of this working tree, shared by every tree scan below.
+fn tree() -> &'static TreeCorpus {
+    static CORPUS: std::sync::OnceLock<TreeCorpus> = std::sync::OnceLock::new();
+    CORPUS.get_or_init(|| {
+        let mut corpus = TreeCorpus {
+            text: Vec::new(),
+            binary: Vec::new(),
+        };
+        for path in publishable_paths(manifest_dir()) {
+            if !path.is_file() {
+                // Tracked and deleted from the working tree. There is nothing
+                // here to read, and the blob it left behind belongs to the
+                // history walk's corpus rather than to this one.
+                continue;
             }
-        } else if is_text(&path) {
-            out.push(path);
+            let bytes =
+                std::fs::read(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+            match as_text(bytes) {
+                Some(text) => corpus.text.push((path, text)),
+                None => corpus.binary.push(path),
+            }
         }
-    }
+        corpus.text.sort_by(|left, right| left.0.cmp(&right.0));
+        corpus.binary.sort();
+        corpus
+    })
 }
 
 /// Every published text file, this guard excluded.
 fn published_files() -> Vec<PathBuf> {
-    let root = manifest_dir();
-    let mut files = Vec::new();
-    for scanned in SCANNED_ROOTS {
-        walk(&root.join(scanned), &mut files);
-    }
-    for scanned in SCANNED_FILES {
-        files.push(root.join(scanned));
-    }
-    let guard = guard_path();
-    files.retain(|path| *path != guard);
-    files.sort();
-    files
+    tree().text.iter().map(|(path, _)| path.clone()).collect()
 }
 
 fn read(path: &Path) -> String {
@@ -531,13 +595,12 @@ fn every_coordinate_is_an_allowlisted_decoy() {
     let mut seen = 0usize;
     let mut offenders: Vec<String> = Vec::new();
 
-    for path in published_files() {
-        let source = read(&path);
+    for (path, source) in &tree().text {
         let rust = path.extension().is_some_and(|ext| ext == "rs");
-        for (marker, value) in coordinates(&source, rust) {
+        for (marker, value) in coordinates(source, rust) {
             seen += 1;
             if !DECOY_COORDINATES.contains(&value.as_str()) {
-                offenders.push(format!("{}: `{marker}` -> `{value}`", shown(&path)));
+                offenders.push(format!("{}: `{marker}` -> `{value}`", shown(path)));
             }
         }
     }
@@ -758,15 +821,15 @@ fn deixis_in(text: &str) -> Vec<&'static str> {
 fn no_source_file_speaks_about_the_authors_own_machine() {
     let mut offenders: Vec<String> = Vec::new();
 
-    for path in published_files() {
-        let relative = shown(&path);
+    for (path, source) in &tree().text {
+        let relative = shown(path);
         if DEIXIS_EXEMPT
             .iter()
             .any(|exempt| relative.ends_with(exempt))
         {
             continue;
         }
-        for phrase in deixis_in(&read(&path)) {
+        for phrase in deixis_in(source) {
             offenders.push(format!("{relative}: `{phrase}`"));
         }
     }
@@ -964,11 +1027,11 @@ fn every_record_timestamp_is_an_allowlisted_fixture() {
     let mut seen = 0usize;
     let mut offenders: Vec<String> = Vec::new();
 
-    for path in published_files() {
-        for instant in instants(&read(&path)) {
+    for (path, source) in &tree().text {
+        for instant in instants(source) {
             seen += 1;
             if !FIXTURE_INSTANTS.contains(&instant.as_str()) {
-                offenders.push(format!("{}: `{instant}`", shown(&path)));
+                offenders.push(format!("{}: `{instant}`", shown(path)));
             }
         }
     }
@@ -1134,136 +1197,163 @@ fn the_historical_instants_are_historical_only() {
 // ───────────────────────────────────────────────────────────────────────────
 
 #[test]
-fn no_published_file_type_is_left_unscanned() {
-    // Adding a root is not one line, and this is the half that is easy to
-    // forget: the walk filters on extension, so a root full of `.py` and
-    // `.html` contributed nothing while `TEXT_EXTENSIONS` held only `rs`, and
-    // the scan reported clean. This fails when a file type appears for the
-    // first time, rather than letting it be silently exempt.
-    let mut present: BTreeSet<String> = BTreeSet::new();
+fn the_text_classifier_reads_content_and_not_a_name() {
+    // Both directions, because a classifier that says yes to everything and one
+    // that says no to everything both leave the corpus above looking settled.
+    assert_eq!(
+        as_text(b"# a published file with no extension\n".to_vec()).as_deref(),
+        Some("# a published file with no extension\n"),
+        "an extensionless UTF-8 file is text, and deciding that from its name is \
+         the defect this replaced"
+    );
+    assert!(
+        as_text(b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR".to_vec()).is_none(),
+        "a PNG is binary whatever it is called, including `notes.md`"
+    );
+    assert!(
+        as_text(vec![0xff, 0xfe, 0x41, 0x00]).is_none(),
+        "bytes that are not UTF-8 are not text"
+    );
+    assert!(
+        as_text(Vec::new()).is_some(),
+        "an empty file is text, and refusing it would put every empty published \
+         file on the binary list"
+    );
+}
 
-    fn collect(dir: &Path, out: &mut BTreeSet<String>) {
-        for entry in std::fs::read_dir(dir).expect("a readable directory") {
-            let path = entry.expect("a directory entry").path();
-            let name = path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or_default();
-            if path.is_dir() {
-                if !SKIPPED_DIRS.contains(&name) {
-                    collect(&path, out);
-                }
-            } else if !name.starts_with('.')
-                && let Some(ext) = path.extension().and_then(|e| e.to_str())
-                && ext != "pyc"
-            {
-                out.insert(ext.to_owned());
-            }
+#[test]
+fn nothing_published_is_beyond_the_reach_of_the_grammars() {
+    // One admission rule, asserted over both corpora in one place. The history
+    // walk's own size test asserts the same emptiness, but for the other
+    // reason: that one catches a walk that COLLAPSED, this one catches content
+    // that no grammar here can read.
+    let unreadable: Vec<String> = tree().binary.iter().map(|path| shown(path)).collect();
+    assert!(
+        unreadable.is_empty(),
+        "a published file is not text, so none of the three grammars reads it: \
+         {unreadable:?}.\n\
+         Nothing in this repository is meant to be binary. If one has to be, say \
+         so out loud rather than letting the scan step over it."
+    );
+    assert!(
+        history().unreadable.is_empty(),
+        "a published blob is not text: {:?}",
+        history().unreadable
+    );
+}
+
+#[test]
+fn a_published_file_with_no_extension_is_scanned() {
+    // The measured defect, asserted rather than described.
+    //
+    // The corpus filtered on extension, `site/_headers` has none, and it entered
+    // no tree scan at all — while the history walk read it the moment it was
+    // committed, and says in its own failure text that only a rewrite removes
+    // what it finds. So the tree scan was silent exactly while the fix was
+    // cheap. `.gitignore` was invisible for a SECOND reason, and that is why
+    // finding one narrowing was not the end of the search: the root-file audit
+    // skipped every name beginning with a dot, so no list mentioned it and no
+    // test missed it.
+    //
+    // Computed rather than named, so it keeps holding when the files change.
+    let scanned: BTreeSet<PathBuf> = published_files().into_iter().collect();
+    let mut extensionless: Vec<String> = Vec::new();
+    let mut unscanned: Vec<String> = Vec::new();
+
+    for path in publishable_paths(manifest_dir()) {
+        if !path.is_file() || path.extension().is_some() {
+            continue;
+        }
+        extensionless.push(shown(&path));
+        if !scanned.contains(&path) {
+            unscanned.push(shown(&path));
         }
     }
 
-    for scanned in SCANNED_ROOTS {
-        collect(&manifest_dir().join(scanned), &mut present);
-    }
-
-    let unscanned: Vec<&String> = present
-        .iter()
-        .filter(|ext| !TEXT_EXTENSIONS.contains(&ext.as_str()))
-        .collect();
-
+    assert!(
+        extensionless.len() >= 2,
+        "this repository publishes {} files with no extension, so this case has \
+         nothing to prove and passes for the wrong reason. It is the class that \
+         was unscanned; a repository holding none of them needs a different \
+         control, not this one.",
+        extensionless.len()
+    );
     assert!(
         unscanned.is_empty(),
-        "a published file type is scanned by nothing: {unscanned:?}.\n\
-         Add it to TEXT_EXTENSIONS, or say in SKIPPED_DIRS why the tree it lives in \
-         is not published."
+        "a published file with no extension is scanned by nothing: {unscanned:?}.\n\
+         The corpus is supposed to admit by CONTENT. Something has put a name \
+         test back in front of it."
     );
 }
 
 #[test]
-fn the_walk_reaches_every_published_root() {
-    // A root that contributes zero files is a root that is not scanned, however
-    // it is spelled in SCANNED_ROOTS. This is the assertion that would have
-    // failed the day `hooks` was added to the roots and the walk still filtered
-    // on `.rs`.
-    let files = published_files();
+fn the_tree_corpus_covers_every_path_in_the_published_commit() {
+    // The control this file did not have, and the reason it did not have one:
+    // every existing check on the corpus was a FLOOR — `files.len() >= 90`,
+    // `seen >= 200` — and a floor cannot see one class go missing while nine
+    // others stay. Two files were absent from every tree scan and every count
+    // sat comfortably above its floor.
+    //
+    // So this is an EQUALITY against git's listing of the commit that gets
+    // published, and it NAMES what is missing rather than subtracting it. It is
+    // also the reconciliation between the two corpora: they cannot be one
+    // enumeration, so this is what stops them narrowing independently, which is
+    // exactly how the extension filter survived on one side and never existed
+    // on the other.
+    let scanned: BTreeSet<String> = tree()
+        .text
+        .iter()
+        .map(|(path, _)| shown(path))
+        .chain(tree().binary.iter().map(|path| shown(path)))
+        .collect();
+
+    let listing = git_must(
+        manifest_dir(),
+        &["ls-tree", "-r", "-z", "--name-only", "HEAD"],
+    );
+    let committed: Vec<&str> = listing
+        .split('\0')
+        .filter(|entry| !entry.is_empty())
+        .collect();
+
+    let mut missing: Vec<&str> = Vec::new();
+    let mut directories: BTreeSet<&str> = BTreeSet::new();
+    for path in &committed {
+        if *path == file!() {
+            continue; // this guard, which is excluded from its own scans
+        }
+        if !manifest_dir().join(path).is_file() {
+            continue; // deleted since the commit; its blob is the walk's corpus
+        }
+        directories.insert(path.split('/').next().unwrap_or_default());
+        if !scanned.contains(*path) {
+            missing.push(path);
+        }
+    }
+
     assert!(
-        files.len() >= 90,
-        "the walk found only {} published files",
-        files.len()
+        committed.len() >= 100,
+        "`git ls-tree HEAD` named only {} paths, so this comparison is against \
+         almost nothing and would pass however narrow the corpus had become",
+        committed.len()
+    );
+    assert!(
+        missing.is_empty(),
+        "a path in the published commit is in no corpus: {missing:?}.\n\
+         Every file git publishes is read by the three grammars or is named as \
+         binary. There is no third outcome, and a file reaching one would be \
+         invisible to this gate until somebody committed it."
     );
 
-    for scanned in SCANNED_ROOTS {
-        let root = manifest_dir().join(scanned);
+    // And every top level the commit contains contributed something. A whole
+    // directory going quiet is the same failure one size larger, and the
+    // equality above would report it as a long list rather than as a cause.
+    for directory in &directories {
         assert!(
-            files.iter().any(|path| path.starts_with(&root)),
-            "`{scanned}` is in SCANNED_ROOTS and contributed no file: \
-             its file types are missing from TEXT_EXTENSIONS"
+            scanned.iter().any(|path| path.starts_with(directory)),
+            "`{directory}` is published and contributed no scanned file at all"
         );
     }
-
-    for scanned in SCANNED_FILES {
-        let path = manifest_dir().join(scanned);
-        assert!(files.contains(&path), "`{scanned}` was not scanned");
-    }
-}
-
-#[test]
-fn every_file_at_the_repository_root_is_accounted_for() {
-    // `SCANNED_FILES` is a hand-written list, and a hand-written list of files
-    // is the one thing in here that cannot fail loudly on its own: a new file
-    // at the root is simply absent from it, and absence is silence.
-    // `no_published_file_type_is_left_unscanned` does not help — it walks
-    // SCANNED_ROOTS, and the root itself is not one of them.
-    //
-    // Directories are covered by SCANNED_ROOTS and are asserted there.
-    // Dot-files are configuration for tools rather than published prose, and
-    // `target` is build output.
-    let root = manifest_dir();
-    let mut unaccounted: Vec<String> = Vec::new();
-
-    for entry in std::fs::read_dir(root).expect("a readable repository root") {
-        let path = entry.expect("a directory entry").path();
-        let name = path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or_default()
-            .to_owned();
-        if path.is_dir() || name.starts_with('.') {
-            continue;
-        }
-        if !SCANNED_FILES.contains(&name.as_str()) {
-            unaccounted.push(name);
-        }
-    }
-
-    assert!(
-        unaccounted.is_empty(),
-        "a file at the repository root is scanned by nothing: {unaccounted:?}.\n\
-         Add it to SCANNED_FILES. Every file here is published."
-    );
-
-    // And every directory at the root is either scanned or deliberately not.
-    let mut unscanned_dirs: Vec<String> = Vec::new();
-    for entry in std::fs::read_dir(root).expect("a readable repository root") {
-        let path = entry.expect("a directory entry").path();
-        let name = path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or_default()
-            .to_owned();
-        if !path.is_dir() || SKIPPED_DIRS.contains(&name.as_str()) {
-            continue;
-        }
-        if !SCANNED_ROOTS.contains(&name.as_str()) {
-            unscanned_dirs.push(name);
-        }
-    }
-
-    assert!(
-        unscanned_dirs.is_empty(),
-        "a directory at the repository root is scanned by nothing: {unscanned_dirs:?}.\n\
-         Add it to SCANNED_ROOTS, or to SKIPPED_DIRS with a reason."
-    );
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -1602,7 +1692,11 @@ fn scan_history(repo: &Path) -> HistoryFindings {
         let where_ = paths.iter().cloned().collect::<Vec<_>>().join(", ");
         let short = &sha[..12.min(sha.len())];
 
-        let Ok(text) = String::from_utf8(bytes) else {
+        // The SAME admission rule the tree corpus uses, so the two surfaces
+        // cannot come to disagree about what counts as scannable. That is what
+        // went wrong before: this walk admitted every blob it could decode and
+        // the tree scan admitted ten file extensions, and nothing compared them.
+        let Some(text) = as_text(bytes) else {
             // Not scannable and not silently skipped. Today this list is empty
             // and the test asserts it stays empty; a binary that has to be
             // published is a decision somebody makes out loud.
