@@ -177,6 +177,21 @@ fn every_encoding_in_the_table_is_caught_at_every_split_point() {
                 !masked.contains(rendered),
                 "{label} leaked when split at byte {split}"
             );
+            // An ABSENCE on its own is not a result. This test used to assert
+            // only the line above, and a masker that emitted nothing at all
+            // satisfied it: the empty string contains no secret. Measured by
+            // making `Masker::scan` return an empty buffer — a masker that
+            // deletes the whole stream — after which this test stayed green
+            // across all twenty encodings and every split point.
+            //
+            // So the output is pinned exactly. The bracketing `a` and `b` are
+            // what make it exact rather than a second `contains`: they prove
+            // the bytes around the match survived and that the replacement
+            // landed in their place, not merely somewhere.
+            assert_eq!(
+                masked, "a[keyless:DECOY]b",
+                "{label} at split {split}: the stream is not what it should be"
+            );
         }
     }
 }
@@ -227,22 +242,43 @@ fn known_limit_compression_cannot_be_caught() {
     // claims coverage the design does not have.
     let masker = masker();
 
-    let mut gzip = match Command::new("/usr/bin/gzip")
+    // A missing tool is a broken environment, not a pass. This used to be
+    // `Err(_) => return`, which made the whole test evaporate into a green tick
+    // wherever `gzip` was absent — the one shape that is indistinguishable, from
+    // the outside, from a limit that was actually demonstrated. Both CI runners
+    // for this project (`ubuntu-latest`, `macos-latest`) ship `/usr/bin/gzip`,
+    // so its absence is a fact worth failing on rather than skipping past.
+    let mut gzip = Command::new("/usr/bin/gzip")
         .arg("-c")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .spawn()
-    {
-        Ok(child) => child,
-        // No gzip: the limit still holds, there is just nothing to demonstrate.
-        Err(_) => return,
-    };
+        .unwrap_or_else(|error| {
+            panic!(
+                "/usr/bin/gzip cannot be spawned ({error}). This test demonstrates \
+                 an accepted limit of substring masking and needs a real compressor \
+                 to do it; skipping it silently would report a limit as proven when \
+                 nothing ran."
+            )
+        });
     gzip.stdin
         .take()
         .expect("piped stdin")
         .write_all(VALUE.as_bytes())
         .expect("write to gzip");
     let compressed = gzip.wait_with_output().expect("gzip output").stdout;
+
+    // The precondition, stated. Everything below is only interesting because the
+    // compressed bytes carry no contiguous image of the value; if they ever did,
+    // masking would catch it and the failure would read as a masking bug rather
+    // than as a fixture that stopped compressing.
+    assert!(
+        !compressed
+            .windows(VALUE.len())
+            .any(|window| window == VALUE.as_bytes()),
+        "gzip left the value contiguous in its output, so this fixture is not \
+         demonstrating the limit it claims to"
+    );
 
     let masked = masker.mask_bytes(&compressed);
     assert_eq!(
@@ -264,20 +300,51 @@ fn known_limit_a_secret_encoded_together_with_other_data_is_not_caught() {
     let secret = Secret::new(password.to_owned());
     let masker = Arc::new(Masker::from_secrets([("PASSWORD", &secret)]));
 
-    let joined = format!("apiuser:{password}");
-    let header = Encoding::Base64Std.encode(&joined);
-    let masked = masker.mask_str(&header);
+    // Both forms are written out, for the reason the table at the top of this
+    // file is written out. `Encoding::Base64Std.encode` used to BUILD the
+    // header this test then asserted about, so both sides of that equality
+    // moved together: corrupt the codec and the header changes, the masked copy
+    // changes with it, and `masked == header` still holds. Measured by swapping
+    // two symbols of `B64_STD` — this test stayed green while
+    // `the_codecs_agree_with_an_independent_oracle` went red, which is the
+    // difference between an oracle and an echo.
+    const HEADER: &str = "YXBpdXNlcjpkZWNveS1iYXNpYy1hdXRoLXBhc3N3b3JkLTEyMzQ=";
+    const PASSWORD_B64: &str = "ZGVjb3ktYmFzaWMtYXV0aC1wYXNzd29yZC0xMjM0";
+
+    // The alignment claim, checked rather than asserted in prose. `apiuser:` is
+    // eight bytes and eight is not a multiple of three, so the password's own
+    // encoding starts on a different boundary inside the joined string. If a
+    // later edit picks a username whose length IS a multiple of three, this
+    // fires and says so, instead of the test quietly stopping being about
+    // misalignment.
+    assert!(
+        !HEADER.contains(PASSWORD_B64),
+        "the fixture no longer demonstrates misalignment: the password's own \
+         base64 is a substring of the header, so masking would catch it"
+    );
+
+    // The codec is pinned against the literal here, once, as its own claim.
+    // Everything below is then stated in terms of the literal, so a defect in
+    // the codec reds this line rather than travelling silently into the
+    // assertions about masking.
     assert_eq!(
-        masked, header,
+        Encoding::Base64Std.encode(&format!("apiuser:{password}")),
+        HEADER,
+        "the codec no longer produces the header this test is written against"
+    );
+
+    let masked = masker.mask_str(HEADER);
+    assert_eq!(
+        masked, HEADER,
         "if this now masks, the limit has been closed and the docs must change"
     );
 
     // The raw form in the same line IS caught, which is the useful half.
-    let line = format!("-u apiuser:{password} -> {header}");
+    let line = format!("-u apiuser:{password} -> {HEADER}");
     let masked = masker.mask_str(&line);
     assert!(masked.contains("[keyless:PASSWORD]"));
     assert!(
-        masked.contains(&header),
+        masked.contains(HEADER),
         "the encoded half still passes through"
     );
 }
