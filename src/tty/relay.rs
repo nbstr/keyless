@@ -37,8 +37,8 @@ use std::fs::File;
 use std::io::{self, Write};
 use std::os::fd::{AsFd, OwnedFd};
 use std::os::unix::thread::{JoinHandleExt, RawPthread};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, mpsc};
 use std::thread::{self, JoinHandle};
 
 use nix::errno::Errno;
@@ -51,6 +51,10 @@ use nix::unistd::{Pid, read, write};
 use zeroize::Zeroize;
 
 use super::{Pty, RawMode, TtyError, enter_raw_mode};
+// One number, not two. How long a masking filter gets after the child has been
+// reaped is a single policy, and the pipe path states it: duplicating the value
+// here behind an equality test would be duplication with extra steps.
+use crate::cmd::run::PUMP_DRAIN_GRACE;
 use crate::mask::{Masker, pump};
 
 /// The signals this process takes over while a child owns the terminal.
@@ -226,8 +230,24 @@ impl Prepared {
         let done = Arc::new(AtomicBool::new(false));
         let _ = pty.propagate_size();
 
+        // A channel rather than the join handle, because `JoinHandle` has no
+        // timed join and [`Relay::drain`] has to be bounded — the same reason,
+        // and the same shape, as the pipe path's own drain.
+        let (finished, output_done) = mpsc::channel::<()>();
         let output = thread::spawn(move || {
-            pump(File::from(self.output_master), io::stdout().lock(), masker)
+            // `io::stdout()` and NOT `io::stdout().lock()`. A held lock is
+            // released when its guard drops, and a filter abandoned at the
+            // deadline never drops anything — it is still blocked reading a
+            // master that a grandchild holds open. Holding the process-wide
+            // stdout lock for this thread's whole life would therefore MOVE the
+            // hang rather than remove it: `run` would return on time and
+            // `main`'s closing flush would block forever on a guard nobody will
+            // ever drop. Locking per write costs one uncontended acquisition
+            // per read and keeps each `write_all` atomic, which is the only
+            // atomicity a stream filter needs.
+            let result = pump(File::from(self.output_master), io::stdout(), masker);
+            let _ = finished.send(());
+            result
         });
 
         let input_master = self.input_master;
@@ -247,6 +267,7 @@ impl Prepared {
 
         Relay {
             output: Some(output),
+            output_done,
             input: Some(input),
             signals: Some(signals),
             signals_thread,
@@ -267,6 +288,8 @@ impl Prepared {
 #[derive(Debug)]
 pub struct Relay {
     output: Option<JoinHandle<io::Result<()>>>,
+    /// One message when the output filter returns. See [`Relay::drain`].
+    output_done: mpsc::Receiver<()>,
     input: Option<JoinHandle<()>>,
     signals: Option<JoinHandle<()>>,
     signals_thread: RawPthread,
@@ -278,25 +301,65 @@ pub struct Relay {
 }
 
 impl Relay {
-    /// Wait for the child's output to finish arriving.
+    /// Wait for the child's output to finish arriving — but not forever.
+    ///
+    /// Returns whether the filter finished. `false` means it was abandoned at
+    /// the deadline and some of the child's output will not be shown; the
+    /// caller owns saying so, because only the caller has somewhere to say it.
     ///
     /// Call after the child is reaped: the master reports end-of-stream only
     /// once every copy of the slave is closed, which happens when the child
     /// exits. Draining before restoring the terminal is what stops the last few
     /// lines of a run being written into a terminal that is already back in
     /// cooked mode and rendering them with the wrong line endings.
-    pub fn drain(&mut self) {
-        if let Some(output) = self.output.take() {
+    ///
+    /// # Why "when the child exits" is not the whole story
+    ///
+    /// The child's own children inherit the terminal, and a backgrounded one
+    /// outlives its parent:
+    ///
+    /// ```console
+    /// $ keyless run -s DECOY -- sh -c "echo ran; (trap '' HUP; sleep 300) &"
+    /// ```
+    ///
+    /// reaps `sh` at once and then reads a master a grandchild is holding open.
+    /// An unbounded join there waits five minutes with the terminal still raw.
+    /// Measured 2026-08-09 on Linux: the run never returned.
+    ///
+    /// The `trap` is not decoration. Without it the grandchild takes the
+    /// `SIGHUP` the kernel sends when the child's session ends, dies, and the
+    /// case proves nothing — which is why the test that covers this uses
+    /// exactly that command.
+    // `must_use` because the whole value of the bound is that somebody SAYS the
+    // output was cut short. A caller that drops the answer has re-created the
+    // silent failure this replaced, and that is a compiler warning rather than a
+    // comment asking nicely.
+    #[must_use]
+    pub fn drain(&mut self) -> bool {
+        let Some(output) = self.output.take() else {
+            // Already drained. Saying "finished" is right: a second call must
+            // not spend the grace again, and `Drop` always makes one.
+            return true;
+        };
+        if self.output_done.recv_timeout(PUMP_DRAIN_GRACE).is_ok() {
             // A panicked pump must not become a panic here, and a downstream
             // broken pipe is not this tool's problem to report.
             let _ = output.join();
+            return true;
         }
+        // Deliberately detached rather than joined: the thread is blocked in a
+        // `read` that nothing in this process can interrupt, and it dies with
+        // the process. Dropping the handle is what says so.
+        drop(output);
+        false
     }
 }
 
 impl Drop for Relay {
     fn drop(&mut self) {
-        self.drain();
+        // Ordinarily a no-op: the caller drains first, so it can report an
+        // abandoned filter. This is the backstop, and it cannot report anything.
+        let _ = self.drain();
         self.done.store(true, Ordering::Release);
         // One byte wakes the input relay out of `poll`. Interrupting a blocking
         // read on a terminal is not portable; giving it a second thing to wait

@@ -21,6 +21,18 @@
 //! is the one `keyless` allocates. Everything the child writes crosses the
 //! masker between the two.
 //!
+//! # Every case here is bounded, because a hang reports NOTHING
+//!
+//! A hanging test and a passing test are the same empty log, and this file is
+//! the worked example: nine of its cases blocked forever on Linux and `cargo
+//! test` never returned, so there was no red line for anyone to read. Every case
+//! here runs through [`support::within`], which abandons a case that stalls and
+//! reports it by name instead of stopping the suite.
+//!
+//! That bound stays whatever the code does. Everything below drives a real
+//! child, a real terminal and descriptors another process can hold open, which
+//! is the exact set of ingredients whose failure mode is silence.
+//!
 //! # No test here sleeps for a fixed period and then asserts
 //!
 //! Every one waits for a marker to appear in the output instead. That is not
@@ -33,17 +45,6 @@
 
 mod support;
 
-// Nine of the ten cases below HANG on Linux, indefinitely, with and without a
-// controlling terminal (measured 2026-08-09 on rust 1.89 / aarch64). That is a
-// real defect in `src/tty/`, in code that is portable and compiled on both
-// platforms -- not a property of the platform, and not something a `#[cfg]`
-// should paper over.
-//
-// They are marked ignored off macOS rather than compiled out, so that they are
-// still COLLECTED there, still link-checked, and still printed by name with
-// their reason on every Linux run. CI pins the ignored count per platform, so
-// the day one is fixed, or a tenth is added, somebody has to come back here.
-
 use std::io::{Read, Write};
 use std::os::fd::{AsFd, AsRawFd, OwnedFd};
 use std::os::unix::process::CommandExt;
@@ -55,13 +56,17 @@ use std::time::{Duration, Instant};
 use nix::pty::{OpenptyResult, Winsize, openpty};
 use nix::sys::termios::{self, LocalFlags, Termios};
 
-use support::{DECOY_VALUE, Stub, scratch, stub_security};
+use support::{DECOY_VALUE, PATIENCE, Stub, scratch, stub_security, within};
 
 const BIN: &str = env!("CARGO_BIN_EXE_keyless");
 
-/// Long enough for a shell to start and print under a loaded parallel run,
-/// short enough that a hang fails the test instead of the suite.
-const PATIENCE: Duration = Duration::from_secs(30);
+/// The bound on a whole case.
+///
+/// Deliberately larger than [`PATIENCE`], which bounds one `await_output`. A
+/// case that stalls waiting for a specific marker should report THAT marker and
+/// what the terminal received instead; only a stall with no more specific owner
+/// should fall through to this one.
+const CASE_PATIENCE: Duration = Duration::from_secs(60);
 
 /// A distinctive terminal size, so "the child saw the size we set" cannot be
 /// confused with "the child saw a plausible default". 24x80 would prove nothing.
@@ -121,9 +126,34 @@ struct UnderTerminal {
     reader: Option<JoinHandle<()>>,
 }
 
+/// Stop this test's terminal being inherited by another test's child.
+///
+/// `openpty` returns descriptors with `FD_CLOEXEC` clear, and these tests run in
+/// parallel in ONE process. So case A's terminal is open while case B forks, and
+/// B's `keyless` — and the shell and grandchild it starts — inherit it. A's
+/// master then never reports end-of-file, because a process A has never heard of
+/// is holding A's slave, and A blocks reading it until that stranger exits.
+///
+/// Measured 2026-08-09 on Linux: with a 60-second grandchild in one case, an
+/// unrelated case blocked for the full sixty seconds. It is a fixture defect and
+/// not a product one, and it is exactly the kind that reads as "the pty path is
+/// flaky under parallelism".
+///
+/// The three descriptors `keyless` is *meant* to get are unaffected: they are
+/// separate `try_clone`s handed to `Stdio`, and `dup2` onto 0, 1 and 2 clears
+/// the flag on the descriptors it creates.
+fn close_on_exec(fd: &OwnedFd) {
+    // SAFETY: `fd` is live and owned by the caller, and `F_SETFD` takes an int.
+    let set =
+        unsafe { nix::libc::fcntl(fd.as_raw_fd(), nix::libc::F_SETFD, nix::libc::FD_CLOEXEC) };
+    assert_ne!(set, -1, "cannot make the test's terminal close-on-exec");
+}
+
 fn start(args: &[&str], ownership: Ownership) -> UnderTerminal {
     let OpenptyResult { master, slave } =
         openpty(Some(&winsize(ROWS, COLS)), None).expect("this platform must provide a pty");
+    close_on_exec(&master);
+    close_on_exec(&slave);
 
     let for_stdin = slave.try_clone().expect("dup slave");
     let for_stdout = slave.try_clone().expect("dup slave");
@@ -269,50 +299,96 @@ fn lines(seen: &str) -> Vec<String> {
 // Detection: the pty path is taken when, and only when, there is a terminal.
 // ---------------------------------------------------------------------------
 
-#[cfg_attr(
-    not(target_os = "macos"),
-    ignore = "the pty relay hangs on Linux -- measured 2026-08-09, indefinitely, with and without a controlling terminal. A DEFECT, not a platform limit: it is ignored here so the gap is counted rather than hidden, and the count is pinned by CI"
-)]
 #[test]
 fn a_masked_child_on_a_terminal_still_believes_it_is_on_a_terminal() {
-    // The whole point. Before this, `keyless run -- npm install` lost its
-    // progress bar, `git log` lost its pager, and every prompt changed shape —
-    // a tax on every invocation, which is how a tool gets uninstalled.
-    let dir = scratch("pty-child-sees-a-terminal");
-    let config = config_with_stub(&dir, &Stub::Returns(DECOY_VALUE));
+    within(
+        CASE_PATIENCE,
+        "a_masked_child_on_a_terminal_still_believes_it_is_on_a_terminal",
+        || {
+            // The whole point. Before this, `keyless run -- npm install` lost its
+            // progress bar, `git log` lost its pager, and every prompt changed shape —
+            // a tax on every invocation, which is how a tool gets uninstalled.
+            let dir = scratch("pty-child-sees-a-terminal");
+            let config = config_with_stub(&dir, &Stub::Returns(DECOY_VALUE));
 
-    let session = start_under_terminal(&[
-        "--config",
-        &config.display().to_string(),
-        "--no-audit",
-        "run",
-        "-s",
-        "DECOY",
-        "--",
-        "/bin/sh",
-        "-c",
-        "for fd in 0 1 2; do if [ -t $fd ]; then echo \"$fd TTY\"; else echo \"$fd PIPE\"; fi; done",
-    ]);
-    let (code, seen) = session.finish();
+            let session = start_under_terminal(&[
+                "--config",
+                &config.display().to_string(),
+                "--no-audit",
+                "run",
+                "-s",
+                "DECOY",
+                "--",
+                "/bin/sh",
+                "-c",
+                "for fd in 0 1 2; do if [ -t $fd ]; then echo \"$fd TTY\"; else echo \"$fd PIPE\"; fi; done",
+            ]);
+            let (code, seen) = session.finish();
 
-    assert_eq!(code, 0, "output was: {seen:?}");
-    assert_eq!(
-        lines(&seen),
-        vec!["0 TTY", "1 TTY", "2 TTY"],
-        "all three streams must be a terminal: {seen:?}"
+            assert_eq!(code, 0, "output was: {seen:?}");
+            assert_eq!(
+                lines(&seen),
+                vec!["0 TTY", "1 TTY", "2 TTY"],
+                "all three streams must be a terminal: {seen:?}"
+            );
+        },
     );
 }
 
 #[test]
 fn piped_stdio_keeps_the_pipe_path_and_never_allocates() {
-    // The other half of "detect, don't assume". A CI job, an agent's shell call
-    // or `keyless run ... | grep` must behave exactly as it did before any of
-    // this existed. Writing terminal escapes into a pipe is not a nicety.
-    let dir = scratch("pty-piped-stays-piped");
-    let config = config_with_stub(&dir, &Stub::Returns(DECOY_VALUE));
+    within(
+        CASE_PATIENCE,
+        "piped_stdio_keeps_the_pipe_path_and_never_allocates",
+        || {
+            // The other half of "detect, don't assume". A CI job, an agent's shell call
+            // or `keyless run ... | grep` must behave exactly as it did before any of
+            // this existed. Writing terminal escapes into a pipe is not a nicety.
+            let dir = scratch("pty-piped-stays-piped");
+            let config = config_with_stub(&dir, &Stub::Returns(DECOY_VALUE));
 
-    let output = Command::new(BIN)
-        .args([
+            let output = Command::new(BIN)
+                .args([
+                    "--config",
+                    &config.display().to_string(),
+                    "--no-audit",
+                    "run",
+                    "-s",
+                    "DECOY",
+                    "--",
+                    "/bin/sh",
+                    "-c",
+                    "if [ -t 1 ]; then echo TTY; else echo PIPE; fi",
+                ])
+                .output()
+                .expect("the binary must run");
+
+            assert_eq!(
+                String::from_utf8_lossy(&output.stdout),
+                "PIPE\n",
+                "a pty was allocated with no terminal to preserve; stderr: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(
+                String::from_utf8_lossy(&output.stderr),
+                "",
+                "the ordinary non-interactive case must be silent"
+            );
+        },
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Masking, through the pty.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn masking_survives_the_pty_path() {
+    within(CASE_PATIENCE, "masking_survives_the_pty_path", || {
+        let dir = scratch("pty-masking");
+        let config = config_with_stub(&dir, &Stub::Returns(DECOY_VALUE));
+
+        let session = start_under_terminal(&[
             "--config",
             &config.display().to_string(),
             "--no-audit",
@@ -322,346 +398,314 @@ fn piped_stdio_keeps_the_pipe_path_and_never_allocates() {
             "--",
             "/bin/sh",
             "-c",
-            "if [ -t 1 ]; then echo TTY; else echo PIPE; fi",
-        ])
-        .output()
-        .expect("the binary must run");
+            "echo \"token=$DECOY\"",
+        ]);
+        let (code, seen) = session.finish();
 
-    assert_eq!(
-        String::from_utf8_lossy(&output.stdout),
-        "PIPE\n",
-        "a pty was allocated with no terminal to preserve; stderr: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert_eq!(
-        String::from_utf8_lossy(&output.stderr),
-        "",
-        "the ordinary non-interactive case must be silent"
-    );
+        assert_eq!(code, 0);
+        assert!(
+            !seen.contains(DECOY_VALUE),
+            "the value reached the terminal: {seen:?}"
+        );
+        assert_eq!(lines(&seen), vec!["token=[keyless:DECOY]"]);
+    });
 }
 
-// ---------------------------------------------------------------------------
-// Masking, through the pty.
-// ---------------------------------------------------------------------------
-
-#[cfg_attr(
-    not(target_os = "macos"),
-    ignore = "the pty relay hangs on Linux -- measured 2026-08-09, indefinitely, with and without a controlling terminal. A DEFECT, not a platform limit: it is ignored here so the gap is counted rather than hidden, and the count is pinned by CI"
-)]
-#[test]
-fn masking_survives_the_pty_path() {
-    let dir = scratch("pty-masking");
-    let config = config_with_stub(&dir, &Stub::Returns(DECOY_VALUE));
-
-    let session = start_under_terminal(&[
-        "--config",
-        &config.display().to_string(),
-        "--no-audit",
-        "run",
-        "-s",
-        "DECOY",
-        "--",
-        "/bin/sh",
-        "-c",
-        "echo \"token=$DECOY\"",
-    ]);
-    let (code, seen) = session.finish();
-
-    assert_eq!(code, 0);
-    assert!(
-        !seen.contains(DECOY_VALUE),
-        "the value reached the terminal: {seen:?}"
-    );
-    assert_eq!(lines(&seen), vec!["token=[keyless:DECOY]"]);
-}
-
-#[cfg_attr(
-    not(target_os = "macos"),
-    ignore = "the pty relay hangs on Linux -- measured 2026-08-09, indefinitely, with and without a controlling terminal. A DEFECT, not a platform limit: it is ignored here so the gap is counted rather than hidden, and the count is pinned by CI"
-)]
 #[test]
 fn the_split_write_property_holds_through_the_pty() {
-    // The suffix-carry survives split-across-3-writes, split-every-character and
-    // split-mid-rune at the unit level. Those properties are worth nothing if
-    // the pty path bypasses the writer that provides them, so this drives the
-    // hardest of the three — one byte per write — through two nested terminals
-    // and the real binary.
-    //
-    // The sleep inside the child is what makes it a genuine split. Without it
-    // the shell would hand the whole value over in one write and the test would
-    // silently stop testing anything — the same shape of rot as a table test
-    // that iterates the very list it is meant to check.
-    let dir = scratch("pty-split-writes");
-    let config = config_with_stub(&dir, &Stub::Returns(DECOY_VALUE));
+    within(
+        CASE_PATIENCE,
+        "the_split_write_property_holds_through_the_pty",
+        || {
+            // The suffix-carry survives split-across-3-writes, split-every-character and
+            // split-mid-rune at the unit level. Those properties are worth nothing if
+            // the pty path bypasses the writer that provides them, so this drives the
+            // hardest of the three — one byte per write — through two nested terminals
+            // and the real binary.
+            //
+            // The sleep inside the child is what makes it a genuine split. Without it
+            // the shell would hand the whole value over in one write and the test would
+            // silently stop testing anything — the same shape of rot as a table test
+            // that iterates the very list it is meant to check.
+            let dir = scratch("pty-split-writes");
+            let config = config_with_stub(&dir, &Stub::Returns(DECOY_VALUE));
 
-    let session = start_under_terminal(&[
-        "--config",
-        &config.display().to_string(),
-        "--no-audit",
-        "run",
-        "-s",
-        "DECOY",
-        "--",
-        "/bin/sh",
-        "-c",
-        "i=1; while [ $i -le ${#DECOY} ]; do \
-           printf '%s' \"$(printf '%s' \"$DECOY\" | cut -c$i)\"; \
-           sleep 0.02; \
-           i=$((i+1)); \
-         done; echo",
-    ]);
-    let (code, seen) = session.finish();
+            let session = start_under_terminal(&[
+                "--config",
+                &config.display().to_string(),
+                "--no-audit",
+                "run",
+                "-s",
+                "DECOY",
+                "--",
+                "/bin/sh",
+                "-c",
+                "i=1; while [ $i -le ${#DECOY} ]; do \
+                   printf '%s' \"$(printf '%s' \"$DECOY\" | cut -c$i)\"; \
+                   sleep 0.02; \
+                   i=$((i+1)); \
+                 done; echo",
+            ]);
+            let (code, seen) = session.finish();
 
-    assert_eq!(code, 0, "output was: {seen:?}");
-    assert!(
-        !seen.contains(DECOY_VALUE),
-        "one byte at a time leaked through the pty: {seen:?}"
-    );
-    assert_eq!(
-        lines(&seen),
-        vec!["[keyless:DECOY]"],
-        "output was: {seen:?}"
+            assert_eq!(code, 0, "output was: {seen:?}");
+            assert!(
+                !seen.contains(DECOY_VALUE),
+                "one byte at a time leaked through the pty: {seen:?}"
+            );
+            assert_eq!(
+                lines(&seen),
+                vec!["[keyless:DECOY]"],
+                "output was: {seen:?}"
+            );
+        },
     );
 }
 
-#[cfg_attr(
-    not(target_os = "macos"),
-    ignore = "the pty relay hangs on Linux -- measured 2026-08-09, indefinitely, with and without a controlling terminal. A DEFECT, not a platform limit: it is ignored here so the gap is counted rather than hidden, and the count is pinned by CI"
-)]
 #[test]
 fn a_prompt_with_no_trailing_newline_reaches_the_terminal_before_the_run_ends() {
-    // The latency property the pty path lives on, end to end. The child prints a
-    // prompt and then blocks forever; if the masker held back a flat needle's
-    // worth of bytes, the user would see a truncated prompt and a session that
-    // looks hung — and it would never resolve, because the next write never
-    // comes. `await_output` returning is the assertion.
-    let dir = scratch("pty-prompt-latency");
-    let config = config_with_stub(&dir, &Stub::Returns(DECOY_VALUE));
+    within(
+        CASE_PATIENCE,
+        "a_prompt_with_no_trailing_newline_reaches_the_terminal_before_the_run_ends",
+        || {
+            // The latency property the pty path lives on, end to end. The child prints a
+            // prompt and then blocks forever; if the masker held back a flat needle's
+            // worth of bytes, the user would see a truncated prompt and a session that
+            // looks hung — and it would never resolve, because the next write never
+            // comes. `await_output` returning is the assertion.
+            let dir = scratch("pty-prompt-latency");
+            let config = config_with_stub(&dir, &Stub::Returns(DECOY_VALUE));
 
-    let session = start_under_terminal(&[
-        "--config",
-        &config.display().to_string(),
-        "--no-audit",
-        "run",
-        "-s",
-        "DECOY",
-        "--",
-        "/bin/sh",
-        "-c",
-        "printf 'Password: '; read ignored",
-    ]);
+            let session = start_under_terminal(&[
+                "--config",
+                &config.display().to_string(),
+                "--no-audit",
+                "run",
+                "-s",
+                "DECOY",
+                "--",
+                "/bin/sh",
+                "-c",
+                "printf 'Password: '; read ignored",
+            ]);
 
-    session.await_output("Password: ");
+            session.await_output("Password: ");
 
-    // Let the child finish so the run can end.
-    session.type_at(b"\r");
-    let (code, seen) = session.finish();
-    assert_eq!(code, 0, "output was: {seen:?}");
+            // Let the child finish so the run can end.
+            session.type_at(b"\r");
+            let (code, seen) = session.finish();
+            assert_eq!(code, 0, "output was: {seen:?}");
+        },
+    );
 }
 
 // ---------------------------------------------------------------------------
 // Window size.
 // ---------------------------------------------------------------------------
 
-#[cfg_attr(
-    not(target_os = "macos"),
-    ignore = "the pty relay hangs on Linux -- measured 2026-08-09, indefinitely, with and without a controlling terminal. A DEFECT, not a platform limit: it is ignored here so the gap is counted rather than hidden, and the count is pinned by CI"
-)]
 #[test]
 fn the_initial_window_size_reaches_the_child() {
-    let dir = scratch("pty-initial-size");
-    let config = config_with_stub(&dir, &Stub::Returns(DECOY_VALUE));
+    within(
+        CASE_PATIENCE,
+        "the_initial_window_size_reaches_the_child",
+        || {
+            let dir = scratch("pty-initial-size");
+            let config = config_with_stub(&dir, &Stub::Returns(DECOY_VALUE));
 
-    let session = start_under_terminal(&[
-        "--config",
-        &config.display().to_string(),
-        "--no-audit",
-        "run",
-        "-s",
-        "DECOY",
-        "--",
-        "/bin/sh",
-        "-c",
-        "stty size",
-    ]);
-    let (code, seen) = session.finish();
+            let session = start_under_terminal(&[
+                "--config",
+                &config.display().to_string(),
+                "--no-audit",
+                "run",
+                "-s",
+                "DECOY",
+                "--",
+                "/bin/sh",
+                "-c",
+                "stty size",
+            ]);
+            let (code, seen) = session.finish();
 
-    assert_eq!(code, 0, "output was: {seen:?}");
-    assert_eq!(
-        lines(&seen),
-        vec![format!("{ROWS} {COLS}")],
-        "the child must see the user's window, not a default: {seen:?}"
+            assert_eq!(code, 0, "output was: {seen:?}");
+            assert_eq!(
+                lines(&seen),
+                vec![format!("{ROWS} {COLS}")],
+                "the child must see the user's window, not a default: {seen:?}"
+            );
+        },
     );
 }
 
-#[cfg_attr(
-    not(target_os = "macos"),
-    ignore = "the pty relay hangs on Linux -- measured 2026-08-09, indefinitely, with and without a controlling terminal. A DEFECT, not a platform limit: it is ignored here so the gap is counted rather than hidden, and the count is pinned by CI"
-)]
 #[test]
 fn a_resize_mid_run_reaches_the_child() {
-    // No signal is synthesised here. `keyless` owns the terminal's foreground
-    // process group, so setting the window size makes the kernel deliver a real
-    // SIGWINCH — the same event a window manager produces. Synthesising one
-    // would have tested the handler while leaving the delivery path unproven,
-    // and delivery is exactly where this broke: a blocked SIGWINCH left at its
-    // default disposition is discarded by macOS before anything can wait on it.
-    let dir = scratch("pty-resize");
-    let config = config_with_stub(&dir, &Stub::Returns(DECOY_VALUE));
+    within(CASE_PATIENCE, "a_resize_mid_run_reaches_the_child", || {
+        // No signal is synthesised here. `keyless` owns the terminal's foreground
+        // process group, so setting the window size makes the kernel deliver a real
+        // SIGWINCH — the same event a window manager produces. Synthesising one
+        // would have tested the handler while leaving the delivery path unproven,
+        // and delivery is exactly where this broke: a blocked SIGWINCH left at its
+        // default disposition is discarded by macOS before anything can wait on it.
+        let dir = scratch("pty-resize");
+        let config = config_with_stub(&dir, &Stub::Returns(DECOY_VALUE));
 
-    // The child synchronises on the resize itself rather than on a sleep: it
-    // watches its own terminal until the size changes. The iteration cap is
-    // what turns "the signal never arrived" into a failed assertion instead of
-    // a suite that hangs.
-    let watch_for_the_resize = format!(
-        "stty size; i=0; \
-         while [ \"$(stty size)\" = \"{ROWS} {COLS}\" ] && [ $i -lt 200 ]; do \
-           sleep 0.05; i=$((i+1)); \
-         done; stty size"
-    );
+        // The child synchronises on the resize itself rather than on a sleep: it
+        // watches its own terminal until the size changes. The iteration cap is
+        // what turns "the signal never arrived" into a failed assertion instead of
+        // a suite that hangs.
+        let watch_for_the_resize = format!(
+            "stty size; i=0; \
+             while [ \"$(stty size)\" = \"{ROWS} {COLS}\" ] && [ $i -lt 200 ]; do \
+               sleep 0.05; i=$((i+1)); \
+             done; stty size"
+        );
 
-    let session = start_owning_terminal(&[
-        "--config",
-        &config.display().to_string(),
-        "--no-audit",
-        "run",
-        "-s",
-        "DECOY",
-        "--",
-        "/bin/sh",
-        "-c",
-        &watch_for_the_resize,
-    ]);
+        let session = start_owning_terminal(&[
+            "--config",
+            &config.display().to_string(),
+            "--no-audit",
+            "run",
+            "-s",
+            "DECOY",
+            "--",
+            "/bin/sh",
+            "-c",
+            &watch_for_the_resize,
+        ]);
 
-    // Only resize once the child has reported the size it started with.
-    session.await_output(&format!("{ROWS} {COLS}"));
-    session.resize(ROWS + 5, COLS - 7);
+        // Only resize once the child has reported the size it started with.
+        session.await_output(&format!("{ROWS} {COLS}"));
+        session.resize(ROWS + 5, COLS - 7);
 
-    let (code, seen) = session.finish();
-    assert_eq!(code, 0, "output was: {seen:?}");
-    assert_eq!(
-        lines(&seen),
-        vec![
-            format!("{ROWS} {COLS}"),
-            format!("{} {}", ROWS + 5, COLS - 7)
-        ],
-        "the resize did not reach the child: {seen:?}"
-    );
+        let (code, seen) = session.finish();
+        assert_eq!(code, 0, "output was: {seen:?}");
+        assert_eq!(
+            lines(&seen),
+            vec![
+                format!("{ROWS} {COLS}"),
+                format!("{} {}", ROWS + 5, COLS - 7)
+            ],
+            "the resize did not reach the child: {seen:?}"
+        );
+    });
 }
 
 // ---------------------------------------------------------------------------
 // Raw mode, and putting it back.
 // ---------------------------------------------------------------------------
 
-#[cfg_attr(
-    not(target_os = "macos"),
-    ignore = "the pty relay hangs on Linux -- measured 2026-08-09, indefinitely, with and without a controlling terminal. A DEFECT, not a platform limit: it is ignored here so the gap is counted rather than hidden, and the count is pinned by CI"
-)]
 #[test]
 fn the_terminal_is_put_in_raw_mode_and_restored_exactly() {
-    // Two assertions, and the first is what stops the second being vacuous: a
-    // `keyless` that never touched the terminal would "restore" it perfectly.
-    // So this proves the terminal really was raw *during* the run, and
-    // byte-for-byte identical afterwards.
-    let dir = scratch("pty-raw-restored");
-    let config = config_with_stub(&dir, &Stub::Returns(DECOY_VALUE));
+    within(
+        CASE_PATIENCE,
+        "the_terminal_is_put_in_raw_mode_and_restored_exactly",
+        || {
+            // Two assertions, and the first is what stops the second being vacuous: a
+            // `keyless` that never touched the terminal would "restore" it perfectly.
+            // So this proves the terminal really was raw *during* the run, and
+            // byte-for-byte identical afterwards.
+            let dir = scratch("pty-raw-restored");
+            let config = config_with_stub(&dir, &Stub::Returns(DECOY_VALUE));
 
-    let mut session = start_under_terminal(&[
-        "--config",
-        &config.display().to_string(),
-        "--no-audit",
-        "run",
-        "-s",
-        "DECOY",
-        "--",
-        "/bin/sh",
-        "-c",
-        "printf 'ready>'; read ignored",
-    ]);
-    let before = session.settings();
-    assert!(
-        before.local_flags.contains(LocalFlags::ICANON),
-        "the fixture must start in canonical mode or it proves nothing"
-    );
+            let mut session = start_under_terminal(&[
+                "--config",
+                &config.display().to_string(),
+                "--no-audit",
+                "run",
+                "-s",
+                "DECOY",
+                "--",
+                "/bin/sh",
+                "-c",
+                "printf 'ready>'; read ignored",
+            ]);
+            let before = session.settings();
+            assert!(
+                before.local_flags.contains(LocalFlags::ICANON),
+                "the fixture must start in canonical mode or it proves nothing"
+            );
 
-    session.await_output("ready>");
-    let during = session.settings();
-    assert!(
-        !during.local_flags.contains(LocalFlags::ICANON)
-            && !during.local_flags.contains(LocalFlags::ECHO),
-        "the terminal was never put in raw mode, so restoring it proves nothing"
-    );
+            session.await_output("ready>");
+            let during = session.settings();
+            assert!(
+                !during.local_flags.contains(LocalFlags::ICANON)
+                    && !during.local_flags.contains(LocalFlags::ECHO),
+                "the terminal was never put in raw mode, so restoring it proves nothing"
+            );
 
-    session.type_at(b"\r");
-    let code = session.wait_for_exit();
-    let after = session.settings();
-    let (_, seen) = session.finish();
-    assert_eq!(code, 0, "output was: {seen:?}");
+            session.type_at(b"\r");
+            let code = session.wait_for_exit();
+            let after = session.settings();
+            let (_, seen) = session.finish();
+            assert_eq!(code, 0, "output was: {seen:?}");
 
-    assert_eq!(
-        after.local_flags, before.local_flags,
-        "local flags were not restored"
-    );
-    assert_eq!(
-        after.input_flags, before.input_flags,
-        "input flags were not restored"
-    );
-    assert_eq!(
-        after.output_flags, before.output_flags,
-        "output flags were not restored"
-    );
-    assert_eq!(
-        after.control_flags, before.control_flags,
-        "control flags were not restored"
-    );
-    assert_eq!(
-        after.control_chars, before.control_chars,
-        "control characters were not restored"
+            assert_eq!(
+                after.local_flags, before.local_flags,
+                "local flags were not restored"
+            );
+            assert_eq!(
+                after.input_flags, before.input_flags,
+                "input flags were not restored"
+            );
+            assert_eq!(
+                after.output_flags, before.output_flags,
+                "output flags were not restored"
+            );
+            assert_eq!(
+                after.control_flags, before.control_flags,
+                "control flags were not restored"
+            );
+            assert_eq!(
+                after.control_chars, before.control_chars,
+                "control characters were not restored"
+            );
+        },
     );
 }
 
-#[cfg_attr(
-    not(target_os = "macos"),
-    ignore = "the pty relay hangs on Linux -- measured 2026-08-09, indefinitely, with and without a controlling terminal. A DEFECT, not a platform limit: it is ignored here so the gap is counted rather than hidden, and the count is pinned by CI"
-)]
 #[test]
 fn the_terminal_is_restored_when_the_child_dies_of_a_signal() {
-    // The exit path that skips a child's own teardown. The child kills itself
-    // rather than returning, and the terminal must still come back.
-    let dir = scratch("pty-restored-after-signal");
-    let config = config_with_stub(&dir, &Stub::Returns(DECOY_VALUE));
+    within(
+        CASE_PATIENCE,
+        "the_terminal_is_restored_when_the_child_dies_of_a_signal",
+        || {
+            // The exit path that skips a child's own teardown. The child kills itself
+            // rather than returning, and the terminal must still come back.
+            let dir = scratch("pty-restored-after-signal");
+            let config = config_with_stub(&dir, &Stub::Returns(DECOY_VALUE));
 
-    let mut session = start_under_terminal(&[
-        "--config",
-        &config.display().to_string(),
-        "--no-audit",
-        "run",
-        "-s",
-        "DECOY",
-        "--",
-        "/bin/sh",
-        "-c",
-        "printf 'ready>'; kill -TERM $$",
-    ]);
-    let before = session.settings();
-    session.await_output("ready>");
+            let mut session = start_under_terminal(&[
+                "--config",
+                &config.display().to_string(),
+                "--no-audit",
+                "run",
+                "-s",
+                "DECOY",
+                "--",
+                "/bin/sh",
+                "-c",
+                "printf 'ready>'; kill -TERM $$",
+            ]);
+            let before = session.settings();
+            session.await_output("ready>");
 
-    let code = session.wait_for_exit();
-    let after = session.settings();
-    let (_, seen) = session.finish();
+            let code = session.wait_for_exit();
+            let after = session.settings();
+            let (_, seen) = session.finish();
 
-    // 128 + SIGTERM(15); some shells trap and exit 143 themselves.
-    assert_eq!(
-        code, 143,
-        "the exit code must survive the pty path: {seen:?}"
-    );
-    assert_eq!(
-        after.local_flags, before.local_flags,
-        "the terminal was left raw after a signalled child"
-    );
-    assert_eq!(
-        after.control_chars, before.control_chars,
-        "the terminal was left raw after a signalled child"
+            // 128 + SIGTERM(15); some shells trap and exit 143 themselves.
+            assert_eq!(
+                code, 143,
+                "the exit code must survive the pty path: {seen:?}"
+            );
+            assert_eq!(
+                after.local_flags, before.local_flags,
+                "the terminal was left raw after a signalled child"
+            );
+            assert_eq!(
+                after.control_chars, before.control_chars,
+                "the terminal was left raw after a signalled child"
+            );
+        },
     );
 }
 
@@ -669,40 +713,139 @@ fn the_terminal_is_restored_when_the_child_dies_of_a_signal() {
 // Input.
 // ---------------------------------------------------------------------------
 
-#[cfg_attr(
-    not(target_os = "macos"),
-    ignore = "the pty relay hangs on Linux -- measured 2026-08-09, indefinitely, with and without a controlling terminal. A DEFECT, not a platform limit: it is ignored here so the gap is counted rather than hidden, and the count is pinned by CI"
-)]
 #[test]
 fn keystrokes_reach_the_child() {
-    // The input half of the relay. Without it the pty would be write-only and
-    // every interactive program would hang at its first prompt — worse than the
-    // piped stdio this replaces.
-    let dir = scratch("pty-input");
-    let config = config_with_stub(&dir, &Stub::Returns(DECOY_VALUE));
+    within(CASE_PATIENCE, "keystrokes_reach_the_child", || {
+        // The input half of the relay. Without it the pty would be write-only and
+        // every interactive program would hang at its first prompt — worse than the
+        // piped stdio this replaces.
+        let dir = scratch("pty-input");
+        let config = config_with_stub(&dir, &Stub::Returns(DECOY_VALUE));
 
-    let session = start_under_terminal(&[
-        "--config",
-        &config.display().to_string(),
-        "--no-audit",
-        "run",
-        "-s",
-        "DECOY",
-        "--",
-        "/bin/sh",
-        "-c",
-        "printf 'ready>'; read answer; echo \"got:$answer\"",
-    ]);
+        let session = start_under_terminal(&[
+            "--config",
+            &config.display().to_string(),
+            "--no-audit",
+            "run",
+            "-s",
+            "DECOY",
+            "--",
+            "/bin/sh",
+            "-c",
+            "printf 'ready>'; read answer; echo \"got:$answer\"",
+        ]);
 
-    // Never type before the child says it is reading: entering raw mode
-    // discards unread input, so an early keystroke is silently destroyed.
-    session.await_output("ready>");
-    session.type_at(b"decoy-typed-answer\r");
+        // Never type before the child says it is reading: entering raw mode
+        // discards unread input, so an early keystroke is silently destroyed.
+        session.await_output("ready>");
+        session.type_at(b"decoy-typed-answer\r");
 
-    let (code, seen) = session.finish();
-    assert_eq!(code, 0, "output was: {seen:?}");
-    assert!(
-        seen.contains("got:decoy-typed-answer"),
-        "the keystrokes never arrived: {seen:?}"
+        let (code, seen) = session.finish();
+        assert_eq!(code, 0, "output was: {seen:?}");
+        assert!(
+            seen.contains("got:decoy-typed-answer"),
+            "the keystrokes never arrived: {seen:?}"
+        );
+    });
+}
+
+// ---------------------------------------------------------------------------
+// The never-block invariant, on the pty path.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_grandchild_holding_the_terminal_open_does_not_hang_the_run() {
+    within(
+        CASE_PATIENCE,
+        "a_grandchild_holding_the_terminal_open_does_not_hang_the_run",
+        || {
+            // The pipe path has had a bounded drain for this since 2026-08-08: a
+            // pty master, like a pipe, reports end-of-stream only when the LAST
+            // holder lets go, and a backgrounded grandchild inherits the terminal
+            // and outlives the child that started it. `keyless` must give up on
+            // that output, not on the caller.
+            //
+            // ⚠️ This case is VACUOUS on macOS and the comment stays here so
+            // nobody reads a green macOS run as proof. XNU revokes a controlling
+            // terminal when its session ends, and the grandchild is in that same
+            // session, so its descriptors are torn out from under it and the
+            // master sees end-of-stream whatever `keyless` does. Linux performs no
+            // such revoke: without a bound, this case never returns. The bound is
+            // real on exactly one of the two platforms, and it is the platform CI
+            // has to catch it on.
+            //
+            // ⚠️ Every line of the shell below is load-bearing, and the naive
+            // version of it is a fixture that passes for the wrong reason.
+            //
+            // Linux sends `SIGHUP` to the foreground process group when the
+            // child's session ends, so a plain `sleep 120 &` is KILLED and holds
+            // nothing. Ignoring `SIGHUP` is what makes a grandchild outlive its
+            // session, which is also how `nohup` and every daemonising child
+            // behave. `trap '' HUP` survives the `exec` a shell may do for the
+            // last command in a subshell, because POSIX keeps an IGNORED
+            // disposition across `exec` — a caught one would not survive.
+            //
+            // And installing the trap is not enough: `(trap '' HUP; sleep 120) &`
+            // RACES its own parent's exit, so whether the grandchild lives is
+            // decided by which of the two wins. Measured 2026-08-09 against the
+            // unbounded drain, on one binary, four invocations: it hung twice and
+            // passed twice — a coin toss reported as a green test. So the parent
+            // waits for a marker the grandchild writes AFTER trapping, and only
+            // then exits.
+            let dir = scratch("pty-grandchild-holds-the-terminal");
+            let config = config_with_stub(&dir, &Stub::Returns(DECOY_VALUE));
+            let trapped = dir.join("trapped");
+            let outlived = dir.join("outlived");
+
+            let hold_the_terminal = format!(
+                "(trap '' HUP; : > '{trapped}'; sleep 0.5; : > '{outlived}'; sleep 120) & \
+                 while [ ! -f '{trapped}' ]; do sleep 0.01; done; \
+                 echo ran",
+                trapped = trapped.display(),
+                outlived = outlived.display(),
+            );
+
+            let started = Instant::now();
+            let session = start_under_terminal(&[
+                "--config",
+                &config.display().to_string(),
+                "--no-audit",
+                "run",
+                "-s",
+                "DECOY",
+                "--",
+                "/bin/sh",
+                "-c",
+                &hold_the_terminal,
+            ]);
+            let (code, seen) = session.finish();
+            let took = started.elapsed();
+
+            assert_eq!(code, 0, "output was: {seen:?}");
+            assert!(
+                seen.contains("ran"),
+                "the child's own output must still arrive: {seen:?}"
+            );
+            // The holder lives for 120 s. Anything near that is the hang this
+            // case exists to catch; the drain's own grace is 2 s.
+            assert!(
+                took < Duration::from_secs(20),
+                "the run waited {took:?} on output a grandchild was holding open; \
+                 it must give up on the output rather than on the caller"
+            );
+
+            // The fixture checks ITSELF. A grandchild that died with its session
+            // holds nothing, and this case would then pass against completely
+            // unbounded code — which is exactly what the naive version did.
+            let deadline = Instant::now() + PATIENCE;
+            while !outlived.exists() && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(10));
+            }
+            assert!(
+                outlived.exists(),
+                "the grandchild did not outlive the session, so it never held the \
+                 terminal and this case proved nothing about the drain"
+            );
+        },
     );
 }
