@@ -25,6 +25,12 @@
 //! in. [`status`] is the shared vocabulary the reports are rendered with, and it
 //! exists so that "what was proven" has exactly one spelling across every verb.
 //!
+//! [`setup`] is the one way in and the two ways out — install, disable, enable,
+//! uninstall — and [`receipt`] is the record that makes the way out exact. They
+//! add no surface to the constraint above either: setup writes a config and
+//! registers a hook pack, and neither the receipt nor the agent instructions it
+//! installs have a field a value fits in.
+//!
 //! [`refuse`] is the same constraint aimed at the person rather than the code.
 //! An absence teaches nobody: somebody who types `keyless get` learns only that
 //! a word was unrecognized, which is what a CLI says about a typo and about a
@@ -35,7 +41,9 @@ pub mod discover;
 pub mod doctor;
 pub mod init;
 pub mod ls;
+pub mod receipt;
 pub mod refuse;
 pub mod run;
+pub mod setup;
 pub mod status;
 pub mod write;

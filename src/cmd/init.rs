@@ -42,11 +42,11 @@
 //!
 //! # The guards, and why they are a step rather than a side effect
 //!
-//! `install/install.sh` places two binaries. It has never mentioned the hook
-//! pack, so a stranger who clones, builds and installs gets **no hooks, no allow
-//! list and no guards** — the protection exists on one machine because that
-//! machine's `settings.json` happens to point at a checkout. That is a hole in
-//! setup, and setup is this verb.
+//! **The complete install is [`crate::cmd::setup`], and it is what a stranger
+//! runs.** This verb is the config half of it, kept as its own word because
+//! writing a `stores` block is a thing people want on its own. It reports the
+//! guards and installs them under `--hooks`; it does not install the agent
+//! instructions and it does not stand up the daemon.
 //!
 //! It is a NAMED step rather than a silent one, for two reasons that are not
 //! symmetric with writing a config:
@@ -122,6 +122,15 @@ pub struct InitRequest<'a> {
     pub interactive: bool,
     /// Install the hook pack into the Claude Code settings file.
     pub install_hooks: bool,
+    /// Whether to report the guards at all.
+    ///
+    /// `false` when [`crate::cmd::setup`] is driving, because that verb owns the
+    /// guards step and resolves the settings file properly — honouring
+    /// `--claude-dir`, which this verb does not. Left on, the two disagreed in
+    /// the worst possible way: a `setup` aimed at one directory printed a green
+    /// guards row about the DEFAULT one, so the report described a machine the
+    /// command was not touching.
+    pub report_guards: bool,
     /// Colour and character set.
     pub style: Style,
 }
@@ -176,6 +185,16 @@ pub fn init(
         }
     }
 
+    // 🔴 THE GUARDS ARE REPORTED BEFORE THE EARLY RETURN BELOW, and that order is
+    // the whole of a bug this verb shipped with. The return fires whenever a
+    // config already exists — which is every machine after the first run — so
+    // `init --hooks` printed "already exists; nothing was written" and installed
+    // nothing at all. The one flag that closes the guards hole was reachable
+    // only on a machine that had never run this verb.
+    if request.report_guards {
+        report_hooks(request, out, err)?;
+    }
+
     // An existing config is never rewritten by accident. Running `init` twice is
     // safe, and the second run is still useful: it re-detects and re-proves, so
     // it answers "is my setup still good?" without touching anything.
@@ -203,8 +222,6 @@ pub fn init(
         )?;
         return Ok(0);
     }
-
-    report_hooks(request, out, err)?;
 
     let usable: Vec<&Finding> = findings.iter().filter(|f| f.is_usable()).collect();
     let chosen = match choose(request, &usable, stdin, out, err)? {
@@ -236,58 +253,13 @@ pub fn init(
     Ok(0)
 }
 
-/// The environment variable that names a packaged hook pack.
-const HOOKS_DIR_ENV: &str = "KEYLESS_HOOKS_DIR";
-
 /// The Claude Code settings file the pack registers itself in.
+///
+/// `init` is the older, narrower verb and reports on the default location only.
+/// `setup` resolves it properly, honours `--claude-dir`, and prints what it
+/// resolved — see [`crate::paths::SetupPaths`].
 fn settings_file() -> Option<std::path::PathBuf> {
     crate::paths::home().map(|home| home.join(".claude").join("settings.json"))
-}
-
-/// Where `hooks/install.py` is, or the reason it could not be found.
-///
-/// Three places, in order, and the third is the one that covers the reported
-/// gap: `cargo install --path .` puts the binary on `PATH` and leaves `hooks/`
-/// in the checkout, so a binary that remembers where it was built can still
-/// reach it. A binary COPIED to another machine cannot, and that is the case
-/// [`HOOKS_DIR_ENV`] exists for — said out loud rather than guessed at.
-fn hooks_installer() -> Result<std::path::PathBuf, String> {
-    let mut looked = Vec::new();
-    let mut candidates: Vec<std::path::PathBuf> = Vec::new();
-
-    if let Ok(dir) = std::env::var(HOOKS_DIR_ENV)
-        && !dir.is_empty()
-    {
-        candidates.push(std::path::PathBuf::from(dir).join("install.py"));
-    }
-    if let Ok(exe) = std::env::current_exe() {
-        let mut at = exe.parent().map(std::path::Path::to_path_buf);
-        // Two levels, because a build tree puts the binary at
-        // `target/<profile>/keyless` and an install puts it at `<prefix>/bin`.
-        for _ in 0..2 {
-            if let Some(dir) = at {
-                candidates.push(dir.join("hooks").join("install.py"));
-                at = dir.parent().map(std::path::Path::to_path_buf);
-            }
-        }
-    }
-    candidates.push(
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("hooks")
-            .join("install.py"),
-    );
-
-    for candidate in candidates {
-        if candidate.is_file() {
-            return Ok(candidate);
-        }
-        looked.push(candidate.display().to_string());
-    }
-    Err(format!(
-        "the hook pack is not on this machine. Looked in: {}. \
-         Set {HOOKS_DIR_ENV} to the directory holding `install.py`",
-        looked.join(", ")
-    ))
 }
 
 /// Whether the pack is already registered in the settings file.
@@ -312,7 +284,7 @@ fn report_hooks(
     let style = request.style;
     heading(out, style, "GUARDS")?;
 
-    let installer = match hooks_installer() {
+    let installer = match super::setup::hooks_installer() {
         Ok(path) => path,
         Err(reason) => {
             // Not a problem and not a failure. A packaged binary with no pack
@@ -467,7 +439,7 @@ fn choose(
                 out,
                 style,
                 &format!(
-                    "or write the config anyway with `{} init --store <backend>`.",
+                    "or write the config anyway with `{} setup --store <backend>`.",
                     crate::NAME
                 ),
             )?;
@@ -713,7 +685,7 @@ fn next_steps(
             style,
             &format!(
                 "{subject} still waiting on a login only you can perform. \
-                 Run `{name} init --force` again afterwards."
+                 Run `{name} setup` again afterwards."
             ),
         )?;
     }
@@ -746,6 +718,7 @@ mod tests {
             only: None,
             interactive,
             install_hooks: false,
+            report_guards: true,
             style: Style::PLAIN,
         }
     }

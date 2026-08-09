@@ -19,6 +19,7 @@ use keyless::cmd::init::{InitRequest, init};
 use keyless::cmd::ls::ls;
 use keyless::cmd::refuse;
 use keyless::cmd::run::{Binding, RunRequest, TtyPolicy, run};
+use keyless::cmd::setup::{SetupRequest, setup, switch_guards, uninstall};
 use keyless::cmd::status::Style;
 use keyless::cmd::write::{new, put};
 use keyless::config::Config;
@@ -49,6 +50,10 @@ use keyless::{NAME, store};
                   So a missing credential is your program's error, at your program's exit code \
                   — never a refusal from this tool.\n\n\
                   WHAT EACH VERB IS FOR\n\
+                  \x20 setup    install everything: config, guards, agent instructions\n\
+                  \x20 disable  stop every guard firing, right now. Nothing is deleted\n\
+                  \x20 enable   arm them again\n\
+                  \x20 uninstall  remove exactly what setup created, and nothing you wrote\n\
                   \x20 init     detect your stores, write a config, and prove one works\n\
                   \x20 doctor   what is proven right now, what is not, and what to do next\n\
                   \x20 ls       the names you have declared, and where each one points\n\
@@ -58,9 +63,15 @@ use keyless::{NAME, store};
                   \x20 put      read a credential on stdin and store it, echoing nothing\n\
                   \x20 run      run a command with named secrets in its environment",
     after_help = "START HERE\n\
-                  \x20 keyless init                    detect, configure, prove\n\
+                  \x20 keyless setup                   one command; it names every file it touches\n\
                   \x20 keyless doctor                  is anything wrong, and where\n\
                   \x20 keyless run -s NAME -- cmd      the only way a value leaves a store\n\n\
+                  IN YOUR WAY?\n\
+                  \x20 keyless disable                 the guards stop firing, instantly. \
+                  Your config and your secrets are untouched, and `keyless enable` is the \
+                  whole of the way back.\n\
+                  \x20 keyless uninstall               removes what setup created, keeps \
+                  what you wrote\n\n\
                   Run `keyless <verb> --help` for one verb in full.",
     disable_help_subcommand = true
 )]
@@ -99,6 +110,19 @@ enum Verb {
     Doctor(DoctorArgs),
     /// Detect your stores, write a config, and prove one works.
     Init(InitArgs),
+
+    /// Install everything: the config, the guards, and the agent instructions.
+    #[command(alias = "install")]
+    Setup(SetupArgs),
+
+    /// Stop every guard firing, right now. Nothing is deleted.
+    Disable(ScopeArgs),
+
+    /// Arm the guards again.
+    Enable(ScopeArgs),
+
+    /// Remove exactly what `setup` created, and nothing you wrote.
+    Uninstall(ScopeArgs),
 
     /// The words people reach for when they want to see a value.
     ///
@@ -247,6 +271,15 @@ struct DoctorArgs {
     /// a keychain access prompt.
     #[arg(long)]
     probe: bool,
+
+    /// The same scope flags `setup` takes.
+    ///
+    /// A report is about ONE machine. Without these, a `doctor` aimed at a
+    /// scratch config still read the default agent directory and printed a
+    /// guards row about a different install — two machines in one report, with
+    /// nothing saying so.
+    #[command(flatten)]
+    scope: ScopeArgs,
 }
 
 /// `init` writes a config file and nothing else. It never accepts a value.
@@ -281,6 +314,96 @@ struct InitArgs {
     /// backs the file up first, and takes itself back out with `--uninstall`.
     #[arg(long)]
     hooks: bool,
+}
+
+/// The flags every setup-family verb shares.
+///
+/// One struct rather than four copies: `uninstall` has to resolve the agent
+/// directory exactly as `setup` did, or it looks for its own work in the wrong
+/// file and reports that there was none.
+#[derive(Args)]
+struct ScopeArgs {
+    /// The agent's configuration directory, holding `settings.json`.
+    ///
+    /// Defaults to `~/.claude`, or `$KEYLESS_CLAUDE_DIR`. Every report prints
+    /// the file it resolved: an install into a settings file the harness never
+    /// opens would report success and guard nothing.
+    #[arg(long, value_name = "DIR")]
+    claude_dir: Option<PathBuf>,
+
+    /// The record of what setup created. Defaults to
+    /// `$XDG_STATE_HOME/keyless/setup-receipt.json`.
+    #[arg(long, value_name = "PATH")]
+    receipt: Option<PathBuf>,
+}
+
+#[derive(Args)]
+struct SetupArgs {
+    #[command(flatten)]
+    scope: ScopeArgs,
+
+    /// Print every file this would touch, and change nothing.
+    #[arg(long)]
+    dry_run: bool,
+
+    /// Also stand up the daemon. Needs root, and asks for it with sudo.
+    ///
+    /// Separate because it is a different kind of act: it creates a system
+    /// user, writes under `/usr/local`, and only makes sense once you move your
+    /// secrets behind it — which is a decision this command cannot take for you.
+    #[arg(long)]
+    daemon: bool,
+
+    /// Do not install the agent instructions.
+    #[arg(long)]
+    no_skill: bool,
+
+    /// Put back entries a previous setup installed and you have since removed.
+    ///
+    /// Without this they stay removed. An installer that silently restores a
+    /// deletion overwrites a decision every time it runs.
+    #[arg(long)]
+    restore: bool,
+
+    /// Write this backend as the default, instead of deciding.
+    #[arg(long, value_name = "BACKEND")]
+    store: Option<String>,
+
+    /// Take the detected answer without asking anything.
+    #[arg(long)]
+    yes: bool,
+}
+
+/// `disable` and `enable`, which are the same write with the bit flipped.
+///
+/// Deliberately trivial to reach: the moment somebody wants the guards to stop
+/// and cannot find the word, the alternative is that they gut their settings
+/// file by hand — and then the protection is gone for good and silently.
+fn switch(scope: &ScopeArgs, enable: bool) -> i32 {
+    match switch_guards(
+        &setup_paths(scope),
+        Style::detect(io::stdout().is_terminal()),
+        enable,
+        &mut io::stdout(),
+    ) {
+        Ok(code) => code,
+        Err(error) => {
+            eprintln!("{NAME}: {error}");
+            1
+        }
+    }
+}
+
+/// Resolve the setup paths from the environment and the flags on top of it.
+fn setup_paths(scope: &ScopeArgs) -> keyless::paths::SetupPaths {
+    let mut resolved = keyless::paths::SetupPaths::discover();
+    if let Some(dir) = &scope.claude_dir {
+        resolved.claude_dir = dir.clone();
+    }
+    if let Some(path) = &scope.receipt {
+        resolved.receipt = path.clone();
+    }
+    resolved
 }
 
 fn main() {
@@ -553,6 +676,9 @@ fn dispatch() -> i32 {
                 load: &load,
                 registry: &built.registry,
                 audit: &log,
+                // The guards row is a top-level fact about this machine, so the
+                // one caller a person actually types always supplies it.
+                setup: Some(&setup_paths(&args.scope)),
                 // Both channels: `doctor` is exactly the place the routine
                 // consequences of a configuration are worth spelling out.
                 notes: &notes,
@@ -582,6 +708,7 @@ fn dispatch() -> i32 {
                 only: args.store.as_deref(),
                 interactive,
                 install_hooks: args.hooks,
+                report_guards: true,
                 style: Style::detect(io::stdout().is_terminal()),
             };
             let stdin = io::stdin();
@@ -591,6 +718,66 @@ fn dispatch() -> i32 {
                 &mut io::stdout(),
                 &mut io::stderr(),
             ) {
+                Ok(code) => code,
+                Err(error) => {
+                    eprintln!("{NAME}: {error}");
+                    1
+                }
+            }
+        }
+
+        Verb::Setup(args) => {
+            let interactive = io::stdin().is_terminal() && io::stdout().is_terminal();
+            let resolved = setup_paths(&args.scope);
+            let request = SetupRequest {
+                paths: &paths,
+                setup: &resolved,
+                dry_run: args.dry_run,
+                restore: args.restore,
+                with_daemon: args.daemon,
+                with_skill: !args.no_skill,
+                interactive,
+                assume_yes: args.yes,
+                only: args.store.as_deref(),
+                style: Style::detect(io::stdout().is_terminal()),
+            };
+            let stdin = io::stdin();
+            match setup(
+                &request,
+                &mut stdin.lock(),
+                &mut io::stdout(),
+                &mut io::stderr(),
+            ) {
+                Ok(code) => code,
+                Err(error) => {
+                    eprintln!("{NAME}: {error}");
+                    1
+                }
+            }
+        }
+
+        // Two verbs, one write. Both are deliberately trivial to reach: the
+        // moment somebody wants the guards to stop, the alternative to finding
+        // this word is that they gut their settings file by hand and the
+        // protection is gone for good.
+        Verb::Disable(scope) => switch(&scope, false),
+        Verb::Enable(scope) => switch(&scope, true),
+
+        Verb::Uninstall(scope) => {
+            let resolved = setup_paths(&scope);
+            let request = SetupRequest {
+                paths: &paths,
+                setup: &resolved,
+                dry_run: false,
+                restore: false,
+                with_daemon: false,
+                with_skill: true,
+                interactive: false,
+                assume_yes: true,
+                only: None,
+                style: Style::detect(io::stdout().is_terminal()),
+            };
+            match uninstall(&request, &mut io::stdout(), &mut io::stderr()) {
                 Ok(code) => code,
                 Err(error) => {
                     eprintln!("{NAME}: {error}");
