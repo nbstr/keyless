@@ -54,7 +54,9 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use nix::pty::{OpenptyResult, Winsize, openpty};
+use nix::sys::signal::{Signal, kill};
 use nix::sys::termios::{self, LocalFlags, Termios};
+use nix::unistd::Pid;
 
 use support::{DECOY_VALUE, PATIENCE, Stub, scratch, stub_security, within};
 
@@ -249,6 +251,17 @@ impl UnderTerminal {
         let size = winsize(rows, cols);
         // SAFETY: a live winsize and a pty master this test owns.
         unsafe { set_winsize(self.master.as_raw_fd(), &raw const size) }.expect("resize the pty");
+    }
+
+    /// Send `keyless` itself a signal, the way `kill`, a supervisor or a
+    /// closing terminal does.
+    ///
+    /// **Process-directed, never `killpg`.** This `keyless` shares the test
+    /// runner's process group — see [`Ownership::Inherited`] — so a group signal
+    /// from here would take the whole suite with it.
+    fn signal(&self, signal: Signal) {
+        kill(Pid::from_raw(self.child.id().cast_signed()), signal)
+            .unwrap_or_else(|error| panic!("cannot send {signal:?} to keyless: {error}"));
     }
 
     /// Type at the terminal.
@@ -704,6 +717,187 @@ fn the_terminal_is_restored_when_the_child_dies_of_a_signal() {
             assert_eq!(
                 after.control_chars, before.control_chars,
                 "the terminal was left raw after a signalled child"
+            );
+        },
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Signals arriving at `keyless` while a child owns the terminal.
+//
+// The relay blocks SIGINT, SIGTERM, SIGHUP and SIGQUIT for every one of its
+// threads and consumes them with `sigwait`, so none of the four can kill this
+// process while the user's terminal is raw. Consuming a signal is only half the
+// contract: the other half is that the CHILD gets it, and until now nothing
+// asserted that half. Deleting the forwarding call left the whole suite green,
+// which is a never-block guarantee nothing was holding — `keyless` would eat a
+// SIGTERM, keep the terminal, and leave the child running.
+//
+// **This is NOT the Ctrl-C path, and the difference matters for what these
+// cases are worth.** A user pressing Ctrl-C sends no signal to `keyless` at all:
+// the user's terminal is raw, so its driver generates nothing, the `0x03` byte
+// travels down the input relay, and the pty slave's own line discipline raises
+// SIGINT for the child's foreground group. What the forwarding covers is every
+// signal that arrives at the `keyless` PROCESS — `kill`, a supervisor, a CI
+// timeout, and SIGHUP when the terminal itself goes away.
+//
+// Each case bounds its own FAILURE rather than relying on the harness: the
+// child sleeps 5 s and then exits normally, so forwarding that has stopped
+// working ends as a wrong exit code within seconds. A child that waited forever
+// would turn a regression into a hang, and a hang reports nothing at all.
+//
+// SIGQUIT is watched and forwarded like the other three and is deliberately not
+// exercised: its default action writes a core dump, and a suite that litters
+// cores on every run gets its guards deleted.
+// ---------------------------------------------------------------------------
+
+/// Interrupt a run with `signal` once its child is up, and report what came out.
+fn run_interrupted_by(tag: &str, signal: Signal) -> (i32, String) {
+    let dir = scratch(tag);
+    let config = config_with_stub(&dir, &Stub::Returns(DECOY_VALUE));
+
+    let session = start_under_terminal(&[
+        "--config",
+        &config.display().to_string(),
+        "--no-audit",
+        "run",
+        "-s",
+        "DECOY",
+        "--",
+        "/bin/sh",
+        "-c",
+        "printf 'ready>'; sleep 5; printf 'outlived'",
+    ]);
+    // Never signal before the child is up: a signal forwarded to a child that
+    // does not exist yet would prove nothing, and the marker is the only thing
+    // that says it does.
+    session.await_output("ready>");
+    session.signal(signal);
+    session.finish()
+}
+
+#[test]
+fn a_signal_to_the_run_reaches_the_child() {
+    within(
+        CASE_PATIENCE,
+        "a_signal_to_the_run_reaches_the_child",
+        || {
+            // `keyless` reports `128 + signal` for a child killed by one, so the
+            // exit code is a statement about WHICH signal arrived — not merely that
+            // the run ended.
+            for (signal, expected, what) in [
+                (Signal::SIGTERM, 143, "a termination request"),
+                (Signal::SIGINT, 130, "an interrupt"),
+                (
+                    Signal::SIGHUP,
+                    129,
+                    "a hangup, which is what a closing terminal sends",
+                ),
+            ] {
+                let (code, seen) = run_interrupted_by(&format!("pty-signal-{signal}"), signal);
+                assert_eq!(
+                    code, expected,
+                    "{what} reached `keyless` and never reached the child: the run exited {code} \
+                 rather than {expected}, so the child died of old age instead. The relay \
+                 consumed the signal and did not forward it. Terminal saw: {seen:?}"
+                );
+                assert!(
+                    !seen.contains("outlived"),
+                    "the child ran to completion after {what} was sent to `keyless`: {seen:?}"
+                );
+            }
+        },
+    );
+}
+
+#[test]
+fn a_forwarded_signal_reaches_the_childs_whole_process_group() {
+    within(
+        CASE_PATIENCE,
+        "a_forwarded_signal_reaches_the_childs_whole_process_group",
+        || {
+            // The relay signals the process GROUP, and the child is a session
+            // leader precisely so that group is its own. Signalling the child
+            // alone would leave every process it started — a background job, a
+            // `make` subprocess, the second half of a pipeline — alive and
+            // holding the terminal, which is the shape of "I pressed Ctrl-C and
+            // it is still running".
+            //
+            // The exit code cannot see that difference: the child dies either
+            // way. Only something the GRANDCHILD would do afterwards can.
+            //
+            // ⚠️ `trap '' HUP` is the whole fixture, and the naive version of
+            // this case PASSES against a relay that signals the child alone.
+            // Measured 2026-08-09 on macOS with `killpg` replaced by `kill`: the
+            // child is a session leader, so its death revokes the controlling
+            // terminal and the kernel sends SIGHUP to that terminal's foreground
+            // group — which kills the background subshell whatever the relay
+            // did. Ignoring SIGHUP is what makes a grandchild outlive its
+            // session, and it is also how `nohup` and every daemonising child
+            // behave. An IGNORED disposition survives `exec`; a caught one would
+            // not.
+            //
+            // ⚠️ And the marker is written on a CUE rather than on a timer.
+            // A grandchild that slept a fixed period would be a race between
+            // that period and how long this test takes to send its signal, and a
+            // margin that holds on an idle machine is exactly the fixture that
+            // passes twice in four runs under load.
+            let dir = scratch("pty-signal-process-group");
+            let config = config_with_stub(&dir, &Stub::Returns(DECOY_VALUE));
+            let trapped = dir.join("trapped");
+            let go = dir.join("go");
+            let orphan = dir.join("orphan");
+
+            // The background subshell inherits the child's process group,
+            // because job control is off in `sh -c`. The child waits for it to
+            // have trapped SIGHUP before announcing itself, so `ready>` means
+            // the fixture is armed and not merely started.
+            let body = format!(
+                "(trap '' HUP; : > '{trapped}'; \
+                  while [ ! -f '{go}' ]; do sleep 0.02; done; : > '{orphan}') & \
+                 while [ ! -f '{trapped}' ]; do sleep 0.01; done; \
+                 printf 'ready>'; sleep 5",
+                trapped = trapped.display(),
+                go = go.display(),
+                orphan = orphan.display(),
+            );
+
+            let session = start_under_terminal(&[
+                "--config",
+                &config.display().to_string(),
+                "--no-audit",
+                "run",
+                "-s",
+                "DECOY",
+                "--",
+                "/bin/sh",
+                "-c",
+                &body,
+            ]);
+            session.await_output("ready>");
+            session.signal(Signal::SIGTERM);
+            let (code, seen) = session.finish();
+
+            assert_eq!(code, 143, "the child outlived the signal: {seen:?}");
+
+            // The fixture checks ITSELF. A subshell that never reached its trap
+            // holds nothing and proves nothing, and this case would then pass
+            // against a relay that signals only the child.
+            assert!(
+                trapped.exists(),
+                "the background subshell never armed itself, so this case tested nothing"
+            );
+
+            // Now cue it. A subshell that is still alive writes within its 20 ms
+            // poll; three seconds is 150 polls. The conclusion rests on having
+            // TOLD it to write and waited, not on a margin against a timer.
+            std::fs::write(&go, b"").expect("cue the background subshell");
+            thread::sleep(Duration::from_secs(3));
+            assert!(
+                !orphan.exists(),
+                "a process the child had started was still alive three seconds after the \
+                 signal and answered its cue; the relay is signalling the child alone rather \
+                 than its process group, so everything the child spawned keeps running"
             );
         },
     );

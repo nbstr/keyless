@@ -36,9 +36,9 @@
 //! Each was an unbounded wait that ended with the child either never running or
 //! never being reported: [`resolve_all`] (N deadlines became one),
 //! [`PUMP_DRAIN_GRACE`] (a grandchild holding the pipes), and
-//! [`crate::store::exec::spawn_serialised`] (two concurrent spawns deadlocking on
-//! an inherited descriptor). Read those three before changing the shape of this
-//! function.
+//! [`crate::store::exec::spawn_persistently`] (two concurrent spawns deadlocking
+//! on an inherited descriptor, and a `fork` refused for want of process slots).
+//! Read those three before changing the shape of this function.
 
 use std::ffi::OsString;
 use std::io::{self, Write};
@@ -767,102 +767,21 @@ fn assemble(
     command
 }
 
-/// How many times to try again when the machine, not the command, said no.
+/// Spawn the run's own child, retrying while the OS is merely out of process
+/// slots.
 ///
-/// Five attempts with [`SPAWN_BACKOFF`] doubling between them spans 150 ms of
-/// contention. That is the number the guard in this module's tests asserts
-/// against, so lowering it turns a named test red rather than passing silently.
-const SPAWN_ATTEMPTS: u32 = 5;
-
-/// How long to wait before the FIRST retry. Every later wait doubles it.
+/// The retry, the backoff and the errno that qualifies for one all live in
+/// [`crate::store::exec`], beside the mutex that serialises the act of forking.
+/// One place owns "create a child on this machine", so a store lookup and a run
+/// cannot disagree about what `EAGAIN` means — and that function holds the only
+/// `Command::spawn` call in `src/`, so there is no door into a spawn that skips
+/// the retry.
 ///
-/// **A retry with no wait is a busy-wait, and against a process limit it is
-/// worse than one.** `RLIMIT_NPROC` is counted per user, so twenty concurrent
-/// agent sessions hit it together and would then re-fork together — the
-/// thundering herd the limit exists to prevent. Doubling spreads them out, and
-/// spreads them further on each pass.
-const SPAWN_BACKOFF: std::time::Duration = std::time::Duration::from_millis(10);
-
-/// Whether a spawn failure says "not right now" rather than "not ever".
-///
-/// `EAGAIN` and `EWOULDBLOCK` are the same number on the platforms this builds
-/// for, and std maps it to `WouldBlock`. The raw check is kept beside it so a
-/// platform where they differ still retries.
-///
-/// One function rather than an inline guard, so the test that feeds it a real
-/// `fork` errno and the loop that acts on it cannot classify differently.
-fn out_of_process_slots(error: &io::Error) -> bool {
-    error.kind() == io::ErrorKind::WouldBlock || error.raw_os_error() == Some(nix::libc::EAGAIN)
-}
-
-/// Spawn, retrying while the OS is merely out of process slots.
-///
-/// `EAGAIN` from `fork` means "not right now", never "not ever": the caller is
-/// at `RLIMIT_NPROC` and the count drops as soon as anything exits — including
-/// the store subprocesses this run has just finished with. Measured 2026-08-08
-/// under `RLIMIT_NPROC` of 128, 256 and 512: `keyless run` exited 127 with no
-/// child where a fork-depth-matched control shell exited 42. One retry loop
-/// closes the whole of that gap, because the condition is transient by
-/// definition and this process is not the one holding the slots.
-///
-/// Bounded rather than unbounded: a limit of 0, or a machine genuinely out of
-/// processes, must end as a reported failure and not as a spin.
+/// `None` rather than a deadline: reaching the spawn IS this call's contract,
+/// nothing is waiting on it, and a run that gave up early would be the
+/// never-block failure the retry exists to remove.
 fn spawn_persistently(command: &mut Command) -> io::Result<std::process::Child> {
-    // Through the same gate the store lookups use. Nothing else should be
-    // spawning by now, but "should" is what the fd-inheritance race feeds on,
-    // and one uncontended mutex is not a cost worth reasoning about.
-    persisting(
-        || crate::store::exec::spawn_serialised(command),
-        thread::sleep,
-    )
-}
-
-/// The retry itself, with the spawn and the wait handed in.
-///
-/// # Why this is a separate function
-///
-/// **A `fork` cannot be made to return `EAGAIN` on demand.** Reaching the real
-/// condition means driving the machine to `RLIMIT_NPROC`, which is counted per
-/// USER — so a test that did it would take down every other process the user is
-/// running, including the rest of the suite. There is no bounded, safe way to
-/// exercise this loop through a real `Command`.
-///
-/// Without a seam the loop is therefore untestable, and it was: changing
-/// [`SPAWN_ATTEMPTS`] from 5 to 1 left the whole suite green. That is a
-/// never-block guard nothing was holding — a spawn that gives up on the first
-/// `EAGAIN` turns a transient resource limit into a dead command, which is the
-/// one outcome `keyless run`'s contract forbids.
-///
-/// The budget is deliberately NOT a parameter. It reads [`SPAWN_ATTEMPTS`] and
-/// [`SPAWN_BACKOFF`] directly, so a test exercises the shipped numbers rather
-/// than numbers of its own, and a mutation of either constant reaches the
-/// assertions.
-///
-/// `pause` is handed in for the same reason a real fork is not: a test that
-/// slept the real schedule would spend 150 ms proving something it can prove by
-/// recording it, and it could not assert on a wait it did not observe.
-fn persisting<T>(
-    mut spawn: impl FnMut() -> io::Result<T>,
-    mut pause: impl FnMut(std::time::Duration),
-) -> io::Result<T> {
-    let mut backoff = SPAWN_BACKOFF;
-    let mut last = None;
-    for attempt in 0..SPAWN_ATTEMPTS {
-        match spawn() {
-            Ok(child) => return Ok(child),
-            Err(error) if out_of_process_slots(&error) => {
-                last = Some(error);
-                if attempt + 1 < SPAWN_ATTEMPTS {
-                    pause(backoff);
-                    backoff *= 2;
-                }
-            }
-            // Not about the machine. Retrying a command that does not exist
-            // only delays the report.
-            Err(error) => return Err(error),
-        }
-    }
-    Err(last.unwrap_or_else(|| io::Error::other("the process could not be started")))
+    crate::store::exec::spawn_persistently(command, None)
 }
 
 /// Whether a spawn failure is about the environment being injected rather than
@@ -969,7 +888,6 @@ fn wire_pty(command: &mut Command, slave: &OwnedFd) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use std::io;
 
     use super::Binding;
 
@@ -1010,170 +928,19 @@ mod tests {
     // A `fork` refused with `EAGAIN` under `RLIMIT_NPROC` is the machine saying
     // "not right now". Giving up on the first one turns a transient limit into a
     // dead command — exit 127, no child — which is the single outcome `keyless
-    // run`'s contract forbids. On a machine running ~20 concurrent agent
-    // sessions that is the condition [`super::SPAWN_ATTEMPTS`] was written for,
-    // not a hypothetical.
+    // run`'s contract forbids.
     //
-    // These four go through [`super::persisting`] rather than through a real
-    // `Command`, because `RLIMIT_NPROC` is counted per USER: a test that reached
-    // the real condition would refuse forks to every other process this user is
-    // running, the rest of the suite included. The seam is the honest way to
-    // reach the loop; the errno fed into it is the real one.
+    // The loop, its budget and its jitter now live beside the spawn mutex in
+    // [`crate::store::exec`], and so do the tests that drive them through a
+    // seam. What is left here is the WIRING: this module's own spawn path still
+    // going through that loop, which no test over there can see.
     // -----------------------------------------------------------------------
 
-    /// The condition clears, and the child still runs.
+    /// The wiring, which the seam tests in `store::exec` cannot see.
     ///
-    /// Four consecutive refusals is the worst case the shipped budget of five
-    /// attempts is documented to survive. A budget that cannot absorb them has
-    /// been cut, and this is what says so — it reds at `SPAWN_ATTEMPTS` of 1, 2,
-    /// 3 and 4 alike.
-    #[test]
-    fn a_spawn_refused_for_want_of_process_slots_is_tried_until_a_slot_appears() {
-        let mut refusals = 4_u32;
-        let mut waits: Vec<Duration> = Vec::new();
-
-        let outcome = super::persisting(
-            || {
-                if refusals > 0 {
-                    refusals -= 1;
-                    // The errno a `fork` reports at `RLIMIT_NPROC`, not a
-                    // stand-in for it.
-                    return Err(io::Error::from_raw_os_error(nix::libc::EAGAIN));
-                }
-                Ok("the child")
-            },
-            |waited| waits.push(waited),
-        );
-
-        assert_eq!(
-            outcome.expect(
-                "a fork refused four times for want of process slots produced no child at all; \
-                 the retry budget no longer covers the contention it was written for"
-            ),
-            "the child"
-        );
-        assert_eq!(
-            waits.len(),
-            4,
-            "the child appeared without the machine being given time to drain"
-        );
-    }
-
-    /// The retry WAITS, and waits longer each time.
-    ///
-    /// **This is the thundering-herd guard, and it is the half that a bare retry
-    /// count does not give.** `RLIMIT_NPROC` is per user, so twenty sessions hit
-    /// it in the same instant; twenty processes re-forking with no wait is the
-    /// pile-up the limit exists to prevent. Asserting the schedule by value pins
-    /// three separate things at once — that a wait happens at all, that it
-    /// doubles, and that the whole window spans the 150 ms the budget claims.
-    #[test]
-    fn the_retry_backs_off_rather_than_spinning_on_a_full_machine() {
-        let mut attempts = 0_u32;
-        let mut waits: Vec<Duration> = Vec::new();
-
-        let outcome = super::persisting(
-            || {
-                attempts += 1;
-                Err::<(), _>(io::Error::from_raw_os_error(nix::libc::EAGAIN))
-            },
-            |waited| waits.push(waited),
-        );
-
-        // A machine genuinely out of processes must end as a reported failure
-        // and not as a spin, so the budget is bounded and the error is the
-        // machine's own rather than a substitute.
-        let error = outcome.expect_err("a permanently full machine must be reported");
-        assert!(
-            super::out_of_process_slots(&error),
-            "the refusal the caller sees is no longer the one the kernel gave: {error}"
-        );
-        assert_eq!(
-            attempts, 5,
-            "the spawn was not attempted the budgeted number of times"
-        );
-
-        // By value, and deliberately not `SPAWN_ATTEMPTS - 1`: a length derived
-        // from the constant under test is satisfied by any value of it, which is
-        // exactly how this loop went unguarded in the first place.
-        assert_eq!(
-            waits,
-            vec![
-                Duration::from_millis(10),
-                Duration::from_millis(20),
-                Duration::from_millis(40),
-                Duration::from_millis(80),
-            ],
-            "the backoff no longer doubles, so twenty sessions at the limit re-fork together"
-        );
-        assert_eq!(
-            waits.iter().sum::<Duration>(),
-            Duration::from_millis(150),
-            "the retry window no longer spans the contention it was written for"
-        );
-    }
-
-    /// The control: retrying is SELECTIVE.
-    ///
-    /// Without this, a `persisting` that retried every failure would pass both
-    /// guards above while making a command that does not exist take 150 ms to
-    /// say so.
-    #[test]
-    fn a_refusal_that_is_not_about_process_slots_is_reported_at_once() {
-        let mut attempts = 0_u32;
-        let mut waits: Vec<Duration> = Vec::new();
-
-        let outcome = super::persisting(
-            || {
-                attempts += 1;
-                Err::<(), _>(io::Error::from_raw_os_error(nix::libc::ENOENT))
-            },
-            |waited| waits.push(waited),
-        );
-
-        assert!(outcome.is_err());
-        assert_eq!(attempts, 1, "a command that does not exist was tried again");
-        assert!(
-            waits.is_empty(),
-            "the caller was made to wait for a failure that will never clear"
-        );
-    }
-
-    /// Which errno reaches the loop at all.
-    ///
-    /// The classifier and the loop share one function, so a test that fed a real
-    /// `fork` errno to one cannot disagree with the other.
-    #[test]
-    fn the_errno_a_fork_reports_at_the_process_limit_is_the_one_that_retries() {
-        assert!(super::out_of_process_slots(&io::Error::from_raw_os_error(
-            nix::libc::EAGAIN
-        )));
-        // std's own spelling of the same condition, which is the form
-        // `Command::spawn` hands back.
-        assert!(super::out_of_process_slots(&io::Error::from(
-            io::ErrorKind::WouldBlock
-        )));
-
-        // The controls. None of these is the machine being momentarily full, and
-        // `E2BIG` in particular has its own repair — see
-        // [`super::caused_by_the_environment`] — which a retry would bypass.
-        for (errno, what) in [
-            (nix::libc::ENOENT, "no such file"),
-            (nix::libc::EACCES, "not executable"),
-            (nix::libc::E2BIG, "the environment is too large"),
-        ] {
-            assert!(
-                !super::out_of_process_slots(&io::Error::from_raw_os_error(errno)),
-                "`{what}` was treated as a transient shortage of process slots"
-            );
-        }
-    }
-
-    /// The wiring, which the four above cannot see.
-    ///
-    /// They exercise [`super::persisting`] directly, so a `spawn_persistently`
-    /// that had stopped calling it would leave every one of them green. This
-    /// runs the shipped path against a real binary.
+    /// They exercise the retry loop directly, so a `spawn_persistently` that had
+    /// stopped calling it would leave every one of them green. This runs the
+    /// shipped path against a real binary.
     #[test]
     fn the_shipped_spawn_path_produces_a_real_child() {
         let mut command = std::process::Command::new("/usr/bin/true");
