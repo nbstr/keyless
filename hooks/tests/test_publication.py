@@ -441,8 +441,7 @@ def claims_in_message(body):
     return claims_in(body.split("\n\n"), ratios=False)
 
 
-# The commits whose messages were written before this gate existed, and which
-# the queued history rewrite replaces.
+# The commits whose messages were written before this gate existed.
 #
 # ⚠️ THIS LIST IS A RATCHET AND IT IS CHECKED IN BOTH DIRECTIONS. A commit that
 # is not on it and carries a claim fails the gate. A commit that IS on it and no
@@ -454,12 +453,21 @@ def claims_in_message(body):
 # It holds shas and nothing else. Naming the figures here in order to forgive
 # them would republish the inventory this file exists to remove, which is the
 # same reason the Rust guard next door is an allowlist of decoys.
+#
+# The history rewrite has run. It removed the census from every TREE and both
+# fixture-coordinate classes from tree and message alike, so these five shas are
+# the rewritten ones and the list is shorter by nothing: the rewrite replaced
+# each message's blobs, never its prose. Emptying it needs the remedy this
+# file's own `check_message_file` prints — keep the reasoning and drop the
+# number, or say what the number is a property OF — applied by hand to five
+# engineering records. A machine cannot choose which figure is a property of
+# the check and which is a census of the machine that ran it.
 KNOWN_UNSCRUBBED = [
-    "2d2efd9dc877fd766e22392309dec344bbcfdb22",
-    "b055488df8df75adda40492e61c47588f3728d88",
-    "9d2b88efcbbfdba9be9e5f9459f2c36863edb5d3",
-    "cee8f6b3ec3fc3de0916353500f9f4890641b238",
-    "7e935af6da4ddab2a9cccb8e012467adb9a6e9dc",
+    "d84887ebf06e5beb39fdcfc27d899c3e1ab1b716",
+    "e1f3492f0e8191367c9cd18e1934113132fecfd6",
+    "0215905c87c0bbc7ccd386dd226bf3430e92baa7",
+    "cc9f653c7716d53ad3c035a196eb47c17d0c4add",
+    "a39d0a368ab9bf454a56166fa7ea9beb0e1c01ce",
 ]
 
 # One planted message per shape that was really written into this history.
