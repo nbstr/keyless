@@ -43,9 +43,25 @@
 //! * **Only the JSON spelling.** It reads `"timeout_ms":<digits>` out of the
 //!   config strings. Deadlines passed as Rust values —
 //!   `DaemonStore::new(path, Duration::from_secs(10))`, `client_config(sock,
-//!   3_000)` — are invisible here. Those bound a unix-socket round trip to an
-//!   in-process daemon rather than a `fork` + `exec` of a shell, so their margin
-//!   is far wider, but the gap is real and it is not closed.
+//!   3_000)` — are invisible here.
+//!
+//!   **This hole has bitten, and the claim that its margin is wider was wrong.**
+//!   `src/ipc/client.rs` handed both of its cases a 200 ms deadline that bounds
+//!   a THREAD SPAWN, not a socket: `Client::request` waits on a channel with the
+//!   same duration it gives the connection, so an absent socket answers
+//!   `Unreachable` only when the worker is scheduled in time and reports
+//!   `Timeout` when it is not. It went red on a loaded machine, green on an idle
+//!   one, and the code it tests never changed. Both are ceilings now, named and
+//!   reasoned about at the constant.
+//!
+//!   Measured 2026-08-09, the size of what is still unseen: **29 Rust-spelled
+//!   deadlines in `src/` test modules, across `store/exec.rs`,
+//!   `daemon/resolver.rs`, `ipc/client.rs` and `tty/relay.rs`.** Most are
+//!   genuine SUBJECTS — `exec.rs` asserts timeout wording, `resolver.rs` sizes a
+//!   coalescing window — so a table of them is not a sweep, it is 29 readings of
+//!   code, and a table filled with guesses states them as checked facts. That is
+//!   the failure this file exists to prevent, so the hole is measured here
+//!   rather than closed badly.
 //! * **It cannot tell a ceiling from a measurement.** That is why the table
 //!   below is a table and not a threshold: only a human knows whether a number
 //!   is the subject of a test or merely a bound on it. A threshold would have
