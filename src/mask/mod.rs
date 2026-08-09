@@ -49,6 +49,10 @@ struct Needle {
     /// this struct is identical either way. Declaring the field as a type that
     /// cannot exist without the scrub moves the guarantee somewhere an edit to
     /// this file cannot reach.
+    ///
+    /// Built once from a slice of exactly its own length and never appended to,
+    /// so it has no reallocation to abandon — see [`Sealed`] for the half of the
+    /// guarantee a scrub-on-drop cannot give on its own.
     bytes: Zeroizing<Vec<u8>>,
     /// Pre-rendered `[keyless:NAME]`, shared between the needles of one secret.
     replacement: Arc<str>,
@@ -272,6 +276,85 @@ impl Masker {
     }
 }
 
+/// The home of [`Sealed`], and a module rather than a bare type on purpose.
+///
+/// A `Vec` inside a tuple struct declared at file scope is still reachable from
+/// every other line of that file: `self.carry.0.extend_from_slice(chunk)`
+/// compiles, and it is the exact defect this type exists to remove. Privacy in
+/// Rust is per module, so putting the type in its own module is what makes the
+/// field unreachable from the eight hundred lines around it. The only surface
+/// left is the three constructors below, none of which can grow anything.
+mod sealed {
+    use zeroize::Zeroizing;
+
+    /// A byte buffer that is allocated at its final size and is never grown.
+    ///
+    /// `Zeroizing<Vec<u8>>` scrubs the allocation it is *holding* when it drops.
+    /// It cannot scrub one the `Vec` has already abandoned, and growing a `Vec`
+    /// does exactly that: it allocates a larger block, copies the bytes across,
+    /// and frees the old block untouched. zeroize says so on its own `Vec` impl
+    /// — "cannot ensure that previous reallocations did not leave values on the
+    /// heap". So a buffer that holds stream bytes and grows leaves a copy of
+    /// itself in freed heap every time it grows, and the scrub on the surviving
+    /// allocation cannot reach it.
+    ///
+    /// The carry is such a buffer. It holds back the tail of the child's output,
+    /// which is precisely where the leading bytes of a split secret sit, and it
+    /// used to be grown with `extend_from_slice` once per write. Driving a
+    /// 37-byte decoy one byte per write left 33 freed blocks holding a prefix of
+    /// it, the longest of them 36 of its 37 bytes.
+    ///
+    /// This type has no growth operation to call. [`Sealed::joined`] is the only
+    /// place it allocates and it sizes the allocation from the pieces the buffer
+    /// will hold, so there is no reallocation to abandon anything — and adding
+    /// one means changing this module rather than editing a call site.
+    ///
+    /// The sizing is delegated to `concat` on purpose. A capacity computed here
+    /// would be arithmetic whose failure mode is a buffer one byte short, which
+    /// then grows; every observable behaviour of the writer is identical either
+    /// way, so nothing downstream could tell the two apart. The proof that this
+    /// allocates exactly is not the arithmetic; it is `tests/carry_residue.rs`,
+    /// which watches the allocator and fails on any freed block that still holds
+    /// stream bytes.
+    pub struct Sealed(Zeroizing<Vec<u8>>);
+
+    /// Compile-time proof of the paragraph above, bound to the actual field.
+    const _: fn(&Sealed) = |sealed| {
+        fn scrubs_on_drop<T: zeroize::ZeroizeOnDrop + ?Sized>(_: &T) {}
+        scrubs_on_drop(&sealed.0);
+    };
+
+    impl Sealed {
+        /// `head` followed by `tail`, in one allocation of exactly their total.
+        pub fn joined(head: &[u8], tail: &[u8]) -> Self {
+            Sealed(Zeroizing::new([head, tail].concat()))
+        }
+
+        /// A copy of `bytes`.
+        pub fn holding(bytes: &[u8]) -> Self {
+            Sealed::joined(bytes, &[])
+        }
+
+        /// No bytes, and no allocation.
+        pub fn empty() -> Self {
+            Sealed::holding(&[])
+        }
+    }
+
+    /// Read access, and deliberately no `DerefMut`: a `&mut [u8]` cannot grow
+    /// the buffer, but handing one out would put the plaintext somewhere a
+    /// caller could copy it back out of, for no caller that needs it.
+    impl std::ops::Deref for Sealed {
+        type Target = [u8];
+
+        fn deref(&self) -> &[u8] {
+            &self.0
+        }
+    }
+}
+
+use sealed::Sealed;
+
 /// A `Write` that redacts on the way through, holding back a suffix so a value
 /// split across writes is still caught.
 pub struct MaskingWriter<W: Write> {
@@ -288,14 +371,24 @@ pub struct MaskingWriter<W: Write> {
     /// destructor to `()` left the whole suite green while deleting the
     /// guarantee. Declaring the field as a type that cannot exist without the
     /// scrub puts it out of reach of an edit to this file.
-    carry: Zeroizing<Vec<u8>>,
+    ///
+    /// Scrubbing on drop is only half the guarantee. The other half is that this
+    /// buffer is never grown, because growth abandons an unscrubbed copy of it
+    /// that the scrub can no longer reach — which is why the type is [`Sealed`]
+    /// rather than a `Vec`.
+    carry: Sealed,
     inner: W,
 }
 
 /// Compile-time proof of the paragraph above, bound to the actual field.
+///
+/// It pins the field's TYPE rather than re-stating the scrub, because the scrub
+/// is now one of two guarantees and [`Sealed`] carries both: its own assertion
+/// holds the scrub, its module holds the absence of growth. Swapping this field
+/// back to a `Vec` or a `Zeroizing<Vec<u8>>` stops the crate compiling here.
 const _: fn(&MaskingWriter<io::Sink>) = |writer| {
-    fn scrubs_on_drop<T: zeroize::ZeroizeOnDrop + ?Sized>(_: &T) {}
-    scrubs_on_drop(&writer.carry);
+    fn is_sealed(_: &Sealed) {}
+    is_sealed(&writer.carry);
 };
 
 impl<W: Write> MaskingWriter<W> {
@@ -303,7 +396,7 @@ impl<W: Write> MaskingWriter<W> {
     pub fn new(masker: Arc<Masker>, inner: W) -> Self {
         MaskingWriter {
             masker,
-            carry: Zeroizing::new(Vec::new()),
+            carry: Sealed::empty(),
             inner,
         }
     }
@@ -320,10 +413,12 @@ impl<W: Write> MaskingWriter<W> {
     }
 
     fn push(&mut self, chunk: &[u8], end_of_stream: bool) -> io::Result<()> {
-        self.carry.extend_from_slice(chunk);
-        // Moved out and put back through the same type, so the intermediate
-        // is scrubbed on drop exactly like the field it came from.
-        let buf = std::mem::replace(&mut self.carry, Zeroizing::new(Vec::new()));
+        // The carry is joined to the chunk into a NEW buffer rather than grown
+        // in place. Growing it would abandon its old block — a verbatim copy of
+        // the held-back bytes, freed without a scrub, once per write. See
+        // [`Sealed`]. The working buffer is scrubbed on drop at the end of this
+        // function, exactly like the field it was built from.
+        let buf = Sealed::joined(&self.carry, chunk);
         let masker = Arc::clone(&self.masker);
         let emit_limit = if end_of_stream {
             buf.len()
@@ -332,7 +427,7 @@ impl<W: Write> MaskingWriter<W> {
         };
         let (out, consumed) = masker.scan(&buf, emit_limit);
         // The previous carry is dropped here, which scrubs it.
-        self.carry = Zeroizing::new(buf[consumed..].to_vec());
+        self.carry = Sealed::holding(&buf[consumed..]);
         self.inner.write_all(&out)
     }
 }
@@ -765,6 +860,35 @@ mod tests {
         // child pauses.
         let masker = masker_for("decoy-partial-prefix-value-7777");
         assert_eq!(seen_so_far(&masker, &[b"token: decoy-partial"]), "token: ");
+    }
+
+    #[test]
+    fn a_tail_that_is_already_the_whole_secret_is_masked_without_waiting() {
+        // The third side of the rule, and the one nothing was checking.
+        //
+        // `could_grow_into_a_needle` answers for a PROPER prefix: a tail that is
+        // already a complete needle needs no carry, because `scan` replaces it on
+        // this very pass. Widening that comparison to `>=` makes a complete
+        // needle answer "yes" to its own question, so the carry point stops at
+        // the start of the secret and the replacement is withheld until more
+        // bytes arrive — or until the stream ends, which on a pty may be never.
+        //
+        // Every existing test missed it. The two beside this one drive text that
+        // is not a needle at all. `the_carry_point_is_never_beyond_what_is_
+        // provably_safe` states its assertion in terms of
+        // `could_grow_into_a_needle`, the very function under mutation, so both
+        // sides move together and it cannot fail. And every test that calls
+        // `finish()` sees the same final bytes either way, because the mutation
+        // delays the output without changing it.
+        //
+        // So this asserts the CONSEQUENCE mid-stream, which is the only place
+        // the difference exists.
+        let value = "decoy-whole-needle-released-9182";
+        let masker = masker_for(value);
+        assert_eq!(
+            seen_so_far(&masker, &[format!("token: {value}").as_bytes()]),
+            "token: [keyless:DECOY]"
+        );
     }
 
     #[test]
