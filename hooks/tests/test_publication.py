@@ -416,6 +416,30 @@ def is_this_repository():
         return 'name = "keyless"' in fh.read()
 
 
+def published_ref():
+    """The ref that says what has been pushed, or None if nothing says.
+
+    Tried in order: the current branch's upstream, then `origin/HEAD`, then
+    `origin/master`. A checkout with none of the three cannot answer whether a
+    commit is still amendable, and says so on its own row rather than passing.
+    """
+    for ref in ("@{upstream}", "origin/HEAD", "origin/master"):
+        if _git("rev-parse", "--verify", "--quiet", ref) is not None:
+            return ref
+    return None
+
+
+def _is_published(sha, ref):
+    """True when `sha` is reachable from `ref`, so amending it means a rewrite.
+
+    `git merge-base --is-ancestor` answers with its exit code and prints
+    nothing, so the empty string it yields on success is a PASS. Comparing
+    truthiness here would read every published commit as unpublished and turn
+    this guard into a permanent red.
+    """
+    return _git("merge-base", "--is-ancestor", sha, ref) is not None
+
+
 def commit_messages():
     """[(sha, body)] for every commit reachable from HEAD, newest first."""
     raw = _git("log", "--format=%H%x1e%B%x1f")
@@ -441,33 +465,49 @@ def claims_in_message(body):
     return claims_in(body.split("\n\n"), ratios=False)
 
 
-# The commits whose messages were written before this gate existed.
+# The commit messages this gate judges guilty and cannot fix.
 #
-# ⚠️ THIS LIST IS A RATCHET AND IT IS CHECKED IN BOTH DIRECTIONS. A commit that
+# ⚠️ A SHA IS ADMITTED HERE FOR ONE REASON: THE MESSAGE IS ALREADY PUBLISHED.
+# A published message cannot be edited without rewriting history other people
+# have pulled, so the gate has nothing left to ask for. A message that is still
+# local is a different case entirely — `git commit --amend` is right there, and
+# amending it is the fix. `_is_published` enforces that, so "it is too late" is
+# a fact the suite checks rather than a sentence somebody types.
+#
+# ⚠️ THIS LIST IS A RATCHET AND IT IS CHECKED IN THREE DIRECTIONS. A commit that
 # is not on it and carries a claim fails the gate. A commit that IS on it and no
 # longer carries one — or whose sha is no longer reachable, which is what a
-# history rewrite does to every sha below — ALSO fails the gate. So the list
-# cannot rot into a permanent exemption, and whoever rewrites the history is
-# told, by a red test, to empty it.
+# history rewrite does to every sha below — ALSO fails the gate. And a sha the
+# remote has never seen fails it too. So the list cannot rot into a permanent
+# exemption, and whoever rewrites the history is told, by a red test, to empty
+# it.
 #
-# It holds shas and nothing else. Naming the figures here in order to forgive
-# them would republish the inventory this file exists to remove, which is the
-# same reason the Rust guard next door is an allowlist of decoys.
+# It holds shas and nothing else, and no per-entry reason. Naming the figures
+# here in order to forgive them would republish the inventory this file exists
+# to remove, which is the same reason the Rust guard next door is an allowlist
+# of decoys. The collective reason is this comment; the admission test is code.
 #
-# The history rewrite has run. It removed the census from every TREE and both
-# fixture-coordinate classes from tree and message alike, so these five shas are
-# the rewritten ones and the list is shorter by nothing: the rewrite replaced
-# each message's blobs, never its prose. Emptying it needs the remedy this
-# file's own `check_message_file` prints — keep the reasoning and drop the
-# number, or say what the number is a property OF — applied by hand to five
-# engineering records. A machine cannot choose which figure is a property of
-# the check and which is a census of the machine that ran it.
+# Emptying the list needs the remedy this file's own `check_message_file`
+# prints — keep the reasoning and drop the number, or say what the number is a
+# property OF — applied by hand to each engineering record, during a history
+# rewrite. A machine cannot choose which figure is a property of the check and
+# which is a census of the machine that ran it.
+#
+# 🔴 THIS LIST GREW AFTER THE GATE EXISTED, AND THE MECHANISM THAT ALLOWED IT IS
+# STILL IN PLACE. `install/commit-msg.sh` is the same grammar as a hook that
+# fires BEFORE the message is written, and it is installed by hand or not at
+# all — a clone's `.git/hooks/` starts empty, so the default posture of this
+# repository is a gate that can only speak once the message is unrewritable.
+# Install it in every clone that commits:
+#
+#     ln -sf ../../install/commit-msg.sh .git/hooks/commit-msg
 KNOWN_UNSCRUBBED = [
     "a40c37c0a65fcda37879393e71206ca2807a539c",
     "3bb7c07ce850a0740b4b6610bb45dc14e4d6e701",
     "801de39bd6279073f708933a4fb1f7a6c93d5492",
     "a77db6a39a6309bda186b608ccbc5f8fdd7ff03c",
     "d244c42ab946415dcf6d3929be27e918136c8816",
+    "c0b74f09302dd4389c4963123d34af1a2972c0a1",
 ]
 
 # One planted message per shape that was really written into this history.
@@ -708,11 +748,27 @@ def _check_commit_messages(s):
                 sys.stderr.write("      census claim  %s: %r near %r\n"
                                  % (sha[:12], number, word))
 
-    # The two directions that stop the list becoming a permanent exemption.
+    # The directions that stop the list becoming a permanent exemption.
     s.check("every known-unscrubbed sha is still reachable",
             sorted(sha[:12] for sha in known - reachable), [])
     s.check("every known-unscrubbed sha still carries a claim",
             sorted(sha[:12] for sha in (known & reachable) - flagged), [])
+
+    # And the direction that stops it growing on an excuse. An allowlist anyone
+    # may append to is a gate that decays one row at a time, and the only reason
+    # this one accepts is "the message is published, so no edit can reach it".
+    # That is a property of the repository, not a claim in a diff: a commit the
+    # remote has never seen is amendable, and amending it is the fix.
+    ref = published_ref()
+    if ref is None:
+        # Visible, never silent. A clone with no remote cannot tell an
+        # unrewritable message from a lazy one, and must not imply it can.
+        s.check("no ref names what is published, so admission is unproven",
+                True, True)
+    else:
+        s.check("every known-unscrubbed sha is published, so no edit can reach it",
+                sorted(sha[:12] for sha in known if not _is_published(sha, ref)),
+                [])
 
 
 def check_message_file(path):
