@@ -313,5 +313,54 @@
     "file": "keyless_hooks/fingerprint.py",
     "find": "    r\"(?P<kw>token|secret_key|",
     "replace": "    r\"(?P<kw>token|key|secret_key|"
+  },
+  {
+    "id": "M46-no-code-terminator",
+    "why": "Half the VALUE/REFERENCE discriminator. Emptying the set makes `credentials: PushConfig,` and `token = getToken(` literals again, which is the deployed defect: 134 of 281 measured corrupting rewrites came back through this door alone. Only the false-positive layer can see it, because every contract assertion stays green when the check finds MORE.",
+    "file": "keyless_hooks/fingerprint.py",
+    "find": "_CODE_END = frozenset([\"(\", \",\", \")\"])",
+    "replace": "_CODE_END = frozenset([])"
+  },
+  {
+    "id": "M47-no-member-path",
+    "why": "The other half. `process.env.SECRET` and `credentials.value.password` are the single largest corrupting class measured — 142 rows of 281 — and 121 of them end on whitespace or on end of line, where the terminator test cannot reach and this rule is the only thing withholding them.",
+    "file": "keyless_hooks/fingerprint.py",
+    "find": "    if \".\" not in value:\n        return False",
+    "replace": "    if True:\n        return False"
+  },
+  {
+    "id": "M48-a-substitution-is-a-literal",
+    "why": "`AUTH_TOKEN=\"$(cat ~/.token)\"` is the remediation this pack prints in its own refusal message, and it was being rewritten into a self-reference that expands to nothing. Removing the test restores that, and no other filter covers it: `${VAR}` and a bare `$VAR` are placeholders, `$(` is neither.",
+    "file": "keyless_hooks/fingerprint.py",
+    "find": "    if \"$(\" in value or \"`\" in value:",
+    "replace": "    if False and (\"$(\" in value or \"`\" in value):"
+  },
+  {
+    "id": "M49-a-colon-is-code-punctuation",
+    "why": "The mutation that WIDENS the exemption, and the contract layer is the only thing that can catch it. `:` looks like C-family punctuation and reads as an obvious addition to the set; it sits inside composite tokens — `<token>::<scope>` in the corpus and `<digits>:<body>` in every Telegram bot token — and adding it dropped a real credential out of 466 on the command corpus.",
+    "file": "keyless_hooks/fingerprint.py",
+    "find": "_CODE_END = frozenset([\"(\", \",\", \")\"])",
+    "replace": "_CODE_END = frozenset([\"(\", \",\", \")\", \":\"])"
+  },
+  {
+    "id": "M50-a-quoted-value-can-be-a-reference",
+    "why": "The quote guard is what keeps `TOKEN = \"a.b.c\"` — a JWT — out of the member-path exemption. Dropping it makes every quoted dotted literal a reference, which is the exact bypass this exemption was designed not to open, and again only a contract assertion notices.",
+    "file": "keyless_hooks/fingerprint.py",
+    "find": "    if start > 0 and text[start - 1] in \"\\\"'`\":\n        return False",
+    "replace": "    if False:\n        return False"
+  },
+  {
+    "id": "M51-a-spliced-name-is-not-an-assignment",
+    "why": "The bypass this closed, and it was published as unfixed. A quote inside the NAME defeats the prefix regex, so `export SECRET''_KEY=<literal>` reached no check at all while `gh''p_<literal>` — the same three marks in the VALUE — was already caught. Reverting to the bare prefix restores the asymmetry, and four adversarial rows go red.",
+    "file": "keyless_hooks/checks/shell_assign.py",
+    "find": "        pair = assignment_split(tok, declared=decl or wrapped)",
+    "replace": "        pair = assignment_split(tok)"
+  },
+  {
+    "id": "M52-collapse-a-name-everywhere",
+    "why": "The widening half, and the one a reader is most likely to think is a simplification. Collapsing the name in assignment-PREFIX position too invents an assignment no shell makes: measured on bash, zsh and sh, `FOO\"\"_BAR=hello` standing alone is a command name and leaves FOO_BAR unset. Only the paired positional assertion can see this; every deny case stays green.",
+    "file": "keyless_hooks/shellview.py",
+    "find": "    if not declared:\n        return None",
+    "replace": "    if False:\n        return None"
   }
 ]

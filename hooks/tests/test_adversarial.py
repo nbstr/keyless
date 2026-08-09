@@ -114,6 +114,20 @@ ATTACKS = [
                          "quote splicing inside the value"),
     ("assign_backslash", "export GH_TOKEN=gh\\p_" + DECOY["github_pat"][4:],
                          "backslash splicing inside the value"),
+    # The same three marks, moved from the VALUE to the NAME. Run on bash, zsh
+    # and sh: after `export`, `declare` or a wrapper the word is an ARGUMENT,
+    # quote removal happens first, and the variable is set exactly as the bare
+    # spelling sets it. In assignment-PREFIX position it is not — `FOO""_BAR=x`
+    # on its own is a command name and the shell answers "command not found" —
+    # which is why there is no bare-prefix row here to match these.
+    ("assign_name_splice", "export SECRET''_KEY=%s" % DECOY["generic"],
+                           "quote splicing inside the NAME"),
+    ("assign_name_splice_dq", 'export PG""PASSWORD=%s psql' % DECOY["generic"],
+                              "double-quote splicing inside the NAME"),
+    ("assign_name_backslash", "export GITHUB\\_TOKEN=%s" % DECOY["github_pat"],
+                              "backslash splicing inside the NAME"),
+    ("assign_name_quoted_whole", 'env "NPM_TOKEN=%s" npm publish' % DECOY["npm"],
+                                 "the whole assignment word quoted, behind a wrapper"),
     ("assign_do",        "for i in 1 2; do export JWT=%s; done" % DECOY["jwt"],
                          "a loop body"),
     ("assign_then",      "if true; then export GITHUB_TOKEN=%s; fi" % DECOY["github_pat"],

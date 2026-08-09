@@ -149,6 +149,116 @@ def _too_plain(value):
     return len(set(value)) < _MIN_DISTINCT
 
 
+# ── a credential VALUE, or a reference to one ───────────────────────────────
+#
+# `SECRET_KEY = "AKIA…"` holds a credential. `this.secret` = `config.secret` and
+# `token` = `getAuthToken()` NAME one, and naming one is the usage this whole pack
+# asks people to write. The name-keyed rule above cannot tell them apart on its
+# own: it sees a credential word, an assignment, and something on the right.
+#
+# Three syntactic tests separate them, and each reads the characters AROUND the
+# value rather than the value's own bytes — no entropy test, because a credential
+# and an identifier are indistinguishable by entropy at these lengths and a
+# threshold there would move with every fixture anyone writes:
+#
+#   a run-time substitution   `AUTH_TOKEN="$(cat ~/.token)"`
+#   a code TERMINATOR         `credentials: PushConfig,`  `token = getToken(`
+#   a member PATH             `this.secret` = `config.secret`
+#
+# **A quoted value is always a literal.** Whatever it holds, someone spelled it,
+# so the two tests that read the value's own SHAPE require it to be UNQUOTED —
+# and `TOKEN = "abc.def.ghi"`, the JWT this exemption must never admit, is a
+# literal by that line alone. The substitution test runs before it, because a
+# quoted `$( … )` is still assembled at run time and still was never typed.
+_SEGMENT = re.compile(r"^[A-Za-z_$][A-Za-z0-9_$]*$")
+
+# Characters that end an EXPRESSION and cannot end a bare value in any data
+# grammar. `.env`, a shell assignment, YAML, an INI and an HTTP header all run a
+# bare value to whitespace or to end of line; none of them puts a `(`, a `,` or a
+# `)` immediately after one. Every programming language does.
+#
+# The list is short because it is a CLOSED list of characters that cannot sit
+# inside a credential, and every character left out was left out for a reason a
+# measurement produced:
+#
+#   `:`  a composite token carries one — `<token>::<scope>` in the corpus, and a
+#        Telegram bot token is `<digits>:<body>`. Reading it as code punctuation
+#        dropped one real credential out of 466 on the command corpus. Measured,
+#        not predicted.
+#   `;`  `SECRET=<literal>; ./deploy.sh` is an ordinary shell line.
+#   `!` `#` `$` `%` `&` `?` `*`
+#        a generated password is made of these. The value class stops at the
+#        first one, so the character AFTER a real password is routinely one of
+#        them.
+#
+# Leaving them out costs 62 exemptions of 217 on the write corpus. 48 are dotted
+# member paths, which `_is_member_path` withholds anyway; the other 14 are a bare
+# identifier standing before a `;`, and those stay rewritten. That is the price
+# of not reading a shell statement separator as code punctuation, paid in full
+# rather than rounded away.
+_CODE_END = frozenset(["(", ",", ")"])
+
+
+def _is_member_path(value):
+    """`process.env.SECRET`, `config.secret`, `credentials.value.password`.
+
+    A member expression reads a credential from somewhere; it never is one. The
+    bounds are what keeps a dotted TOKEN out: a JWT's first segment is base64 of
+    a JSON header — longer than 24 characters and carrying digits — so it fails
+    twice here, and it is caught by the `jwt` vendor pattern regardless, which
+    this exemption cannot reach because it withholds only the name-keyed finding.
+    """
+    if "." not in value:
+        return False
+    parts = value.split(".")
+    if not 2 <= len(parts) <= 4:
+        return False
+    for part in parts:
+        if len(part) > 40 or not _SEGMENT.match(part):
+            return False
+    head = parts[0]
+    return len(head) <= 24 and not any(c.isdigit() for c in head)
+
+
+def _is_reference(text, start, end):
+    """True when the matched value NAMES a credential rather than holding one.
+
+    What this does NOT separate is the residual class, and naming it is worth
+    more than a claim of completeness: a bare identifier that ends on whitespace
+    or on end of line. `password`: `E2E_LOGIN_PASSWORD` and `PGPASSWORD`=<a real
+    literal> are the same three tokens in the same order, and only the value's
+    own randomness tells them apart. Measured over 51,384 write payloads that
+    class is 102 of the 259 name-keyed findings that still survive this test.
+
+    Three discriminators reach it and none is here, each for a measured reason:
+    an ENTROPY floor, which no pattern in this module tests and which moves with
+    every fixture anyone writes; the SEPARATOR, exempting `key: value` and
+    keeping `key=value`, which drops a credential written into an HTTP header
+    and one in a YAML mapping; and "the same word APPEARS ELSEWHERE in this
+    file", which drops a real API key that a test spelled twice.
+    """
+    value = text[start:end]
+    if "$(" in value or "`" in value:
+        # Assembled when the file is READ, so nothing was typed and nothing is in
+        # the transcript. `${VAR}` and a bare `$VAR` are already placeholders;
+        # this is the third spelling and the pack's own remediation uses it.
+        #
+        # Scoped to the name-keyed rule on purpose. `_is_placeholder` is shared
+        # with `_URL_AUTH`, and putting it there would clear a connection string
+        # whose userinfo password is a back-quoted substitution. That row is the
+        # ONE proof that KL-ASSIGN's expansion-blanking is load-bearing rather
+        # than decorative, and clearing it here would make the proof vacuous.
+        return True
+    if start > 0 and text[start - 1] in "\"'`":
+        return False
+    if (text[end] if end < len(text) else "") in _CODE_END:
+        # `token` = `getAuthToken(`, `credentials: PushConfig,`, `secret: KEY)`.
+        # The match is an expression in a programming language, so the credential
+        # word in front of it is a field name and not a key holding a value.
+        return True
+    return _is_member_path(text[start:end])
+
+
 def _name_left_of(text, offset, end=None):
     """The identifier around a match, as a rewrite name.
 
@@ -225,6 +335,8 @@ def scan(text, limit=64):
         if _is_placeholder(value) or _too_plain(value):
             continue
         gi = 2 if m.group(2) is not None else (3 if m.group(3) is not None else 4)
+        if _is_reference(text, m.start(gi), m.end(gi)):
+            continue
         raw.append((m.start(gi), m.end(gi), "named_credential",
                     _name_left_of(text, m.start("kw"), m.end("kw"))))
         if len(raw) >= limit:

@@ -243,7 +243,7 @@ def _unquote(tok):
     return tok
 
 
-def assignment_split(token):
+def assignment_split(token, declared=False):
     """`(name, raw_value)` for a shell assignment word, or None.
 
     The value is returned EXACTLY as written — quotes, expansions and all —
@@ -255,13 +255,37 @@ def assignment_split(token):
     A second copy of that pattern in a check module drifts the first time this
     one is corrected, and the two would then disagree about where a statement's
     assignment prefix ends.
+
+    `declared` collapses quotes and backslashes out of the NAME before matching,
+    and it exists because the two positions genuinely behave differently. Run on
+    bash, zsh and sh:
+
+        FOO""_BAR=hello              -> command not found; FOO_BAR is UNSET
+        export FOO""_BAR=hello       -> FOO_BAR is hello
+        env FOO""_BAR=hello sh -c …  -> FOO_BAR is hello
+
+    In assignment-prefix position the name must be unquoted or the word is a
+    COMMAND, so collapsing there would invent an assignment the shell never
+    makes. After `export`, `declare`, `local`, `readonly` or a wrapper the word
+    is an ARGUMENT: quote removal happens first and the builtin then parses
+    `NAME=value` out of the result. The pack already collapses both marks on the
+    VALUE side, where `gh""p_<literal>` is caught; a name a tokenizer cannot read
+    was the same six-character bypass wearing the other hat.
     """
     if not token:
         return None
     m = _ASSIGN_PREFIX.match(token)
-    if not m:
+    if m:
+        return token[:m.end() - 1], token[m.end():]
+    if not declared:
         return None
-    return token[:m.end() - 1], token[m.end():]
+    eq = token.find("=")
+    if eq <= 0:
+        return None
+    name = token[:eq].replace("'", "").replace('"', "").replace("\\", "")
+    if not _ASSIGN_PREFIX.match(name + "="):
+        return None
+    return name, token[eq + 1:]
 
 
 def is_wrapper(name):

@@ -109,9 +109,16 @@ def assignments(stmt):
     is the whole precision of this check: the same token is an assignment before
     the statement's head and an argument after it, and only one of those two is
     a shell variable being set.
+
+    The walk also decides whether a quote inside the NAME counts. After a
+    declaration verb or a wrapper the word is an ARGUMENT and the shell removes
+    the quotes before setting the variable, so `export SECRET''_KEY=<literal>`
+    sets SECRET_KEY; in assignment-PREFIX position the same word is a command
+    name and sets nothing. `assignment_split` carries the measurement.
     """
     out = []
     decl = False
+    wrapped = False
     past_head = False
     skip_next = False
     for start, end in words(stmt):
@@ -125,7 +132,7 @@ def assignments(stmt):
             if not tok.strip("<>&|0123456789"):
                 skip_next = True
             continue
-        pair = assignment_split(tok)
+        pair = assignment_split(tok, declared=decl or wrapped)
         if pair is not None:
             if decl or not past_head:
                 out.append(pair)
@@ -141,6 +148,12 @@ def assignments(stmt):
         if not past_head and is_wrapper(word):
             # `env FOO=1 cmd` puts the assignment AFTER the wrapper. Treating
             # `env` as the head would read `FOO=1` as its argument.
+            #
+            # It also moves the word out of assignment-PREFIX position and into
+            # argument position, where the shell removes quotes from the NAME
+            # before setting the variable — so `declared` goes on here for the
+            # same reason it goes on after `export`.
+            wrapped = True
             continue
         if decl:
             # `export FOO` — a name already set is being re-exported, no value.
