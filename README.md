@@ -89,6 +89,18 @@ cargo install --path .
 keyless --version
 ```
 
+**The repository is private, and the clone is the step that tells you so
+badly.** Without access, git answers `remote: Repository not found` — which
+reads as a typo in the URL, not as a permission you have to be given. There is
+no way to tell those apart from the message, so: if you see it, you need to be
+added to the repository. Nothing later in this file is reachable until you are.
+
+With access, the SSH remote avoids a browser round trip:
+
+```console
+git clone git@github.com:nbstr/keyless
+```
+
 Requires Rust 1.89 or later — [rustup.rs](https://rustup.rs) if you have no
 toolchain. `cargo install` writes to `~/.cargo/bin`, which has to be on your
 `PATH`; the `--version` line is there so you find that out now rather than
@@ -99,34 +111,179 @@ behaviour beyond POSIX process handling. The daemon's caller attestation is the
 exception — it is XNU-specific, and [`install/README.md`](install/README.md)
 records what replaces each piece on Linux.
 
-That installs the client only, and the client alone reads your keychain
-directly. For the uid boundary, see [`install/README.md`](install/README.md) —
+That builds two binaries — `keyless`, the client, and `keylessd`, the daemon —
+and puts both on your `PATH`. Installing them is not standing the daemon up:
+until you do, nothing is listening, and `keyless` reads your keychain directly
+as you. For the uid boundary, see [`install/README.md`](install/README.md) —
 one `sudo`, and the installer is dry-run until you pass `--commit`.
+
+### Who this is for
+
+Somebody who runs commands in a terminal. That is not a style note — `run` is
+the whole product, and it wraps a command you were going to type anyway. Wrap
+nothing and there is nothing to gain: this tool never stores a password for a
+website, and there is no window to open.
+
+There is also no release binary. Installing means a Rust toolchain and a
+compile from source, and every store beyond the keychain means a CLI you log
+into yourself. Both are fine for somebody whose day already contains a
+terminal, and both are a wall for somebody whose day does not.
+
+### What is yours alone, and cannot be handed to you
+
+The keychain path below needs nothing but a Mac. **Every other store needs an
+account that is yours**, and no amount of configuration shortcuts it:
+
+| | What you have to do yourself |
+|---|---|
+| **macOS keychain** | Nothing. It is on by default and needs no config file. |
+| **Infisical** | Log in as you. The CLI resolves its project from the **working directory**, so the same command answers in one directory and fails in another with nothing in the output saying that location was the difference. |
+| **Proton Pass** | Log in as you. The agent token is minted per account and its session directory does **not** copy between machines or between people. |
+
+So a config file can be shared and a *setup* cannot. Somebody else's working
+`config.json` is a map, never a key: the names and routes in it are portable,
+and the identity that opens them is not.
+
+Nothing in that table is a limitation of this tool — a broker that let one
+person's vault session travel to another person would be the bug.
 
 ---
 
-## Your first command
+## The first five minutes
 
-Put a secret in your keychain — or let `keyless` generate one and put it there,
-which is the flow in which no plaintext exists outside the store:
+Nothing assumed, ending in one working `keyless run`. Keychain only, because it
+is the one store that needs no account you do not already have.
 
-```console
-$ security add-generic-password -s keyless -a DATABASE_URL -w
-$ keyless new DATABASE_URL          # generates it; see Storing a secret below
-```
-
-Then use it:
+**1. Install, and prove it is on your `PATH`.**
 
 ```console
-$ keyless run -s DATABASE_URL -- psql
+$ cargo install --path .
+$ keyless --version
 ```
 
-That already works with no config file at all: an undeclared name is looked up
-as its own account under the default keychain service. **Declaring names is what
-makes them enumerable**, which is what `ls` lists — and what lets one name point
-somewhere other than the default.
+**2. Store something. Not a real credential yet — a throwaway.**
 
-`~/.config/keyless/config.json`:
+`put` reads the value from stdin and nothing else. It echoes nothing back.
+
+```console
+$ printf '%s' 'throwaway-value' | keyless put FIRST_SECRET
+keyless: `FIRST_SECRET` is not declared in your config, so `keyless ls` will not
+list it and `keyless doctor --probe` will not check it. The value is stored either way.
+stored	FIRST_SECRET	keychain keyless/FIRST_SECRET	keychain (this user, no separate manager exists)
+```
+
+The warning is the first line and `stored` is the result. Both are true: the
+write landed, and until step 5 gives the name a config entry, the two verbs you
+would reach for to confirm it will say nothing about it.
+
+**3. Use it.**
+
+```console
+$ keyless run -s FIRST_SECRET -- sh -c 'echo "${#FIRST_SECRET} characters arrived"'
+15 characters arrived
+```
+
+That is the whole product. The value reached the child, your shell history
+holds the name and not the value, and nothing printed it.
+
+**4. Now try to check your work the way you check everything else.**
+
+```console
+$ keyless get FIRST_SECRET
+keyless: there is no `get`, and there will not be one.
+```
+
+**This is the part worth pausing on.** Every other tool you have used answers
+that question, and the absence of an answer here is the product rather than a
+gap in it. There is no flag, no debug mode and no newer build in which `get`
+appears.
+
+There *is* a way to ask whether a name resolves. It just never answers with a
+value — and it only knows about names you have **declared**, which is what the
+config file is for.
+
+**5. Write the config file. This is the only hand-written step.**
+
+Everything above worked without one, because an undeclared name is looked up as
+its own account in the default store. What a config buys is that `keyless` now
+knows the name exists — so it can list it, and check it.
+
+`~/.config/keyless/config.json`, in full:
+
+```json
+{
+  "stores": { "keychain": { "service": "keyless" } },
+  "secrets": { "FIRST_SECRET": { "note": "throwaway, delete me" } }
+}
+```
+
+```console
+$ keyless ls
+FIRST_SECRET	*	-	throwaway, delete me
+
+$ keyless doctor --probe
+store    keychain ok
+name     FIRST_SECRET resolves
+```
+
+`resolves`, never the value, and never its length — a length is still
+information about a secret.
+
+**6. Read the one failure that does not look like a failure.**
+
+Ask for a name that does not exist, with a command that would otherwise
+succeed:
+
+```console
+$ keyless run -s NO_SUCH_NAME -- sh -c 'echo "got [${NO_SUCH_NAME}]"'
+keyless: DEGRADED — 1 names unresolved: NO_SUCH_NAME
+keyless:   NO_SUCH_NAME: not found in any store
+got []
+$ echo $?
+0
+```
+
+**Exit 0, with the secret missing.** That is deliberate and it is
+[Rule 1](#rule-1-it-never-refuses-to-run-your-command): blocking your work gets
+the tool uninstalled, and then the plaintext comes back. The cost is that a
+misconfigured name reaches your program as an unset variable, so what you see
+is your program's own error — a `401`, an empty query, a login page — and not
+this tool's.
+
+**So read stderr on your first run of anything.** `DEGRADED` is the only place
+that failure is ever named. Every line after it belongs to your command.
+
+**7. Clean up the throwaway**, so it is not mistaken later for something real:
+
+```console
+$ security delete-generic-password -s keyless -a FIRST_SECRET
+```
+
+You are now in a position to store a real credential the same way, and to read
+the rest of this file when a question comes up rather than before.
+
+---
+
+## Names, the config, and what `ls` is telling you
+
+[The first five minutes](#the-first-five-minutes) walks the shortest path
+through these. This section is the rest of the answer.
+
+Three ways a value gets into a store, and the third leaves no plaintext
+anywhere outside it:
+
+```console
+$ security add-generic-password -s keyless -a DATABASE_URL -w   # type it
+$ printf '%s' "$from_the_provider" | keyless put DATABASE_URL   # pipe it
+$ keyless new DATABASE_URL          # generate it; see Storing a secret below
+```
+
+All three work **with no config file at all**: an undeclared name is looked up
+as its own account under the default keychain service. What a config buys is
+enumerability — a name `keyless` has been told about is one `ls` can list and
+`doctor --probe` can check, and an undeclared name is invisible to both even
+though `run` resolves it perfectly well. Declaring is also what lets one name
+point somewhere other than the default:
 
 ```json
 {
@@ -138,22 +295,7 @@ somewhere other than the default.
 }
 ```
 
-```console
-$ keyless ls
-DATABASE_URL	*	-	staging read replica
-GITHUB_TOKEN	*	-	-
-
-$ keyless doctor
-config   /Users/you/.config/keyless/config.json
-         ok, 2 names declared
-audit    /Users/you/.local/state/keyless/audit.jsonl
-         ok, 41 rows, chain intact
-store    keychain ok
-
-0 problem(s). A problem here degrades a run; it never blocks one.
-```
-
-`doctor --probe` additionally asks each name whether it **resolves**, printing
+`doctor --probe` asks each declared name whether it **resolves**, printing
 `resolves` or `missing` — never a value, and never a length, because a length is
 still information about a secret. It may trigger a keychain access prompt, which
 a plain `doctor` does not.

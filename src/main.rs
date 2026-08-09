@@ -4,6 +4,7 @@
 //! and so the never-block invariant is provable by calling a function rather
 //! than by scraping a terminal.
 
+use std::env;
 use std::ffi::OsString;
 use std::io::{self, IsTerminal, Write};
 use std::path::PathBuf;
@@ -15,6 +16,7 @@ use keyless::audit::AuditLog;
 use keyless::cmd::discover::{fields, items};
 use keyless::cmd::doctor::doctor;
 use keyless::cmd::ls::ls;
+use keyless::cmd::refuse;
 use keyless::cmd::run::{Binding, RunRequest, TtyPolicy, run};
 use keyless::cmd::write::{new, put};
 use keyless::config::Config;
@@ -80,6 +82,32 @@ enum Verb {
     Put(PutArgs),
     /// Check the config, the stores and the audit log.
     Doctor(DoctorArgs),
+
+    /// The words people reach for when they want to see a value.
+    ///
+    /// Hidden, so the verb list above stays exactly as long as it was and a
+    /// reader can still check at a glance that nothing prints a value. Nothing
+    /// new is reachable: these already exited 2, and they still exit 2. What
+    /// changes is that the exit now says why. See [`keyless::cmd::refuse`].
+    #[command(
+        name = "get",
+        hide = true,
+        aliases = ["show", "cat", "read", "reveal", "print", "view", "dump", "export"]
+    )]
+    Refused(RefusedArgs),
+}
+
+#[derive(Args)]
+struct RefusedArgs {
+    /// Swallowed and never read. `keyless get DATABASE_URL` has to reach the
+    /// refusal rather than dying on an unexpected argument, because the name is
+    /// exactly what somebody typing this would have supplied.
+    #[arg(
+        trailing_var_arg = true,
+        allow_hyphen_values = true,
+        value_name = "IGNORED"
+    )]
+    rest: Vec<OsString>,
 }
 
 #[derive(Args)]
@@ -144,12 +172,26 @@ struct PutArgs {
 struct RunArgs {
     /// A secret to inject, as NAME or ENV=NAME. Repeatable.
     ///
-    /// `OsString` rather than `String`, and that is a never-block fix rather
-    /// than a nicety. clap rejects a non-UTF-8 value for a `String` argument
-    /// **before `dispatch` is ever called**, and exits 2 — a third way out with
-    /// no child, reached while a perfectly runnable command sat after the `--`.
-    /// Taken as bytes, the same input becomes one unresolvable name: the run
-    /// warns, degrades, and still runs the command.
+    /// `-s DATABASE_URL` puts the secret `DATABASE_URL` in the child's
+    /// environment as `$DATABASE_URL`. `-s PGURL=DATABASE_URL` puts the same
+    /// secret there as `$PGURL`, so what a store calls something and what a
+    /// program expects never have to agree.
+    ///
+    /// Repeat the flag for each name. A name that cannot be resolved does not
+    /// stop the run: it is reported on stderr and the command runs with that
+    /// variable unset.
+    //
+    // `OsString` rather than `String`, and that is a never-block fix rather
+    // than a nicety. clap rejects a non-UTF-8 value for a `String` argument
+    // **before `dispatch` is ever called**, and exits 2 — a third way out with
+    // no child, reached while a perfectly runnable command sat after the `--`.
+    // Taken as bytes, the same input becomes one unresolvable name: the run
+    // warns, degrades, and still runs the command.
+    //
+    // Kept as an ordinary comment, not a doc comment: clap renders paragraph
+    // two onward of a doc comment as `--help` text, so this paragraph was
+    // being shown to every user who asked what `-s` does. A maintainer's
+    // reason for a type is not the answer to that question.
     #[arg(short = 's', long = "secret", value_name = "[ENV=]NAME")]
     secret: Vec<OsString>,
 
@@ -266,7 +308,22 @@ fn dispatch() -> i32 {
         // The header is for a person; a pipe gets the four fields it always
         // got. `stdout` is the stream being asked about, so it is the one asked.
         Verb::Ls => match ls(&load.config, io::stdout().is_terminal(), &mut io::stdout()) {
-            Ok(()) => 0,
+            Ok(()) => {
+                // An empty `ls` printed nothing at all and exited 0, which is
+                // the same output a broken install produces — and the state
+                // every new user is in on their first run. The counts stay on
+                // stdout at zero bytes, so a parser sees exactly what it always
+                // saw; the sentence goes to stderr, where every other note from
+                // this tool already goes.
+                if load.config.secrets.is_empty() {
+                    eprintln!(
+                        "{NAME}: no names declared. `{NAME} run -s NAME -- cmd` still works for a \
+                         name your default store already holds; declaring names is what makes \
+                         them listable here."
+                    );
+                }
+                0
+            }
             Err(error) => {
                 eprintln!("{NAME}: {error}");
                 1
@@ -339,6 +396,7 @@ fn dispatch() -> i32 {
             else {
                 return 78;
             };
+            warn_if_undeclared(&load.config, &args.name);
             let route = load.config.route(&args.name);
             let written = new(
                 writer.as_ref(),
@@ -363,6 +421,7 @@ fn dispatch() -> i32 {
             else {
                 return 78;
             };
+            warn_if_undeclared(&load.config, &args.name);
             let route = load.config.route(&args.name);
             let interactive = io::stdin().is_terminal();
 
@@ -437,6 +496,38 @@ fn dispatch() -> i32 {
                 }
             }
         }
+
+        // Stderr, not stdout. This verb produces no result, and a message on
+        // stdout would land in whatever the user piped it into — the one place
+        // an explanation is no help at all.
+        Verb::Refused(_) => {
+            let word = refuse::typed_word(env::args());
+            match refuse::no_such_verb(&word, &mut io::stderr()) {
+                Ok(code) => code,
+                Err(_) => refuse::EXIT_NO_SUCH_VERB,
+            }
+        }
+    }
+}
+
+/// Say so when a stored name is one nothing else in the tool will ever mention.
+///
+/// `put` and `new` accept an undeclared name on purpose — it routes to its own
+/// account in the default store, and requiring a config edit before a first
+/// write would put a text editor in front of the shortest safe path. But `ls`
+/// and `doctor --probe` read the CONFIG, so an undeclared name is invisible to
+/// both: `put` reports `stored`, and the two verbs a person then reaches for to
+/// confirm it print nothing about it at all.
+///
+/// Three outputs that each look like a working tool, describing a name that is
+/// really there. The write is fine; the silence afterwards is what needs a
+/// sentence. On stderr, so `stored` stays the only thing on stdout.
+fn warn_if_undeclared(config: &Config, name: &str) {
+    if !config.secrets.contains_key(name) {
+        eprintln!(
+            "{NAME}: `{name}` is not declared in your config, so `{NAME} ls` will not list it \
+             and `{NAME} doctor --probe` will not check it. The value is stored either way."
+        );
     }
 }
 
