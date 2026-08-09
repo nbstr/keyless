@@ -1503,6 +1503,7 @@ fn doctor_report(dir: &Path, config: &str) -> (String, i32) {
             load: &load,
             registry: &registry,
             audit: &audit,
+            setup: None,
             notes: &[],
             probe: false,
             style: keyless::cmd::status::Style::PLAIN,

@@ -127,14 +127,48 @@ fn the_help_verb_list_does_not_grow_a_reading_verb() {
         .collect::<Vec<_>>();
     assert!(!listed.is_empty(), "the parser read no rows: {commands}");
 
+    // The four setup-family verbs are the justification this gate asks for.
+    // None of them reads a store: `setup` writes a config and registers a hook
+    // pack, `disable`/`enable` flip one boolean in the pack's own config, and
+    // `uninstall` deletes what a receipt says was created. Not one of them can
+    // reach a credential, so none of them can print one.
     assert_eq!(
         listed,
         [
-            "run", "ls", "items", "fields", "new", "put", "doctor", "init"
+            "run",
+            "ls",
+            "items",
+            "fields",
+            "new",
+            "put",
+            "doctor",
+            "init",
+            "setup",
+            "disable",
+            "enable",
+            "uninstall"
         ],
         "the visible verb set changed; every addition has to be justified against \
          `no verb prints a value`"
     );
+}
+
+/// The way out is listed where a person in a hurry will look.
+///
+/// A guard that cannot be turned off gets destroyed instead: somebody who
+/// cannot find the switch guts their settings file by hand, and then the
+/// protection is gone silently and for good. So `--help` has to name it — and
+/// this is the surface a PERSON reads, which is why the block message an agent
+/// reads deliberately does not.
+#[test]
+fn the_help_names_the_off_switch_and_the_way_back() {
+    let text = stdout_of(&keyless(&["--help"]));
+    for expected in ["disable", "enable", "uninstall"] {
+        assert!(
+            text.contains(expected),
+            "`--help` does not mention `{expected}`:\n{text}"
+        );
+    }
 }
 
 #[test]

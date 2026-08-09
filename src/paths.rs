@@ -257,6 +257,87 @@ impl Paths {
     }
 }
 
+/// The three paths setup writes that are not the config and not the audit log.
+///
+/// Separate from [`Paths`] rather than three more fields on it, because every
+/// verb takes `Paths` and only three of them have any business knowing these
+/// exist. The split is also what keeps `run` unable to reach the receipt.
+#[derive(Debug, Clone)]
+pub struct SetupPaths {
+    /// What setup created, so uninstall can remove exactly that and no more.
+    pub receipt: PathBuf,
+    /// The hook pack's own config — where the guards are switched off.
+    ///
+    /// The same file `hooks/keyless_hooks/config.py` reads, resolved the same
+    /// way. Two resolvers that disagree would put the off switch in a file
+    /// nothing reads, which is the failure a kill switch may not have.
+    pub hooks_config: PathBuf,
+    /// The agent harness's configuration directory. May not exist, and an
+    /// absent one is a normal machine rather than a fault.
+    pub claude_dir: PathBuf,
+}
+
+impl SetupPaths {
+    /// Resolve from the environment.
+    ///
+    /// Overrides, highest precedence first: `KEYLESS_RECEIPT`,
+    /// `KEYLESS_HOOKS_CONFIG` and `KEYLESS_CLAUDE_DIR`; then `XDG_STATE_HOME` /
+    /// `XDG_CONFIG_HOME`; then `$HOME`.
+    ///
+    /// **The agent directory is `~/.claude` and the override is one of ours.**
+    /// The harness's own documented location is that path; whether it reads an
+    /// environment variable of its own to move it is not established, so
+    /// nothing here claims it does. A machine that keeps its settings somewhere
+    /// else says so with `--claude-dir` or `KEYLESS_CLAUDE_DIR`, and every
+    /// report prints the resolved file — an install into a settings file the
+    /// harness never opens would report success and guard nothing, so the path
+    /// is named on screen rather than assumed.
+    #[must_use]
+    pub fn discover() -> Self {
+        let prefix = NAME.to_uppercase();
+        let home = env::var_os("HOME").map_or_else(|| PathBuf::from("."), PathBuf::from);
+
+        let receipt = env::var_os(format!("{prefix}_RECEIPT"))
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                dir_from_env("XDG_STATE_HOME", home.join(".local").join("state"))
+                    .join(NAME)
+                    .join("setup-receipt.json")
+            });
+
+        let hooks_config = env::var_os(format!("{prefix}_HOOKS_CONFIG"))
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                dir_from_env("XDG_CONFIG_HOME", home.join(".config"))
+                    .join(NAME)
+                    .join("hooks.json")
+            });
+
+        SetupPaths {
+            receipt,
+            hooks_config,
+            claude_dir: dir_from_env(&format!("{prefix}_CLAUDE_DIR"), home.join(".claude")),
+        }
+    }
+
+    /// Every setup path under one directory. Used by tests and by anyone who
+    /// wants a self-contained profile.
+    #[must_use]
+    pub fn under(root: &Path) -> Self {
+        SetupPaths {
+            receipt: root.join("setup-receipt.json"),
+            hooks_config: root.join("hooks.json"),
+            claude_dir: root.join("claude"),
+        }
+    }
+
+    /// The settings file the hook pack registers itself in.
+    #[must_use]
+    pub fn settings(&self) -> PathBuf {
+        self.claude_dir.join("settings.json")
+    }
+}
+
 fn dir_from_env(var: &str, fallback: PathBuf) -> PathBuf {
     match env::var_os(var) {
         Some(value) if !value.is_empty() => PathBuf::from(value),

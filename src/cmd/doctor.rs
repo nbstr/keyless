@@ -141,6 +141,12 @@ pub struct DoctorRequest<'a> {
     pub registry: &'a Registry,
     /// The log to verify.
     pub audit: &'a AuditLog,
+    /// Where the guards' switch is, so this report can say when it is off.
+    ///
+    /// `None` skips the row entirely rather than reporting an unknown state.
+    /// A caller with no opinion about setup is asking about stores and names,
+    /// and inventing a guards row for it would be a claim nobody made.
+    pub setup: Option<&'a crate::paths::SetupPaths>,
     /// How the registry was assembled, for someone who came to ask.
     pub notes: &'a [String],
     /// Also ask each declared name whether it resolves. READS each credential.
@@ -169,6 +175,7 @@ pub fn doctor(request: &DoctorRequest<'_>, out: &mut dyn Write) -> io::Result<i3
         load,
         registry,
         audit,
+        setup,
         notes,
         probe,
         style,
@@ -176,6 +183,9 @@ pub fn doctor(request: &DoctorRequest<'_>, out: &mut dyn Write) -> io::Result<i3
     let mut problems = 0;
 
     header(paths, load, style, out)?;
+    if let Some(setup) = setup {
+        guards(setup, style, out)?;
+    }
 
     if !notes.is_empty() {
         heading(out, style, "NOTES")?;
@@ -241,8 +251,98 @@ fn header(paths: &Paths, load: &ConfigLoad, style: Style, out: &mut dyn Write) -
         action(
             out,
             style,
-            &format!("{} init detects your stores and writes one", crate::NAME),
+            &format!("{} setup detects your stores and writes one", crate::NAME),
         )?;
+    }
+    Ok(())
+}
+
+/// Whether the guards are firing — and it is at the TOP of the report for one
+/// reason.
+///
+/// A disabled install that reports healthy is the worst false green available
+/// here: the reader believes a whole layer is protecting them and it is inert.
+/// So the state is stated before the store rows rather than after them, in the
+/// same vocabulary as everything else, with a distinct glyph and a distinct
+/// word — and a reader who scans only the marks still sees it.
+///
+/// It deliberately does NOT count as a problem for the exit code. Somebody who
+/// turned the guards off meant to, and a health command that goes red over a
+/// choice is a health command people stop running — which is how the switch
+/// stops being an honest alternative to gutting the settings file by hand.
+fn guards(setup: &crate::paths::SetupPaths, style: Style, out: &mut dyn Write) -> io::Result<()> {
+    use crate::cmd::setup::Guards;
+
+    heading(out, style, "GUARDS")?;
+    match crate::cmd::setup::guards(setup) {
+        Guards::Armed => {
+            let registered = std::fs::read_to_string(setup.settings())
+                .is_ok_and(|text| text.contains("keyless_hook.py"));
+            if registered {
+                row(
+                    out,
+                    style,
+                    Mark::Proven,
+                    "guards",
+                    6,
+                    "proven",
+                    &format!("registered in {}", setup.settings().display()),
+                )?;
+            } else {
+                row(
+                    out,
+                    style,
+                    Mark::NotSetUp,
+                    "guards",
+                    6,
+                    "absent",
+                    "nothing refuses a command that would print a credential",
+                )?;
+                action(
+                    out,
+                    style,
+                    &format!(
+                        "{} setup   installs them, naming every file it touches",
+                        crate::NAME
+                    ),
+                )?;
+            }
+        }
+        Guards::Disabled => {
+            row(
+                out,
+                style,
+                Mark::Off,
+                "guards",
+                6,
+                "off",
+                &format!(
+                    "SWITCHED OFF. No check fires, whatever is registered. \
+                     `enabled: false` in {}",
+                    setup.hooks_config.display()
+                ),
+            )?;
+            action(
+                out,
+                style,
+                &format!("{} enable   turns them back on, instantly", crate::NAME),
+            )?;
+        }
+        Guards::Observing => {
+            row(
+                out,
+                style,
+                Mark::Off,
+                "guards",
+                6,
+                "off",
+                &format!(
+                    "recording only. Every check runs and NOTHING is blocked. \
+                     `observe: true` in {}",
+                    setup.hooks_config.display()
+                ),
+            )?;
+        }
     }
     Ok(())
 }
@@ -825,6 +925,7 @@ mod tests {
                 load,
                 registry,
                 audit,
+                setup: None,
                 notes: &[],
                 probe,
                 style: Style::PLAIN,
