@@ -1367,12 +1367,14 @@ fallback is automatic, so a switch would only be a way to get it wrong.
 Append-only JSONL at `~/.local/state/keyless/audit.jsonl`, mode 0600.
 
 ```json
-{"hash":"9f2c…","v":1,"ts":"2026-08-06T14:22:01.417Z","ts_ms":1786033321417,
+{"hash":"9f2c…","v":1,"ts":"2000-01-01T00:00:00.123Z","ts_ms":946684800123,
  "verb":"run","state":"INJECTED","cwd":"/Users/you/src/app",
  "names":["DATABASE_URL"],"unresolved":[],
  "argv":["psql","--dbname=[keyless:DATABASE_URL]"],
  "argv_truncated":false,"exit_code":0,"prev":"4ab1…"}
 ```
+
+`ts` is `ts_ms` rendered and nothing else, so the two can never disagree.
 
 **A value is never in here.** Not raw, not encoded, not hashed. The argv is
 redacted with the same masker that filters the child's output, so a value typed
@@ -1486,7 +1488,7 @@ There are no `TODO` comments in the source. Work is either done or listed here.
 ## Development
 
 ```console
-cargo test                              # 518 pass, 15 ignored (the live Proton suite)
+cargo test                              # 15 ignored (the live Proton suite)
 cargo clippy --all-targets -- -D warnings
 cargo fmt --check
 ```
@@ -1505,11 +1507,16 @@ Two guards police what this repository publishes about the person who wrote it.
 `tests/publication.rs` refuses a vault, item, account or service name that is
 not an allowlisted decoy, any prose that makes a claim about the machine it was
 written on, and any wall-clock instant that is not an obvious fixture — across
-every published file, not only the Rust sources. The publication layer of the
-hook suite refuses a number standing next to a word that makes it a measurement
-of one machine, in `hooks/` prose **and in commit messages**. Install the
-matching `commit-msg` hook so the second one fires before the message is written,
-which is the only point at which it can still be edited:
+every published file, not only the Rust sources, and a second time across every
+blob any ref can reach. That second corpus is not thoroughness: a class removed
+from the working tree by a later commit is still in the history a clone
+receives, and reading the tree alone reports it clean.
+
+The publication layer of the hook suite refuses a number standing next to a
+word that makes it a measurement of one machine, in `hooks/` prose **and in
+commit messages**. Install the matching `commit-msg` hook so the second one
+fires before the message is written, which is the only point at which it can
+still be edited:
 
 ```console
 ln -sf ../../install/commit-msg.sh .git/hooks/commit-msg
