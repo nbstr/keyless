@@ -96,6 +96,20 @@ for binary in keyless keylessd; do
     echo "Build first: cargo build --release  (missing target/release/$binary)" >&2
     exit 1
   fi
+  # And built from THIS source, not from whatever the tree said last week. The
+  # rule is cargo's own — a source newer than the artefact means a rebuild — so
+  # this refuses exactly what `cargo build --release` would redo, and `keyless
+  # doctor` asks the same question of the binary already installed.
+  #
+  # `-newer` on a path list rather than a `find -newer` over `src/` alone:
+  # `Cargo.lock` changes on a dependency bump and nothing under `src/` does.
+  newer="$(find "$REPO/src" "$REPO/Cargo.toml" "$REPO/Cargo.lock" \
+             -newer "$REPO/target/release/$binary" -print -quit 2>/dev/null || true)"
+  if [[ -n "$newer" ]]; then
+    echo "Stale build: $newer changed after target/release/$binary was built." >&2
+    echo "Run: cargo build --release" >&2
+    exit 1
+  fi
 done
 
 # Pick ids below 500 so macOS hides the account from the login window. Chosen
@@ -155,8 +169,12 @@ step dseditgroup -o edit -a "$DAEMON_USER" -t user "$ACCESS_GROUP"
 
 note "Binaries."
 step install -d -m 0755 "$BIN_DIR"
-step install -m 0755 "$REPO/target/release/keyless" "$BIN_DIR/keyless"
-step install -m 0755 "$REPO/target/release/keylessd" "$BIN_DIR/keylessd"
+# `-p` preserves the BUILD time on the copy. Without it the copy is stamped at
+# install time, so a binary built before a source edit looks newer than that
+# edit and `keyless doctor` reports a stale install as current — the one way
+# this check can be made to lie.
+step install -p -m 0755 "$REPO/target/release/keyless" "$BIN_DIR/keyless"
+step install -p -m 0755 "$REPO/target/release/keylessd" "$BIN_DIR/keylessd"
 
 # --- directories -----------------------------------------------------------
 
