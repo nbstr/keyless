@@ -23,7 +23,7 @@ __all__ = [
     "strip_quoted", "strip_heredocs", "heredocs", "Heredoc", "stripped",
     "statement_spans", "statements", "head_of", "head_or_wrapper", "words",
     "candidate_operands", "file_operands", "expand_local_assignments",
-    "interpreter_payloads", "rest_after_head", "first_positional",
+    "interpreter_payloads", "rest_after_head", "first_positional", "delegated_head",
     "flatten_substitutions", "substitution_payloads",
     "assignment_split", "is_wrapper",
 ]
@@ -56,11 +56,32 @@ _HEREDOC_OPEN = re.compile(r"<<-?\s*(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\1")
 
 
 def strip_quoted(cmd):
-    """Blank the interior of quoted spans, preserving length and the quote marks.
+    """Blank quoted interiors AND backslash escapes, preserving length.
 
     Single quotes are literal in every shell. Double quotes still interpolate,
     but for ACT detection the distinction does not matter: text inside either is
     an argument, not a command position.
+
+    A backslash escape is the same statement in one character. `\\;`, `\\(`,
+    `\\|` and `\\&` are LITERALS the shell hands to the program as ordinary
+    argument characters — that is the entire reason they are written with a
+    backslash. Leaving the escaped character standing in a view whose only job is
+    to say where a COMMAND begins has the escaping exactly backwards, and it made
+    the separator scan cut a `find` expression at its own parentheses:
+
+        find ~ -maxdepth 2 \\( -name ".netrc" -o -name ".pgpass" \\)
+
+    cut after `\\(`, so the tail carried no command word, `.netrc` was read as the
+    head, and a filesystem sweep was refused as a credential read. The same cut
+    lands on `find . -name x -exec grep -l TOKEN {} \\;` and on every line
+    continuation, where `ls -la \\<newline> .netrc` was refused for naming a file
+    `ls` cannot print.
+
+    Blanking BOTH characters is what keeps this from becoming a hole. `\\\\;` is
+    an escaped backslash followed by a REAL separator: the pair is consumed as a
+    unit, the `;` after it is never reached by the escape branch, and it still
+    cuts. Genuine separators are untouched — they are the ones nothing escapes
+    and no quote covers.
     """
     if not cmd:
         return ""
@@ -69,6 +90,9 @@ def strip_quoted(cmd):
     while i < n:
         c = cmd[i]
         if c == "\\":
+            out[i] = " "
+            if i + 1 < n:
+                out[i + 1] = " "
             i += 2
             continue
         if c in ("'", '"'):
@@ -76,6 +100,9 @@ def strip_quoted(cmd):
             j = i + 1
             while j < n:
                 if cmd[j] == "\\" and quote == '"':
+                    out[j] = " "
+                    if j + 1 < n:
+                        out[j + 1] = " "
                     j += 2
                     continue
                 if cmd[j] == quote:
@@ -261,6 +288,12 @@ def words(text):
 
     Offsets index `text`. A quoted span is one word even when it contains spaces,
     which is what makes `-c "cat .env"` two words and not three.
+
+    A backslash-newline is DELETED by the shell before it tokenizes anything, so
+    it neither starts a word nor ends one. It reaches this function now only
+    because `strip_quoted` stopped cutting statements there; without the skip
+    below, `cmd a \\<newline> b` yields a word made of the continuation itself,
+    and `_walk_head` would name that as the command.
     """
     out = []
     n = len(text)
@@ -268,6 +301,9 @@ def words(text):
     while i < n:
         if text[i].isspace():
             i += 1
+            continue
+        if text[i] == "\\" and i + 1 < n and text[i + 1] == "\n":
+            i += 2
             continue
         start = i
         while i < n and not text[i].isspace():
@@ -392,6 +428,12 @@ def _walk_head(stmt):
             # starts with a flag has no head we can name.
             continue
         name = _unquote(tok)
+        # A line continuation is deleted before the shell tokenizes, so it joins
+        # rather than separates: `ca\<newline>t` invokes `cat`. Removing the pair
+        # here is what keeps the head a NAME after the separator scan stopped
+        # cutting at it.
+        if "\\\n" in name:
+            name = name.replace("\\\n", "")
         if name.startswith("\\"):
             name = name[1:]
         if "/" in name:
@@ -631,6 +673,45 @@ def first_positional(stmt):
         if tok.startswith("-") or _ASSIGN_PREFIX.match(tok) or _REDIRECT_TOKEN.match(tok):
             continue
         return _unquote(tok)
+    return ""
+
+
+# Operands that introduce a PROGRAM inside a statement whose own head reads
+# nothing. `find`'s four are the whole set: the word after each is a command the
+# statement runs on every file it matched.
+_DELEGATING_OPERANDS = frozenset(["-exec", "-execdir", "-ok", "-okdir"])
+
+
+def delegated_head(stmt):
+    """The program a statement hands its own matches to, or "".
+
+    `find` is on the non-reader list because `find -name .netrc` prints a PATH and
+    never opens the file. `find -name .env -exec cat {} \\;` opens every one of
+    them, and a check that skips the statement on its head alone cannot tell the
+    two apart — it reads `find` and stops.
+
+    Keyed on the OPERAND rather than on `find`, because the operand is what makes
+    the claim: a word after `-exec` is a command by `find`'s own grammar, and a
+    rule spelled that way stays true for `-execdir`, `-ok` and `-okdir` without
+    naming them one program at a time.
+
+    A leading path and a wrapper are absorbed, so `-exec /bin/cat` and
+    `-exec sudo cat` both answer `cat`.
+    """
+    if not stmt or "-exec" not in stmt and "-ok" not in stmt:
+        return ""
+    take = False
+    for start, end in words(stmt):
+        tok = stmt[start:end]
+        if take:
+            name = _unquote(tok)
+            if "/" in name:
+                name = name.rsplit("/", 1)[-1]
+            if not name or name in _WRAPPERS:
+                continue
+            return name
+        if tok in _DELEGATING_OPERANDS:
+            take = True
     return ""
 
 

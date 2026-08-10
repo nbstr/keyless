@@ -53,6 +53,15 @@ ATTACKS = [
     ("env_wrapper",      "env cat .env",                   "a wrapper program"),
     ("command_builtin",  "command cat .env",               "a shell builtin wrapper"),
     ("xargs",            "echo .env | xargs cat",          "the operand arriving on stdin"),
+    # `find` is on the non-reader list, and these hand every match to a program
+    # that is not. The head alone cannot tell `find -name .netrc`, which prints a
+    # path, from `find -name .env -exec cat`, which prints the file.
+    ("find_exec",        "find . -name .env -exec cat {} \\;",
+                         "a reader run by an allowlisted command"),
+    ("find_execdir",     "find . -name .env -execdir cat {} \\;",
+                         "a reader run by an allowlisted command"),
+    ("find_exec_wrapped", "find . -name .env -exec sudo /bin/cat {} \\;",
+                         "a wrapper and a path in front of the delegated reader"),
     ("local_var",        "F=.env; cat $F",                 "a variable set in the same command"),
     ("local_var_brace",  "F=.env; cat ${F}",               "a braced variable"),
     ("export_var",       "export F=.env; cat $F",          "an exported variable"),
