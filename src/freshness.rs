@@ -62,6 +62,14 @@
 //!
 //! # What it cannot see, stated rather than implied
 //!
+//! - **Whether that source tree is itself current.** This is the big one, and
+//!   it is not a corner case: a checkout six commits behind builds a binary
+//!   that is `Current` by this rule, because the source WAS the source. The
+//!   remote box printed `build proven` for exactly that on 2026-08-10, over a
+//!   binary carrying a false green fixed six commits earlier. [`crate::checkout`]
+//!   is the other half and it answers only that question — the two are
+//!   independent, and neither subsumes the other: an uncommitted edit moves an
+//!   mtime and moves no ref.
 //! - **A copy whose mtime was reset.** `install -p` preserves the build time;
 //!   without `-p` the copy is stamped at install time and a binary built before
 //!   an edit can look newer than it. `install/install.sh` passes `-p` and
