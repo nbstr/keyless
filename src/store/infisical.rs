@@ -136,9 +136,41 @@
 //! - **A secret whose name is one of those forwarded ones is not listed.** An
 //!   inherited `PATH` and a secret called `PATH` arrive as one entry, and
 //!   nothing in the environment says which wrote it. The forwarded set is
-//!   deliberately tiny and fixed so the blind spot is nameable; the exact check
-//!   for one of those names is `keyless doctor --probe`, which proves a single
-//!   name resolves without printing it.
+//!   deliberately tiny and fixed so the blind spot is nameable.
+//!
+//! # The lookup is cleared too, and that is not decoration
+//!
+//! [`InfisicalStore::resolve`] runs the vendor with the SAME cleared
+//! environment, for a reason measured rather than argued. The probe's child is
+//! `printenv KEY`, and `printenv` cannot tell a variable the vendor injected
+//! from one this process already carried. So a probe that inherited the
+//! environment answered from that environment: with a config declaring `X`
+//! against Infisical, `X` exported in the calling shell, and a store holding
+//! **nothing at all**, `keyless doctor --probe` printed
+//! `✔ X proven — read back from infisical`. That is the exact false green this
+//! tool exists to refuse, and it was not confined to the nine forwarded names —
+//! it applied to every name. A `run` on the same evidence said nothing at all,
+//! which is how this tool spells success, and wrote an `INJECTED` row naming
+//! that store into the audit log — so the wrong answer was durable rather than
+//! merely printed.
+//!
+//! Clearing makes the lookup exact for every name that is NOT forwarded: the
+//! store holds it, or `printenv` exits 1 and the name is unresolved. For a name
+//! that IS forwarded the variable must still be handed in — the vendor needs
+//! `HOME` and `PATH` to run at all — so [`InfisicalStore::resolve`] compares the
+//! value it reads back against the exact bytes it forwarded and refuses to
+//! return its own environment as a credential. Three outcomes, all stated:
+//!
+//! | Read back | Meaning | What happens |
+//! |---|---|---|
+//! | differs from what was forwarded | only the vendor could have written it | resolved |
+//! | identical to what was forwarded | the store holds nothing, or holds that same value | reported, never returned |
+//! | `printenv` exits 1 | the variable is unset in the child | unresolved, as for any name |
+//!
+//! **Whether the vendor's injection outranks a forwarded variable of the same
+//! name is the vendor's own behaviour, and this crate asserts nothing about
+//! it.** It does not need to: the comparison is correct under either
+//! precedence. That is the whole reason it is a comparison rather than a rule.
 //!
 //! # Why not the vendor's own listing verbs, and why not its REST API
 //!
@@ -377,6 +409,10 @@ pub const NAMES_VERB: &str = "__names";
 /// forwarded variable and is not listed.** Keeping the list to the names nobody
 /// stores as a credential is what keeps that blind spot nameable.
 ///
+/// A LOOKUP of such a name is a different matter and is not blind: see
+/// [`InfisicalStore::resolve`], which compares what it reads back against what
+/// it forwarded, and reports the collision rather than returning either guess.
+///
 /// - `HOME` — where the CLI keeps its login, its instance domain and its cache.
 ///   Without it the lookup is unauthenticated.
 /// - `PATH` — the binary defaults to the bare name `infisical`, so the spawn
@@ -423,6 +459,36 @@ fn forwarded_vars() -> Vec<(std::ffi::OsString, std::ffi::OsString)> {
     std::env::vars_os()
         .filter(|(name, _)| is_forwarded(&name.to_string_lossy()))
         .collect()
+}
+
+/// The value this process hands the vendor under `key`, if it hands one.
+///
+/// `None` covers both halves of "there is no collision": a key that is not
+/// forwarded at all, and a forwarded NAME that this machine does not actually
+/// set. The second is the same asymmetry [`forwarded_vars`] rests on — with no
+/// proxy configured, a secret called `HTTPS_PROXY` is an ordinary secret.
+fn forwarded_value(key: &str) -> Option<std::ffi::OsString> {
+    if is_forwarded(key) {
+        std::env::var_os(key)
+    } else {
+        None
+    }
+}
+
+/// Why a forwarded name's value cannot be attributed, and how to make it one.
+///
+/// Written by this crate rather than taken from a backend's stderr, like the
+/// empty-value sentence beside it. It carries no value: the whole subject is
+/// that the two candidate values are byte-identical, so naming either would
+/// name both.
+fn shadowed_detail(key: &str) -> String {
+    format!(
+        "`{key}` is one of the variables this process must hand the Infisical CLI for it to \
+         run at all, and the value read back is byte-for-byte the one that was handed in. \
+         Either the store holds no `{key}`, or it holds that same value — nothing in a child's \
+         environment says which wrote it, so this is reported rather than guessed. Store the \
+         secret under a key of its own and point at it with \"key\" under `secrets`."
+    )
 }
 
 /// One environment-and-folder pair a listing can be taken at.
@@ -562,8 +628,21 @@ impl InfisicalStore {
     ///
     /// The key reaches `printenv` as an argument, never as text interpolated
     /// into a shell command, so a name cannot become a command.
+    ///
+    /// **The environment is cleared**, down to [`FORWARDED_EXACT`] and
+    /// `INFISICAL_*`, exactly as [`names_command`](Self::names_command) does.
+    /// `printenv` reads a variable, not a store, so without the clearing it
+    /// answers from whatever this process happened to carry and the adapter
+    /// reports the caller's own environment as a credential read back from
+    /// Infisical. The module docs carry the measurement.
+    ///
+    /// `--expand=false` is deliberately NOT passed here, unlike in the listing:
+    /// expansion rewrites values, a value is precisely what this path is for,
+    /// and a secret that references another is the vendor's own feature.
     fn probe_command(&self, at: &Coordinates) -> Command {
         let mut command = Command::new(&self.binary);
+        command.env_clear();
+        command.envs(forwarded_vars());
         command.arg("run");
         command.arg(format!("--env={}", at.env));
         command.arg(format!("--path={}", at.path));
@@ -704,6 +783,11 @@ impl Store for InfisicalStore {
 
     fn resolve(&self, name: &str) -> Result<Option<Secret>, StoreError> {
         let at = self.coordinates(name)?;
+        // Read BEFORE the spawn, from the same source the spawn forwards from,
+        // so the comparison below is against the exact bytes that went in
+        // rather than against a second reading of a variable that could have
+        // changed in between.
+        let forwarded = forwarded_value(&at.key);
         let mut captured = capture(self.probe_command(&at), self.timeout)
             .map_err(|error| self.unreachable(&error))?;
 
@@ -733,6 +817,15 @@ impl Store for InfisicalStore {
                 "{} is set but empty at {} {}",
                 at.key, at.env, at.path
             )));
+        }
+
+        // The one name the clearing cannot make exact: a key the vendor itself
+        // needs. Returning this would hand the caller's own `PATH` back as a
+        // credential, stamped `INJECTED`.
+        if let Some(shadow) = &forwarded
+            && bytes == std::os::unix::ffi::OsStrExt::as_bytes(shadow.as_os_str())
+        {
+            return Err(self.backend(shadowed_detail(&at.key)));
         }
 
         Secret::from_bytes(bytes)
