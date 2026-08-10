@@ -45,6 +45,7 @@
 
 pub mod daemon;
 pub mod discover;
+pub mod envnames;
 pub mod exec;
 pub mod file;
 pub mod infisical;

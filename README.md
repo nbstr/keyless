@@ -964,23 +964,67 @@ The template's shape is the only one of the two you can read without printing a
 credential, so it is the tempting thing to build against — and it is wrong for a
 real item. Both are handled.
 
+### Infisical lists keys through the same verb it reads them through
+
+Infisical's CLI has no listing verb: `infisical secrets`, `infisical secrets get`
+and `infisical export` all print the values, and `--silent` does not suppress
+them. So the listing is not taken from its output at all. `infisical run` puts
+the secrets at a coordinate into a child process's environment — and `keyless`
+is that child:
+
+```console
+$ keyless items infisical --env staging:/demo
+staging:/demo	Active	secret	DEMO_API_KEY
+staging:/demo	Active	secret	DEMO_DATABASE_URL
+…
+
+$ keyless items infisical          # every coordinate your config declares
+prod:/demo	Active	secret	DEMO_API_KEY
+staging:/demo	Active	secret	DEMO_DATABASE_URL
+…
+```
+
+The child reads its own environment and writes back the NAMES. **A value cannot
+be smuggled out as a name**, and that is a property of the environment rather
+than of a filter: the environment is an array of NUL-terminated C strings split
+at the FIRST `=`, so a value containing a newline, a tab, a further `=`, a JSON
+brace or an ANSI escape is still one entry with one split point. This is exactly
+what a text filter cannot promise — strip the values off a vendor's output and a
+value containing a newline produces a following line with no `=` in it, which the
+filter passes straight through as though it were a key.
+
+Three things that follow, none of them hidden:
+
+- **There is no default environment, here either.** With `--env` / `--vault` you
+  list the coordinate you named. Without one you get the coordinates your config
+  already declares, and no others — the catalogue is an allowlist, so
+  enumerating a coordinate nobody wrote down is something you do on purpose.
+- **A secret whose NAME is `HOME`, `PATH`, `TMPDIR`, `INFISICAL_*`, an
+  `SSL_CERT_*` or a proxy variable is not listed.** Those are forwarded into the
+  cleared environment the vendor runs in, because it needs them to authenticate
+  and to reach the network, and nothing afterwards says whether the store
+  overwrote one. `keyless doctor --probe` is the exact check for a single name.
+- **`keyless fields` has no answer for Infisical, and says so.** A secret there
+  is one value, so a config entry needs a `key` and never a `field`.
+
+The REST API would return JSON, where a typed `secretKey` could not carry a
+fragment of a value — but reaching it needs a credential `keyless` does not have.
+This tool authenticates by spawning the vendor's CLI and inheriting its login; it
+opens no file under `~/.infisical`, has no config field a token fits in, and
+carries no HTTP client.
+
 ### Two backends say why they cannot do this
 
 A verb that works in one backend and leaks in another is worse than one that is
 plainly absent in the second, because you learn to trust it from the backend
 where it is safe. So:
 
-| Backend | `items` / `fields` | Why |
-|---|---|---|
-| `proton` | yes | `item list` and `item view`, with the extraction above |
-| `keychain` | no | `security` has no verb listing one service's items without dumping the whole keychain file, and one extra flag on that dump prints values |
-| `infisical` | no | every verb that lists keys prints their values, and there is no keys-only flag |
-| `daemon` | no | a client that could enumerate the store could read what it never named — the hole the uid boundary closes |
-
-For Infisical the tempting workaround is unsafe rather than merely ugly: filter
-the vendor's output down to what is left of each `=`, and a value containing a
-newline produces a following line with no `=` in it, which the filter passes
-straight through.
+| Backend | `items` | `fields` | Why |
+|---|---|---|---|
+| `proton` | yes | yes | `item list` and `item view`, with the extraction above |
+| `infisical` | yes | no | the environment `infisical run` builds is the listing; a secret is one value, so there is no field to name |
+| `keychain` | no | no | `security` has no verb listing one service's items without dumping the whole keychain file, and one extra flag on that dump prints values |
+| `daemon` | no | no | a client that could enumerate the store could read what it never named — the hole the uid boundary closes |
 
 ---
 

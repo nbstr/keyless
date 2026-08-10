@@ -692,6 +692,17 @@ fn next_steps(
             &format!("{name} new FIRST_SECRET"),
             "generates a credential and stores it, showing it to nobody",
         )?;
+    } else if chosen == "infisical" {
+        // Two differences from a vault backend, and both would waste somebody's
+        // first five minutes: an Infisical coordinate is never defaulted, so a
+        // bare `items` against a config with no declared name has nothing to
+        // list; and a secret there is one value, so `fields` has no answer.
+        command(
+            out,
+            style,
+            &format!("{name} items infisical --env <SLUG>"),
+            "lists the keys at one environment: names and coordinates, never a value",
+        )?;
     } else {
         command(
             out,

@@ -27,6 +27,7 @@ use keyless::paths::Paths;
 use keyless::random::DEFAULT_LENGTH;
 use keyless::store::Invocation;
 use keyless::store::discover::discoverer;
+use keyless::store::envnames;
 use keyless::store::manage::manager;
 use keyless::store::proton::Reason;
 use keyless::{NAME, store};
@@ -136,6 +137,22 @@ enum Verb {
         aliases = ["show", "cat", "read", "reveal", "print", "view", "dump", "export"]
     )]
     Refused(RefusedArgs),
+
+    /// One half of a wire protocol, not a verb anybody types.
+    ///
+    /// `keyless items --store infisical` spawns `infisical run` with THIS
+    /// binary as the child, because the environment that child is handed is the
+    /// only place the vendor's CLI ever says which keys a coordinate holds. The
+    /// child writes back the NAMES of its own environment and never a value; see
+    /// [`keyless::store::envnames`] for why a value cannot leave through it.
+    ///
+    /// Hidden for the same reason `get` is: the verb list is a security property
+    /// a reader checks at a glance, and this one is machinery rather than a
+    /// verb. Unlike `get` it is hidden without being a refusal — running it by
+    /// hand prints the names of your own shell environment, which is what `env`
+    /// already does.
+    #[command(name = keyless::store::infisical::NAMES_VERB, hide = true)]
+    Names,
 }
 
 #[derive(Args)]
@@ -154,27 +171,59 @@ struct RefusedArgs {
 #[derive(Args)]
 struct ItemsArgs {
     /// Which store to ask. Defaults to the only configured one.
-    #[arg(long, value_name = "STORE")]
+    ///
+    /// `keyless items proton` is what a person types, so the positional form is
+    /// the documented one. `--store` still works and is what a script that
+    /// already had one keeps using; supplying both is refused rather than
+    /// ranked.
+    #[arg(value_name = "STORE")]
     store: Option<String>,
 
-    /// Narrow to one vault. Without it, every vault the identity can see.
-    #[arg(long, value_name = "VAULT")]
+    /// Same thing as the positional STORE, for a caller that already spelled it
+    /// this way.
+    #[arg(long = "store", value_name = "STORE", conflicts_with = "store")]
+    store_flag: Option<String>,
+
+    /// Narrow to one vault.
+    ///
+    /// Proton: a vault name; without it, every vault the identity can see.
+    /// Infisical: `<env>` or `<env>:<path>` — the coordinate `keyless ls`
+    /// prints. Without it, every coordinate the config declares, and no others.
+    #[arg(long, visible_alias = "env", value_name = "VAULT")]
     vault: Option<String>,
+}
+
+impl ItemsArgs {
+    /// The store, from whichever spelling arrived. `clap` guarantees at most one.
+    fn store(&self) -> Option<&str> {
+        self.store.as_deref().or(self.store_flag.as_deref())
+    }
 }
 
 #[derive(Args)]
 struct FieldsArgs {
     /// Which store to ask. Defaults to the only configured one.
-    #[arg(long, value_name = "STORE")]
+    #[arg(value_name = "STORE")]
     store: Option<String>,
 
+    /// Same thing as the positional STORE.
+    #[arg(long = "store", value_name = "STORE", conflicts_with = "store")]
+    store_flag: Option<String>,
+
     /// The vault the item is in. Required for stores that have vaults.
-    #[arg(long, value_name = "VAULT")]
+    #[arg(long, visible_alias = "env", value_name = "VAULT")]
     vault: Option<String>,
 
     /// The item's exact title.
     #[arg(long, value_name = "TITLE")]
     item: String,
+}
+
+impl FieldsArgs {
+    /// The store, from whichever spelling arrived. `clap` guarantees at most one.
+    fn store(&self) -> Option<&str> {
+        self.store.as_deref().or(self.store_flag.as_deref())
+    }
 }
 
 #[derive(Args)]
@@ -524,7 +573,7 @@ fn dispatch() -> i32 {
         },
 
         Verb::Items(args) => {
-            let store = match store::choose_store(&load.config, None, args.store.as_deref()) {
+            let store = match store::choose_store(&load.config, None, args.store()) {
                 Ok(store) => store,
                 Err(problem) => {
                     eprintln!("{NAME}: {problem}");
@@ -554,7 +603,7 @@ fn dispatch() -> i32 {
         }
 
         Verb::Fields(args) => {
-            let store = match store::choose_store(&load.config, None, args.store.as_deref()) {
+            let store = match store::choose_store(&load.config, None, args.store()) {
                 Ok(store) => store,
                 Err(problem) => {
                     eprintln!("{NAME}: {problem}");
@@ -797,6 +846,18 @@ fn dispatch() -> i32 {
                 Err(_) => refuse::EXIT_NO_SUCH_VERB,
             }
         }
+
+        // The listing probe. It reads no config, reaches no store and writes no
+        // audit row, because it is not an invocation of `keyless` in its own
+        // right — it is the far end of one `items` call that already recorded
+        // itself. Its whole body is "name the environment I was handed".
+        Verb::Names => match envnames::emit(envnames::names(), &mut io::stdout()) {
+            Ok(()) => 0,
+            // A broken pipe here is the parent giving up on the listing, which
+            // it will report itself. Saying it twice on a stream the parent is
+            // also reading would corrupt the diagnosis it is building.
+            Err(_) => 1,
+        },
     }
 }
 

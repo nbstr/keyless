@@ -417,6 +417,9 @@ fn items_and_fields_say_why_a_backend_cannot_enumerate() {
     );
     assert!(stdout_of(&output).is_empty());
 
+    // Infisical enumerates ITEMS and has no FIELDS, which is a different kind of
+    // absence and says so: a secret there is one value, so the coordinate is
+    // complete without one and the message names the verb that does answer.
     let output = keyless(&[
         "--config",
         &config,
@@ -428,9 +431,56 @@ fn items_and_fields_say_why_a_backend_cannot_enumerate() {
     ]);
     assert_eq!(output.status.code(), Some(1));
     assert!(
-        stderr_of(&output).contains("keys-only flag"),
+        stderr_of(&output).contains("single value"),
         "{}",
         stderr_of(&output)
+    );
+    assert!(
+        stderr_of(&output).contains("items infisical"),
+        "{}",
+        stderr_of(&output)
+    );
+}
+
+#[test]
+fn a_store_is_nameable_as_a_word_and_not_only_as_a_flag() {
+    // `keyless items proton` is what a person types. It used to die on clap's
+    // `unexpected argument 'proton'`, whose Usage line names `--store` nowhere —
+    // so the message was true and taught nothing, which is the same defect
+    // `keyless get` had.
+    let dir = scratch("positional-store");
+    let config = config_with_stub(&dir, &Stub::Returns(DECOY_VALUE));
+    let config = config.display().to_string();
+
+    // Each side is asserted against a LITERAL rather than against the other.
+    // Comparing the two outputs would take both sides of the equality from the
+    // code under test, so it would hold whatever that code did — including if
+    // both spellings broke identically. `tests/oracle_independence.rs` fails a
+    // build written the other way, and it caught this test.
+    for output in [
+        keyless(&["--config", &config, "items", "keychain"]),
+        keyless(&["--config", &config, "items", "--store", "keychain"]),
+    ] {
+        assert_eq!(output.status.code(), Some(1));
+        assert!(
+            stderr_of(&output).contains("whole keychain file"),
+            "this spelling must reach the backend, not clap: {}",
+            stderr_of(&output)
+        );
+        assert!(stdout_of(&output).is_empty());
+    }
+
+    // Both at once is refused rather than ranked. Two spellings that disagree
+    // is a question, and answering it by picking one is how a caller ends up
+    // reading a store they did not ask about.
+    let both = keyless(&[
+        "--config", &config, "items", "keychain", "--store", "proton",
+    ]);
+    assert_eq!(both.status.code(), Some(2));
+    assert!(
+        stderr_of(&both).contains("cannot be used with"),
+        "{}",
+        stderr_of(&both)
     );
 }
 
