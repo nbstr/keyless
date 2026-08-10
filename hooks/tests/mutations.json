@@ -586,5 +586,33 @@
     "file": "keyless_hooks/payload.py",
     "find": "            if not isinstance(entry, dict):\n                continue",
     "replace": "            if False:\n                continue"
+  },
+  {
+    "id": "M84-dest-existence-inverted",
+    "why": "KL-DEST fires exactly where a copy is taken: the destination already exists. Inverting the test makes it silent on every real capture and noisy on the one case KL-WRITE repairs — a write CREATING the file, where the rewrite is the useful outcome and a deny above it throws that rewrite away.",
+    "file": "keyless_hooks/checks/dest_write.py",
+    "find": "    if not exists:",
+    "replace": "    if exists:"
+  },
+  {
+    "id": "M85-dest-only-two-tools",
+    "why": "The copy is taken by MultiEdit and NotebookEdit exactly as by Edit. A tool set naming two of the four is a gate with two doors open and a name that says otherwise — the shape a matcher audit catches and a unit test never does.",
+    "file": "keyless_hooks/checks/dest_write.py",
+    "find": "_TOOLS = frozenset([\"Write\", \"Edit\", \"MultiEdit\", \"NotebookEdit\"])",
+    "replace": "_TOOLS = frozenset([\"Write\", \"Edit\"])"
+  },
+  {
+    "id": "M86-dest-unresolvable-means-absent",
+    "why": "`I could not look` and `there is nothing there` are the same empty answer from a filesystem test, and only one of them is safe. This is the tilde defect that already cost file_read a whole block, arriving in the new check by the same road.",
+    "file": "keyless_hooks/checks/dest_write.py",
+    "find": "    resolved = resolve(path, payload.cwd)\n    if resolved is None:",
+    "replace": "    resolved = resolve(path, payload.cwd) or path\n    if resolved is None and False:"
+  },
+  {
+    "id": "M87-dest-tier-is-advice",
+    "why": "A BLOCK check demoted to WARN still runs, still logs and still returns `deny`; the engine degrades every one of them to a note and the tool call proceeds. The registry is the only place that fact lives, so nothing about the check's own code changes and it keeps reading as enforcing.",
+    "file": "keyless_hooks/registry.py",
+    "find": "        (\"KL-DEST\",   \"PreToolUse\", BLOCK,   dest_write.run),",
+    "replace": "        (\"KL-DEST\",   \"PreToolUse\", WARN,   dest_write.run),"
   }
 ]

@@ -736,6 +736,143 @@ def run():
     s.check("KL-SEEN warns on output", v.kind, "warn")
     s.check("KL-SEEN does not echo the value", DECOY["github_pat"] in v.message, False)
 
+    # ── KL-DEST: the DESTINATION is a credential file ───────────────────────
+    #
+    # KL-WRITE asks what is in the text; this asks what the text lands on. The
+    # two are independent, and the gap between them is the whole reason this
+    # check exists: an edit that changes a hostname inside a `.env` carries no
+    # credential literal, so KL-WRITE is silent by design — and the host still
+    # copies every other line of that file, verbatim, into ~/.claude/file-history/.
+    # So every "fires" row below deliberately writes INNOCENT text.
+    def edit(path, old="HOST=old", new="HOST=new", cwd=None):
+        return {"hook_event_name": "PreToolUse", "tool_name": "Edit",
+                "tool_input": {"file_path": path, "old_string": old,
+                               "new_string": new},
+                "cwd": cwd or root, "session_id": "test-session"}
+
+    for path in (os.path.join(root, ".env"),
+                 os.path.join(root, "prod.env"),
+                 os.path.join(root, ".npmrc"),
+                 os.path.join(root, "nested", "app", ".env"),
+                 os.path.join(root, "packages", "prisma-db", ".env")):
+        s.check("KL-DEST fires: Edit %s" % os.path.basename(path),
+                drive(edit(path)).kind, "deny")
+
+    s.check("KL-DEST fires: Write over an existing credential file",
+            drive(write(os.path.join(root, ".env"), "HOST=new\n")).kind, "deny")
+    s.check("KL-DEST fires: MultiEdit",
+            drive({"hook_event_name": "PreToolUse", "tool_name": "MultiEdit",
+                   "tool_input": {"file_path": os.path.join(root, ".env"),
+                                  "edits": [{"old_string": "HOST=old",
+                                             "new_string": "HOST=new"}]},
+                   "cwd": root, "session_id": "test-session"}).kind, "deny")
+    s.check("KL-DEST fires: NotebookEdit via notebook_path",
+            drive({"hook_event_name": "PreToolUse", "tool_name": "NotebookEdit",
+                   "tool_input": {"notebook_path": os.path.join(root, ".env"),
+                                  "new_source": "HOST=new"},
+                   "cwd": root, "session_id": "test-session"}).kind, "deny")
+
+    # A relative destination, resolved against the payload's cwd. The absolute
+    # form is the one every other row uses, and a matcher can pass on it while
+    # failing on the spelling an agent actually writes.
+    s.check("KL-DEST fires: a relative destination",
+            drive(edit(".env")).kind, "deny")
+
+    # A symlink onto a credential file. `expansions` walks realpath, and this is
+    # the row that proves it: the NAME here is protected by nothing.
+    if os.path.islink(os.path.join(root, "config-link")):
+        s.check("KL-DEST fires: through a symlink whose own name is innocent",
+                drive(edit(os.path.join(root, "config-link"))).kind, "deny")
+
+    # An unresolvable protected path. "I could not look" and "there is nothing
+    # there" are the same empty answer from a filesystem test, and only one of
+    # them is safe — the tilde bug that cost `file_read` a whole block.
+    v = drive({"hook_event_name": "PreToolUse", "tool_name": "Edit",
+               "tool_input": {"file_path": "$SOMEWHERE/prod.env",
+                              "old_string": "a", "new_string": "b"},
+               "cwd": root, "session_id": "test-session"})
+    s.check("KL-DEST fires: an unresolvable protected path", v.kind, "deny")
+    s.check_in("KL-DEST says it could not resolve it", "unresolvable path", v.message)
+
+    # ── KL-DEST stops where the copy stops, and KL-WRITE keeps its repair ────
+    #
+    # These two rows are the seam between the checks, and they are the rows that
+    # caught this check denying too widely on its first run. A write CREATING a
+    # protected path copies nothing — there is no prior content — so KL-DEST has
+    # no opinion, and KL-WRITE's rewrite survives to do the useful thing:
+    # the write lands, the secret does not. A deny here returns above KL-WRITE
+    # and throws that away, handing back a refusal instead of a working file.
+    fresh = os.path.join(root, "brand-new.env")
+    if os.path.exists(fresh):
+        os.unlink(fresh)
+    s.check("KL-DEST silent: a protected path that does not exist yet",
+            drive(write(fresh, "HOST=new\n")).kind, "silent")
+    v = drive(write(fresh, "STRIPE_KEY=%s\n" % DECOY["stripe"]))
+    s.check("KL-WRITE still rewrites a literal into a NEW protected file",
+            v.kind, "rewrite")
+    s.check("KL-DEST did not swallow that rewrite",
+            DECOY["stripe"] in str(v.updated), False)
+
+    # ── KL-DEST: silent when the destination is not a credential file ───────
+    for path in ("README.md", "src/app.ts", "package.json", "docs/setup.md",
+                 "logs/.env/notes.txt"):
+        s.check("KL-DEST silent: Edit %s" % path,
+                drive(edit(os.path.join(root, path))).kind, "silent")
+
+    # The allow list wins, and cannot be shadowed by a broader protected glob.
+    # `.env.example` is matched by `.env.*`; editing one is ordinary work.
+    for path in (".env.example", ".env.sample", ".env.template"):
+        s.check("KL-DEST silent: allowed look-alike %s" % path,
+                drive(edit(os.path.join(root, path))).kind, "silent")
+
+    # The language idioms. `*.env` is the loosest entry in the protected list and
+    # these are the strings it was measured refusing for no reason.
+    for path in ("process.env", "import.meta.env"):
+        s.check("KL-DEST silent: idiom %s" % path,
+                drive(edit(os.path.join(root, path))).kind, "silent")
+
+    # ── KL-DEST: look-alikes — the file NAMED, never written ────────────────
+    s.check("KL-DEST look-alike: a source file that MENTIONS the path",
+            drive(edit(os.path.join(root, "src", "config.ts"),
+                       old="const p = 'nope'",
+                       new="const p = '.env'")).kind, "silent")
+    s.check("KL-DEST look-alike: prose about editing one",
+            drive(edit(os.path.join(root, "README.md"),
+                       old="x", new="Copy .env.example to .env.")).kind, "silent")
+
+    # ── KL-DEST: empty parse is no opinion, never an approval ───────────────
+    for ti in ({}, {"file_path": ""}, {"file_path": ["/x/.env"]},
+               {"file_path": None}):
+        v = drive({"hook_event_name": "PreToolUse", "tool_name": "Edit",
+                   "tool_input": ti, "cwd": root, "session_id": "test-session"})
+        s.check("KL-DEST empty parse is silent: %r" % ti, v.kind, "silent")
+        s.check("KL-DEST empty parse never allows: %r" % ti,
+                v.kind == "allow", False)
+
+    # ── KL-DEST: the message is a prompt, not an error code ─────────────────
+    v = drive(edit(os.path.join(root, ".env")))
+    s.check("KL-DEST message fires as a deny", v.kind, "deny")
+    s.check_in("KL-DEST names itself", "[KL-DEST]", v.message)
+    s.check_in("KL-DEST names the pattern that matched", "`.env`", v.message)
+    s.check_in("KL-DEST names WHERE the copy goes", "file-history", v.message)
+    s.check_in("KL-DEST names the runnable alternative", "sed -i", v.message)
+    s.check_in("KL-DEST names the keyless route", "keyless run -s", v.message)
+    s.check_in("KL-DEST names the explicit no-op exit", "allowed", v.message)
+    s.check_in("KL-DEST names what the copy would contain", "STRIPE_KEY", v.message)
+    s.check("KL-DEST leaks no value", DECOY["stripe"] in v.message, False)
+    s.check("KL-DEST leaks no value on stdout", DECOY["stripe"] in v.stdout, False)
+
+    # ── KL-DEST: registered, and registered as a block ──────────────────────
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__)))))
+    from keyless_hooks import registry as _reg
+    _rows = {cid: (event, tier) for cid, event, tier, _run in _reg.all_checks()}
+    s.check("KL-DEST is registered", "KL-DEST" in _rows, True)
+    s.check("KL-DEST is registered on PreToolUse",
+            _rows.get("KL-DEST", (None, None))[0], "PreToolUse")
+    s.check("KL-DEST is registered at BLOCK",
+            _rows.get("KL-DEST", (None, None))[1], _reg.BLOCK)
+
     # ── no message ever carries a value ─────────────────────────────────────
     leaky = []
     for payload in (bash("cat .env"), read(os.path.join(root, ".env")),
