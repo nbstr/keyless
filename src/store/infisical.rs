@@ -116,8 +116,48 @@
 //!
 //! `path` is deliberately not treated the same way — see
 //! [`crate::config::InfisicalConfig::path`] for the asymmetry.
+//!
+//! # Listing what a coordinate holds, on a CLI with no listing verb
+//!
+//! [`Discover`] is implemented on the same one verb. `infisical run` puts every
+//! secret at a coordinate into a child's environment, so the child knows their
+//! NAMES — and `keyless` is the child. It runs itself as
+//! `keyless __names`, which writes the names of its own environment and never a
+//! value; see [`crate::store::envnames`] for why a value cannot be smuggled out
+//! as a name through that path.
+//!
+//! Two consequences of taking a listing from an environment rather than from a
+//! vendor's listing verb, both stated rather than implied:
+//!
+//! - **The child's environment is cleared before the vendor runs**, down to
+//!   [`FORWARDED_EXACT`] plus `INFISICAL_*`. Without that, every variable this
+//!   process happens to carry would appear in the listing as though the store
+//!   held it.
+//! - **A secret whose name is one of those forwarded ones is not listed.** An
+//!   inherited `PATH` and a secret called `PATH` arrive as one entry, and
+//!   nothing in the environment says which wrote it. The forwarded set is
+//!   deliberately tiny and fixed so the blind spot is nameable; the exact check
+//!   for one of those names is `keyless doctor --probe`, which proves a single
+//!   name resolves without printing it.
+//!
+//! # Why not the vendor's own listing verbs, and why not its REST API
+//!
+//! `infisical secrets` and `infisical export` print values, and `--silent`
+//! does not suppress them — measured. Building on them would mean stripping
+//! values off text, and a value containing a newline produces a following line
+//! with no `=` in it, which a stripper passes through as though it were a key.
+//! Being *nearly* safe is how this class of bug ships.
+//!
+//! The REST API returns JSON, where a typed `secretKey` field could not carry a
+//! fragment of a value — but reaching it needs a credential, and `keyless` has
+//! none. This adapter authenticates by spawning the vendor's CLI and inheriting
+//! its login; there is no code path here that opens a file under `~/.infisical`,
+//! and no config field a token fits in. An HTTP client would also be the first
+//! network stack in a crate whose whole dependency list is five crates and
+//! whose auditability is the product. So the API is the wrong trade here, not
+//! an unexamined one.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::process::Command;
 use std::time::Duration;
@@ -126,6 +166,8 @@ use crate::config::Config;
 use crate::error::StoreError;
 use crate::secret::Secret;
 use crate::store::Store;
+use crate::store::discover::{Discover, FieldSummary, ItemSummary};
+use crate::store::envnames;
 use crate::store::exec::{self, CaptureError, capture, first_line, strip_one_newline};
 
 /// Disables the vendor CLI's telemetry, which defaults to on.
@@ -239,6 +281,38 @@ impl Routing {
         })
     }
 
+    /// Every distinct coordinate the config's own names point at.
+    ///
+    /// This is what `items` lists when nobody named a location, and the choice
+    /// is the answer to "should a listing verb enumerate a whole store?".
+    /// **It does not.** The config is an allowlist, so with no `--vault` the
+    /// verb reports the coordinates already written down in it and no others —
+    /// which is exactly the set somebody setting up a name needs to see. A
+    /// coordinate nobody declared is reachable only by naming it, which makes
+    /// enumerating the store a thing a person does on purpose rather than a
+    /// default.
+    ///
+    /// Ordered and deduplicated, so two names in one folder cost one listing.
+    fn declared_locations(&self) -> Vec<Location> {
+        let mut seen: BTreeSet<Location> = self
+            .routes
+            .values()
+            .filter_map(|route| {
+                route.env.as_ref().map(|env| Location {
+                    env: env.clone(),
+                    path: route.path.clone(),
+                })
+            })
+            .collect();
+        if let Some(env) = &self.invocation_env {
+            seen.insert(Location {
+                env: env.clone(),
+                path: self.default_path.clone(),
+            });
+        }
+        seen.into_iter().collect()
+    }
+
     /// Coordinates a health check may use, without inventing an environment.
     ///
     /// The invocation's own environment first, then the first declared name that
@@ -282,6 +356,135 @@ fn missing_env_detail(name: &str) -> String {
          under `secrets`, or pass `keyless run --env staging` for the whole \
          command. A name's own `env` wins over the flag."
     )
+}
+
+/// The subcommand the listing probe runs `keyless` as.
+///
+/// Two leading underscores because it is not a verb anybody types: it is one
+/// half of a wire protocol whose other half is [`InfisicalStore::items`]. It is
+/// hidden from `--help` for the same reason `get` is — the verb list is a
+/// security property a reader must be able to check at a glance — and unlike
+/// `get` it is hidden without being a refusal, because it does something.
+pub const NAMES_VERB: &str = "__names";
+
+/// The variables forwarded into the cleared environment the vendor CLI runs in.
+///
+/// Everything else is dropped, so a variable this process happens to carry
+/// cannot appear in a listing as though the store held it.
+///
+/// Each entry is here because the vendor needs it, and the list is short on
+/// purpose: **a secret whose name is on this list cannot be told apart from the
+/// forwarded variable and is not listed.** Keeping the list to the names nobody
+/// stores as a credential is what keeps that blind spot nameable.
+///
+/// - `HOME` — where the CLI keeps its login, its instance domain and its cache.
+///   Without it the lookup is unauthenticated.
+/// - `PATH` — the binary defaults to the bare name `infisical`, so the spawn
+///   itself needs it.
+/// - `TMPDIR`, `SSL_CERT_FILE`, `SSL_CERT_DIR` and the proxy variables — the
+///   ordinary way a machine says how to reach the network at all.
+///
+/// `LOG_LEVEL`, `LOG_FORMAT` and `LOG_DESTINATION` are deliberately ABSENT.
+/// The CLI reads all three from the environment, this adapter pins them on the
+/// command line, and forwarding them would only let an ambient variable make
+/// the vendor noisier on a stream this code reads.
+pub const FORWARDED_EXACT: [&str; 9] = [
+    "HOME",
+    "PATH",
+    "TMPDIR",
+    "SSL_CERT_FILE",
+    "SSL_CERT_DIR",
+    "HTTPS_PROXY",
+    "HTTP_PROXY",
+    "NO_PROXY",
+    "no_proxy",
+];
+
+/// Every variable starting with this is forwarded too.
+///
+/// Machine-identity auth, a self-hosted domain and a service token all arrive
+/// this way, and a listing that worked only for a browser login would be a
+/// listing that worked only on a laptop.
+pub const FORWARDED_PREFIX: &str = "INFISICAL_";
+
+/// Whether a variable of this process is handed to the vendor CLI.
+#[must_use]
+fn is_forwarded(name: &str) -> bool {
+    FORWARDED_EXACT.contains(&name) || name.starts_with(FORWARDED_PREFIX)
+}
+
+/// This process's forwarded variables, name and value.
+///
+/// The listing's baseline, and the only thing a listing subtracts. It is what
+/// this process ACTUALLY carries rather than what [`is_forwarded`] would allow:
+/// on a machine with no proxy configured, `HTTPS_PROXY` is forwarded by nothing
+/// and a secret of that name is a real secret.
+fn forwarded_vars() -> Vec<(std::ffi::OsString, std::ffi::OsString)> {
+    std::env::vars_os()
+        .filter(|(name, _)| is_forwarded(&name.to_string_lossy()))
+        .collect()
+}
+
+/// One environment-and-folder pair a listing can be taken at.
+///
+/// The same two coordinates [`Route`] carries, without the key — because a
+/// listing is the question "which keys are here?", so a key would be an answer
+/// smuggled into the question.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Location {
+    /// The environment slug. Never defaulted; see the module docs.
+    pub env: String,
+    /// The folder path, defaulted to the vendor's own `/`.
+    pub path: String,
+}
+
+impl Location {
+    /// The one field a listing shows, in the spelling `ls` already prints:
+    /// `staging:/backend`.
+    #[must_use]
+    pub fn describe(&self) -> String {
+        format!("{}:{}", self.env, self.path)
+    }
+
+    /// Read the `--vault` form: `staging`, or `staging:/backend`.
+    ///
+    /// The path half is optional and falls back to `default_path`, which is the
+    /// same field `resolve` defaults a route's path from — so a location typed
+    /// with no path points where an undeclared name of the config would.
+    ///
+    /// # Errors
+    ///
+    /// A sentence naming the accepted form, when the environment half is empty.
+    /// An environment is never guessed here for the same reason it is never
+    /// guessed in a lookup: `prod` and `staging` hold the same key names.
+    pub fn parse(spec: &str, default_path: &str) -> Result<Location, String> {
+        let (env, path) = match spec.split_once(':') {
+            Some((env, path)) => (env.trim(), path.trim()),
+            None => (spec.trim(), ""),
+        };
+        if env.is_empty() {
+            return Err(format!(
+                "`{spec}` names no Infisical environment. Write it as `<env>` or \
+                 `<env>:<path>`, for example `staging` or `staging:/backend` — \
+                 the same coordinate `{} ls` prints beside every Infisical name",
+                crate::NAME
+            ));
+        }
+        let path = if path.is_empty() {
+            default_path.to_owned()
+        } else if path.starts_with('/') {
+            path.to_owned()
+        } else {
+            // The vendor's paths are absolute. Accepting `staging:backend` and
+            // fixing it is kinder than a 404 from the API that says the folder
+            // was not found.
+            format!("/{path}")
+        };
+        Ok(Location {
+            env: env.to_owned(),
+            path,
+        })
+    }
 }
 
 /// The variable a health check asks for.
@@ -381,29 +584,116 @@ impl InfisicalStore {
         command
     }
 
+    /// Build one `infisical run … -- keyless __names` invocation.
+    ///
+    /// The same flags as [`probe_command`](Self::probe_command), plus two
+    /// differences that are the whole of this path's safety:
+    ///
+    /// - **The environment is cleared** down to [`FORWARDED_EXACT`] and
+    ///   `INFISICAL_*`. What is left is exactly the baseline the caller
+    ///   subtracts, so nothing this process carries can appear in a listing.
+    /// - **`--expand=false`.** That switches off the CLI's own shell-parameter
+    ///   expansion, which rewrites VALUES and can neither add nor remove a key —
+    ///   so a names-only read loses nothing, and one thing that interpolates
+    ///   value text near a stream this code reads stops running. It is not the
+    ///   whole of expansion: the request the CLI sends still carries
+    ///   `expandSecretReferences=true`, which is the server's own, observed in
+    ///   the URL a 404 quotes back. One interpolation removed, not all.
+    ///
+    /// `probe` is the `keyless` binary itself. It is passed in rather than
+    /// resolved here so a test can point it somewhere it can observe.
+    fn names_command(&self, at: &Location, probe: &std::path::Path) -> Command {
+        let mut command = Command::new(&self.binary);
+        command.env_clear();
+        command.envs(forwarded_vars());
+        command.arg("run");
+        command.arg(format!("--env={}", at.env));
+        command.arg(format!("--path={}", at.path));
+        command.arg("--silent");
+        command.arg("--log-level=error");
+        command.arg("--log-destination=stderr");
+        command.arg("--expand=false");
+        command.arg(TELEMETRY_OFF);
+        if let Some(project) = &self.project_id {
+            command.arg(format!("--projectId={project}"));
+        }
+        if let Some(dir) = &self.config_dir {
+            command.arg("--project-config-dir");
+            command.arg(dir);
+        }
+        command.arg("--");
+        command.arg(probe);
+        command.arg(NAMES_VERB);
+        command
+    }
+
+    /// The names the store holds at one location, and nothing else.
+    ///
+    /// The subtraction is exact, because the baseline is not a guess about what
+    /// a shell might carry: [`names_command`](Self::names_command) cleared the
+    /// environment and set exactly [`forwarded_vars`], so that is what comes
+    /// back out.
+    ///
+    /// Filtering by the SET rather than by [`is_forwarded`] is the difference
+    /// between hiding what was forwarded and hiding what COULD have been. On a
+    /// machine with no proxy configured, nothing forwards `HTTPS_PROXY` — so a
+    /// secret of that name is a real secret and gets listed.
+    fn names_at(&self, at: &Location, probe: &std::path::Path) -> Result<Vec<String>, StoreError> {
+        let baseline: BTreeSet<String> = forwarded_vars()
+            .into_iter()
+            .map(|(name, _)| name.to_string_lossy().into_owned())
+            .collect();
+        let captured = capture(self.names_command(at, probe), self.timeout)
+            .map_err(|error| self.unreachable(&error))?;
+
+        if !captured.status.success() {
+            // stderr only, as everywhere in this crate. Measured against
+            // 0.43.114: a bad environment, a bad folder and a bad login all
+            // answer with the vendor's own sentence and an EMPTY stdout, so
+            // there is nothing on the other stream to be tempted by.
+            return Err(self.backend(format!(
+                "cannot list {}: {}",
+                at.describe(),
+                first_line(&captured.stderr)
+            )));
+        }
+
+        // Sorted, because the order an environment comes back in carries no
+        // meaning — unlike a vault listing, where the vendor's order is at
+        // least the vendor's. A stable order is what makes two listings of one
+        // coordinate diffable.
+        let mut names: Vec<String> = envnames::parse(&captured.stdout)
+            .map_err(|detail| self.backend(format!("cannot list {}: {detail}", at.describe())))?
+            .into_iter()
+            .filter(|name| !baseline.contains(name))
+            .collect();
+        names.sort();
+        Ok(names)
+    }
+
     fn unavailable(&self, detail: impl Into<String>) -> StoreError {
         StoreError::Unavailable {
-            store: self.id().to_owned(),
+            store: STORE_ID.to_owned(),
             detail: detail.into(),
         }
     }
 
     fn backend(&self, detail: impl Into<String>) -> StoreError {
         StoreError::Backend {
-            store: self.id().to_owned(),
+            store: STORE_ID.to_owned(),
             detail: detail.into(),
         }
     }
 
     fn misconfigured(&self, detail: impl Into<String>) -> StoreError {
         StoreError::Misconfigured {
-            store: self.id().to_owned(),
+            store: STORE_ID.to_owned(),
             detail: detail.into(),
         }
     }
 
     fn unreachable(&self, error: &CaptureError) -> StoreError {
-        exec::unavailable(self.id(), &self.binary, error)
+        exec::unavailable(STORE_ID, &self.binary, error)
     }
 }
 
@@ -482,11 +772,96 @@ impl Store for InfisicalStore {
     }
 }
 
+impl Discover for InfisicalStore {
+    fn id(&self) -> &str {
+        STORE_ID
+    }
+
+    fn items(&self, vault: Option<&str>) -> Result<Vec<ItemSummary>, StoreError> {
+        // The listing is taken from a child of this binary, so the binary has to
+        // be able to name itself. A build that cannot is reported rather than
+        // guessed at: `argv[0]` would be a guess, and on a machine where it is
+        // wrong the guess spawns something else entirely.
+        let probe = std::env::current_exe().map_err(|error| {
+            self.unavailable(format!(
+                "cannot locate the running `{}` binary, which is the listing probe: {error}",
+                crate::NAME
+            ))
+        })?;
+
+        let locations = match vault {
+            Some(spec) => vec![
+                Location::parse(spec, &self.routing.default_path)
+                    .map_err(|detail| self.misconfigured(detail))?,
+            ],
+            None => {
+                let declared = self.routing.declared_locations();
+                if declared.is_empty() {
+                    // The example is a METAVARIABLE, never a real coordinate.
+                    // `tests/publication.rs` reads the token after `--vault ` in
+                    // any published file and fails on anything that is not an
+                    // allowlisted decoy — a spelled-out `<env>:<path>` is the
+                    // form that teaches the shape without naming an account.
+                    return Err(self.misconfigured(format!(
+                        "no Infisical coordinate is declared anywhere, so there is nothing to \
+                         list. Name one — `{} items infisical --vault <env>:<path>` — or put \
+                         \"env\" on a name under `secrets`. There is no default environment, \
+                         because `prod` and `staging` hold the same key names",
+                        crate::NAME
+                    )));
+                }
+                declared
+            }
+        };
+
+        let mut summaries = Vec::new();
+        for at in locations {
+            let vault = at.describe();
+            summaries.extend(self.names_at(&at, &probe)?.into_iter().map(|key| {
+                ItemSummary {
+                    vault: vault.clone(),
+                    // What a config entry's `key` must match, and what its
+                    // `name` defaults to.
+                    title: key,
+                    // Infisical has no trash and no per-secret state: a key that
+                    // reached the child's environment is a key `run` resolves.
+                    // The word is the resolver's own allowlist value, so
+                    // `is_active` agrees with what a lookup would do.
+                    state: "Active".to_owned(),
+                    // One word, because this backend has one kind of thing. A
+                    // richer answer — shared against personal, imported against
+                    // direct — is not in what an environment can say.
+                    kind: "secret".to_owned(),
+                }
+            }));
+        }
+        Ok(summaries)
+    }
+
+    fn fields(&self, _vault: Option<&str>, item: &str) -> Result<Vec<FieldSummary>, StoreError> {
+        // An honest absence rather than a fabricated single field named after
+        // the item. `fields` exists because a Proton item is a record with
+        // several values in it and a config entry has to name one; an Infisical
+        // secret is one value, so the coordinate is complete without a field and
+        // a config entry that sets one is wrong rather than incomplete.
+        Err(self.backend(format!(
+            "an Infisical secret is a single value, so `{item}` has no fields to choose between \
+             and a config entry needs no \"field\". `{} items infisical --vault <env>:<path>` \
+             lists the keys, and a key goes in \"key\"",
+            crate::NAME
+        )))
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{CHILD_EXIT_MARKER, InfisicalStore, NO_ENV, Routing, TELEMETRY_OFF};
+    use super::{
+        CHILD_EXIT_MARKER, FORWARDED_EXACT, InfisicalStore, Location, NO_ENV, Routing,
+        TELEMETRY_OFF, is_forwarded,
+    };
     use crate::config::Config;
     use crate::store::Store;
+    use crate::store::discover::Discover;
     use std::ffi::OsStr;
 
     fn config_from(json: &str) -> Config {
@@ -763,5 +1138,197 @@ mod tests {
         assert!(
             !"Please either run infisical init to connect to a project".contains(CHILD_EXIT_MARKER)
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Listing: the coordinate, the invocation, and what it refuses to guess.
+    // -----------------------------------------------------------------------
+
+    /// The argv of the listing probe, rendered without running it.
+    fn listing_argv(store: &InfisicalStore, spec: &str) -> Vec<String> {
+        let at = Location::parse(spec, "/").expect("this fixture supplies an environment");
+        let command = store.names_command(&at, std::path::Path::new("/opt/keyless"));
+        std::iter::once(command.get_program())
+            .chain(command.get_args())
+            .map(OsStr::to_string_lossy)
+            .map(std::borrow::Cow::into_owned)
+            .collect()
+    }
+
+    #[test]
+    fn a_location_reads_an_environment_and_an_optional_path() {
+        assert_eq!(
+            Location::parse("staging:/backend", "/").expect("valid"),
+            Location {
+                env: "staging".to_owned(),
+                path: "/backend".to_owned()
+            }
+        );
+        // No path half: the config's default, which is the same one an
+        // undeclared name would be looked up at.
+        assert_eq!(
+            Location::parse("prod", "/backend").expect("valid"),
+            Location {
+                env: "prod".to_owned(),
+                path: "/backend".to_owned()
+            }
+        );
+        // The vendor's paths are absolute, and a 404 saying "folder not found"
+        // is a worse answer than fixing an obvious spelling.
+        assert_eq!(
+            Location::parse("prod:backend", "/").expect("valid").path,
+            "/backend"
+        );
+        assert_eq!(
+            Location::parse("staging:/backend", "/")
+                .expect("valid")
+                .describe(),
+            "staging:/backend",
+            "the listing must name a coordinate in the spelling `ls` prints"
+        );
+    }
+
+    #[test]
+    fn a_location_with_no_environment_is_refused_rather_than_defaulted() {
+        // The same rule as a lookup, for the same reason: `prod` and `staging`
+        // hold the same key names, so guessing lists the wrong side of a
+        // tenancy boundary and looks exactly like listing the right one.
+        for spec in [":/backend", "", "   "] {
+            let said = Location::parse(spec, "/").expect_err("an environment is mandatory");
+            assert!(said.contains("names no Infisical environment"), "{said}");
+            assert!(said.contains("<env>:<path>"), "{said}");
+        }
+    }
+
+    #[test]
+    fn the_listing_uses_run_and_no_verb_that_prints_a_value() {
+        // The same assertion as the lookup path, on the newer invocation. The
+        // denied verbs are denied because they print plaintext; a listing built
+        // on one would be the way around that.
+        let store = store_from("{}");
+        let argv = listing_argv(&store, "dev");
+        assert_eq!(argv.get(1).map(String::as_str), Some("run"));
+        for forbidden in ["secrets", "export", "get", "read", "reveal"] {
+            assert!(
+                !argv.iter().any(|arg| arg == forbidden),
+                "`{forbidden}` appeared in {argv:?}"
+            );
+        }
+        assert!(argv.iter().any(|arg| arg == TELEMETRY_OFF));
+        assert!(argv.iter().any(|arg| arg == "--log-destination=stderr"));
+        // Shell-parameter expansion rewrites values and cannot change the key
+        // set, so a names-only read switches it off.
+        assert!(argv.iter().any(|arg| arg == "--expand=false"));
+    }
+
+    #[test]
+    fn the_listing_child_is_this_binary_asking_for_names() {
+        let store = store_from("{}");
+        let argv = listing_argv(&store, "dev");
+        let separator = argv
+            .iter()
+            .position(|arg| arg == "--")
+            .expect("the invocation must separate the child command");
+        // One LITERAL for the whole child command, so nothing on the right-hand
+        // side can be edited by editing the implementation. Spelling this as
+        // `argv.len() == separator + 3` took both sides from the code under
+        // test — the length and the offset move together — and
+        // `tests/oracle_independence.rs` failed the build for it. The literal
+        // also states "and no other argument" without arithmetic.
+        let child: Vec<&str> = argv[separator + 1..].iter().map(String::as_str).collect();
+        assert_eq!(child, ["/opt/keyless", "__names"], "{argv:?}");
+    }
+
+    #[test]
+    fn the_listing_hands_the_vendor_only_the_forwarded_variables() {
+        // The subtraction that turns a child's environment into a listing is
+        // exact only because this set is. Anything else this process carries
+        // would show up as though the store held it.
+        let store = store_from("{}");
+        let at = Location::parse("dev", "/").expect("valid");
+        let command = store.names_command(&at, std::path::Path::new("/opt/keyless"));
+        for (name, _) in command.get_envs() {
+            let name = name.to_string_lossy().into_owned();
+            assert!(
+                is_forwarded(&name),
+                "`{name}` was handed to the vendor but is not a forwarded variable"
+            );
+        }
+    }
+
+    #[test]
+    fn the_forwarded_set_is_the_documented_one() {
+        // A guard on the blind spot's SIZE. Every name added here is a name a
+        // listing can no longer report, so growing this set silently is how the
+        // verb starts lying by omission.
+        assert!(is_forwarded("HOME"));
+        assert!(is_forwarded("PATH"));
+        assert!(is_forwarded("INFISICAL_TOKEN"));
+        assert!(is_forwarded("INFISICAL_API_URL"));
+        assert!(!is_forwarded("DATABASE_URL"));
+        assert!(!is_forwarded("NODE_ENV"));
+        // Deliberately absent: the CLI reads all three from the environment and
+        // this adapter pins them on the command line, so forwarding one could
+        // only make the vendor noisier on a stream this code reads.
+        for quiet in ["LOG_LEVEL", "LOG_FORMAT", "LOG_DESTINATION"] {
+            assert!(!is_forwarded(quiet), "`{quiet}` must not be forwarded");
+        }
+        assert_eq!(
+            FORWARDED_EXACT.len(),
+            9,
+            "a variable added to the forwarded set is a name `items` can no longer report"
+        );
+    }
+
+    #[test]
+    fn with_no_location_the_listing_covers_only_the_declared_coordinates() {
+        // The answer to "should a listing verb enumerate a whole store?". The
+        // config is an allowlist, so the default is the coordinates in it —
+        // deduplicated, because two names in one folder are one listing.
+        let config = config_from(
+            r#"{"stores":{"infisical":{"path":"/backend"}},
+                "secrets":{"A":{"env":"prod"},
+                           "B":{"env":"prod"},
+                           "C":{"env":"staging"},
+                           "D":{"env":"prod","path":"/web"},
+                           "E":{}}}"#,
+        );
+        let declared = Routing::from_config(&config, None).declared_locations();
+        let described: Vec<String> = declared.iter().map(Location::describe).collect();
+        assert_eq!(
+            described,
+            ["prod:/backend", "prod:/web", "staging:/backend"],
+            "a coordinate nobody declared must not be listed, and one declared twice \
+             must not be listed twice"
+        );
+    }
+
+    #[test]
+    fn a_config_that_declares_no_environment_refuses_to_list_rather_than_guessing() {
+        let store = store_from(r#"{"stores":{"infisical":{"enabled":true}},"secrets":{"A":{}}}"#);
+        let said = Discover::items(&store, None)
+            .expect_err("there is no coordinate to list")
+            .to_string();
+        assert!(
+            said.contains("no Infisical coordinate is declared"),
+            "{said}"
+        );
+        assert!(said.contains("--vault"), "{said}");
+        // The reason, not just the refusal: somebody who reads only this line
+        // has to learn why a default would be wrong rather than which flag to add.
+        assert!(said.contains("same key names"), "{said}");
+    }
+
+    #[test]
+    fn fields_says_an_infisical_secret_has_none_and_points_at_the_key() {
+        let store = store_from(r#"{"secrets":{"A":{"env":"dev"}}}"#);
+        let said = Discover::fields(&store, None, "DATABASE_URL")
+            .expect_err("an Infisical secret is one value")
+            .to_string();
+        assert!(said.contains("single value"), "{said}");
+        assert!(said.contains("DATABASE_URL"), "{said}");
+        // An absence that names the verb that DOES answer, rather than one that
+        // leaves the reader looking for a flag.
+        assert!(said.contains("items infisical"), "{said}");
     }
 }

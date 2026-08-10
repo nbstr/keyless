@@ -37,6 +37,7 @@
 
 use crate::config::Config;
 use crate::error::StoreError;
+use crate::store::infisical::InfisicalStore;
 use crate::store::proton::{ProtonStore, Reason};
 
 /// What kind of thing a name came from.
@@ -147,20 +148,6 @@ const KEYCHAIN_HAS_NO_LISTING: &str = "the macOS keychain has no verb that lists
      keychain file, and the verb that dumps it prints values with one extra flag. Address a \
      keychain name directly with \"service\" and \"account\" instead";
 
-/// Why Infisical has no `items` or `fields`.
-///
-/// Every verb that lists keys prints their values: `infisical secrets`,
-/// `infisical secrets get`, `infisical export`. There is no keys-only flag.
-///
-/// The tempting workaround — run the vendor's output through a filter that keeps
-/// only what is left of each `=` — is unsafe rather than merely ugly: a value
-/// containing a newline produces a following line with no `=` in it, and the
-/// filter passes that fragment of the value straight through. Being *nearly*
-/// safe is how this class of bug ships.
-const INFISICAL_HAS_NO_KEY_LISTING: &str = "every Infisical verb that lists keys also prints their values, and there is no keys-only \
-     flag; stripping the values off its output can still pass through a fragment of a value that \
-     contains a newline. List them in the Infisical UI and declare the names you need";
-
 /// The [`Discover`] implementation for a store id, or the reason there is none.
 ///
 /// `reason` is the justification Proton Pass records against everything it
@@ -184,8 +171,12 @@ pub fn discoverer(
 
     match store {
         "proton" => Ok(Box::new(ProtonStore::from_config(config, reason.clone()))),
+        // The environment `infisical run` builds is the listing. It carries no
+        // value out of the child, and no environment slug is defaulted, so the
+        // verb enumerates only a coordinate somebody named or declared. See
+        // [`crate::store::infisical`] and [`crate::store::envnames`].
+        "infisical" => Ok(Box::new(InfisicalStore::from_config(config, None))),
         "keychain" => Err(unavailable(KEYCHAIN_HAS_NO_LISTING)),
-        "infisical" => Err(unavailable(INFISICAL_HAS_NO_KEY_LISTING)),
         "daemon" => Err(unavailable(
             "the daemon deliberately cannot be enumerated: a client that could list the store \
              could read what it never named, which is the hole the uid boundary exists to close. \
@@ -209,14 +200,17 @@ mod tests {
     }
 
     #[test]
-    fn proton_has_a_discoverer_and_the_others_say_why_they_do_not() {
+    fn the_two_vault_backends_enumerate_and_the_others_say_why_they_do_not() {
         // The honest-degrade rule: a verb that works in one backend and leaks in
         // another is worse than one that is plainly absent in the second.
         assert!(discoverer(&config(), "proton", &Reason::default()).is_ok());
+        // Infisical enumerates through the same verb it resolves through, so a
+        // build where this went back to a refusal has lost the listing rather
+        // than gained a protection.
+        assert!(discoverer(&config(), "infisical", &Reason::default()).is_ok());
 
         for (store, expected) in [
             ("keychain", "whole keychain file"),
-            ("infisical", "keys-only flag"),
             ("daemon", "uid boundary"),
         ] {
             let message = discoverer(&config(), store, &Reason::default())
