@@ -62,6 +62,7 @@ pub mod config;
 #[cfg(any(target_os = "macos", keyless_force_xnu))]
 pub mod daemon;
 pub mod error;
+pub mod freshness;
 pub mod ipc;
 pub mod mask;
 pub mod paths;

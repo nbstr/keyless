@@ -95,6 +95,7 @@ use crate::audit::AuditLog;
 use crate::cmd::run::Binding;
 use crate::config::{Config, ConfigLoad};
 use crate::error::StoreError;
+use crate::freshness::{self, Freshness};
 use crate::paths::Paths;
 use crate::store::{self, Registry, Resolution, Store};
 
@@ -186,6 +187,7 @@ pub fn doctor(request: &DoctorRequest<'_>, out: &mut dyn Write) -> io::Result<i3
     if let Some(setup) = setup {
         guards(setup, style, out)?;
     }
+    problems += report_build(&freshness::check(), style, out)?;
 
     if !notes.is_empty() {
         heading(out, style, "NOTES")?;
@@ -255,6 +257,61 @@ fn header(paths: &Paths, load: &ConfigLoad, style: Style, out: &mut dyn Write) -
         )?;
     }
     Ok(())
+}
+
+/// Whether this binary was built from the source beside it. Returns how many
+/// rows are problems.
+///
+/// **Directly under the header, above every other section, and it counts.** A
+/// stale binary does not make one row wrong; it makes the whole report a
+/// statement about code nobody is reading — including the rows that say
+/// everything is fine. So it is placed where it cannot be reached by scrolling
+/// past a wall of green, for the same reason [`guards`] is.
+///
+/// It is `Broken` rather than `NotSetUp`: a store you have not configured is a
+/// step you have not taken, and this is a fault. The action is the command that
+/// fixes it, naming the directory, because the person reading this is not
+/// necessarily standing in it.
+///
+/// [`Freshness::NoSourceTree`] prints NOTHING. On a machine that installed a
+/// release there is no tree to compare against and no finding to report, and a
+/// row saying so on every invocation would be noise that teaches people to skip
+/// this section. [`Freshness::Unknown`] does print, as `unproven` and not as a
+/// problem: a comparison that could not be made must never read as one that
+/// passed.
+fn report_build(freshness: &Freshness, style: Style, out: &mut dyn Write) -> io::Result<i32> {
+    let (mark, state, detail, next) = match freshness {
+        Freshness::NoSourceTree => return Ok(0),
+        Freshness::Current => (
+            Mark::Proven,
+            "proven",
+            format!(
+                "built from {} after its last source change",
+                freshness::source_dir().display()
+            ),
+            None,
+        ),
+        Freshness::Unknown { reason } => (Mark::Unproven, "unproven", reason.clone(), None),
+        Freshness::Stale { newest } => (
+            Mark::Broken,
+            "stale",
+            format!(
+                "{} changed after this binary was built, so every row here is about \
+                 older code",
+                newest.display()
+            ),
+            Some(format!(
+                "cargo build --release   (in {})",
+                freshness::source_dir().display()
+            )),
+        ),
+    };
+    heading(out, style, "BUILD")?;
+    row(out, style, mark, "build", 6, state, &detail)?;
+    if let Some(text) = next {
+        action(out, style, &text)?;
+    }
+    Ok(i32::from(mark.is_problem()))
 }
 
 /// Whether the guards are firing — and it is at the TOP of the report for one
@@ -856,11 +913,12 @@ fn report_capability_boundary(style: Style, out: &mut dyn Write) -> io::Result<(
 
 #[cfg(test)]
 mod tests {
-    use super::doctor;
+    use super::{doctor, report_build};
     use crate::audit::AuditLog;
     use crate::cmd::status::Style;
     use crate::config::Config;
     use crate::error::StoreError;
+    use crate::freshness::Freshness;
     use crate::paths::Paths;
     use crate::secret::Secret;
     use crate::store::{Registry, Store};
@@ -900,6 +958,84 @@ mod tests {
         load.config = serde_json::from_str(json).expect("valid");
         load.loaded = true;
         load
+    }
+
+    /// One BUILD section, rendered plain, with the number of problems it counted.
+    fn build_section(freshness: &Freshness) -> (String, i32) {
+        let mut out: Vec<u8> = Vec::new();
+        let problems = report_build(freshness, Style::PLAIN, &mut out).expect("write");
+        (String::from_utf8(out).expect("utf-8"), problems)
+    }
+
+    #[test]
+    fn a_stale_binary_is_a_problem_and_names_both_the_file_and_the_fix() {
+        let (text, problems) = build_section(&Freshness::Stale {
+            newest: PathBuf::from("/somewhere/src/store/infisical.rs"),
+        });
+        assert_eq!(problems, 1, "{text}");
+        assert!(text.contains("stale"), "{text}");
+        assert!(
+            text.contains("/somewhere/src/store/infisical.rs"),
+            "the row must name the evidence a reader can check: {text}"
+        );
+        assert!(
+            text.contains("cargo build --release"),
+            "a diagnosis with no next action is the shape this report used to have: {text}"
+        );
+    }
+
+    #[test]
+    fn a_current_binary_costs_no_problem() {
+        let (text, problems) = build_section(&Freshness::Current);
+        assert_eq!(problems, 0, "{text}");
+        assert!(text.contains("after its last source change"), "{text}");
+    }
+
+    #[test]
+    fn a_machine_with_no_source_tree_is_told_nothing_at_all() {
+        // The control first: the same function does print for a verdict.
+        let (present, _) = build_section(&Freshness::Current);
+        assert!(!present.is_empty());
+
+        let (text, problems) = build_section(&Freshness::NoSourceTree);
+        assert_eq!(problems, 0);
+        assert!(
+            text.is_empty(),
+            "an installed release has no tree to compare against and no finding \
+             to report; a row on every invocation teaches people to skip this \
+             section: {text}"
+        );
+    }
+
+    #[test]
+    fn a_comparison_that_could_not_be_made_never_reads_as_one_that_passed() {
+        let (text, problems) = build_section(&Freshness::Unknown {
+            reason: "cannot locate the running binary".to_owned(),
+        });
+        assert_eq!(problems, 0, "an unanswered question is not a fault: {text}");
+        assert!(text.contains("unproven"), "{text}");
+        assert!(text.contains("cannot locate the running binary"), "{text}");
+        assert!(
+            !text.contains("after its last source change"),
+            "an unknown verdict must not borrow the passing row's words: {text}"
+        );
+    }
+
+    #[test]
+    fn the_build_row_comes_before_everything_it_would_invalidate() {
+        // Placement is the claim: a stale binary does not make one row wrong, it
+        // makes every row a statement about code nobody is reading. Reported
+        // below the stores, it is reached by scrolling past the green it
+        // invalidates.
+        let load = loaded(r#"{"secrets":{"A":{}}}"#);
+        let (text, _) = report(&load, Registry::new(vec![Box::new(Healthy)]), false);
+        let build = text.find("BUILD").expect("the BUILD section is rendered");
+        for later in ["STORES", "NAMES", "AUDIT"] {
+            assert!(
+                build < text.find(later).unwrap_or(usize::MAX),
+                "BUILD must precede {later}:\n{text}"
+            );
+        }
     }
 
     fn report(load: &crate::config::ConfigLoad, registry: Registry, probe: bool) -> (String, i32) {
