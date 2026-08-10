@@ -57,6 +57,7 @@
 
 pub mod attest;
 pub mod audit;
+pub mod checkout;
 pub mod cmd;
 pub mod config;
 #[cfg(any(target_os = "macos", keyless_force_xnu))]

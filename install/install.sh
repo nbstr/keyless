@@ -91,6 +91,59 @@ if [[ "$TARGET_USER" == "root" ]]; then
   exit 1
 fi
 
+# --- install only from a checkout that is not behind what it tracks --------
+#
+# FIRST, before the build check below, because the two prescribe opposite
+# actions and only one of them can be right. The build check says "cargo build
+# --release"; on a tree that is six commits behind, that compiles the wrong
+# code and produces an artefact both checks then call fresh.
+#
+# The build check compares the binary against the source beside it, and it is
+# blind to a source tree that is ITSELF old. A checkout six commits behind
+# builds a binary that is fresh by that rule — nothing under src/ is newer than
+# the artefact — and installs a program missing every fix in those six commits.
+# Measured 2026-08-10 on the remote box: `keyless doctor` printed `build proven`
+# over a binary carrying a lookup that answered from the caller's own
+# environment, fixed six commits earlier.
+#
+# `keyless doctor` asks the same question of the tree the running binary was
+# built from. This asks it at the one moment somebody is standing here, which is
+# the moment a refusal can still be acted on.
+#
+# It NEVER fetches. This runs under sudo, and a fetch as root writes root-owned
+# objects into a human's .git. So it reads the ref the last fetch left behind,
+# which means it can only ever MISS a finding and can never invent one — a
+# refusal here is therefore always true, and a pass is only as new as that
+# fetch.
+#
+# Everything else is skipped rather than guessed: no git, no repository, a
+# detached HEAD or a branch tracking nothing all leave `behind` empty and let
+# the install through. Installing a deliberately older revision already looks
+# like that — `git switch --detach <sha>` has no upstream — so the legitimate
+# case passes without needing an override flag nobody would resist using.
+
+# git must run as the human who owns the checkout. As root it refuses a
+# repository owned by somebody else ("dubious ownership"), so without this the
+# check would silently skip itself in exactly the mode that installs.
+as_owner() {
+  if [[ "$(id -u)" -eq 0 && "$TARGET_USER" != "root" ]]; then
+    sudo -u "$TARGET_USER" "$@"
+  else
+    "$@"
+  fi
+}
+
+if UPSTREAM="$(GIT_OPTIONAL_LOCKS=0 as_owner git -C "$REPO" rev-parse --abbrev-ref '@{u}' 2>/dev/null)"; then
+  BEHIND="$(GIT_OPTIONAL_LOCKS=0 as_owner git -C "$REPO" rev-list --count "HEAD..$UPSTREAM" 2>/dev/null || true)"
+  if [[ "${BEHIND:-0}" =~ ^[0-9]+$ && "${BEHIND:-0}" -gt 0 ]]; then
+    echo "Stale checkout: $REPO is at least $BEHIND commit(s) behind $UPSTREAM." >&2
+    echo "The binary matches this source; this source is that old. Nothing here" >&2
+    echo "contacted the remote, so the real distance may be greater." >&2
+    echo "Run: git -C $REPO pull --ff-only && cargo build --release" >&2
+    exit 1
+  fi
+fi
+
 for binary in keyless keylessd; do
   if [[ ! -x "$REPO/target/release/$binary" ]]; then
     echo "Build first: cargo build --release  (missing target/release/$binary)" >&2
