@@ -27,8 +27,8 @@ def _table():
     # Imported inside the function so a broken check module cannot stop the
     # engine from loading the others: the import cost is paid once per process
     # either way, and the failure mode differs.
-    from .checks import (env_dump, file_read, heredoc_write, literal_write,
-                         shell_assign, vault_cli)
+    from .checks import (dest_write, env_dump, file_read, heredoc_write,
+                         literal_write, shell_assign, vault_cli)
 
     return [
         # id                event          tier      handler
@@ -58,6 +58,26 @@ def _table():
         # check returning "deny" is degraded to advice by the engine, which is the
         # correct treatment of a registry error and the wrong outcome here.
         ("KL-WRITE",  "PreToolUse", BLOCK,   literal_write.run),
+        # BLOCK rather than OBSERVE, and the rung is not skipped — it is
+        # satisfied in advance, the way KL-ASSIGN's row above was.
+        #
+        # OBSERVE exists to gather rows when a predicate is unproven. This
+        # predicate is `secretpaths.is_protected`, the pack's oldest classifier,
+        # already licensed to DENY on Read, Grep and Bash under KL-FILE. Nothing
+        # new is judged here; one more surface is told the same answer, and a
+        # pack that refuses to READ a file while allowing it to be overwritten
+        # wholesale was incoherent in a way an operator could not have guessed.
+        #
+        # It was replayed against a body of real write-tool calls before it was
+        # registered, and every destination it refused was a genuine credential
+        # file. The rate is a rounding error against ordinary editing because the
+        # predicate names files, not text: an agent that edits source all day
+        # never meets it.
+        #
+        # The failure it prevents is not the edit. It is the plaintext copy the
+        # host takes on the way through, into ~/.claude/file-history/, which no
+        # later gate can redact and which outlives the file itself.
+        ("KL-DEST",   "PreToolUse", BLOCK,   dest_write.run),
         ("KL-SEEN",   "PostToolUse", WARN,   literal_write.run_post),
     ]
 
