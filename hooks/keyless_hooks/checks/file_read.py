@@ -22,9 +22,10 @@ import os
 import time
 
 from ..secretpaths import is_protected, names_in, resolve
-from ..shellview import (expand_local_assignments, file_operands,
-                         first_positional, flatten_substitutions, head_of,
-                         statements, strip_heredocs, substitution_payloads)
+from ..shellview import (delegated_head, expand_local_assignments,
+                         file_operands, first_positional, flatten_substitutions,
+                         head_of, statements, strip_heredocs,
+                         substitution_payloads)
 
 CHECK = "KL-FILE"
 _RENDER_TTL = 6 * 3600
@@ -260,7 +261,17 @@ def _scan_statements(text, payload, cfg):
             # A command that cannot put a file's content on stdout. This is the
             # closed side of the allowlist: small, enumerable, and it fails
             # toward blocking when a name is missing from it.
-            continue
+            #
+            # Unless it RUNS one. `find` earns its place on that list because
+            # `find -name .netrc` prints a path, and loses it the moment an
+            # `-exec` hands every match to a program: `find . -name .env -exec cat
+            # {} \;` printed the file with this check silent. The statement is
+            # then judged by what it actually runs, so `-exec ls` and `-exec rm`
+            # stay silent on the same rule that always covered them.
+            delegate = delegated_head(stmt)
+            if not delegate or delegate in cfg.non_readers:
+                continue
+            head = delegate
         # For a tool whose first argument is a PATTERN, that one operand is not a
         # path and its metacharacters are not a glob. `grep -rn '.*' src/` is a
         # regex; expanding it against the real directory matched every dotfile

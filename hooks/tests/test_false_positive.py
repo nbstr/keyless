@@ -329,6 +329,92 @@ FILE_TRUE_POSITIVES = [
     "python3 -c \"open('$d/.claude.json')\"",
 ]
 
+# ── an ESCAPED shell metacharacter is an argument, never a separator ────────
+#
+# A `find` expression carries its own parentheses and its own `-exec` terminator,
+# and they are written with a backslash precisely so the shell hands them over as
+# literals. The statement splitter cut at them anyway: the tail of
+#
+#     find ~ -maxdepth 2 \( -name ".netrc" -o -name ".pgpass" \)
+#
+# carried no command word, `.netrc` was read as the head, and a filesystem sweep
+# for credential files — the exact audit a session runs while doing security work
+# — was refused as a credential READ. The refusal named the head as `.netrc`,
+# which is the tell: it believed the filename was the program.
+#
+# `find` is on `non_readers` and the simple spelling always passed, so this was
+# never about the allowlist. Every row is a spelling the shell passes through as
+# an argument: escaped parens, the `-exec` terminator, an escaped pipe, an escaped
+# ampersand, an escaped semicolon, and a line continuation — which is the same
+# defect and the cheaper one to hit, because `ls -la \<newline> .netrc` was
+# refused for naming a file `ls` cannot print.
+ESCAPED_SEPARATOR_FALSE_POSITIVES = [
+    'find . -maxdepth 2 \\( -name ".netrc" -o -name ".pgpass" \\)',
+    'find . -maxdepth 3 \\( -name "id_rsa*" -o -name "*.pem" \\) -print',
+    # The `-exec` terminator. The row that CARRIES the proof is the one with an
+    # operand after it: the bare `find … {} \\;` spellings sit at the end of the
+    # line, so the cut lands past the last character and they were silent before
+    # this fix as well. They are a regression guard; this one is the evidence.
+    'find . -name "*.log" -exec rm {} \\; -o -name ".netrc" -print',
+    "find . -name x -exec grep -l TOKEN {} \\;",
+    'find . -name ".netrc" -exec ls -l {} \\;',
+    # `-exec` delegating to something that still cannot print the file. The
+    # delegated-head rule withdraws `find`'s pass only when the program it runs is
+    # a reader, so these stay silent on the same list that always covered them.
+    'find . -name ".env" -exec ls -l {} \\;',
+    'find . -name ".env" -exec rm {} \\;',
+    'find . -name ".env" -exec dirname {} \\;',
+    "ls \\( .netrc \\)",
+    "echo a \\| .netrc",
+    "echo a \\& .netrc",
+    "stat \\; .netrc",
+    'find . -maxdepth 2 \\\n  -name ".netrc"',
+    "ls -la \\\n  .netrc",
+    "stat \\\n  .npmrc",
+]
+
+# The other direction, and it is the half that keeps this from being a hole. The
+# splitter exists so `cat foo && cat ~/.netrc` cannot smuggle a read past a check
+# that only reads the head. Every genuine separator below is unescaped and
+# unquoted, and every row must still be REFUSED.
+#
+# `cat foo \; cat .env` belongs here rather than above: the escape makes the
+# whole line ONE statement headed by `cat`, and `.env` is that statement's own
+# operand. Not splitting it is what refuses it.
+#
+# `\\;` is the discriminating row — an escaped BACKSLASH followed by a real
+# separator. The escape branch consumes the pair, never reaches the `;`, and the
+# cut still lands. A fix that blanked one character instead of two would open
+# exactly this spelling.
+GENUINE_SEPARATOR_TRUE_POSITIVES = [
+    "cat foo && cat .env",
+    "cat foo || cat .env",
+    "cat foo ; cat .env",
+    "cat foo | cat .env",
+    "cat foo & cat .env",
+    "(cat .env)",
+    "for f in *; do cat .env; done",
+    "cat foo \\; cat .env",
+    "echo a \\\\; cat .env",
+    "cat foo \\\n  && cat .env",
+]
+
+# Silence has to explain itself. Every row above could pass because the splitter
+# was fixed, or because KL-FILE stopped looking at `find` commands entirely — and
+# no assertion of the form "it is silent" tells the two apart. These read the
+# splitter directly: ONE statement, and its head is the PROGRAM.
+#
+# The head is the assertion that actually pins the bug. `.netrc` as a head is the
+# defect in one word.
+SPLIT_CONTROL = [
+    ('find . -maxdepth 2 \\( -name ".netrc" -o -name ".pgpass" \\)', 1, "find"),
+    ('find . -name "*.log" -exec rm {} \\; -o -name ".netrc" -print', 1, "find"),
+    ("ls -la \\\n  .netrc", 1, "ls"),
+    # ...and the control on the control: a real separator still yields two.
+    ("cat foo && cat .env", 2, "cat"),
+    ("cat foo ; cat .env", 2, "cat"),
+]
+
 # The `pat` class. Every organic KL-ENVVAR warn this check produced before the
 # case test fired on a lower-case `pat` in a session writing regular expressions
 # — a PATTERN variable. The upper-case spellings below are the genuine act and
@@ -686,6 +772,11 @@ EXPECTED_CHECKS = (len(SAFE) + len(PREFIX_REFUSES) + 1 + 3 * len(HELP_CONTROL)
                    + 2 * len(ARGV_SECRET)
                    + len(FILE_FALSE_POSITIVES_REGEX_CWD)
                    + len(FILE_FALSE_POSITIVES) + len(FILE_TRUE_POSITIVES)
+                   # escaped metacharacters: silent, then the genuine separators
+                   # that must still deny, then the splitter control (2 each)
+                   + len(ESCAPED_SEPARATOR_FALSE_POSITIVES)
+                   + len(GENUINE_SEPARATOR_TRUE_POSITIVES)
+                   + 2 * len(SPLIT_CONTROL)
                    # the two `~` allow/control assertions, then the copy idioms
                    + 2 + len(ENV_COPY_FALSE_POSITIVES)
                    + len(ENVVAR_FALSE_POSITIVES) + len(ENVVAR_TRUE_POSITIVES)
@@ -773,6 +864,25 @@ def run():
     for cmd in FILE_TRUE_POSITIVES:
         s.check("KL-FILE still denies: %s" % cmd[:48],
                 drive(bash(cmd, cwd=root), env=home).kind, "deny")
+
+    # ── an escaped metacharacter is an argument, not a separator ─────────────
+    for cmd in ESCAPED_SEPARATOR_FALSE_POSITIVES:
+        s.check("KL-FILE allows escaped: %s" % cmd[:48].replace("\n", "\\n"),
+                drive(bash(cmd, cwd=root), env=home).kind, "silent")
+    for cmd in GENUINE_SEPARATOR_TRUE_POSITIVES:
+        s.check("a real separator still denies: %s" % cmd[:48].replace("\n", "\\n"),
+                drive(bash(cmd, cwd=root), env=home).kind, "deny")
+
+    # control 5: the splitter itself, so the silence above is the CUT's doing
+    # rather than KL-FILE having stopped looking at these commands.
+    from keyless_hooks.shellview import head_of, statements
+    for cmd, count, head in SPLIT_CONTROL:
+        label = cmd[:44].replace("\n", "\\n")
+        parts = statements(cmd)
+        s.check("split control: %d statement(s) in %s" % (count, label),
+                len(parts), count)
+        s.check("split control: the head is a program in %s" % label,
+                head_of(parts[0]) if parts else "<none>", head)
 
     # ── KL-FILE: a protected name that is READ, but whose file is elsewhere ──
     #
