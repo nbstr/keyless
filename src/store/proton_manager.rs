@@ -54,7 +54,7 @@ use zeroize::Zeroize;
 use crate::config::{Config, SecretRoute};
 use crate::secret::Secret;
 use crate::store::exec::{self, CaptureError, capture, capture_with_input, summarise};
-use crate::store::manage::{MINT_A_MANAGER_TOKEN, Manage, ManageError, Stored};
+use crate::store::manage::{Manage, ManageError, Stored, mint_a_manager_token};
 use crate::store::proton::{
     ItemListing, Matched, REASON_VAR, REFERENCE_SCHEME, Reason, SESSION_DIR_VAR, flag_value,
     match_title, relative_session_dir, remove_ambient_references, resolve_executable, scrub,
@@ -110,8 +110,16 @@ const ROLE_REFUSALS: &[&str] = &["notallowed", "not allowed", "permission", "for
 /// failure is far more often a read-only token than anything else — but asserting
 /// it would be wrong the day the vault is full or the network drops, and a
 /// confidently wrong diagnosis costs more than an honest guess.
-const UNEXPLAINED_CREATE_HINT: &str = "the vendor did not say why. By far the most common cause is the token's ROLE: `--role` on \
-     `pass-cli agent access grant` defaults to `viewer`, and a viewer cannot create an item";
+///
+/// It names the FLAG and not a command line. The command that sets the role is
+/// part of the recipe appended right after this sentence, where it is spelled
+/// once, in full, with the session it runs in — see
+/// [`crate::store::manage::mint_a_manager_token`]. Half a command here would be
+/// a second thing to keep correct, and the half that gets dropped is always the
+/// session.
+const UNEXPLAINED_CREATE_HINT: &str = "the vendor did not say why. By far the most common cause is the token's ROLE: `--role` \
+     defaults to `viewer` when an agent is granted access to a vault, and a viewer cannot create \
+     an item";
 
 /// Writes items to Proton Pass through `pass-cli item create`.
 pub struct ProtonManager {
@@ -152,7 +160,7 @@ impl ProtonManager {
         let Some((manager, session_dir)) = manager else {
             return Err(ManageError::NoIdentity {
                 store: "proton".to_owned(),
-                detail: MINT_A_MANAGER_TOKEN.to_owned(),
+                detail: mint_a_manager_token(None),
             });
         };
 
@@ -371,10 +379,14 @@ impl ProtonManager {
         let detail = if named_the_role {
             format!(
                 "{context}: {vendor}. That is the token's ROLE, not the request: an agent token \
-                 with viewer access cannot create or trash an item. {MINT_A_MANAGER_TOKEN}"
+                 with viewer access cannot create or trash an item. {}",
+                mint_a_manager_token(Some(&self.session_dir))
             )
         } else if create_failed {
-            format!("{context}: {vendor}. {UNEXPLAINED_CREATE_HINT}. {MINT_A_MANAGER_TOKEN}")
+            format!(
+                "{context}: {vendor}. {UNEXPLAINED_CREATE_HINT}. {}",
+                mint_a_manager_token(Some(&self.session_dir))
+            )
         } else {
             format!("{context}: {vendor}")
         };

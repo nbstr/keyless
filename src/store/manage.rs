@@ -186,12 +186,40 @@ impl std::error::Error for ManageError {}
 ///   normal one rather than an unusual one.
 /// - A viewer-role token returns `NotAllowed` from `item create` and from
 ///   `item trash`.
-pub const MINT_A_MANAGER_TOKEN: &str = "add \"manager\": {\"session_dir\": \"~/.keyless-pass-manager\"} to stores.proton — a leading \
-     `~` is expanded against your home directory, and the path must not be relative — then put a \
-     SECOND agent token in that directory with the editor role: `pass-cli agent create <name> \
-     --expiration 3m --vault <VAULT>`, then `pass-cli agent access grant <name> --vault-name \
-     <VAULT> --role editor` — `--role` defaults to `viewer`, which is exactly why a write fails \
-     with NotAllowed. Keep the reader token viewer-only: it is the one every session gets";
+///
+/// # Which session each of the three commands runs in, which is the whole recipe
+///
+/// The recipe this replaces named two commands and no session, and it was
+/// unfollowable twice over.
+///
+/// - `agent create` and `agent access grant` act as the **account**. They mint a
+///   token for an agent; they are not run by one. So they belong in whichever
+///   session directory holds your own login — the default one unless you keep it
+///   elsewhere — and NOT in the manager's directory, which has no identity in it
+///   until the third command puts one there.
+/// - The third command is the one that was missing altogether. `agent create`
+///   prints a token and writes to no session directory, so a recipe that stops
+///   after `access grant` leaves a token in the scrollback, a config pointing at
+///   an empty directory, and a store that fails authentication for a reason
+///   nothing on the machine explains.
+pub fn mint_a_manager_token(session_dir: Option<&std::path::Path>) -> String {
+    format!(
+        "add \"manager\": {{\"session_dir\": \"~/.keyless-pass-manager\"}} to stores.proton — a \
+         leading `~` is expanded against your home directory, and the path must not be relative \
+         — then put a SECOND agent token in that directory with the editor role. In the session \
+         where you are logged in as the ACCOUNT (the default one, unless you keep your own login \
+         in a named {session_var}), run `pass-cli agent create <name> --expiration 3m --vault \
+         <VAULT>` and then `pass-cli agent access grant <name> --vault-name <VAULT> --role \
+         editor` — `--role` defaults to `viewer`, which is exactly why a write fails with \
+         NotAllowed. Then log the token it printed into the manager's own directory, which is \
+         the step that actually creates that session: `{login}`. The token goes in the \
+         environment rather than in `--pat`, so it is not readable from the process table; it is \
+         still in your shell history. Keep the reader token viewer-only: it is the one every \
+         session gets",
+        session_var = crate::store::proton::SESSION_DIR_VAR,
+        login = crate::store::proton::login_with_token(session_dir),
+    )
+}
 
 /// Why Infisical has no manager identity here.
 const INFISICAL_HAS_NO_WRITER: &str = "this build writes through no Infisical verb. `infisical secrets set` takes the value as a \
@@ -296,6 +324,54 @@ mod tests {
             "the message must name the flag, not just the idea: {error}"
         );
         assert!(error.contains("viewer-only"), "{error}");
+        // The step that was missing entirely. `agent create` prints a token and
+        // writes to no session directory, so a recipe that stops at `access
+        // grant` leaves the configured directory empty and every later write
+        // failing authentication with nothing on the machine to explain it.
+        assert!(
+            error.contains("PROTON_PASS_PERSONAL_ACCESS_TOKEN"),
+            "the recipe never says how the token becomes a session: {error}"
+        );
+        assert!(
+            error.contains("PROTON_PASS_SESSION_DIR"),
+            "the recipe never says which session it lands in: {error}"
+        );
+        // As ONE command line. Naming both halves in separate sentences is what
+        // the doctor row used to do, and it is followable only by somebody who
+        // already knew the answer.
+        assert!(
+            error.contains(
+                "PROTON_PASS_SESSION_DIR=<the session directory you chose> \
+                 PROTON_PASS_PERSONAL_ACCESS_TOKEN"
+            ),
+            "the two halves are named but never joined into one line: {error}"
+        );
+        // Never the flag form: an argument is readable from the process table.
+        assert!(
+            !error.contains("login --pat"),
+            "the recipe recommends a credential in argv: {error}"
+        );
+    }
+
+    #[test]
+    fn the_manager_recipe_names_the_configured_directory_when_there_is_one() {
+        // The negative control for the test above, and a separate property: once
+        // `manager.session_dir` IS set, the login step must name THAT directory
+        // rather than the placeholder. A write refused by the vendor is the one
+        // moment an operator needs to re-mint into a directory that already
+        // exists, and a placeholder there sends them to invent a second one.
+        let recipe = super::mint_a_manager_token(Some(std::path::Path::new("/tmp/mgr-session")));
+        assert!(
+            recipe.contains(
+                "PROTON_PASS_SESSION_DIR=/tmp/mgr-session \
+                             PROTON_PASS_PERSONAL_ACCESS_TOKEN"
+            ),
+            "{recipe}"
+        );
+        assert!(
+            !recipe.contains("<the session directory you chose>"),
+            "a configured directory was reported as unknown: {recipe}"
+        );
     }
 
     #[test]

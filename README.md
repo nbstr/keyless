@@ -801,7 +801,8 @@ Measured 2026-08-08. `--env-file` is not the only place it looks — one unrelat
 `UNRELATED=pass://…` exported in your shell is enough:
 
 ```console
-$ UNRELATED=pass://bogus/bogus/password pass-cli run -- printenv HOME
+$ PROTON_PASS_SESSION_DIR=~/.keyless-pass-session \
+  UNRELATED=pass://bogus/bogus/password pass-cli run -- printenv HOME
 Error: Failed to resolve secrets
 Caused by:
     0: Failed to resolve secret pass://bogus/bogus/password in variable UNRELATED
@@ -1094,12 +1095,33 @@ used by `new` and `put` and by nothing else:
 }
 ```
 
-Minting it, measured against `pass-cli` 2.2.5:
+Minting it takes three commands and **two different identities**, measured
+against `pass-cli` 2.2.5. The first two act as your ACCOUNT — they mint a token
+for an agent, they are not run by one — so they belong wherever your own login
+lives, which is the default session unless you keep it somewhere named:
 
 ```console
+# No PROTON_PASS_SESSION_DIR here — these run as the ACCOUNT, in whichever
+# session your own login lives in, and the default one is where it usually is.
 $ pass-cli agent create keyless-manager --expiration 3m --vault personal
 $ pass-cli agent access grant keyless-manager --vault-name personal --role editor
 ```
+
+The third is the one that creates the manager's session, and leaving it out is
+why a config can point at a directory that has nothing in it. `agent create`
+prints a token and writes to no session directory:
+
+```console
+$ PROTON_PASS_SESSION_DIR=~/.keyless-pass-manager \
+  PROTON_PASS_PERSONAL_ACCESS_TOKEN=<the token above> pass-cli login
+```
+
+That spelling is the vendor's own, from `pass-cli agent instructions`. The
+alternative, `pass-cli login --pat <TOKEN>`, exists and is not recommended here:
+an argument is readable from the process table for as long as the process lives,
+which is the leak this tool exists to remove. The environment is not free either
+— that line lands in your shell history — but it is the better of the two the
+vendor offers.
 
 **`--role` defaults to `viewer`.** That is why an unexplained `NotAllowed` from a
 write is nearly always the token's role and not the vault's permissions, and why

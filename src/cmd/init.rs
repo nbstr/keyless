@@ -649,9 +649,17 @@ fn setup_step(id: &str) -> String {
         "infisical" => "`infisical login`, then add \"project_id\" under \
                         `stores.infisical` and an \"env\" on each name"
             .to_owned(),
-        _ => "`pass-cli login` into a session directory, then set \
-              `stores.proton.session_dir` to it"
-            .to_owned(),
+        // The variable is the whole of the instruction. "Log in into a session
+        // directory" is followable only by somebody who already knows the
+        // directory travels in an environment variable — and every spelling
+        // reached for instead is a documented dead end. See
+        // `crate::store::proton::scoped_command_template`.
+        _ => format!(
+            "`{}`, then set `stores.proton.session_dir` to that same directory — \
+             the variable is not optional, a bare `pass-cli login` logs into the \
+             DEFAULT session and reports success",
+            crate::store::proton::scoped_command_template("login")
+        ),
     }
 }
 
