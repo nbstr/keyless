@@ -608,7 +608,7 @@ fn store_rows(config: &Config, registry: &Registry) -> Vec<StoreRow> {
                     detail: points_at(config, id),
                     action: None,
                 },
-                Err(error) => failing_row(id, &error),
+                Err(error) => failing_row(config, id, &error),
             },
             None => dormant_row(config, id),
         })
@@ -648,7 +648,7 @@ fn points_at(config: &Config, id: &str) -> String {
 /// has to be sent — the install, their own config file, and the store itself —
 /// so the mark and the action are read off the variant rather than sniffed out
 /// of a message.
-fn failing_row(id: &str, error: &StoreError) -> StoreRow {
+fn failing_row(config: &Config, id: &str, error: &StoreError) -> StoreRow {
     let (mark, state) = match error {
         // Not there yet: no binary, no login, no network. A step nobody took,
         // which is amber rather than red — but still a problem, because a store
@@ -667,7 +667,7 @@ fn failing_row(id: &str, error: &StoreError) -> StoreRow {
         // backend fails they are looking at. Never its stdout; see
         // `crate::error`.
         detail: detail_of(error),
-        action: Some(remedy(id, error)),
+        action: Some(remedy(config, id, error)),
     }
 }
 
@@ -686,7 +686,7 @@ fn detail_of(error: &StoreError) -> String {
 /// MACHINE, not about the lookup that failed — and because a `Misconfigured`
 /// error already carries the config fix in its own detail, so repeating it would
 /// give a reader two sentences to reconcile.
-fn remedy(id: &str, error: &StoreError) -> String {
+fn remedy(config: &Config, id: &str, error: &StoreError) -> String {
     if matches!(error, StoreError::Misconfigured { .. }) {
         return format!(
             "the fix is one line of {}'s config file, not anything in the store",
@@ -700,9 +700,23 @@ fn remedy(id: &str, error: &StoreError) -> String {
         "infisical" => "`infisical login`, then check `stores.infisical.project_id` \
                         and the `env` on each name"
             .to_owned(),
-        "proton" => "`pass-cli login` into `stores.proton.session_dir`, \
-                     or re-issue the agent token"
-            .to_owned(),
+        // The command with THIS machine's session directory already in it. The
+        // sentence it replaces — "`pass-cli login` into
+        // `stores.proton.session_dir`" — is followable only by someone who
+        // already knows that the directory travels in an environment variable;
+        // typed literally it logs into the DEFAULT session, which on a machine
+        // with a full-account login answers `Already authenticated` and leaves
+        // the broken session untouched. That answer cost a day.
+        "proton" => match &config.stores.proton.session_dir {
+            Some(dir) => format!(
+                "`{}`, or re-issue the agent token — the variable is not optional, \
+                 a bare `pass-cli login` logs into the DEFAULT session",
+                crate::store::proton::login_into(dir.as_path())
+            ),
+            None => "set `stores.proton.session_dir`, then log in with \
+                     `PROTON_PASS_SESSION_DIR=<that directory> pass-cli login`"
+                .to_owned(),
+        },
         "daemon" => "start `keylessd`, or set `stores.daemon.enabled` to false so \
                      this machine reads its own stores"
             .to_owned(),
@@ -1090,7 +1104,7 @@ fn report_capability_boundary(style: Style, out: &mut dyn Write) -> io::Result<(
 
 #[cfg(test)]
 mod tests {
-    use super::{doctor, report_build};
+    use super::{doctor, remedy, report_build};
     use crate::audit::AuditLog;
     use crate::checkout::Checkout;
     use crate::cmd::status::Style;
@@ -1676,5 +1690,43 @@ mod tests {
         let load = loaded(r#"{"secrets":{"DECOY":{}}}"#);
         let (text, _) = report(&load, Registry::new(vec![Box::new(Healthy)]), true);
         assert!(!text.contains('\x1b'), "a redirected report was coloured");
+    }
+
+    /// A `Unavailable` from a store, for the rows that are about the ACTION.
+    fn unavailable(store: &str) -> StoreError {
+        StoreError::Unavailable {
+            store: store.to_owned(),
+            detail: "the session cannot be used".to_owned(),
+        }
+    }
+
+    #[test]
+    fn the_proton_next_action_names_the_variable_that_selects_the_session() {
+        // The action column is a separate sentence from the adapter's detail,
+        // and it is the one a reader copies. `pass-cli login` on its own logs
+        // into the DEFAULT session — on macOS `~/Library/Application
+        // Support/proton-pass-cli/.session` — which on a machine with a
+        // full-account login answers `Already authenticated` and leaves the
+        // configured session exactly as broken as it was. That answer is true,
+        // it is about a different session, and it cost a day on 2026-08-10.
+        let load = loaded(
+            r#"{"stores":{"proton":{"enabled":true,"session_dir":"/tmp/keyless-doctor-agent"}}}"#,
+        );
+        let action = remedy(&load.config, "proton", &unavailable("proton"));
+        assert!(
+            action.contains("PROTON_PASS_SESSION_DIR=/tmp/keyless-doctor-agent pass-cli login"),
+            "the next action did not name this machine's session directory: {action}"
+        );
+    }
+
+    #[test]
+    fn the_proton_next_action_with_no_session_directory_asks_for_one_first() {
+        // There is no directory to name, so the advice must not invent one. It
+        // still says how the directory travels, because that is the half nobody
+        // guesses.
+        let load = loaded(r#"{"stores":{"proton":{"enabled":true}}}"#);
+        let action = remedy(&load.config, "proton", &unavailable("proton"));
+        assert!(action.contains("stores.proton.session_dir"), "{action}");
+        assert!(action.contains("PROTON_PASS_SESSION_DIR"), "{action}");
     }
 }

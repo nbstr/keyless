@@ -470,6 +470,189 @@ pub(crate) fn relative_session_dir(field: &str, dir: &Path) -> String {
     )
 }
 
+/// The subdirectory `pass-cli` keeps one identity's session in.
+///
+/// Under `PROTON_PASS_SESSION_DIR`, not beside it: measured 2026-08-11, a
+/// directory this crate handed the vendor came back holding
+/// `<dir>/.session/{pass-cli.db,pat_key,session.json}`.
+const SESSION_SUBDIR: &str = ".session";
+
+/// The prefix on the file `pass-cli` writes a session into before renaming it.
+///
+/// `session.tmp.<pid>.<seq>`. The literal `session.tmp.` is in the vendor's
+/// binary (`pass-cli` 2.2.5), beside `session.json` — so the write-temp-then-
+/// rename is the VENDOR's, and one of those files left behind is its rename
+/// having never happened.
+const SESSION_TEMP_PREFIX: &str = "session.tmp.";
+
+/// How long an unfinished write must sit still before this crate calls it dead.
+///
+/// A zero-byte temp file being written right now and one abandoned by a killed
+/// process are byte-for-byte the same file. The only thing that separates them
+/// without inspecting open file descriptors is that one of them stops moving,
+/// so this is the whole discriminator and it is deliberately generous: calling
+/// a live write dead is the error that costs a session.
+const STALE_TEMP_AFTER: Duration = Duration::from_secs(10);
+
+/// An unfinished `session.json` write, found beside the session it belongs to.
+///
+/// Metadata only. Nothing in this crate opens `session.json` or any temp file —
+/// a session file holds an authenticated identity, and a broker that reads one
+/// is a `get` verb with extra steps.
+struct InterruptedWrite {
+    /// The temp file's own name, e.g. `session.tmp.28182.0`.
+    name: String,
+    /// How long it has sat unmodified, or `None` when the clock could not say.
+    ///
+    /// `None` on a file whose modification time is in the FUTURE as well: a
+    /// skewed clock is a reason to make no claim, never a reason to make the
+    /// confident one.
+    idle: Option<Duration>,
+}
+
+impl InterruptedWrite {
+    /// Whether it has been still long enough to be finished-or-dead for certain.
+    fn stale(&self) -> bool {
+        self.idle.is_some_and(|idle| idle >= STALE_TEMP_AFTER)
+    }
+}
+
+/// The name of the file the temp files are renamed over.
+const SESSION_FILE: &str = "session.json";
+
+/// The oldest unfinished session write that is still the LAST thing to happen.
+///
+/// Reads the directory listing and each entry's modification time, and nothing
+/// else — never a byte of any file in it.
+///
+/// # A temp file older than `session.json` is debris, and saying otherwise
+/// # would make this check wrong forever
+///
+/// `rename` carries the source file's modification time with it, so after a
+/// write that COMPLETED, `session.json` is exactly as new as the temp file that
+/// became it — and strictly newer than any temp left over from an earlier,
+/// failed attempt. So `session.json` being newer proves a later write landed,
+/// and the leftover is then a scar rather than a cause.
+///
+/// Measured on the incident's own directory, 2026-08-11: the abandoned
+/// `session.tmp.28182.0` from 17:47:30 the previous day was still on disk beside
+/// a `session.json` rewritten at 06:35:14 that morning — the personal-access-
+/// token session had re-established itself, exactly as
+/// [`remove_ambient_references`] documents it can. Without this comparison every
+/// unrelated Proton failure from that day onward — an expired token, a revoked
+/// one — would have been reported as a half-written session, on the strength of
+/// a file that stopped mattering months earlier.
+///
+/// The OLDEST of several rather than the newest, because the one that has sat
+/// longest is the one whose writer is least likely to still exist.
+fn interrupted_write(session_dir: &Path) -> Option<InterruptedWrite> {
+    let session = session_dir.join(SESSION_SUBDIR);
+    // `None` when there is no session file at all, which is not a reason to stay
+    // quiet: a rename that never happened leaves precisely that.
+    let landed = fs::symlink_metadata(session.join(SESSION_FILE))
+        .and_then(|meta| meta.modified())
+        .ok();
+    let entries = fs::read_dir(&session).ok()?;
+    let now = std::time::SystemTime::now();
+
+    entries
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if !name.starts_with(SESSION_TEMP_PREFIX) {
+                return None;
+            }
+            let modified = entry
+                .metadata()
+                .ok()
+                .and_then(|meta| meta.modified().ok())?;
+            if landed.is_some_and(|landed| landed > modified) {
+                return None;
+            }
+            Some(InterruptedWrite {
+                name,
+                idle: now.duration_since(modified).ok(),
+            })
+        })
+        // An entry whose age is unknown sorts last, so a readable clock always
+        // decides the answer when there is one.
+        .max_by_key(|write| write.idle.unwrap_or_default())
+}
+
+/// Render a path as ONE shell word, so a remedy can be pasted as printed.
+///
+/// A session directory with a space in it would otherwise produce advice that
+/// silently logs into a DIFFERENT directory — which is the exact failure this
+/// whole report exists to name.
+fn shell_word(path: &Path) -> String {
+    let text = path.display().to_string();
+    let safe = !text.is_empty()
+        && text
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"._-/:@%+=,".contains(&byte));
+    if safe {
+        text
+    } else {
+        format!("'{}'", text.replace('\'', r"'\''"))
+    }
+}
+
+/// The login command for ONE session directory, ready to paste.
+///
+/// # Why the variable is on the front, every time
+///
+/// `pass-cli login` with nothing in front of it logs into the DEFAULT session —
+/// `~/Library/Application Support/proton-pass-cli/.session` on macOS — which on
+/// a machine that has ever had a full-account login answers `Already
+/// authenticated` and changes nothing about the directory `keyless` reads. That
+/// answer is true, and it is about a different session; it cost a day.
+///
+/// `PROTON_PASS_SESSION_DIR` is the variable this adapter puts on every child it
+/// spawns, so it is by construction the variable that decides which identity
+/// answers `keyless`. Advice that omits it cannot be followed.
+pub(crate) fn login_into(session_dir: &Path) -> String {
+    format!(
+        "{SESSION_DIR_VAR}={} pass-cli login",
+        shell_word(session_dir)
+    )
+}
+
+/// What to tell an operator whose session directory holds an unfinished write.
+///
+/// Two states, because they call for opposite actions: a write that stopped
+/// moving is damage, and a write from two seconds ago may be a sibling process
+/// doing its job.
+fn interrupted_write_detail(session_dir: &Path, write: &InterruptedWrite, vendor: &str) -> String {
+    let dir = session_dir.display();
+    let name = &write.name;
+
+    if !write.stale() {
+        return format!(
+            "the session at {dir} did not answer, and `{SESSION_SUBDIR}/{name}` was written \
+             moments ago — a `pass-cli` may be writing this session right now. Run `keyless \
+             doctor` again before concluding anything: a temp file that is still there and no \
+             longer changing is an interrupted write, and this one is too fresh to call. \
+             `pass-cli` says: {vendor}"
+        );
+    }
+
+    format!(
+        "the session at {dir} is HALF-WRITTEN, and that is WHY there is no identity here: \
+         `{SESSION_SUBDIR}/{name}` is an unfinished write that stopped moving, and it is the \
+         last thing that happened in that directory. `pass-cli` writes a session to a temp file \
+         and renames it over `{SESSION_FILE}`, so a `pass-cli` killed between the two leaves \
+         exactly this pair. keyless writes NOTHING in this directory — the whole write is the \
+         vendor's — so it cannot make that rename atomic and cannot repair the result. Log in \
+         again with the directory NAMED, because a plain `pass-cli login` answers about the \
+         default session and reports `Already authenticated` while this one stays broken: `{}`. \
+         keyless leaves `{name}` where it is: a temp file held by a live writer and one \
+         abandoned by a dead one are the same zero bytes, and deleting a live session would be \
+         worse than reporting this one — once a login has landed, a leftover older than \
+         `{SESSION_FILE}` is ignored by this check anyway. `pass-cli` says: {vendor}",
+        login_into(session_dir)
+    )
+}
+
 /// Where one name lives, in the stable form: vault name, item title, field.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ItemAddress {
@@ -1450,17 +1633,29 @@ impl Store for ProtonStore {
         .map_err(|error| self.unreachable(&error))?;
 
         if captured.status.success() {
-            Ok(())
-        } else {
-            // stderr only, as everywhere else in this adapter, and with the fix
-            // attached: the vendor says what is wrong, not what to do about it.
-            Err(self.unavailable(format!(
-                "the session at {} cannot be used: {}; re-mint it with `pass-cli login` \
-                 (or re-issue the agent token) and check `stores.proton.session_dir`",
-                session_dir.display(),
-                summarise(&captured.stderr)
-            )))
+            // Deliberately no forensics on the success path. An orphan temp file
+            // beside a session that ANSWERED is debris, not a fault, and a health
+            // check that reports a problem on a working store is how a health
+            // check gets ignored.
+            return Ok(());
         }
+
+        // stderr only, as everywhere else in this adapter, and with the fix
+        // attached: the vendor says what is wrong, not what to do about it.
+        let vendor = summarise(&captured.stderr);
+
+        // Asked only once the round trip has already failed, so a working store
+        // never pays for it and a passing report never depends on it.
+        if let Some(write) = interrupted_write(session_dir) {
+            return Err(self.unavailable(interrupted_write_detail(session_dir, &write, &vendor)));
+        }
+
+        Err(self.unavailable(format!(
+            "the session at {} cannot be used: {vendor}; re-mint it with `{}` \
+             (or re-issue the agent token) and check `stores.proton.session_dir`",
+            session_dir.display(),
+            login_into(session_dir)
+        )))
     }
 }
 
