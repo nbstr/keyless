@@ -1544,8 +1544,16 @@ fn doctor_reports_an_expired_proton_session_as_a_problem() {
     );
     // And the fix, because "requires an authenticated client" does not tell
     // anybody which session directory to re-mint.
-    assert!(flat.contains("pass-cli login"), "{report}");
-    assert!(flat.contains(SCOPED_SESSION_DIR), "{report}");
+    // As ONE string. Asserting the command and the directory separately passes
+    // on a report that names both and joins neither, which is the report that
+    // cost the hours: `pass-cli login` typed without the variable in front of it
+    // reaches the DEFAULT session and answers `Already authenticated`.
+    assert!(
+        flat.contains(&format!(
+            "PROTON_PASS_SESSION_DIR={SCOPED_SESSION_DIR} pass-cli login"
+        )),
+        "{report}"
+    );
     assert_eq!(code, 1, "{report}");
     assert!(!report.contains("0 problem(s)"), "{report}");
 

@@ -713,9 +713,10 @@ fn remedy(config: &Config, id: &str, error: &StoreError) -> String {
                  a bare `pass-cli login` logs into the DEFAULT session",
                 crate::store::proton::login_into(dir.as_path())
             ),
-            None => "set `stores.proton.session_dir`, then log in with \
-                     `PROTON_PASS_SESSION_DIR=<that directory> pass-cli login`"
-                .to_owned(),
+            None => format!(
+                "set `stores.proton.session_dir`, then log in with `{}`",
+                crate::store::proton::scoped_command_template("login")
+            ),
         },
         "daemon" => "start `keylessd`, or set `stores.daemon.enabled` to false so \
                      this machine reads its own stores"

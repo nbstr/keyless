@@ -113,6 +113,40 @@
 //! No token file, no keyring entry, no account credential. The login belongs to
 //! `pass-cli` and is inherited by spawning it, and there is no config field in
 //! which a token would fit.
+//!
+//! # Why there is no `keyless login proton`, and no `keyless proton -- …`
+//!
+//! The obvious close for the lost-session-directory class is a `keyless` verb
+//! that runs the vendor for you with the variable already set. Attacked before
+//! being built, it is not the answer:
+//!
+//! - **The general form is a `get` verb wearing a hyphen.** `keyless proton --
+//!   <args>` reaches `item view --field password`, `totp generate`, `inject` and
+//!   `personal-access-token create`, and every one of those prints a credential
+//!   to stdout. The whole claim of this tool is that no verb prints a value, and
+//!   the most reachable verb in it must not be the exception. An allowlist of
+//!   harmless vendor verbs would narrow that and would still be a list this
+//!   crate has to keep correct against somebody else's release schedule.
+//! - **A narrow `keyless login proton` closes one verb out of seventeen.** See
+//!   [`SESSION_SCOPED_VERBS`]: an operator reaches for `info`, `logout`, `agent
+//!   create` and `agent renew` in the same sitting, and each one silently
+//!   answers about the DEFAULT session when the variable is missing. Closing the
+//!   one that was noticed leaves the class open.
+//! - **Neither reaches the person who typed the command.** Both incidents began
+//!   with a command line that had been WRITTEN DOWN without the variable — in
+//!   this crate's own messages, in its README, and in the vendor's own `agent
+//!   instructions`, which tells its reader to recover from an authentication
+//!   error by logging out. A new verb adds a second correct spelling; it removes
+//!   no wrong one.
+//! - **Every wrapper is one more place to destroy a session.** See
+//!   [`remove_ambient_references`]: handed an environment somebody sanitised,
+//!   `pass-cli` reinitialises the session database at that path, and a web-login
+//!   session does not come back.
+//!
+//! So the coordinate is attached where a command line is WRITTEN instead.
+//! [`scoped_command`] is the only place the prefix is assembled, and
+//! `tests/session_coordinate.rs` fails the suite when a published file writes a
+//! command line the variable is absent from.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -597,7 +631,40 @@ fn shell_word(path: &Path) -> String {
     }
 }
 
-/// The login command for ONE session directory, ready to paste.
+/// Every `pass-cli` verb whose answer depends on which session directory it runs in.
+///
+/// Taken from `pass-cli --help` on 2.2.5. The list is the vendor's whole verb
+/// set MINUS `help`, `update` and `support` — the three that reach no vault — so
+/// it is written as an exception list rather than as a judgement made verb by
+/// verb. Two of them were measured rather than assumed: `settings view` and
+/// `item list` both answer `This operation requires an authenticated client`
+/// against a session directory with no identity in it.
+///
+/// It exists to be READ BY A TEST. `tests/session_coordinate.rs` scans every
+/// published file for a `pass-cli` command line written without the variable
+/// that decides which identity runs it, and this is the list of verbs that makes
+/// such a line wrong. See that file for what the scan cannot see.
+pub const SESSION_SCOPED_VERBS: &[&str] = &[
+    "agent",
+    "info",
+    "inject",
+    "invite",
+    "item",
+    "login",
+    "logout",
+    "password",
+    "personal-access-token",
+    "run",
+    "session",
+    "settings",
+    "share",
+    "ssh-agent",
+    "totp",
+    "user",
+    "vault",
+];
+
+/// One `pass-cli` command line, with the session it runs in on the front.
 ///
 /// # Why the variable is on the front, every time
 ///
@@ -605,16 +672,89 @@ fn shell_word(path: &Path) -> String {
 /// `~/Library/Application Support/proton-pass-cli/.session` on macOS — which on
 /// a machine that has ever had a full-account login answers `Already
 /// authenticated` and changes nothing about the directory `keyless` reads. That
-/// answer is true, and it is about a different session; it cost a day.
+/// answer is true, and it is about a different session; it cost a day, twice, on
+/// two machines.
 ///
 /// `PROTON_PASS_SESSION_DIR` is the variable this adapter puts on every child it
 /// spawns, so it is by construction the variable that decides which identity
 /// answers `keyless`. Advice that omits it cannot be followed.
-pub(crate) fn login_into(session_dir: &Path) -> String {
+///
+/// # Why this is a function rather than a habit
+///
+/// Every wrong spelling of this that reached an operator was a hand-written
+/// string. There is no other way to build one now: this is the only place the
+/// prefix is assembled, [`shell_word`] is the only place the directory is
+/// quoted, and a test asserts that no published file writes a `pass-cli`
+/// command line the variable is absent from. A sentence nobody is required to
+/// write correctly is not a mechanism.
+#[must_use]
+pub fn scoped_command(session_dir: &Path, arguments: &str) -> String {
     format!(
-        "{SESSION_DIR_VAR}={} pass-cli login",
+        "{SESSION_DIR_VAR}={} pass-cli {arguments}",
         shell_word(session_dir)
     )
+}
+
+/// What stands in for the directory in advice written before there is one.
+///
+/// `keyless init` and `keyless setup` run BEFORE `stores.proton.session_dir`
+/// exists, so their advice cannot name a real path. It can still name the
+/// variable, which is the half that was missing: an operator who is told to
+/// "log in to a session directory" has no way to discover that the directory
+/// travels in an environment variable, and every other spelling they will reach
+/// for is a documented failure — `pass-cli login` hits the default session,
+/// `HOME=<dir> pass-cli login` moves the macOS keychain out from under the
+/// vendor and dies at `-25307`, and `pass-cli --session-dir <dir>` is not a flag
+/// that exists.
+pub const SESSION_DIR_PLACEHOLDER: &str = "<the session directory you chose>";
+
+/// The same command line, before the directory is known. See
+/// [`SESSION_DIR_PLACEHOLDER`].
+#[must_use]
+pub fn scoped_command_template(arguments: &str) -> String {
+    format!("{SESSION_DIR_VAR}={SESSION_DIR_PLACEHOLDER} pass-cli {arguments}")
+}
+
+/// The environment variable an agent token travels in, at login.
+///
+/// Read out of `pass-cli agent instructions` on 2026-08-11 — the vendor's own
+/// text, printed by the vendor's own binary, which is the only reason this crate
+/// states it. The alternative spelling `pass-cli login --pat <TOKEN>` exists and
+/// is **not** what this crate ever recommends: an argument is readable from the
+/// process table for as long as the process lives, which is the exact leak
+/// `keyless` exists to remove, and this crate does not get to make an exception
+/// for its own setup instructions.
+pub const TOKEN_VAR: &str = "PROTON_PASS_PERSONAL_ACCESS_TOKEN";
+
+/// How a minted agent token becomes the identity in ONE session directory.
+///
+/// # The step that was missing entirely, not merely under-specified
+///
+/// `agent create` prints a token and writes nothing to any session directory.
+/// Until that token is logged in somewhere, the directory named in the config is
+/// empty — so an operator who follows a recipe ending at `agent access grant`
+/// has a token, a config pointing at nothing, and a store that fails
+/// authentication. That was true of this crate's own manager-token recipe and of
+/// its README.
+///
+/// The token is a value, so it goes in the child's environment and never in an
+/// argument. It does land in shell history, which is the vendor's design and not
+/// something `keyless` can route around: say so rather than pretend the line is
+/// free.
+/// `None` when the directory is the one the operator is being told to invent —
+/// [`SESSION_DIR_PLACEHOLDER`] stands in for it, because a path that does not
+/// exist yet cannot be quoted as a shell word and a tilde that got quoted would
+/// stop expanding.
+#[must_use]
+pub fn login_with_token(session_dir: Option<&Path>) -> String {
+    let dir = session_dir.map_or_else(|| SESSION_DIR_PLACEHOLDER.to_owned(), shell_word);
+    format!("{SESSION_DIR_VAR}={dir} {TOKEN_VAR}=<the token `agent create` printed> pass-cli login")
+}
+
+/// The login command for ONE session directory, ready to paste.
+#[must_use]
+pub fn login_into(session_dir: &Path) -> String {
+    scoped_command(session_dir, "login")
 }
 
 /// What to tell an operator whose session directory holds an unfinished write.

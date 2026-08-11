@@ -368,10 +368,13 @@ pub fn setup(
     note(
         out,
         style,
-        "A store credential is per-person and this command cannot mint one. \
-         Infisical needs `infisical login` against your own account. Proton \
-         needs `pass-cli login` into a session directory that does not copy \
-         between machines or accounts.",
+        &format!(
+            "A store credential is per-person and this command cannot mint one. \
+             Infisical needs `infisical login` against your own account. Proton needs \
+             `{}` — a session directory that does not copy between machines or \
+             accounts, named by that variable and by nothing else.",
+            crate::store::proton::scoped_command_template("login")
+        ),
     )?;
     note(
         out,
