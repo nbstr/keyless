@@ -185,6 +185,16 @@ DEFAULT_VAULT_VERBS = [
     ["pass-cli", r"^inject$", "pass-cli run -- <cmd>", None],
     ["pass-cli", r"^personal-access-token\s+(create|renew)\b",
      "pass-cli run -- <cmd>", None],
+    # ── Claude Code CLI — measured 2026-08-13 ───────────────────────────────
+    # `claude mcp get <name>` prints the server's stored env block verbatim, and
+    # an MCP server is registered with `--env NAME=<token>` by nearly every
+    # vendor's own copy-paste line — so the value is in ~/.claude.json in the
+    # clear and this verb reads it back out. That file is already `protected`
+    # and KL-FILE refuses to READ it; this row closes the door beside that one,
+    # where a subcommand reads the same bytes on the agent's behalf.
+    # `claude mcp list` names the servers, their command and their status, and
+    # prints no env at all — measured against a server that had one.
+    ["claude", r"^mcp\s+get\b", "claude mcp list", None],
     # ── pass / gopass — documented ──────────────────────────────────────────
     # These have no print SUBCOMMAND: `pass <name>` is itself the print form, so
     # the safe verbs are the enumerable side and this row is the one negation

@@ -178,7 +178,11 @@ def run():
                 # clustered ahead of another flag. Both parse, and both used to
                 # walk past the flag condition.
                 "kubectl get secret db -ojson",
-                "security find-generic-password -ws keyless"):
+                "security find-generic-password -ws keyless",
+                # The subcommand that reads ~/.claude.json on the agent's
+                # behalf. KL-FILE already refuses a direct read of that file;
+                # this is the door beside it, and it printed a live token.
+                "claude mcp get 1up"):
         s.check("KL-VAULT fires: %s" % cmd[:38], drive(bash(cmd)).kind, "deny")
 
     # ── KL-VAULT: the safe sibling verb stays open ──────────────────────────
@@ -192,13 +196,23 @@ def run():
                 "vault kv put secret/app foo=bar",
                 "security find-generic-password -s keyless -a TOKEN",
                 "kubectl get secret db",
-                "aws ssm get-parameter --name /a/b"):
+                "aws ssm get-parameter --name /a/b",
+                # Every other `claude` verb must stay open, or the gate blocks
+                # the working path and gets uninstalled. `mcp list` names the
+                # servers and prints no env; `mcp add` writes and prints
+                # nothing; `-p` never reaches a verb path at all.
+                "claude mcp list",
+                "claude mcp add 1up -- bun server.ts",
+                "claude mcp remove 1up -s user",
+                "claude -p 'what changed'",
+                "claude mcp get --help"):
         s.check("KL-VAULT silent: %s" % cmd[:38], drive(bash(cmd)).kind, "silent")
 
     # ── KL-VAULT: look-alikes ───────────────────────────────────────────────
     for cmd in ('git commit -m "document op read usage"',
                 'echo "use op read to fetch it"',
-                "grep -rn 'op read' docs/"):
+                "grep -rn 'op read' docs/",
+                'git commit -m "wrap claude mcp get in keyless"'):
         s.check("KL-VAULT look-alike: %s" % cmd[:38], drive(bash(cmd)).kind, "silent")
 
     # ── KL-ENV ──────────────────────────────────────────────────────────────
