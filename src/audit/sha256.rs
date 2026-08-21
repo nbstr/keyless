@@ -90,19 +90,18 @@ pub fn digest(data: &[u8]) -> [u8; 32] {
     let mut state = INITIAL;
     let bit_len = (data.len() as u64).wrapping_mul(8);
 
-    let mut blocks = data.chunks_exact(64);
-    for block in blocks.by_ref() {
+    let (blocks, rest) = data.as_chunks::<64>();
+    for block in blocks {
         compress(&mut state, block);
     }
 
     // Pad the remainder: 0x80, zeroes, then the length as 64 big-endian bits.
     let mut tail = [0u8; 128];
-    let rest = blocks.remainder();
     tail[..rest.len()].copy_from_slice(rest);
     tail[rest.len()] = 0x80;
     let tail_len = if rest.len() < 56 { 64 } else { 128 };
     tail[tail_len - 8..tail_len].copy_from_slice(&bit_len.to_be_bytes());
-    for block in tail[..tail_len].chunks_exact(64) {
+    for block in tail[..tail_len].as_chunks::<64>().0 {
         compress(&mut state, block);
     }
 

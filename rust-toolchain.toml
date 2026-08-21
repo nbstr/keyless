@@ -1,0 +1,11 @@
+# The compiler this repository is checked with, pinned so the local gate and any
+# future CI cannot disagree about what a warning is. Before this file existed the
+# only record of the pin was `RUST_TOOLCHAIN` inside the workflow files, so
+# deleting those would have deleted the pin with them.
+#
+# Moving this number is a deliberate act: a newer clippy adds lints, and the gate
+# in scripts/verify.sh runs with `-D warnings`, so a bump can turn a green tree
+# red without a source change. Bump it, run the gate, fix what it finds.
+[toolchain]
+channel = "1.98.0"
+components = ["clippy", "rustfmt"]
