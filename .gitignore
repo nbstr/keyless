@@ -21,7 +21,7 @@ __pycache__/
 # one tool writes, never a pattern that could swallow a real file. `mutants.out`
 # is unanchored because it is the directory cargo-mutants creates inside
 # whatever `--output` it is given; the other two are the repository-root paths
-# `.github/workflows/mutants.yml` writes.
+# `scripts/mutants.sh` writes.
 /mutants-run/
 /mutants.log
 mutants.out/

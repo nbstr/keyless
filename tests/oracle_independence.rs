@@ -53,7 +53,7 @@
 //!   assertion shape can see either. `cargo-mutants` sees all three, because a
 //!   surviving mutant means "no test distinguishes this program from that one"
 //!   whatever the cause. This gate is a cheap complement to that campaign, never
-//!   a replacement — see `.github/workflows/mutants.yml`.
+//!   a replacement — see `scripts/mutants.sh`.
 //! * **A tautology spread across more than one assertion**, or one whose oracle
 //!   arrives through a struct field, a closure capture or a channel. The taint
 //!   pass follows `let` and `for`, and nothing else.

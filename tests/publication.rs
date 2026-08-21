@@ -177,7 +177,7 @@ fn as_text(bytes: Vec<u8>) -> Option<String> {
 /// half, and `cargo mutants` does not copy `.git` unless it is told to.**
 /// Without `--copy-vcs true` the UNMUTATED baseline fails, the campaign tests
 /// zero mutants and reports no outcomes — a dead gate that reads like a quiet
-/// one. `.github/workflows/mutants.yml` passes the flag and says why. Keep it:
+/// one. `scripts/mutants.sh` passes the flag and says why. Keep it:
 /// the alternative is to skip when `.git` is absent, which is the empty-result
 /// trap this whole file exists to close.
 fn publishable_paths(repo: &Path) -> Vec<PathBuf> {

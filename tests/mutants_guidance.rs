@@ -1,17 +1,26 @@
-//! The mutation baseline must send people to the workflow, not to their laptop.
+//! The mutation baseline must send people through the queue, not straight at
+//! their machine.
 //!
-//! `.github/mutants-baseline.txt` opened for a long time with a runnable local
+//! `.github/mutants-baseline.txt` opened for a long time with a runnable bare
 //! `cargo mutants` command under the word REGENERATE, and people ran it, because
 //! that is what the file said to do. The campaign is about forty minutes of
 //! saturated CPU; on a shared workstation it starves every other job behind one
-//! queue. The command is now a `gh workflow run` dispatch.
+//! queue. The command became a CI dispatch, and when the workflows were deleted
+//! -- the account has no Actions billing, so every run was red for reasons that
+//! had nothing to do with the code -- it became `scripts/mutants.sh`.
+//!
+//! The destination changed twice; the thing being defended never did. It was
+//! never "run it on a server". It was "do not let one command eat the machine".
+//! `scripts/mutants.sh` submits through `cq run`, so the campaign waits for a
+//! slot behind the same admission cap as every other heavy job here, and it
+//! refuses outright where no queue is answering.
 //!
 //! That fix is one comment block, and a comment block is exactly the kind of
 //! thing somebody restores while being helpful. This is the ratchet that stops
-//! it going back, and it is the only mechanical guard the REPOSITORY can offer:
-//! nothing checked into a git tree can refuse a `cargo mutants` typed into a
-//! shell. Refusing the command is a job for a tool that sits in front of the
-//! shell, which is not this repository's to install.
+//! it going back. It is narrow because it has to be: nothing checked into a git
+//! tree can refuse a `cargo mutants` typed into a shell. Refusing the command
+//! itself is a job for a tool that sits in front of the shell -- which on this
+//! machine exists, and is exactly what the script routes through.
 //!
 //! So the guard is narrow on purpose. It does not ban discussing the tool — the
 //! file has to name it to explain itself, and both documents do. It bans the one
@@ -43,14 +52,13 @@ fn runnable_local_campaign_lines(text: &str) -> Vec<&str> {
 }
 
 #[test]
-fn the_baseline_sends_a_regeneration_to_the_workflow() {
+fn the_baseline_sends_a_regeneration_to_the_capped_campaign() {
     let text = std::fs::read_to_string(baseline_path()).expect("the baseline is readable");
     assert!(
-        text.contains("gh workflow run mutants.yml"),
+        text.contains("scripts/mutants.sh"),
         "`.github/mutants-baseline.txt` no longer tells anyone HOW to regenerate \
-         itself against the workflow. A baseline nobody can re-derive gets \
-         hand-edited, and a hand-edited baseline is a gate that agrees with \
-         whatever somebody typed."
+         itself. A baseline nobody can re-derive gets hand-edited, and a \
+         hand-edited baseline is a gate that agrees with whatever somebody typed."
     );
 }
 
@@ -60,11 +68,12 @@ fn the_baseline_hands_nobody_a_local_campaign_to_copy() {
     let found = runnable_local_campaign_lines(&text);
     assert!(
         found.is_empty(),
-        "`.github/mutants-baseline.txt` carries a runnable local campaign again:\n  {}\n\
-         The campaign of record is `.github/workflows/mutants.yml`; a local run \
-         is forty minutes of saturated CPU and starves every other job on a \
-         shared machine. Dispatch the workflow instead. Naming the tool in prose \
-         is fine — this only refuses an indented command line.",
+        "`.github/mutants-baseline.txt` carries a bare runnable campaign again:\n  {}\n\
+         The campaign of record is `scripts/mutants.sh`, which submits through \
+         `cq run`; a bare invocation is forty minutes of saturated CPU with no \
+         admission cap in front of it, and it starves every other job on this \
+         machine. Point at the script instead. Naming the tool in prose is fine \
+         — this only refuses an indented command line.",
         found.join("\n  ")
     );
 }

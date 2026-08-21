@@ -15,8 +15,8 @@
 //! # The platform line runs through this module
 //!
 //! [`ffi`] is XNU and nothing else. It is compiled on macOS only, and
-//! `keyless_force_xnu` compiles it anywhere so CI can run the link and require
-//! it to fail — see the header of `.github/workflows/ci.yml`.
+//! `keyless_force_xnu` compiles it anywhere so the link can be run and required
+//! to fail — see the header of `scripts/linux-gates.sh`.
 //!
 //! [`client`] and [`protocol`] are portable, and so is the half of [`peer`]
 //! that is plain data. What is macOS-only is exactly what asks the kernel a

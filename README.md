@@ -1875,8 +1875,8 @@ cargo fmt --check
 ```
 
 The 15 ignored are the entire live Proton Pass suite, which needs a real
-account. CI asserts `ignored == 15`, so that stays visible rather than quietly
-drifting.
+account. `scripts/verify.sh` asserts `ignored == 15`, so that stays visible
+rather than quietly drifting.
 
 The hook pack has its own suite: `python3 hooks/tests/run.py` runs every check
 against fixed inputs, and `python3 hooks/tests/mutate.py` breaks each check on
