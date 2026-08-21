@@ -1869,6 +1869,26 @@ There are no `TODO` comments in the source. Work is either done or listed here.
 ## Development
 
 ```console
+scripts/install-hooks.sh   # once per clone — hooks are not tracked by git
+scripts/verify.sh          # ~90s. what the pre-commit hook runs
+scripts/verify-all.sh      # the above, plus a hostile environment and cargo audit
+scripts/mutants.sh         # ~40 min, queued. the mutation campaign
+scripts/linux-gates.sh     # the three checks that need Linux
+```
+
+There is no CI. There was, and it was red for twelve days on two faults that had
+nothing to do with the code, which is worse than none: a check nobody reads is a
+check nobody reads. Every assertion it made lives in the scripts above, with
+three exceptions that a Mac physically cannot perform — `keylessd` refusing on
+Linux, the four-XNU-symbol surface, and the hook pack under a second interpreter.
+Those are in `scripts/linux-gates.sh`, which refuses to run anywhere else rather
+than skipping, because a skip and a pass look identical once the run is over.
+**Nothing runs them automatically.** Run them on a Linux box when
+`src/ipc/ffi.rs` changes and before a release.
+
+The underlying commands, if you want one on its own:
+
+```console
 cargo test                              # 15 ignored (the live Proton suite)
 cargo clippy --all-targets -- -D warnings
 cargo fmt --check
@@ -1877,6 +1897,11 @@ cargo fmt --check
 The 15 ignored are the entire live Proton Pass suite, which needs a real
 account. `scripts/verify.sh` asserts `ignored == 15`, so that stays visible
 rather than quietly drifting.
+
+Every step in those scripts asserts the SIZE of what it did, not just its exit
+code, and that is the part worth keeping if you rewrite them. Exit 0 is not
+evidence that anything ran: a filtered run matching zero tests exits 0, and a
+suite whose harness never linked can too. Both read exactly like a pass.
 
 The hook pack has its own suite: `python3 hooks/tests/run.py` runs every check
 against fixed inputs, and `python3 hooks/tests/mutate.py` breaks each check on

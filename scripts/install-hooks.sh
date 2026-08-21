@@ -39,3 +39,17 @@ HOOK
 chmod +x "$hook"
 echo "installed $hook"
 echo "it runs scripts/verify.sh, about 90 seconds on a warm tree."
+
+# The second hook, and the reason it is a symlink rather than a copy: it is
+# TRACKED, at install/commit-msg.sh, so a copy would be a second version to
+# forget. It refuses a number standing next to a word that makes it a
+# measurement of one machine -- in a commit message, which is the one place the
+# publication guards in tests/publication.rs cannot reach, because a message is
+# not a file in the tree.
+msg="$root/.git/hooks/commit-msg"
+if [ -e "$msg" ] && [ ! -L "$msg" ]; then
+  echo "$msg exists and is not a symlink. Move it aside first." >&2
+  exit 1
+fi
+ln -sf ../../install/commit-msg.sh "$msg"
+echo "installed $msg -> install/commit-msg.sh"
