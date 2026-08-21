@@ -733,6 +733,11 @@ fn dispatch() -> i32 {
                 // consequences of a configuration are worth spelling out.
                 notes: &notes,
                 probe: args.probe,
+                // The one caller that is a real machine asks the real machine.
+                // Every other caller hands `doctor` a fixed answer, which is
+                // what keeps the report testable.
+                freshness: &keyless::freshness::check(),
+                checkout: &keyless::checkout::check(),
                 // The stream being decorated is the one asked about, exactly as
                 // `ls` asks about its own. A redirected report gets clean text.
                 style: Style::detect(io::stdout().is_terminal()),

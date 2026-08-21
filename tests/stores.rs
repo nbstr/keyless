@@ -1506,6 +1506,11 @@ fn doctor_report(dir: &Path, config: &str) -> (String, i32) {
             setup: None,
             notes: &[],
             probe: false,
+            // Fixed, not probed: these cases are about STORES, and a real
+            // checkout reading would make them fail whenever the developer's
+            // branch happened to be ahead of its remote.
+            freshness: &keyless::freshness::Freshness::NoSourceTree,
+            checkout: &keyless::checkout::Checkout::NoSourceTree,
             style: keyless::cmd::status::Style::PLAIN,
         },
         &mut out,
