@@ -178,7 +178,8 @@ impl std::error::Error for ManageError {}
 /// product and a generic "permission denied" sends the reader to the wrong one —
 /// vault permissions, usually, which are not the problem.
 ///
-/// Measured 2026-08-08 against a live account and `pass-cli` 2.2.5:
+/// Measured 2026-08-08 against a live account and `pass-cli` 2.2.5, and again
+/// 2026-08-21 against 2.3.2:
 ///
 /// - `agent access grant` takes `--role`, whose values are `viewer`, `editor`
 ///   and `manager`, and whose **default is `viewer`**. So a token minted without
@@ -186,6 +187,18 @@ impl std::error::Error for ManageError {}
 ///   normal one rather than an unusual one.
 /// - A viewer-role token returns `NotAllowed` from `item create` and from
 ///   `item trash`.
+/// - **`agent create --vault <V>` fixes the agent's access set permanently.**
+///   A later `agent access grant` on that agent answers `NotAllowed` for every
+///   role — including the one it already holds — and `agent access revoke`
+///   answers `NotExists` for the very vault the agent can read. So the editor
+///   agent is created with NO `--vault` and granted afterwards, and only the
+///   viewer agent is created with one.
+///
+/// That last point inverts the order this recipe used to give, which paired
+/// `agent create --vault <V>` with a following `access grant --role editor`.
+/// Both commands report success-shaped failures for the wrong reason: the grant
+/// blames permission, so the reader goes and checks the vault's sharing settings
+/// and the account's plan, and neither is what is wrong.
 ///
 /// # Which session each of the three commands runs in, which is the whole recipe
 ///
@@ -208,10 +221,14 @@ pub fn mint_a_manager_token(session_dir: Option<&std::path::Path>) -> String {
          leading `~` is expanded against your home directory, and the path must not be relative \
          — then put a SECOND agent token in that directory with the editor role. In the session \
          where you are logged in as the ACCOUNT (the default one, unless you keep your own login \
-         in a named {session_var}), run `pass-cli agent create <name> --expiration 3m --vault \
-         <VAULT>` and then `pass-cli agent access grant <name> --vault-name <VAULT> --role \
+         in a named {session_var}), run `pass-cli agent create <name> --expiration 3m` with NO \
+         `--vault`, and then `pass-cli agent access grant <name> --vault-name <VAULT> --role \
          editor` — `--role` defaults to `viewer`, which is exactly why a write fails with \
-         NotAllowed. Then log the token it printed into the manager's own directory, which is \
+         NotAllowed. The `--vault` is omitted from the create deliberately: an agent minted with \
+         one has a FIXED access set, and every later `access grant` on it answers NotAllowed for \
+         every role while `access revoke` answers NotExists — so a create that names the vault \
+         cannot be given the editor role afterwards at all. Then log the token it printed into \
+         the manager's own directory, which is \
          the step that actually creates that session: `{login}`. The token goes in the \
          environment rather than in `--pat`, so it is not readable from the process table; it is \
          still in your shell history. Keep the reader token viewer-only: it is the one every \
