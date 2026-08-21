@@ -153,6 +153,20 @@ pub struct DoctorRequest<'a> {
     pub notes: &'a [String],
     /// Also ask each declared name whether it resolves. READS each credential.
     pub probe: bool,
+    /// How fresh the running binary is against the source tree it was built
+    /// from.
+    ///
+    /// Injected rather than measured inside, for the same reason `style` is.
+    /// [`crate::freshness::check`] and [`crate::checkout::check`] read the REAL
+    /// repository, so a `doctor` that called them itself made every test that
+    /// went through it a test of the developer's working copy. Measured: five
+    /// cases here failed the moment a branch diverged from its remote and
+    /// `checkout` began -- correctly -- reporting a problem. The report is a
+    /// pure function of what it is told; asking the world is the caller's job.
+    pub freshness: &'a Freshness,
+    /// Where this checkout stands against its upstream, injected for the reason
+    /// above.
+    pub checkout: &'a Checkout,
     /// Colour and character set.
     ///
     /// A field rather than something detected inside, for the reason
@@ -180,6 +194,8 @@ pub fn doctor(request: &DoctorRequest<'_>, out: &mut dyn Write) -> io::Result<i3
         setup,
         notes,
         probe,
+        freshness,
+        checkout,
         style,
     } = *request;
     let mut problems = 0;
@@ -188,7 +204,7 @@ pub fn doctor(request: &DoctorRequest<'_>, out: &mut dyn Write) -> io::Result<i3
     if let Some(setup) = setup {
         guards(setup, style, out)?;
     }
-    problems += report_build(&freshness::check(), &crate::checkout::check(), style, out)?;
+    problems += report_build(freshness, checkout, style, out)?;
 
     if !notes.is_empty() {
         heading(out, style, "NOTES")?;
@@ -1449,6 +1465,22 @@ mod tests {
                 setup: None,
                 notes: &[],
                 probe,
+                // Fixed rather than probed. See the field docs: these cases are
+                // about names and stores, and a real reading here made them a
+                // test of whoever's checkout happened to be running them.
+                //
+                // `Current` + `NotBehind` rather than `NoSourceTree` for both:
+                // no source tree renders NO BUILD section at all, and one case
+                // here asserts the section's POSITION, so the quiet value would
+                // have deleted the thing it measures. This pair renders the
+                // section and contributes no problem, which is what every case
+                // reached through this helper needs.
+                freshness: &Freshness::Current,
+                checkout: &Checkout::NotBehind {
+                    upstream: String::new(),
+                    ahead: 0,
+                    fetched_ago: None,
+                },
                 style: Style::PLAIN,
             },
             &mut out,
