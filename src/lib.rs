@@ -51,9 +51,9 @@
 //! no daemon behaves exactly as a session whose daemon is absent already does:
 //! it degrades, and the child runs.
 //!
-//! `keyless_force_xnu` compiles the macOS-only half anywhere, so CI can run the
-//! link on Linux and require it to fail on exactly those four names. See
-//! `Cargo.toml` and `.github/workflows/ci.yml`.
+//! `keyless_force_xnu` compiles the macOS-only half anywhere, so the link can be
+//! run on Linux and required to fail on exactly those four names. See
+//! `Cargo.toml` and `scripts/linux-gates.sh`.
 
 pub mod attest;
 pub mod audit;

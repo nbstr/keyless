@@ -1,6 +1,6 @@
 # Mutants that survive the test suite, and why each one is allowed to.
 #
-# `.github/workflows/mutants.yml` diffs this file against the survivors of a
+# `scripts/mutants.sh` diffs this file against the survivors of a
 # real campaign, in both directions. A survivor missing from here is a guard
 # somebody lost. An entry here that no longer survives is a gap somebody closed
 # while this file still claimed it was open. Both are red.
@@ -18,39 +18,36 @@
 # unrelated mutation campaign in `hooks/tests/mutate.py`, and a count from that
 # one says nothing about any line below.
 #
-# REGENERATE — dispatch the workflow. Do not hand-edit a line, re-derive it:
+# REGENERATE — run the campaign script. Do not hand-edit a line, re-derive it:
 #
-#     gh workflow run mutants.yml --ref <your-branch>
-#     gh run watch "$(gh run list --workflow=mutants.yml --limit 1 \
-#       --json databaseId --jq '.[0].databaseId')"
+#     scripts/mutants.sh
 #
-# With no `-f scope=…` the run uses the one scope this file describes. A run on
-# any other scope is REPORTED and never diffed, so it cannot regenerate this.
+# With no argument it uses the one scope this file describes. A run on any other
+# scope is REPORTED and never diffed, so it cannot regenerate this.
 #
-# A run whose survivors differ from this file FAILS and uploads its evidence:
+# A run whose survivors differ from this file FAILS and says where it left the
+# normalised list. That file is what goes below, each line with its reason: it
+# is produced by the same code that checks it, so a baseline pasted from it
+# cannot red on the day it lands.
 #
-#     gh run download <run-id> -n mutants-run
+# NEVER PASTE A BARE `cargo mutants` INTO A SHELL AS THE ROUTINE PATH. This
+# line used to be exactly that, and whoever read it ran one. The campaign is
+# about forty minutes of saturated CPU; on a workstation running many concurrent
+# sessions behind one job queue it holds a slot for the whole of it while every
+# other session's typecheck and test run waits behind it. Measured: one local
+# campaign held the queue eighty minutes with no output, and another drove the
+# machine to critical memory pressure and was killed.
 #
-# `mutants-run/mutants.out/missed.txt` is the raw list. Normalise it with the
-# SAME three lines the workflow uses — the `NORMALISE` heredoc in
-# `.github/workflows/mutants.yml` — and paste the result below, each line with
-# its reason. A baseline produced by different code from the one that checks it
-# is a baseline that reds on the day it lands. There is deliberately no artifact
-# on a green run: a green run has nothing to regenerate from, because this file
-# already matches.
+# `scripts/mutants.sh` is that same command with the cap in front of it — it
+# submits through `cq run`, so the campaign takes a SLOT rather than the
+# machine, and it refuses outright where no queue is answering. That is the
+# difference the script buys, and it is the whole reason the routine path is
+# allowed to be local at all. `tests/mutants_guidance.rs` is the ratchet that
+# keeps a bare invocation from coming back into this file.
 #
-# THIS COMMAND USED TO BE A LOCAL `cargo mutants` INVOCATION, and whoever read
-# it ran one, which is the whole reason the line is now a dispatch. The campaign
-# is about forty minutes of saturated CPU. On a workstation running many
-# concurrent sessions behind one job queue it holds a slot for the whole of it
-# while every other session's typecheck and test run waits behind it; measured,
-# one local campaign held the queue eighty minutes with no output and another
-# drove the machine to critical memory pressure and was killed. The runner is
-# waiting on nobody.
-#
-# A maintainer debugging the GATE ITSELF still needs a local run, and that is
-# legitimate — the invocation lives in the workflow, `--copy-vcs true` and all.
-# What is not legitimate is a local campaign as the ROUTINE path, and that is
+# A maintainer debugging the GATE ITSELF still needs a raw run, and that is
+# legitimate — the invocation lives in the script, `--copy-vcs true` and all.
+# What is not legitimate is a bare campaign as the ROUTINE path, and that is
 # what this line used to hand people.
 #
 # ---------------------------------------------------------------------------

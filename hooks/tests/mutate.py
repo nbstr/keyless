@@ -9,7 +9,7 @@ and the one that does not names a gate nothing is testing.
 alone into a temporary directory and runs the suite from there, so its verdict
 is a statement about the hooks and can never be one about the Rust crate. The
 crate has its own campaign — `cargo mutants`, driven by
-`.github/workflows/mutants.yml` against `.github/mutants-baseline.txt`.
+`scripts/mutants.sh` against `.github/mutants-baseline.txt`.
 
 Two gates, both called "the mutation gate", is how a green from this one gets
 quoted as coverage of `src/`. It has happened. So every line this script prints
@@ -109,7 +109,7 @@ def main():
     scope = _scope(spec)
     print("scope: %s" % scope)
     print("       the python hook pack. The rust crate is NOT in this campaign;")
-    print("       its coverage is cargo mutants, see .github/workflows/mutants.yml\n")
+    print("       its coverage is cargo mutants, see scripts/mutants.sh\n")
 
     print("baseline control: the unmutated copy must be green")
     tmp, tree = _copy_tree()
@@ -149,7 +149,7 @@ def main():
     bad = [r for r in results if r[1] != "caught"]
     print("\n%d/%d mutations caught in %s." % (len(results) - len(bad), len(results), scope))
     print("That is the hook pack's coverage and nothing else. The rust crate's")
-    print("is a separate campaign: cargo mutants, .github/workflows/mutants.yml.")
+    print("is a separate campaign: cargo mutants, scripts/mutants.sh.")
     if bad:
         print("Uncaught:")
         for mid, status, detail in bad:
