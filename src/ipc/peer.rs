@@ -195,7 +195,7 @@ pub fn decode_hex(text: &str) -> Option<[u8; CDHASH_LEN]> {
         return None;
     }
     let mut out = [0u8; CDHASH_LEN];
-    for (index, pair) in bytes.chunks_exact(2).enumerate() {
+    for (index, pair) in bytes.as_chunks::<2>().0.iter().enumerate() {
         let high = nibble(pair[0])?;
         let low = nibble(pair[1])?;
         out[index] = (high << 4) | low;
