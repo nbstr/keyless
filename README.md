@@ -1096,16 +1096,35 @@ used by `new` and `put` and by nothing else:
 ```
 
 Minting it takes three commands and **two different identities**, measured
-against `pass-cli` 2.2.5. The first two act as your ACCOUNT — they mint a token
+against `pass-cli` 2.3.2. The first two act as your ACCOUNT — they mint a token
 for an agent, they are not run by one — so they belong wherever your own login
 lives, which is the default session unless you keep it somewhere named:
 
 ```console
 # No PROTON_PASS_SESSION_DIR here — these run as the ACCOUNT, in whichever
 # session your own login lives in, and the default one is where it usually is.
-$ pass-cli agent create keyless-manager --expiration 3m --vault personal
+$ pass-cli agent create keyless-manager --expiration 3m
 $ pass-cli agent access grant keyless-manager --vault-name personal --role editor
 ```
+
+**The create names no vault, and that is the whole trick.** `agent create
+--vault <V>` grants access at mint time and FIXES the access set: every later
+`agent access grant` on that agent answers `NotAllowed` — for every role,
+including the one it already holds — and `agent access revoke` answers
+`NotExists` for the very vault the agent can read. So an editor agent cannot be
+created with `--vault` and upgraded afterwards; it is created bare and granted.
+
+The reader agent is the opposite case and keeps its `--vault`, because viewer is
+what `create` grants and no second command is wanted:
+
+```console
+# Still no PROTON_PASS_SESSION_DIR — minting is the ACCOUNT's act either way.
+$ pass-cli agent create keyless-reader --expiration 3m --vault personal
+```
+
+`NotAllowed` from `access grant` therefore has two unrelated causes that read
+identically — a vault the account cannot share, and an agent that was minted
+with `--vault`. The second is the common one and nothing in the message says so.
 
 The third is the one that creates the manager's session, and leaving it out is
 why a config can point at a directory that has nothing in it. `agent create`
