@@ -48,7 +48,14 @@ source scripts/linux.sh
 DEFAULT_SCOPE='src/mask/** src/secret.rs src/audit/**'
 MUTANT_FLOOR=280
 BASELINE=.github/mutants-baseline.txt
-SCOPE="${*:-$DEFAULT_SCOPE}"
+# The scope travels in an ENVIRONMENT VARIABLE across the container boundary,
+# never as argv. It is a list of GLOBS, and cargo-mutants is the thing meant to
+# interpret them -- a shell that expands `src/mask/**` first hands the campaign
+# an explicit file list, which is a different string from DEFAULT_SCOPE, which
+# silently turns the baseline diff off. Measured 2026-08-22: a full 320-mutant
+# campaign ran and reported "scope is not the default, so there is no baseline
+# to diff against", so the gate produced no verdict while looking like it had.
+SCOPE="${KEYLESS_SCOPE-${*:-$DEFAULT_SCOPE}}"
 OUT=mutants-run
 
 # Not already inside the pinned Linux? Go there and re-enter this same file, so
@@ -65,11 +72,15 @@ if [ -z "${KEYLESS_IN_LINUX_GATE-}" ]; then
   # Through the queue as well, where one answers: the cgroup keeps the campaign
   # from eating the machine, and the queue keeps two campaigns from starting.
   # Different jobs, both worth doing, neither a substitute for the other.
-  inner="env KEYLESS_IN_LINUX_GATE=1 bash scripts/mutants.sh $SCOPE"
+  export KEYLESS_SCOPE="$SCOPE"
   if command -v cq > /dev/null 2>&1; then
-    cq run --kind mutants -- bash -c "source scripts/linux.sh && linux_run keyless-mutants-$$ $inner"
+    cq run --kind mutants -- bash -c \
+      'source scripts/linux.sh && linux_run "keyless-mutants-$$" \
+         env KEYLESS_IN_LINUX_GATE=1 KEYLESS_SCOPE="$KEYLESS_SCOPE" \
+         bash scripts/mutants.sh'
   else
-    linux_run "keyless-mutants-$$" env KEYLESS_IN_LINUX_GATE=1 bash scripts/mutants.sh $SCOPE
+    linux_run "keyless-mutants-$$" \
+      env KEYLESS_IN_LINUX_GATE=1 KEYLESS_SCOPE="$SCOPE" bash scripts/mutants.sh
   fi
   exit $?
 fi
@@ -92,8 +103,17 @@ fi
 # earlier, and clearing the volume alone took it back to 1.
 unset CARGO_TARGET_DIR
 
-files=""
-for glob in $SCOPE; do files="$files -f $glob"; done
+# An ARRAY, not a string. A string of arguments has to be re-expanded at the
+# call site to become arguments again, and that second expansion globs: measured
+# 2026-08-22, `-f src/mask/**` became `-f src/mask/encodings.rs src/mask/mod.rs`
+# and cargo-mutants refused with `unexpected argument`. `set -f` around the loop
+# alone does not help, because the damage happens where the string is USED.
+# Array expansion is never globbed, so the globs reach cargo-mutants intact --
+# which is the point, since interpreting them is its job and not the shell's.
+files=()
+set -f
+for glob in $SCOPE; do files+=(-f "$glob"); done
+set +f
 echo "${BOLD}mutants${OFF} ${DIM}scope: $SCOPE${OFF}"
 echo "${DIM}~40 minutes for the default scope, inside the pinned Linux, memory capped.${OFF}"
 echo "${DIM}The python hook pack is a SEPARATE campaign: hooks/tests/mutate.py${OFF}"
@@ -103,8 +123,19 @@ echo "${DIM}The python hook pack is a SEPARATE campaign: hooks/tests/mutate.py${
 # timeout multiplier and mutants move between "timed out" and "caught" for
 # reasons that have nothing to do with a test.
 #
+# The output directory is DESTROYED first, and this is the most important line
+# in the file. cargo-mutants refused its arguments on 2026-08-22 and tested
+# nothing, and the checks below then read the PREVIOUS run's `outcomes.json`,
+# still on disk, and reported "the surviving mutants are exactly the 2 recorded
+# in the baseline". A campaign that never ran had produced a passing verdict.
+#
+# Every guard downstream asks "is there an outcomes.json and what does it say".
+# None of them can tell last week's answer from this minute's. Removing it is
+# what makes "the file exists" mean "this run wrote it".
+rm -rf "$OUT"
+
 # Redirected, never piped: a pipeline reports its last stage's status.
-cargo mutants $files \
+cargo mutants "${files[@]}" \
   --copy-vcs true \
   --jobs 2 \
   --timeout-multiplier 8 \
