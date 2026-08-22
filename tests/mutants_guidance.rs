@@ -11,9 +11,11 @@
 //!
 //! The destination changed twice; the thing being defended never did. It was
 //! never "run it on a server". It was "do not let one command eat the machine".
-//! `scripts/mutants.sh` submits through `cq run`, so the campaign waits for a
-//! slot behind the same admission cap as every other heavy job here, and it
-//! refuses outright where no queue is answering.
+//! `scripts/mutants.sh` runs the campaign inside a pinned Linux container with
+//! a memory limit, so a mutant that allocates without end is killed by the
+//! kernel rather than by the operator noticing. A queue cap was tried first and
+//! is NOT the guard: admission is decided when a job asks, and a job already
+//! running is not made smaller by a limit it already passed.
 //!
 //! That fix is one comment block, and a comment block is exactly the kind of
 //! thing somebody restores while being helpful. This is the ratchet that stops
@@ -69,11 +71,12 @@ fn the_baseline_hands_nobody_a_local_campaign_to_copy() {
     assert!(
         found.is_empty(),
         "`.github/mutants-baseline.txt` carries a bare runnable campaign again:\n  {}\n\
-         The campaign of record is `scripts/mutants.sh`, which submits through \
-         `cq run`; a bare invocation is forty minutes of saturated CPU with no \
-         admission cap in front of it, and it starves every other job on this \
-         machine. Point at the script instead. Naming the tool in prose is fine \
-         — this only refuses an indented command line.",
+         The campaign of record is `scripts/mutants.sh`, which runs inside a \
+         memory-capped Linux container; a bare invocation has no limit on it at \
+         all, and one reached 41 GB on this machine. It also cannot regenerate \
+         this file, whose survivors were measured on Linux. Point at the script \
+         instead. Naming the tool in prose is fine — this only refuses an \
+         indented command line.",
         found.join("\n  ")
     );
 }

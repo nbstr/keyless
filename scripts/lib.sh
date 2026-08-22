@@ -113,6 +113,18 @@ heavy() {
   fi
 }
 
+# target_dir -- where cargo actually put the binaries.
+#
+# NOT the literal `target/`. When `CARGO_TARGET_DIR` is set -- which it is inside
+# the pinned Linux image, pointing at a cache volume -- cargo builds there and
+# `./target/` still holds whatever the HOST last built. Measured: the Linux gate
+# built keylessd into /target and then executed the mounted macOS binary from
+# ./target/debug, and Docker reported `Exec format error`. A gate that runs the
+# wrong binary is worse than one that does not run.
+target_dir() {
+  echo "${CARGO_TARGET_DIR:-target}"
+}
+
 # vendorless_path -- a PATH that cannot reach `infisical` or `pass-cli`.
 #
 # Built once per gate run and cached in GATE_LOG_DIR. See

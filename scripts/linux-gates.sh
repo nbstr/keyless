@@ -17,23 +17,39 @@
 # and supports 3.7 upward; a single-interpreter run cannot see a version-shaped
 # break. This machine has one Python, so that axis lives here too.
 #
-# NOTHING RUNS THESE AUTOMATICALLY. That is a real reduction in coverage against
-# the workflows they came from, and pretending otherwise would be worse than the
-# gap. Run it when `src/ipc/ffi.rs` changes, when the porting table in
-# install/README.md changes, and before a release.
+# These used to say "find a Linux machine", which meant they never ran. They now
+# bring their own: `scripts/linux.sh` holds a pinned Linux image, so this is one
+# command on a Mac, on the Arcadia, or anywhere a container runtime answers.
+# Running it costs a couple of minutes and needs no other machine.
 set -uo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 source scripts/lib.sh
+source scripts/linux.sh
+
+# Not already inside the pinned Linux? Go there and re-enter this same file.
+# One script, one set of assertions, executed in exactly one place -- the
+# alternative is a second copy for the container that drifts from this one.
+if [ "$(uname -s)" != "Linux" ] && [ -z "${KEYLESS_IN_LINUX_GATE-}" ]; then
+  if ! linux_available; then
+    echo "This is $(uname -s), and these three gates need Linux:" >&2
+    echo "  * keylessd must BUILD and then REFUSE to run, naming why" >&2
+    echo "  * the daemon's unportable surface must be exactly four XNU symbols," >&2
+    echo "    read out of a Linux linker's undefined-reference output" >&2
+    echo "  * the hook pack under a second Python interpreter" >&2
+    echo >&2
+    echo "No container runtime is answering, so there is no Linux to borrow." >&2
+    echo "Start OrbStack (or Docker), or run this on a Linux host." >&2
+    echo "It is not skippable here: a skip and a pass look identical after." >&2
+    exit 1
+  fi
+  linux_image_ready || exit 1
+  exec_env=KEYLESS_IN_LINUX_GATE=1
+  linux_run "keyless-linux-gates-$$" env "$exec_env" bash scripts/linux-gates.sh "$@"
+  exit $?
+fi
 
 if [ "$(uname -s)" != "Linux" ]; then
-  echo "This is $(uname -s). These three gates need Linux:" >&2
-  echo "  * keylessd must BUILD and then REFUSE to run, naming why" >&2
-  echo "  * the daemon's unportable surface must be exactly four XNU symbols," >&2
-  echo "    which is read out of a Linux linker's undefined-reference output" >&2
-  echo "  * the hook pack under a second Python interpreter" >&2
-  echo >&2
-  echo "Copy the checkout to a Linux machine and run this there. It is not" >&2
-  echo "skippable here: a skip and a pass look identical afterwards." >&2
+  echo "re-entered outside Linux; refusing rather than reporting a skip as a pass." >&2
   exit 1
 fi
 
@@ -46,7 +62,7 @@ echo "${BOLD}linux gates${OFF} ${DIM}$(uname -sm)${OFF}"
 # can tell apart from a build that quietly broke.
 keylessd_refuses() {
   cargo build --locked --bin keylessd || return 1
-  ./target/debug/keylessd run > refusal.log 2>&1
+  "$(target_dir)/debug/keylessd" run > refusal.log 2>&1
   local code=$?
   cat refusal.log
   if [ "$code" -eq 0 ]; then
