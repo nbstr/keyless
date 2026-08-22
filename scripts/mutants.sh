@@ -2,32 +2,45 @@
 # The mutation campaign over the Rust crate's security core.
 #
 # ---------------------------------------------------------------------------
-# Why this is a script now, and why that is not the mistake it looks like
+# Why this runs on Linux, in a container, and never on the host
 # ---------------------------------------------------------------------------
 #
-# `.github/mutants-baseline.txt` used to open with a runnable `cargo mutants`
-# line. People ran it, because that is what the file said to do, and the
-# campaign is about forty minutes of saturated CPU -- on a workstation running
-# many concurrent sessions it starves every other job. So the line was replaced
-# with a `gh workflow run` dispatch, and `tests/mutants_guidance.rs` was written
-# as the ratchet that stops the local command coming back.
+# Two independent reasons. Either one alone would be enough.
 #
-# The workflows are gone: the account has no Actions billing. The dispatch is
-# now the dead link, and the ratchet points at nothing.
+# 1. THE BASELINE IS LINUX-DERIVED. `.github/mutants-baseline.txt` records the
+#    survivors of a campaign that ran `runs-on: ubuntu-latest`. Which mutants
+#    survive depends on which tests RUN, and this suite ignores a different set
+#    per platform. A macOS campaign diffed against that file reports differences
+#    of PLATFORM rather than of coverage, every time, for as long as anyone
+#    leaves it running -- and a gate that reds for a reason nobody can act on is
+#    a gate that gets deleted.
 #
-# What the ratchet was actually defending was never "run it on a server" -- it
-# was "do not let one command eat the machine". That objection has a local
-# answer here: codeine's queue. `cq run` holds the campaign behind the same
-# admission cap every other heavy job on this machine waits in, so it takes a
-# slot instead of taking the machine. The ratchet stays, with its teeth: the
-# baseline still must not hand anyone a bare `cargo mutants` to paste. It now
-# hands them this file, which is the same command with the cap in front of it.
+# 2. ONLY A CGROUP CAN BOUND THE MEMORY. A campaign deliberately compiles wrong
+#    programs, and a wrong program may allocate without end. Measured on
+#    2026-08-22: `replace += with -= in Masker::scan` turned a loop counter
+#    around and reached 41 GB resident on ten cores before a human noticed.
 #
-# Where no `cq` answers there IS no cap, and this script says so and refuses
-# rather than starting a forty-minute run on an unbounded machine.
+# ---------------------------------------------------------------------------
+# What does NOT protect the machine, since both were tried
+# ---------------------------------------------------------------------------
+#
+# cargo-mutants' own timeout does not. It was working correctly that day -- it
+# had auto-set 390 seconds and was enforcing it. A timeout bounds TIME. Nothing
+# about 390 seconds prevents allocating every page in the machine first.
+#
+# `cq` does not, and an earlier version of this file wrongly said it did. The
+# queue decides admission when a job ASKS; a job already running is not made
+# smaller by the cap it already passed. Being in the queue is still worth having
+# -- it stops two campaigns starting at once -- but it is not the guard.
+#
+# `--memory` on the container IS the guard: the kernel kills the offending
+# process at the limit, cargo-mutants records the outcome, the campaign carries
+# on, and the host never participates. Verified on 2026-08-22 by deliberately
+# allocating past the cap inside the image: exit 137, host untouched.
 set -uo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 source scripts/lib.sh
+source scripts/linux.sh
 
 # The one scope .github/mutants-baseline.txt describes. Any other scope is
 # REPORTED and never diffed -- a baseline describes one scope, and checking it
@@ -38,30 +51,60 @@ BASELINE=.github/mutants-baseline.txt
 SCOPE="${*:-$DEFAULT_SCOPE}"
 OUT=mutants-run
 
+# Not already inside the pinned Linux? Go there and re-enter this same file, so
+# there is exactly one copy of every assertion below.
+if [ -z "${KEYLESS_IN_LINUX_GATE-}" ]; then
+  if ! linux_available; then
+    echo "no container runtime is answering, so there is no capped Linux to" >&2
+    echo "run this on. Uncapped is not an option here: a runaway mutant took" >&2
+    echo "41 GB and ten cores the last time this ran on a host." >&2
+    echo "Start OrbStack (or Docker) and try again." >&2
+    exit 1
+  fi
+  linux_image_ready || exit 1
+  # Through the queue as well, where one answers: the cgroup keeps the campaign
+  # from eating the machine, and the queue keeps two campaigns from starting.
+  # Different jobs, both worth doing, neither a substitute for the other.
+  inner="env KEYLESS_IN_LINUX_GATE=1 bash scripts/mutants.sh $SCOPE"
+  if command -v cq > /dev/null 2>&1; then
+    cq run --kind mutants -- bash -c "source scripts/linux.sh && linux_run keyless-mutants-$$ $inner"
+  else
+    linux_run "keyless-mutants-$$" env KEYLESS_IN_LINUX_GATE=1 bash scripts/mutants.sh $SCOPE
+  fi
+  exit $?
+fi
+
 if ! command -v cargo-mutants > /dev/null 2>&1; then
-  echo "cargo-mutants is not installed. Install it with:" >&2
-  echo "    cargo install cargo-mutants --locked" >&2
+  echo "cargo-mutants is not in the image. Rebuild it: docker build -f docker/Dockerfile docker" >&2
   exit 1
 fi
 
-# The cap is the whole reason this is allowed to run locally. Without a queue
-# answering, a forty-minute saturating campaign is exactly what the guidance
-# test exists to prevent, so refuse instead of degrading.
-if ! command -v cq > /dev/null 2>&1; then
-  echo "no cq on PATH, so there is no admission cap to hold this campaign." >&2
-  echo "It saturates the CPU for roughly forty minutes. Run it deliberately," >&2
-  echo "on a machine you are not using, or install the queue first." >&2
-  exit 1
-fi
+# The campaign gets its OWN target directories, one per copied tree, which is
+# cargo-mutants' default and is why this unsets rather than sets.
+#
+# `CARGO_TARGET_DIR` is set image-wide to a cache volume, which is right for
+# every other job here because their source is always /work. It is WRONG for
+# this one: cargo-mutants builds each mutant in its own copy under /tmp, and a
+# shared target directory hands them each other's artifacts. `CARGO_MANIFEST_DIR`
+# is baked in by `env!` at COMPILE time, so binaries cached from one copied tree
+# carry a path that no longer exists. Measured 2026-08-22: 31 tests failed
+# against `/tmp/cargo-mutants-work-au0dHI.tmp`, a directory deleted hours
+# earlier, and clearing the volume alone took it back to 1.
+unset CARGO_TARGET_DIR
 
 files=""
 for glob in $SCOPE; do files="$files -f $glob"; done
 echo "${BOLD}mutants${OFF} ${DIM}scope: $SCOPE${OFF}"
-echo "${DIM}~40 minutes for the default scope, queued behind cq's admission cap.${OFF}"
+echo "${DIM}~40 minutes for the default scope, inside the pinned Linux, memory capped.${OFF}"
 echo "${DIM}The python hook pack is a SEPARATE campaign: hooks/tests/mutate.py${OFF}"
 
+# Flags IDENTICAL to the workflow that produced the baseline. The survivor set
+# is a property of the method as much as of the code: change `--jobs` or the
+# timeout multiplier and mutants move between "timed out" and "caught" for
+# reasons that have nothing to do with a test.
+#
 # Redirected, never piped: a pipeline reports its last stage's status.
-cq run --kind mutants -- cargo mutants $files \
+cargo mutants $files \
   --copy-vcs true \
   --jobs 2 \
   --timeout-multiplier 8 \

@@ -38,12 +38,21 @@
 # campaign held the queue eighty minutes with no output, and another drove the
 # machine to critical memory pressure and was killed.
 #
-# `scripts/mutants.sh` is that same command with the cap in front of it — it
-# submits through `cq run`, so the campaign takes a SLOT rather than the
-# machine, and it refuses outright where no queue is answering. That is the
-# difference the script buys, and it is the whole reason the routine path is
-# allowed to be local at all. `tests/mutants_guidance.rs` is the ratchet that
-# keeps a bare invocation from coming back into this file.
+# `scripts/mutants.sh` is that same command run somewhere it cannot do harm. It
+# executes inside a pinned Linux container with `--memory` set, so a mutant that
+# allocates without end is killed by the kernel at the limit and the campaign
+# carries on — measured 2026-08-22, when `replace += with -= in Masker::scan`
+# reached 41 GB and ten cores on a host that had no such limit.
+#
+# It is ALSO the only correct place to run it: the survivors recorded below were
+# produced on Linux, and which mutants survive depends on which tests run, which
+# differs per platform. A macOS campaign cannot regenerate this file.
+#
+# The queue is not the guard, and this file said otherwise for a day. `cq`
+# decides admission when a job ASKS and never resizes one already running. It
+# still wraps the campaign, so two cannot start at once; that is a different job
+# from bounding one. `tests/mutants_guidance.rs` is the ratchet that keeps a bare
+# invocation from coming back into this file.
 #
 # A maintainer debugging the GATE ITSELF still needs a raw run, and that is
 # legitimate — the invocation lives in the script, `--copy-vcs true` and all.

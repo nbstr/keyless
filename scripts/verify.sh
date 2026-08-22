@@ -53,16 +53,20 @@ run_step "clippy"  heavy 'cargo clippy --locked --all-targets -- -D warnings'
 
 # Named binaries, not a bare `cargo build`. On Linux a bare build exits 101 for
 # the daemon while the client is already linked and on disk.
-run_step "build keyless (debug + release)" heavy '
+# Double quotes, and the path expanded HERE. `heavy` hands its argument to a
+# fresh `bash -c`, which has none of this file's functions -- a `$(target_dir)`
+# left for that shell to evaluate is an empty string and a path of `/release/...`.
+TARGET="$(target_dir)"
+run_step "build keyless (debug + release)" heavy "
   cargo build --locked --bin keyless \
     && cargo build --locked --release --bin keyless \
-    && ./target/release/keyless --version'
+    && '$TARGET/release/keyless' --version"
 
 if [ "$(uname -s)" = "Darwin" ]; then
-  run_step "build keylessd (debug + release)" heavy '
+  run_step "build keylessd (debug + release)" heavy "
     cargo build --locked --bin keylessd \
       && cargo build --locked --release --bin keylessd \
-      && ./target/release/keylessd --version'
+      && '$TARGET/release/keylessd' --version"
 fi
 
 # ---- the suite, with no vendor CLI within reach ---------------------------
