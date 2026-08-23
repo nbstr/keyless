@@ -247,9 +247,12 @@ fn as_of(fetched_ago: Option<std::time::Duration>) -> String {
 mod tests {
     use super::report_build;
     use crate::checkout::Checkout;
-    // The whitespace-collapsing helper is shared with the report these rows are
-    // rendered into; it lives beside `doctor` itself.
-    use crate::cmd::doctor::tests::flat;
+    // The whitespace-collapsing helper and the state-column read are shared with
+    // the report these rows are rendered into; both live beside `doctor` itself.
+    // One copy means one definition of where the state column IS: a second one
+    // here could drift to a different `nth`, and a wrong column reads as a
+    // passing assertion rather than as an error.
+    use crate::cmd::doctor::tests::{flat, state_of};
     use crate::cmd::status::Style;
     use crate::freshness::Freshness;
     use std::path::PathBuf;
@@ -289,7 +292,7 @@ mod tests {
             &quiet(),
         );
         assert_eq!(problems, 1, "{text}");
-        assert!(text.contains("stale"), "{text}");
+        assert_eq!(state_of(&text, "build"), "stale", "{text}");
         assert!(
             text.contains("/somewhere/src/store/infisical.rs"),
             "the row must name the evidence a reader can check: {text}"
@@ -344,7 +347,7 @@ mod tests {
             &quiet(),
         );
         assert_eq!(problems, 0, "an unanswered question is not a fault: {text}");
-        assert!(text.contains("unproven"), "{text}");
+        assert_eq!(state_of(&text, "build"), "unproven", "{text}");
         assert!(text.contains("cannot locate the running binary"), "{text}");
         assert!(
             !text.contains("newer than every source file"),

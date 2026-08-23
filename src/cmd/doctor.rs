@@ -693,8 +693,7 @@ mod tests {
             Registry::new(vec![Box::new(Named("infisical"))]),
             false,
         );
-        assert!(text.contains("keychain"), "{text}");
-        assert!(text.contains("off"), "{text}");
+        assert_eq!(state_of(&text, "keychain"), "off", "{text}");
         assert!(text.contains("proton"), "{text}");
         // A store nobody enabled is not an error, so it must not raise the
         // exit code.

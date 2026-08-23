@@ -41,9 +41,14 @@
 //!
 //! That mutation is the negative control for this whole file, and it is cheap to
 //! re-run: give `status::row` a `let state = format!("{state}X");` and every
-//! state word in the report gains a suffix at once. Measured on the tree this
-//! gate landed in, **17 tests go red**. On the tree before `8dc557b`, none did.
-//! The tests still green under it are the ones [`OPEN`] names.
+//! state word in the report gains a suffix at once. Measured on this tree,
+//! **20 tests go red**. On the tree before `8dc557b`, none did.
+//!
+//! Run it as `cargo test --no-fail-fast`. Without that flag the run stops at the
+//! first target that fails and reports a fraction of the count — nine, on this
+//! tree, because the lib target reds first and the integration tests never
+//! execute. A count that low reads as a gate that has rotted rather than as a
+//! run that stopped early.
 //!
 //! # Why a gate rather than a sweep
 //!
@@ -99,16 +104,19 @@
 //! spared, through `!x.contains(…)`, `!(x.contains(…))` and the `&&`/`||` chains
 //! the suite writes them in.
 //!
-//! # Three instances this gate does not fix, and does not bless either
+//! # An instance this gate cannot fix yet
 //!
-//! [`OPEN`] lists them: three assertions under `src/cmd/doctor` that ARE this
-//! defect and were left standing, because that tree was being changed by other
-//! work at the moment this gate landed and editing a file under somebody else's
-//! hand is how that work gets lost. Each row names its fix and is deleted BY
-//! that fix — the stale-row check reds on a row that stops flagging, so the list
-//! cannot quietly become the permanent shape of this gate. It is the price of
-//! having the gate now rather than after the queue drains: a new instance
-//! written next month reds immediately, which is the whole point.
+//! [`OPEN`] is empty, and empty is its correct state. It exists for the case a
+//! gate like this one otherwise cannot survive: an instance that IS this defect
+//! and cannot be edited right now — a file under other work in flight, say —
+//! where the alternatives are blessing it in [`ACCEPTED`], which is a lie, or
+//! not committing the gate at all, which protects nothing against the instance
+//! somebody writes next month.
+//!
+//! A row there names its fix and is deleted BY that fix: the stale-row check
+//! reds on a row that stops flagging, so the list cannot quietly become the
+//! permanent shape of this gate. Both directions are load-bearing — delete a
+//! row without fixing its site and the corpus scan reds instead.
 //!
 //! # What this scanner CANNOT see
 //!
@@ -181,32 +189,7 @@ const ACCEPTED: &[(&str, &str)] = &[(
 /// A row must name the fix, and it is deleted BY the fix — the stale-row check
 /// below reds on a row that no longer flags anything, so this list cannot
 /// quietly become permanent.
-const OPEN: &[(&str, &str)] = &[
-    (
-        "src/cmd/doctor.rs::a_store_that_is_switched_off_gets_a_row_and_is_not_a_problem::off",
-        "`text.contains(\"off\")` over the whole report. THE FIX: \
-         `assert_eq!(state_of(&text, \"keychain\"), \"off\", \"{text}\")`, using \
-         the `state_of` that file already has. Left open here only because \
-         `src/cmd/doctor*` was being changed by other work in flight when this \
-         gate landed, and editing a file under someone else's hand is how that \
-         work gets lost.",
-    ),
-    (
-        "src/cmd/doctor/build.rs::a_stale_binary_is_a_problem_and_names_both_the_file_and_the_fix::stale",
-        "`text.contains(\"stale\")` over the whole section. THE FIX: \
-         `assert_eq!(line_for(&text, \"build\").split_whitespace().nth(2), \
-         Some(\"stale\"))` — `line_for` is already in that file, and its own \
-         rustdoc names this exact hazard for `proven`/`unproven`. Left open for \
-         the reason above.",
-    ),
-    (
-        "src/cmd/doctor/build.rs::a_comparison_that_could_not_be_made_never_reads_as_one_that_passed::unproven",
-        "`text.contains(\"unproven\")` over the whole section, which is the \
-         weaker half of the pair `line_for`'s rustdoc was written about. THE \
-         FIX: the same whole-column read through `line_for(&text, \"build\")`. \
-         Left open for the reason above.",
-    ),
-];
+const OPEN: &[(&str, &str)] = &[];
 
 /// Directories scanned, relative to the crate root.
 const SCANNED: &[&str] = &["src", "tests"];
