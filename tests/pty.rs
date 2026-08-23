@@ -164,7 +164,10 @@ static NAMING: Mutex<()> = Mutex::new(());
 ///
 /// So the flag is part of each descriptor's creation. There is no ordering for
 /// a future reader to preserve and no lock for one to forget, which is the
-/// whole reason to spend three syscalls here rather than one call to `openpty`.
+/// whole reason to spend five calls here — `posix_openpt`, `grantpt`,
+/// `unlockpt`, `ptsname`, `open` — rather than one call to `openpty`. They are
+/// named rather than counted so the next reader checks the list against the
+/// body instead of trusting a number that drifts the moment a call moves.
 ///
 /// The three descriptors `keyless` is *meant* to get are unaffected: they are
 /// separate `try_clone`s handed to `Stdio`, and `dup2` onto 0, 1 and 2 clears
