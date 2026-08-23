@@ -102,7 +102,13 @@ if [ -n "${CLEAN_PATH:-}" ]; then
     fi
   done
 
-  if run_step "test suite" heavy "PATH='$CLEAN_PATH' cargo test --locked"; then
+  # --no-fail-fast costs NOTHING on the path this gate spends its life on: when
+  # nothing fails, every target runs either way and the counts below are the
+  # same numbers. It is only the red path that differs, and there it is the
+  # difference between one failing target named and all of them. This is the
+  # pre-commit gate, so the alternative is a developer paying the whole gate
+  # again per failing file to learn what one run already knew.
+  if run_step "test suite" heavy "PATH='$CLEAN_PATH' cargo test --locked --no-fail-fast"; then
     log="$GATE_LOG_DIR/$(printf '%02d' "$GATE_STEP").log"
     passed=$(count_result "$log" 'passed;')
     ignored=$(count_result "$log" 'ignored;')
