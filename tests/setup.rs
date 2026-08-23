@@ -75,7 +75,17 @@ impl Machine {
 
     /// Run the binary with every path pointed inside this machine.
     fn run(&self, args: &[&str]) -> Output {
-        Command::new(BIN)
+        self.run_with_path(args, None)
+    }
+
+    /// The same, with `first` prepended to `PATH`.
+    ///
+    /// Prepended rather than replacing it: `setup` runs the hook installer with
+    /// `python3`, so a `PATH` built from scratch would break a step that has
+    /// nothing to do with what the caller is aiming at.
+    fn run_with_path(&self, args: &[&str], first: Option<&Path>) -> Output {
+        let mut command = Command::new(BIN);
+        command
             .args(args)
             .arg("--config")
             .arg(self.config())
@@ -86,9 +96,14 @@ impl Machine {
             .env("XDG_CONFIG_HOME", self.root.join("xdg-config"))
             .env("XDG_STATE_HOME", self.root.join("xdg-state"))
             .env("NO_COLOR", "1")
-            .env("KEYLESS_ASCII", "1")
-            .output()
-            .expect("the binary must run")
+            .env("KEYLESS_ASCII", "1");
+        if let Some(first) = first {
+            let inherited = std::env::var_os("PATH").unwrap_or_default();
+            let mut dirs = vec![first.to_path_buf()];
+            dirs.extend(std::env::split_paths(&inherited));
+            command.env("PATH", std::env::join_paths(dirs).expect("join PATH"));
+        }
+        command.output().expect("the binary must run")
     }
 
     /// A setup run, with the agent directory and receipt named explicitly.
@@ -845,4 +860,102 @@ fn re_enabling_says_whether_anything_actually_changed() {
     // alone cannot tell them apart — which is exactly why the detail is the
     // subject here.
     assert_eq!(state_of(&already, "guards"), "proven", "{already}");
+}
+
+// ---------------------------------------------------------------------------
+// the exit code, which nothing had ever seen be non-zero
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_step_that_breaks_costs_the_exit_code_and_names_itself() {
+    // `setup` counts its broken steps and returns `problems > 0`. Every test
+    // above drives a run where nothing fails, so that whole accumulator could
+    // be inverted, zeroed or multiplied and the suite stayed green — a setup
+    // that reported success no matter what happened would have passed.
+    //
+    // A settings file whose `permissions` is not an object is the reachable
+    // break: the hook installer refuses it by name rather than writing over it,
+    // and `setup` has to carry that refusal out to the caller.
+    let machine = Machine::fresh("step-breaks").with_harness(r#"{"permissions": "not an object"}"#);
+    let before = std::fs::read_to_string(machine.settings()).expect("read");
+
+    let output = machine.setup(&[]);
+    let text = out(&output);
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "a run with a broken step exited 0, so nothing that goes wrong here \
+         can ever be noticed by a script:\n{text}"
+    );
+    assert_eq!(
+        state_of(&text, "guards"),
+        "broken",
+        "the broken step is not named in the report:\n{text}"
+    );
+    assert!(
+        text.contains("REFUSING"),
+        "the installer's own reason was swallowed:\n{text}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(machine.settings()).expect("read"),
+        before,
+        "a refused merge still edited the settings file"
+    );
+
+    // THE CONTROL. The steps that did not break must not be reported as broken,
+    // or "broken" would just be what every row says on a failed run.
+    assert_eq!(state_of(&text, "keyless"), "proven", "{text}");
+}
+
+#[test]
+fn the_binaries_row_reports_the_daemon_it_actually_found() {
+    // `which` is the only thing that decides this row, and it had no test at
+    // all: it could answer `None` for every machine, or answer with an empty
+    // path, and the report would still render a row somebody reads as a fact.
+    let machine = Machine::fresh("binaries-row").with_harness("{}");
+    let bin = machine.root.join("fake-bin");
+    std::fs::create_dir_all(&bin).expect("mkdir");
+    let daemon = bin.join("keylessd");
+    std::fs::write(&daemon, "#!/bin/sh\nexit 0\n").expect("write daemon");
+
+    let claude = machine.claude();
+    let receipt = machine.receipt();
+    let text = out(&machine.run_with_path(
+        &[
+            "setup",
+            "--claude-dir",
+            claude.to_str().expect("utf-8"),
+            "--receipt",
+            receipt.to_str().expect("utf-8"),
+            "--store",
+            "keychain",
+            "--yes",
+        ],
+        Some(&bin),
+    ));
+
+    assert!(
+        text.contains(&daemon.display().to_string()),
+        "the daemon on PATH is not named in the report:\n{text}"
+    );
+}
+
+#[test]
+fn only_the_off_switch_mentions_the_daemon_it_leaves_running() {
+    // `disable` stops the guards and deliberately does NOT stop the daemon —
+    // stopping it would stop credentials resolving, which is not what the word
+    // means. That note belongs on the way out and nowhere else; printed on
+    // `enable` it would read as a warning about an action that just undid the
+    // thing being warned about.
+    let machine = Machine::fresh("switch-note");
+    let off = out(&machine.run(&["disable"]));
+    assert!(
+        off.contains("is also still running"),
+        "disable does not say the daemon is left running:\n{off}"
+    );
+    let on = out(&machine.run(&["enable"]));
+    assert!(
+        !on.contains("is also still running"),
+        "enable carries a note that only makes sense on the way out:\n{on}"
+    );
 }
