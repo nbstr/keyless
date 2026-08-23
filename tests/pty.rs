@@ -58,17 +58,32 @@ use nix::sys::signal::{Signal, kill};
 use nix::sys::termios::{self, LocalFlags, Termios};
 use nix::unistd::Pid;
 
-use support::{DECOY_VALUE, PATIENCE, Stub, scratch, stub_security, within};
+use support::{DECOY_VALUE, Stub, scratch, stub_security, within};
 
 const BIN: &str = env!("CARGO_BIN_EXE_keyless");
 
 /// The bound on a whole case.
 ///
-/// Deliberately larger than [`PATIENCE`], which bounds one `await_output`. A
-/// case that stalls waiting for a specific marker should report THAT marker and
-/// what the terminal received instead; only a stall with no more specific owner
-/// should fall through to this one.
+/// Deliberately larger than [`MARKER_PATIENCE`], which bounds one wait for one
+/// marker. A case that stalls waiting for a specific marker should report THAT
+/// marker and what the terminal received instead; only a stall with no more
+/// specific owner should fall through to this one.
 const CASE_PATIENCE: Duration = Duration::from_secs(60);
+
+/// The bound on one wait for one thing the CHILD has to produce.
+///
+/// A wall clock, and it has to be: there is no watched body here to charge, and
+/// the thing being waited for is another process's output rather than any work
+/// this thread does. So it is a HANG bound and never a measurement — nothing
+/// that uses it asserts anything about how long the marker took, and every case
+/// that does assert on elapsed time says so at its own assertion. Its only job
+/// is to name the marker that never arrived, which is the one thing
+/// [`CASE_PATIENCE`] cannot say.
+///
+/// It is far above anything a terminal fixture in this file costs, deliberately:
+/// these cases spend their time waiting rather than computing, so a machine with
+/// no cpu to spare barely moves them.
+const MARKER_PATIENCE: Duration = Duration::from_secs(30);
 
 /// A distinctive terminal size, so "the child saw the size we set" cannot be
 /// confused with "the child saw a plausible default". 24x80 would prove nothing.
@@ -327,7 +342,7 @@ impl UnderTerminal {
     /// mid-run. Waiting for the thing itself is the only way to be sure the
     /// child has got where it needs to be.
     fn await_output(&self, needle: &str) {
-        let deadline = Instant::now() + PATIENCE;
+        let deadline = Instant::now() + MARKER_PATIENCE;
         while Instant::now() < deadline {
             if self.text().contains(needle) {
                 return;
@@ -1137,7 +1152,7 @@ fn a_grandchild_holding_the_terminal_open_does_not_hang_the_run() {
             // The fixture checks ITSELF. A grandchild that died with its session
             // holds nothing, and this case would then pass against completely
             // unbounded code — which is exactly what the naive version did.
-            let deadline = Instant::now() + PATIENCE;
+            let deadline = Instant::now() + MARKER_PATIENCE;
             while !outlived.exists() && Instant::now() < deadline {
                 thread::sleep(Duration::from_millis(10));
             }

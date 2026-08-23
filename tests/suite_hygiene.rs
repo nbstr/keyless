@@ -125,8 +125,13 @@
 //       are read against, because nothing else in this suite is sensitive to
 //       thread count in that direction.
 
+mod support;
+
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+use support::within;
 
 /// Every `"timeout_ms"` a config string in `tests/` is allowed to name, and why.
 ///
@@ -397,6 +402,42 @@ fn timeouts_in(text: &str) -> Vec<u64> {
         }
     }
     out
+}
+
+/// The bound that wraps most of this suite must still FIRE, and nothing else
+/// here proves it.
+///
+/// Every other test in the repository proves [`support::within`] does not fire
+/// when it should not — that is what the rest of the suite going green means.
+/// None of them proves the other direction, and a watchdog that has stopped
+/// firing is invisible: it looks exactly like a suite with no hangs in it. So
+/// this case hands it one.
+///
+/// It matters more since the bound stopped being a wall clock. `within` charges
+/// a body only for the share of the machine it was actually handed, which is
+/// what stops a starved test being reported as a stalled one — and the failure
+/// mode of that idea is an instrument so forgiving it never reports anything at
+/// all. This is the control on exactly that.
+///
+/// The hang is a receive on a channel whose sender has been leaked: nothing can
+/// ever send, and nothing can ever disconnect. It costs no cpu at all while its
+/// wall clock runs, which is the whole shape of a real hang and precisely the
+/// shape a wall clock cannot tell apart from a machine that is merely busy.
+#[test]
+#[should_panic(expected = "HUNG")]
+fn a_body_that_never_makes_progress_is_reported_as_hung() {
+    within(
+        // Far below anything a real case uses. The number is not a ceiling on
+        // any behaviour: it is how long this test is willing to spend proving
+        // that a bound still has teeth.
+        Duration::from_millis(250),
+        "a deliberate hang",
+        || {
+            let (sender, receiver) = std::sync::mpsc::channel::<()>();
+            std::mem::forget(sender);
+            let _ = receiver.recv();
+        },
+    );
 }
 
 fn collect_rust_sources(dir: &Path, out: &mut Vec<PathBuf>) {

@@ -453,19 +453,18 @@ fn a_value_with_a_nul_byte_degrades_instead_of_killing_the_run() {
 
 #[test]
 fn a_value_too_large_for_arg_max_degrades_instead_of_killing_the_run() {
-    // A HANG bound, and not a measurement of anything. This case's cost is linear
-    // in the size of the value and every byte of it is paid by an unoptimized
-    // build, which makes it the most expensive case in the file by a wide margin
-    // — and on a machine with more runnable work than cores that cost stretches
-    // without limit. A wall clock cannot tell a case that is starved from one
-    // that is stalled, so no constant here is provably right and a tight one is
-    // simply a red test waiting for a busy afternoon. This one sits far past the
-    // case's own cost on purpose: the only job it has is to turn a stall into a
-    // named red rather than a suite that never returns, and being generous about
-    // that costs nothing except the time to report a hang that has already
-    // happened.
+    // The default bound, and it is the default DESPITE this being the most
+    // expensive case in the file. Its cost is linear in the size of the value
+    // and every byte of it is paid by an unoptimized build, so on a machine with
+    // far more runnable work than cores its wall cost stretches without limit —
+    // which is why it once carried a bespoke constant many times its own cost,
+    // and why that constant lost anyway. [`support::within`] no longer bounds
+    // wall time: it charges a body only for the share of the machine the body
+    // was actually given, so the cost that stretches is no longer the cost being
+    // measured, and the case that needs the widest bound is exactly the case
+    // that needs no bespoke one.
     within(
-        Duration::from_secs(300),
+        PATIENCE,
         "a_value_too_large_for_arg_max_degrades_instead_of_killing_the_run",
         || {
             // `E2BIG`, `Argument list too long`, exit 127, no child. Measured on macOS:
