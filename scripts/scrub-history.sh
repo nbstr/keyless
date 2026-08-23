@@ -31,11 +31,17 @@ cd "$(dirname "${BASH_SOURCE[0]}")/.."
 # The substitutions, as two parallel arrays. Keep each OLD long enough to be
 # unambiguous: a short string matches somewhere nobody intended, and a commit
 # message is not a thing to edit by accident.
+# Longest first: these are applied in order, and a short pattern that is a
+# SUBSTRING of a longer one fires inside it and leaves the longer one unable
+# to match. The result is not a missed scrub, which would be visible -- it is
+# a sentence rewritten into something that reads fine and says the wrong thing.
 OLD=(
+  "`m.replace(and reached 41 GB resident on ten cores...)`"
   "and reached 41 GB resident on ten cores"
   "held the queue eighty minutes with no"
 )
 NEW=(
+  "`m.replace(...)`"
   "and allocated until something stopped it"
   "held the queue far past its own runtime with no"
 )
