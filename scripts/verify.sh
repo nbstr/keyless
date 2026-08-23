@@ -37,13 +37,16 @@
 # of that tree materialised somewhere else. That is the form the pre-commit
 # hook uses, and it is the difference between a green gate and a green COMMIT:
 # a checkout still holding the unstaged half of a `git add -p` compiles when
-# the commit does not. `gate_staged_tree` in scripts/lib.sh does that work, and
-# says there why it copies the tree rather than stashing around it.
+# the commit does not. `gate_staged_tree` in scripts/staged-tree.sh does that
+# work, and says there why it copies the tree rather than stashing around it.
 set -uo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 source scripts/lib.sh
 
 if [ "${1:-}" = "--staged" ]; then
+  # Sourced here rather than from lib.sh: this is the only caller, and the
+  # other gates have no index to gate.
+  source scripts/staged-tree.sh || exit 1
   gate_staged_tree; staged_code=$?
   # A failure counted here is one of the assertions made BEFORE the copy was
   # gated; the run inside the copy prints its own summary and must not be given

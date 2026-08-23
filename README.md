@@ -1893,12 +1893,27 @@ There are no `TODO` comments in the source. Work is either done or listed here.
 ## Development
 
 ```console
-scripts/install-hooks.sh   # once per clone — hooks are not tracked by git
-scripts/verify.sh          # ~90s. what the pre-commit hook runs
-scripts/verify-all.sh      # the above, plus a hostile environment and cargo audit
-scripts/mutants.sh         # ~40 min, queued. the mutation campaign
-scripts/linux-gates.sh     # the three checks that need Linux
+scripts/install-hooks.sh    # once per clone — hooks are not tracked by git
+scripts/verify.sh           # ~90s. gates the tree you are standing in
+scripts/verify.sh --staged  # the same gate, over the tree the commit would
+                            # create. what the pre-commit hook runs
+scripts/verify-all.sh       # verify.sh, plus a hostile environment and cargo audit
+scripts/mutants.sh          # ~40 min, queued. the mutation campaign
+scripts/linux-gates.sh      # the three checks that need Linux
 ```
+
+The two forms of `verify.sh` are pointed at different trees, and the difference
+is the difference between a green gate and a green commit. Bare, it reads the
+checkout — which is what somebody checking their own work in progress means by
+it. With `--staged` it builds a linked worktree from the staged tree and runs
+the gate in there, so what gets checked is exactly what the commit will carry: a
+`git add -p` leaves the other half of the file in the checkout, where the
+compiler can still see it, and a checkout that compiles is not a commit that
+compiles. That copy keeps its own build cache under
+`$(git rev-parse --git-common-dir)/keyless-gate`; deleting it costs one slower
+run. `scripts/staged-tree.sh` holds that machinery and `scripts/lib.sh` the
+reporting every gate shares — both are sourced by the scripts above, never run
+on their own.
 
 There is no CI. There was, and it was red for twelve days on two faults that had
 nothing to do with the code, which is worse than none: a check nobody reads is a
