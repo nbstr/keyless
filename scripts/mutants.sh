@@ -47,6 +47,13 @@ source scripts/linux.sh
 # REPORTED and never diffed -- a baseline describes one scope, and checking it
 # against a different one would red every time and mean nothing.
 DEFAULT_SCOPE='src/mask/** src/secret.rs src/audit/**'
+# A floor on the DEFAULT scope only, and it is checked nowhere else. This number
+# describes one glob set against one baseline: it says "the campaign the baseline
+# was recorded from still generates about as much as it did". Applied to a scope
+# somebody chose in order to look at one module, it is a number about a different
+# question, and it aborted every such run BEFORE the survivor list was written --
+# which made the only reporting an exploratory run produces unreachable from the
+# exploratory runs the scope argument exists for.
 MUTANT_FLOOR=280
 BASELINE=.github/mutants-baseline.txt
 # The scope travels in an ENVIRONMENT VARIABLE across the container boundary,
@@ -146,20 +153,77 @@ status=$?
 echo "cargo-mutants exited $status"
 tail -n 40 "$GATE_LOG_DIR/mutants.log"
 
-if [ ! -f "$OUT/mutants.out/outcomes.json" ]; then
-  fail "cargo-mutants produced no outcomes.json (exit $status). It never got as far as testing mutants; the whole log is at $GATE_LOG_DIR/mutants.log"
+out="$OUT/mutants.out"
+
+# ---------------------------------------------------------------------------
+# A campaign that tested nothing: THREE causes, three different places to look
+# ---------------------------------------------------------------------------
+#
+# They are told apart by which file cargo-mutants got as far as writing, because
+# that is a fact about how far it ran rather than a sentence that can be reworded
+# in the next release:
+#
+#   `mutants.json`   is the list it GENERATED. Written as soon as the source has
+#                    been parsed, before a single test runs.
+#   `outcomes.json`  is what it TESTED, baseline included. Written at the end.
+#
+# So: no `mutants.json` means it never parsed the tree; an empty one means the
+# scope matched nothing mutable; a full one with no green baseline means the
+# suite was already red before anything was mutated.
+#
+# That last case is the one this block exists for. Measured, cargo-mutants
+# 27.1.0: with one deliberately failing test in the UNMUTATED tree it exits 4,
+# generates its mutants, tests none of them, and writes an `outcomes.json` whose
+# only entry is `{"scenario": "Baseline", "summary": "Failure"}` with
+# `total_mutants: 0`. Read as a mutant count alone, that is indistinguishable
+# from a glob that matched nothing -- and it was reported as one, which sent the
+# reader to edit a scope that was correct while a failing test sat in the tree.
+# A glob matching nothing exits 0 and writes no `outcomes.json` at all, so the
+# count was never the thing that separated them.
+generated=$(python3 -c 'import json,sys;print(len(json.load(open(sys.argv[1]))))' \
+  "$out/mutants.json" 2> /dev/null) || generated=-1
+
+if [ "$generated" -lt 0 ]; then
+  fail "cargo-mutants wrote no list of mutants (exit $status). It never got as far as reading the source, so this is neither a scope nor a test failure; the whole log is at $GATE_LOG_DIR/mutants.log"
   gate_summary; exit 1
 fi
 
-out="$OUT/mutants.out"
+if [ "$generated" -eq 0 ]; then
+  fail "the scope matched no mutable source, so nothing was generated and nothing ran (exit $status). THE TESTS ARE NOT INVOLVED. Fix the globs: scope was '$SCOPE'"
+  gate_summary; exit 1
+fi
+
+if [ ! -f "$out/outcomes.json" ]; then
+  fail "cargo-mutants generated $generated mutants and then wrote no outcomes.json (exit $status). It died between reading the source and finishing the run; the whole log is at $GATE_LOG_DIR/mutants.log"
+  gate_summary; exit 1
+fi
+
+baseline=$(python3 - "$out/outcomes.json" <<'BASELINE'
+import json, sys
+
+for outcome in json.load(open(sys.argv[1]))['outcomes']:
+    if outcome.get('scenario') == 'Baseline':
+        print(outcome.get('summary', 'unknown'))
+        break
+else:
+    print('absent')
+BASELINE
+)
+
+if [ "$baseline" != "Success" ]; then
+  fail "the baseline never went green, so none of the $generated mutants was tested (cargo-mutants exit $status, baseline $baseline). THE SCOPE IS NOT THE PROBLEM: the suite fails in the UNMUTATED tree. The failing test is named in the log above; fix it, then re-run this."
+  gate_summary; exit 1
+fi
+
 field() { python3 -c "import json,sys;print(json.load(open(sys.argv[1]))[sys.argv[2]])" "$out/outcomes.json" "$1"; }
 total=$(field total_mutants); caught=$(field caught); missed=$(field missed)
 timeout=$(field timeout); unviable=$(field unviable)
-echo "tested=$total caught=$caught missed=$missed timeout=$timeout unviable=$unviable"
+echo "generated=$generated tested=$total caught=$caught missed=$missed timeout=$timeout unviable=$unviable"
 
-# A --file glob that matches nothing produces zero survivors and exits 0.
-if [ "$total" -lt "$MUTANT_FLOOR" ]; then
-  fail "only $total mutants were generated; the floor is $MUTANT_FLOOR. Check the scope, not the tests."
+# The floor is a statement about the DEFAULT scope's baseline and is checked for
+# no other scope. See MUTANT_FLOOR above.
+if [ "$SCOPE" = "$DEFAULT_SCOPE" ] && [ "$total" -lt "$MUTANT_FLOOR" ]; then
+  fail "only $total mutants were generated from the default scope; the floor is $MUTANT_FLOOR. The baseline was green, so this is the scope shrinking under the globs in DEFAULT_SCOPE -- a file renamed, moved, or deleted."
   gate_summary; exit 1
 fi
 
