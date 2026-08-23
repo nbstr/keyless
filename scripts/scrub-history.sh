@@ -36,15 +36,39 @@ cd "$(dirname "${BASH_SOURCE[0]}")/.."
 # to match. The result is not a missed scrub, which would be visible -- it is
 # a sentence rewritten into something that reads fine and says the wrong thing.
 OLD=(
-  "`m.replace(and reached 41 GB...)`"
-  "and reached 41 GB resident on ten cores"
-  "held the queue eighty minutes with no"
+  '`m.replace(and reached 41 GB...)`'
+  'and reached 41 GB resident on ten cores'
+  'held the queue eighty minutes with no'
 )
 NEW=(
-  "`m.replace(...)`"
-  "and allocated until something stopped it"
-  "held the queue far past its own runtime with no"
+  '`m.replace(...)`'
+  'and allocated until something stopped it'
+  'held the queue far past its own runtime with no'
 )
+
+# SINGLE quotes above, and that is not style. A double-quoted string runs
+# backticks as a command: `"`m.replace(x)`"` became the empty string plus a
+# syntax error on stderr, and an EMPTY pattern matches every commit ever made.
+# It was harmless only because its replacement was emptied the same way, making
+# it replace("", "") -- had one survived and the other not, the rewrite would
+# have inserted text between every character of every message in the repository.
+#
+# The guard below is what makes that structural rather than remembered.
+if [ "${#OLD[@]}" -ne "${#NEW[@]}" ]; then
+  echo "the substitution table is uneven: ${#OLD[@]} patterns, ${#NEW[@]} replacements." >&2
+  exit 1
+fi
+i=0
+while [ "$i" -lt "${#OLD[@]}" ]; do
+  if [ -z "${OLD[$i]}" ]; then
+    echo "pattern ${i} is EMPTY, which matches every commit message in the" >&2
+    echo "repository. Refusing to rewrite anything. The usual cause is a" >&2
+    echo "double-quoted entry containing a backtick, which the shell ran as a" >&2
+    echo "command and replaced with nothing." >&2
+    exit 1
+  fi
+  i=$((i + 1))
+done
 
 APPLY=0
 [ "${1-}" = "--apply" ] && APPLY=1
