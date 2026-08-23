@@ -19,7 +19,7 @@
 #
 # These used to say "find a Linux machine", which meant they never ran. They now
 # bring their own: `scripts/linux.sh` holds a pinned Linux image, so this is one
-# command on a Mac, on the Arcadia, or anywhere a container runtime answers.
+# command anywhere a container runtime answers, macOS included.
 # Running it costs a couple of minutes and needs no other machine.
 set -uo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
@@ -38,7 +38,7 @@ if [ "$(uname -s)" != "Linux" ] && [ -z "${KEYLESS_IN_LINUX_GATE-}" ]; then
     echo "  * the hook pack under a second Python interpreter" >&2
     echo >&2
     echo "No container runtime is answering, so there is no Linux to borrow." >&2
-    echo "Start OrbStack (or Docker), or run this on a Linux host." >&2
+    echo "Start a container runtime, or run this on a Linux host." >&2
     echo "It is not skippable here: a skip and a pass look identical after." >&2
     exit 1
   fi

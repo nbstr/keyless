@@ -416,10 +416,11 @@ mod tests {
 
     #[test]
     fn a_checkout_behind_its_upstream_is_reported_behind_with_the_count() {
-        // The Arcadia's condition, reproduced: the working tree is moved back
-        // and the remote is not. Seven commits pushed, then six undone, so the
-        // literal below comes from this test's own arithmetic and from no
-        // reading the code under test performs.
+        // The condition this row exists for: the working tree is moved back and
+        // the remote is not, so the checkout is old while every file in it looks
+        // untouched. Seven commits pushed, then six undone, so the literal below
+        // comes from this test's own arithmetic and from no reading the code
+        // under test performs.
         let work = repo("behind", 7);
         git(&work, &["reset", "--hard", "--quiet", "HEAD~6"]);
         match check_at(&work) {

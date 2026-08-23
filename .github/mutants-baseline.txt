@@ -42,7 +42,7 @@
 # executes inside a pinned Linux container with `--memory` set, so a mutant that
 # allocates without end is killed by the kernel at the limit and the campaign
 # carries on — measured 2026-08-22, when `replace += with -= in Masker::scan`
-# reached 41 GB and ten cores on a host that had no such limit.
+# reverses a loop counter and allocates until something does.
 #
 # It is ALSO the only correct place to run it: the survivors recorded below were
 # produced on Linux, and which mutants survive depends on which tests run, which

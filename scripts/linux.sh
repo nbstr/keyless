@@ -9,10 +9,11 @@
 # ---------------------------------------------------------------------------
 #
 # A mutation campaign deliberately compiles wrong programs, and a wrong program
-# may allocate without bound. On 2026-08-22 one reached 41 GB and ten cores on
-# the host. Nothing on macOS stops that: cargo-mutants' own timeout was working
-# and bounds TIME, not memory, and `cq`'s admission cap is decided when a job
-# ASKS and never resizes one already running.
+# may allocate without bound -- a mutant that reverses a loop counter takes
+# whatever the machine has, and takes it in seconds. A timeout is no defence,
+# because a timeout bounds TIME rather than memory. An admission queue is no
+# defence either, because admission is decided when a job ASKS and never
+# resizes one already running.
 #
 # A cgroup does bound it. Inside `--memory`, the kernel kills the offending
 # process and the campaign records the result and continues. The host is never a
@@ -22,9 +23,9 @@ set -uo pipefail
 
 KEYLESS_IMAGE="${KEYLESS_IMAGE:-keyless-linux-gate}"
 
-# Sized against the DOCKER VM, never the host: OrbStack and Docker Desktop each
-# run their own Linux VM with its own RAM, and a cap above that VM's size is not
-# a cap at all -- the VM dies first and takes every container with it.
+# Sized against the DOCKER VM, never the host: off Linux the runtime runs its
+# own Linux VM with its own RAM, and a cap above that VM's size is not a cap at
+# all -- the VM dies first and takes every container with it.
 linux_memory_cap() {
   local vm_bytes
   vm_bytes=$(docker info --format '{{.MemTotal}}' 2>/dev/null) || return 1
@@ -95,7 +96,7 @@ if [ "${BASH_SOURCE[0]-}" = "${0-}" ] && [ -n "${BASH_SOURCE[0]-}" ]; then
   cd "$(dirname "${BASH_SOURCE[0]}")/.."
   if ! linux_available; then
     echo "no docker daemon is answering, so there is no Linux to run on." >&2
-    echo "Start OrbStack (or Docker), or run this on a Linux host directly." >&2
+    echo "Start a container runtime, or run this on a Linux host directly." >&2
     exit 1
   fi
   linux_image_ready || exit 1

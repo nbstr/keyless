@@ -18,7 +18,8 @@
 # 2. ONLY A CGROUP CAN BOUND THE MEMORY. A campaign deliberately compiles wrong
 #    programs, and a wrong program may allocate without end. Measured on
 #    2026-08-22: `replace += with -= in Masker::scan` turned a loop counter
-#    around and reached 41 GB resident on ten cores before a human noticed.
+#    around and allocates until something stops it. Uncapped, the thing that
+#    stops it is the operator noticing.
 #
 # ---------------------------------------------------------------------------
 # What does NOT protect the machine, since both were tried
@@ -64,8 +65,8 @@ if [ -z "${KEYLESS_IN_LINUX_GATE-}" ]; then
   if ! linux_available; then
     echo "no container runtime is answering, so there is no capped Linux to" >&2
     echo "run this on. Uncapped is not an option here: a runaway mutant took" >&2
-    echo "41 GB and ten cores the last time this ran on a host." >&2
-    echo "Start OrbStack (or Docker) and try again." >&2
+    echo "take every page this machine has, and a timeout will not stop it." >&2
+    echo "Start a container runtime and try again." >&2
     exit 1
   fi
   linux_image_ready || exit 1

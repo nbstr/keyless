@@ -16,8 +16,7 @@
 # 2. ONLY LINUX CAN CAP THE MEMORY. A mutation campaign deliberately builds
 #    programs that are wrong, and a wrong program is entitled to allocate
 #    forever: measured on 2026-08-22, `replace += with -= in Masker::scan` turned
-#    a loop counter around and reached 41 GB resident and ten cores before a
-#    human noticed. cargo-mutants' timeout was working correctly and is no
+#    a loop counter around and allocates until something stops it. cargo-mutants' timeout was working correctly and is no
 #    defence -- a timeout bounds TIME, and 390 seconds is plenty to exhaust a
 #    machine. cgroups bound MEMORY, the OOM killer takes the mutant and nothing
 #    else, and the campaign carries on. macOS has no equivalent that holds.
