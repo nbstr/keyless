@@ -346,7 +346,7 @@ fn disable_stops_the_guards_and_doctor_says_so_and_enable_undoes_it() {
     );
 
     let off = out(&machine.run(&["disable"]));
-    assert!(off.contains("off"), "{off}");
+    assert_eq!(state_of(&off, "guards"), "off", "{off}");
     // Nothing was unregistered: the pack is still in the settings file, and the
     // switch is one key in a file `keyless` owns.
     assert!(

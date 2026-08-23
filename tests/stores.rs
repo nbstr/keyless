@@ -1672,7 +1672,7 @@ fn doctor_reports_an_expired_proton_session_as_a_problem() {
         !proton_row(&report).contains("proven"),
         "a dead session was reported as proven:\n{report}"
     );
-    assert!(proton_row(&report).contains("absent"), "{report}");
+    assert_eq!(state_of(proton_row(&report)), "absent", "{report}");
     // The vendor's own words, so the reader knows which of the many ways this
     // backend fails they are looking at.
     //
@@ -1765,9 +1765,11 @@ fn a_proton_store_with_no_session_directory_is_unhealthy_without_spawning_anythi
     );
     let (report, code) = doctor_report(&dir, &config);
 
+    let state = state_of(proton_row(&report));
     assert!(
-        proton_row(&report).contains("config") || proton_row(&report).contains("absent"),
-        "{report}"
+        state == "config" || state == "absent",
+        "the row's state is `{state}`, and an unset session directory is either \
+         a config fault or an unreachable store:\n{report}"
     );
     assert!(report.contains("session_dir"), "{report}");
     assert_eq!(code, 1, "{report}");

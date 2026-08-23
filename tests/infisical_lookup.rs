@@ -222,8 +222,9 @@ fn a_value_this_process_carries_is_never_reported_as_read_back_from_the_store() 
         !row.contains("proven"),
         "the caller's own environment was reported as read back from the store: {row}"
     );
-    assert!(
-        row.contains("absent"),
+    assert_eq!(
+        state_of(&row),
+        "absent",
         "a store holding nothing must say so: {row}"
     );
     assert!(

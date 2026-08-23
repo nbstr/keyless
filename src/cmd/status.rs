@@ -225,10 +225,16 @@ const STATE_WIDTH: usize = 9;
 /// | `config` | [`Mark::NotSetUp`] | edit one line of the config file |
 /// | `ambiguous` | [`Mark::NotSetUp`] | pin a store on the name, or set a default |
 /// | `broken` | [`Mark::Broken`] | it is installed and saying no; read the detail |
+/// | `stale` | [`Mark::Broken`] | rebuild: this binary is older than the source beside it |
+/// | `behind` | [`Mark::Broken`] | pull: that source is older than the branch it tracks |
 /// | `off` | [`Mark::Off`] | enable it, if you wanted it |
 /// | `blocked` | [`Mark::Unproven`] | fix the store above; this row is a symptom |
 ///
-/// A ninth word should replace one of these rather than join them.
+/// An eleventh word should replace one of these rather than join them.
+///
+/// The table is the vocabulary, and `tests/state_vocabulary.rs` holds it to
+/// that: it derives the same set from every `state` literal the crate renders
+/// and reds when the two disagree, in either direction.
 pub fn row(
     out: &mut dyn Write,
     style: Style,

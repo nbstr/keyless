@@ -1368,7 +1368,7 @@ fn a_home_with_no_keychain_is_reported_without_spawning_security() {
     );
     // Amber, not red: this HOME has no keychain, which is a state rather than a
     // fault in the store.
-    assert!(row_for(&report, "keychain").contains("absent"), "{report}");
+    assert_eq!(state_of(row_for(&report, "keychain")), "absent", "{report}");
 }
 
 #[test]
