@@ -631,20 +631,41 @@ fn store_rows(config: &Config, registry: &Registry) -> Vec<StoreRow> {
         .collect()
 }
 
-/// Where a live store points, for the detail column of a proven row.
+/// The coordinates a live store was ASKED for, for the detail column of a
+/// proven row.
 ///
 /// A proven row still has to say WHAT was proven against, or two machines with
-/// wildly different configurations produce the same green line. The state word
-/// says how far the proof reached; this says where it reached to.
+/// wildly different configurations produce the same green line. Every word this
+/// returns is read out of the config file, though, and none of it is read back
+/// from the backend that answered — so it names the coordinates handed to the
+/// store, never coordinates the report established.
+///
+/// For three of the four backends those are the same sentence: the keychain
+/// service, the Proton session directory and the daemon socket are each passed
+/// to the backend verbatim, so config is what the lookup used.
+///
+/// Infisical is the one where that gap is load-bearing rather than pedantic.
+/// The adapter hands the vendor CLI this process's `HOME` and every
+/// `INFISICAL_*` variable and passes neither a domain nor a token, so WHICH
+/// SERVER answered and AS WHOM are decided entirely by the ambient environment
+/// — which this report never reads and this config never states. Its row says
+/// so out loud, because `path /backend, project p-1` printed against a
+/// self-hosted instance nobody here named is a green line that misidentifies
+/// the thing it certifies.
 fn points_at(config: &Config, id: &str) -> String {
     match id {
         "keychain" => format!("service \"{}\"", config.stores.keychain.service),
         "infisical" => {
             let path = &config.stores.infisical.path;
-            match &config.stores.infisical.project_id {
+            let asked = match &config.stores.infisical.project_id {
                 Some(project) => format!("path {path}, project {project}"),
                 None => format!("path {path}, project from the working directory"),
-            }
+            };
+            format!(
+                "{asked} — from this config. WHICH INSTANCE answered, and AS \
+                 WHOM, are decided by the environment's HOME and INFISICAL_*; \
+                 this row reads neither and does not establish the instance."
+            )
         }
         "proton" => match &config.stores.proton.session_dir {
             Some(dir) => format!("session {}", dir.as_path().display()),
@@ -1121,7 +1142,7 @@ fn report_capability_boundary(style: Style, out: &mut dyn Write) -> io::Result<(
 
 #[cfg(test)]
 mod tests {
-    use super::{doctor, remedy, report_build};
+    use super::{doctor, points_at, remedy, report_build};
     use crate::audit::AuditLog;
     use crate::checkout::Checkout;
     use crate::cmd::status::Style;
@@ -1587,6 +1608,86 @@ mod tests {
             code, 0,
             "an unenabled store was counted as a problem: {text}"
         );
+    }
+
+    #[test]
+    fn a_proven_infisical_row_never_reads_as_having_established_the_instance() {
+        // The defect this pins is a green line that misidentifies what it
+        // certifies. The adapter hands the vendor CLI this process's `HOME` and
+        // every `INFISICAL_*` variable and passes no domain and no token, so the
+        // server that answered and the account it answered for are decided by
+        // the ambient environment — while the detail column is built entirely
+        // from the config file. `proven — path /backend, project p-decoy` was
+        // therefore printable for a lookup that reached a different instance
+        // altogether.
+        //
+        // Asserted as a property, not as a sentence: the row must NAME the
+        // levers it cannot see and must DENY having read them. Any rewording
+        // that keeps the meaning keeps both; a row that quietly grew back into a
+        // claim about the instance would keep neither.
+        use crate::store::infisical::{FORWARDED_EXACT, FORWARDED_PREFIX};
+
+        let load = loaded(
+            r#"{"stores":{"infisical":{"enabled":true,"path":"/backend","project_id":"p-decoy"}},
+                "secrets":{}}"#,
+        );
+        let detail = points_at(&load.config, "infisical");
+
+        // The coordinates survive: telling two machines apart is the reason this
+        // column exists, and a caveat that ate the content would be its own bug.
+        assert!(detail.contains("/backend"), "{detail}");
+        assert!(detail.contains("p-decoy"), "{detail}");
+        // ...attributed, so a reader can tell a config echo from a reading.
+        assert!(
+            detail.contains("config"),
+            "the coordinates must say where they came from: {detail}"
+        );
+
+        // The levers, read off the adapter's own constants rather than typed
+        // here. If what the adapter forwards ever changes, this is what drags
+        // the report along instead of letting the caveat go quietly stale.
+        assert!(
+            FORWARDED_EXACT.contains(&"HOME"),
+            "the adapter stopped forwarding HOME; the row's caveat now names the \
+             wrong lever: {FORWARDED_EXACT:?}"
+        );
+        assert!(detail.contains("HOME"), "{detail}");
+        assert!(detail.contains(FORWARDED_PREFIX), "{detail}");
+
+        // The denial itself, matched as a negation rather than as a sentence. A
+        // row that CLAIMS the instance ("verified against ...", "authenticated
+        // as ...") carries no negation at all, which is the single thing this
+        // assertion exists to catch.
+        assert!(
+            ["not ", "never", "neither", "cannot"]
+                .iter()
+                .any(|denial| detail.contains(denial)),
+            "the row must DENY having read the instance, not merely omit it: {detail}"
+        );
+
+        // And it reaches the report a person actually reads, wrapping included.
+        let (text, _) = report(
+            &load,
+            Registry::new(vec![Box::new(Named("infisical"))]),
+            false,
+        );
+        assert!(flat(&text).contains(FORWARDED_PREFIX), "{text}");
+    }
+
+    #[test]
+    fn the_ambient_caveat_belongs_only_to_the_backend_that_has_one() {
+        // The control for the case above, which would otherwise pass on a report
+        // that appends the same disclaimer to every proven row. A caveat printed
+        // everywhere is read nowhere, and it would stop meaning anything on the
+        // one row where it is true. The keychain service is handed to `security`
+        // verbatim, so those coordinates ARE the ones the lookup used.
+        let load = loaded(r#"{"stores":{"keychain":{"enabled":true}},"secrets":{}}"#);
+        let detail = points_at(&load.config, "keychain");
+        assert!(
+            !detail.contains(crate::store::infisical::FORWARDED_PREFIX),
+            "{detail}"
+        );
+        assert!(!detail.contains("HOME"), "{detail}");
     }
 
     #[test]
