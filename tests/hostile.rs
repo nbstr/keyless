@@ -66,19 +66,21 @@ use keyless::store::keychain::KeychainStore;
 use keyless::store::{Registry, Store};
 
 use support::{
-    DECOY_VALUE, PATIENCE, Stub, run_with, scratch, stub_security, within, witness, witnessed,
+    DECOY_VALUE, PATIENCE, Stub, install_executable, run_with, scratch, stub_security, within,
+    witness, witnessed,
 };
 
 /// A `security` stand-in that behaves badly in one specific way.
+///
+/// Installed through [`support::install_executable`] rather than written and
+/// `chmod`ded here, and that is not a tidiness preference. Every case in this
+/// file writes a stub and then reaches it through a spawned child, and they run
+/// on many threads at once — which is precisely the arrangement in which a
+/// `fork` on one thread copies the descriptor another thread is writing a stub
+/// through, and `execve` then refuses the stub as busy. See that function for
+/// the mechanism and why close-on-exec does not cover it.
 fn hostile_security(dir: &Path, name: &str, body: &str) -> std::path::PathBuf {
-    let path = dir.join(name);
-    std::fs::write(&path, format!("#!/bin/sh\n{body}")).expect("write the hostile stub");
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
-    }
-    path
+    install_executable(&dir.join(name), &format!("#!/bin/sh\n{body}"))
 }
 
 /// How long a marker another process owes us is waited for.
