@@ -26,14 +26,31 @@
 # and the floors are set below the measured count so they catch a suite that
 # collapsed rather than a suite that lost one case.
 #
-# debt: this gate reads the WORKING TREE, not the staged tree. A commit made
-#       with `git add -p` can therefore be green here and broken as committed.
-#       Fixing it properly means a stash dance around a hook, which can lose
-#       work when it goes wrong -- a worse failure than the one it prevents.
-#       Upgrade trigger: the first time a partial commit lands broken.
+# ---------------------------------------------------------------------------
+# What it is pointed at
+# ---------------------------------------------------------------------------
+#
+# Run by hand, this gates the tree it is standing in, which is what somebody
+# checking their own work in progress means by it.
+#
+# Run as `--staged`, it gates the tree a commit would create instead, in a copy
+# of that tree materialised somewhere else. That is the form the pre-commit
+# hook uses, and it is the difference between a green gate and a green COMMIT:
+# a checkout still holding the unstaged half of a `git add -p` compiles when
+# the commit does not. `gate_staged_tree` in scripts/lib.sh does that work, and
+# says there why it copies the tree rather than stashing around it.
 set -uo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 source scripts/lib.sh
+
+if [ "${1:-}" = "--staged" ]; then
+  gate_staged_tree; staged_code=$?
+  # A failure counted here is one of the assertions made BEFORE the copy was
+  # gated; the run inside the copy prints its own summary and must not be given
+  # a second one reading this shell's untouched counter.
+  [ "$GATE_FAILURES" -eq 0 ] || gate_summary
+  exit "$staged_code"
+fi
 
 # Measured on macOS 2026-08-21: 714 passed, 15 ignored. Set below the measured
 # count, per above. The ignored figure is asserted EXACTLY -- it counts the

@@ -27,18 +27,26 @@ if [ ! -x "$gate" ]; then
   echo "not pass silently." >&2
   exit 1
 fi
-bash "$gate"
+# --staged, because the subject of a pre-commit gate is the index. Without it
+# this reads the checkout, where the unstaged half of a `git add -p` is still
+# sitting -- and a checkout that compiles is not a commit that compiles.
+bash "$gate" --staged
 code=$?
 if [ "$code" -ne 0 ]; then
   echo >&2
   echo "pre-commit: the gate failed, so nothing was committed." >&2
-  echo "Fix it, or commit with --no-verify if you know why you are bypassing." >&2
+  echo "It gated what you STAGED, in a copy of that tree. A working tree that" >&2
+  echo "builds does not answer this: stage the rest, or fix what you staged." >&2
+  echo "Reproduce it with: bash scripts/verify.sh --staged" >&2
 fi
 exit "$code"
 HOOK
 chmod +x "$hook"
 echo "installed $hook"
-echo "it runs scripts/verify.sh, about 90 seconds on a warm tree."
+echo "it runs scripts/verify.sh --staged: the gate, over the tree the commit"
+echo "would create rather than over the checkout. About 90 seconds on a warm"
+echo "tree, and the copy it gates keeps its own build cache under"
+echo "$(git rev-parse --git-common-dir)/keyless-gate -- disposable, at the cost of one slower run."
 
 # The second hook, and the reason it is a symlink rather than a copy: it is
 # TRACKED, at install/commit-msg.sh, so a copy would be a second version to
