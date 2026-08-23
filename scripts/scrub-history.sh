@@ -36,7 +36,7 @@ cd "$(dirname "${BASH_SOURCE[0]}")/.."
 # to match. The result is not a missed scrub, which would be visible -- it is
 # a sentence rewritten into something that reads fine and says the wrong thing.
 OLD=(
-  "`m.replace(and reached 41 GB resident on ten cores...)`"
+  "`m.replace(and reached 41 GB...)`"
   "and reached 41 GB resident on ten cores"
   "held the queue eighty minutes with no"
 )
