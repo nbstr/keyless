@@ -680,6 +680,71 @@ fn a_missing_name_degrades_and_still_runs_the_command() {
 }
 
 #[test]
+fn a_name_the_config_never_declared_says_so_and_a_declared_one_does_not() {
+    // Hit live: a credential really was in the store, under the right item and
+    // the right field, and its name had never been declared. Nothing said where
+    // to look, so nothing looked there — and the run reported it exactly as it
+    // reports a declared name the store was asked for and does not hold. Two
+    // states, one sentence, and the sentence sent its reader to the store.
+    //
+    // Both names go through one invocation, so the two messages are produced by
+    // the same binary, the same config and the same store on the same run:
+    // `DECOY` is declared by `config_with_stub`, `NOT_DECLARED_ANYWHERE` is not,
+    // and the keychain stub answers `errSecItemNotFound` to both.
+    let dir = scratch("e2e-undeclared");
+    let config = config_with_stub(&dir, &Stub::NotFound);
+
+    let output = keyless(&[
+        "--config",
+        &config.display().to_string(),
+        "--no-audit",
+        "run",
+        "-s",
+        "DECOY",
+        "-s",
+        "NOT_DECLARED_ANYWHERE",
+        "--",
+        "/bin/sh",
+        "-c",
+        "exit 7",
+    ]);
+
+    assert_eq!(output.status.code(), Some(7), "the command must still run");
+    let stderr = stderr_of(&output);
+
+    let undeclared = line_for(&stderr, "NOT_DECLARED_ANYWHERE");
+    assert!(
+        undeclared.contains("not declared in your config"),
+        "the undeclared name did not name the file that is missing the line: {stderr}"
+    );
+    assert!(
+        undeclared.contains("Declare it under \"secrets\""),
+        "the diagnosis carried no next action: {stderr}"
+    );
+
+    // The negative control, and the direction that matters: a name that IS
+    // declared must keep pointing at the store. If both lines start naming the
+    // config, one conflation has been traded for another and every reader is
+    // sent to the wrong file instead of the wrong store.
+    let declared = line_for(&stderr, "DECOY");
+    assert_eq!(
+        declared, "keyless:   DECOY: not found in any store",
+        "the declared-and-absent message changed: {stderr}"
+    );
+}
+
+/// The one degraded line about `name`, whole, so a message meant for one name
+/// cannot be satisfied by the other name's line.
+fn line_for(stderr: &str, name: &str) -> String {
+    let prefix = format!("keyless:   {name}: ");
+    stderr
+        .lines()
+        .find(|line| line.starts_with(&prefix))
+        .unwrap_or_else(|| panic!("no degraded line for `{name}` in: {stderr}"))
+        .to_owned()
+}
+
+#[test]
 fn an_absent_config_still_runs_the_command() {
     let dir = scratch("e2e-no-config");
     let output = keyless(&[

@@ -464,6 +464,34 @@ fn through_the_daemon(config: &DaemonConfig, dir: &std::path::Path) -> (State, S
 }
 
 #[test]
+fn a_name_the_daemon_does_not_hold_is_absent_rather_than_undeclared() {
+    // A client config under the daemon declares nothing about where a name
+    // lives — the daemon's config decides that — so "you never declared it"
+    // would send this reader to edit the one file that has no say. The absence
+    // message is the honest one on this path, and it is the one that must
+    // survive.
+    let dir = scratch("daemon-absent-name");
+    let config = daemon_config(&dir);
+    // A vault holding something else entirely, so the daemon answers a real
+    // "I do not have that" rather than failing to open its store.
+    write_secrets(&config.stores.file.path, &[("NEIGHBOUR", DECOY_VALUE)]);
+    let (state, seen, notes) = through_the_daemon(&config, &dir);
+
+    assert_eq!(state, State::Degraded);
+    assert_eq!(seen, "<unset>");
+    assert!(
+        notes.contains("not found in any store"),
+        "the daemon's absence lost its wording: {notes}"
+    );
+    assert!(
+        !notes.contains("not declared in your config"),
+        "the client blamed a config that does not decide where names live: {notes}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn the_daemons_own_default_store_settles_a_two_store_ambiguity() {
     // The remedy the ambiguity message prescribes, applied where the ambiguity
     // actually is. Without a `stores.default` the daemon can read, this is a

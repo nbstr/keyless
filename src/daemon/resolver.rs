@@ -207,7 +207,10 @@ impl Resolver {
         self.upstream_calls.fetch_add(1, Ordering::Relaxed);
         match self.registry.resolve(name) {
             Resolution::Found { secret, .. } => Outcome::Found(Arc::new(secret)),
-            Resolution::NotFound => Outcome::Absent,
+            // Both shapes of absence collapse here on purpose: `Absent` carries
+            // no text, and the client renders the reason from ITS config, which
+            // is the one a client's `-s NAME` was spelled against.
+            Resolution::NotFound { .. } => Outcome::Absent,
             Resolution::Failed(errors) => Outcome::Failed(
                 errors
                     .iter()

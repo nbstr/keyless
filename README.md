@@ -341,7 +341,7 @@ succeed:
 ```console
 $ keyless run -s NO_SUCH_NAME -- sh -c 'echo "got [${NO_SUCH_NAME}]"'
 keyless: DEGRADED — 1 names unresolved: NO_SUCH_NAME
-keyless:   NO_SUCH_NAME: not found in any store
+keyless:   NO_SUCH_NAME: not declared in your config, so nothing says where its value lives; no store had one under the name itself. Declare it under "secrets", or write it there with `keyless put`
 got []
 $ echo $?
 0
@@ -356,6 +356,15 @@ this tool's.
 
 **So read stderr on your first run of anything.** `DEGRADED` is the only place
 that failure is ever named. Every line after it belongs to your command.
+
+**That message is two facts, and the second one is the fix.** A name your config
+declares says the shorter thing — `not found in any store` — because its
+coordinate was asked and came back empty, and the store is where to look. A name
+nothing declares has no coordinate to ask, so the only thing that could be looked
+for is the name itself. Being in a vault and being resolvable are different
+states, and the line above is careful to claim only the one it can prove: it never
+says a store holds your credential, because nothing asked any store where it
+lives.
 
 **7. Clean up the throwaway**, so it is not mistaken later for something real:
 

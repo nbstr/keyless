@@ -1726,9 +1726,16 @@ impl Store for ProtonStore {
             // name I have no address for" is a config mistake with a specific
             // fix, and reporting it as a plain absence would leave the user
             // hunting in the vault for an item that was never named.
+            //
+            // Two configs reach this line — an entry with no address, and no
+            // entry at all — and this adapter cannot tell them apart, because
+            // both arrive as a name that is missing from `addresses`. So the
+            // fix names the FILE rather than an entry: told to add three fields
+            // "to its config entry", the reader of the second config goes
+            // looking for an entry that was never written.
             return Err(self.backend(format!(
                 "no Proton address declared for `{name}`; \
-                 add \"vault\", \"item\" and \"field\" to its config entry"
+                 give it \"vault\", \"item\" and \"field\" under \"secrets\""
             )));
         };
 

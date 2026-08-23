@@ -54,7 +54,7 @@ pub mod manage;
 pub mod proton;
 pub mod proton_manager;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::config::{Config, Policy};
 use crate::error::StoreError;
@@ -97,7 +97,24 @@ pub enum Resolution {
         secret: Secret,
     },
     /// Every backend that was asked was healthy and none had it.
-    NotFound,
+    NotFound {
+        /// The config behind this registry was consulted and declares no such
+        /// name.
+        ///
+        /// **"In a store" and "resolvable" are different states, and the plain
+        /// absence message is true of both.** A name the config never declared
+        /// has no coordinate — no vault, no item, no field, no account — so the
+        /// only thing a backend could be asked for is the name itself. Reported
+        /// as a plain absence, that sends the reader to the vault to look for
+        /// something that may well be sitting there, when the line that fixes
+        /// it is in the config file.
+        ///
+        /// `false` means EITHER declared OR not knowable — see
+        /// [`Registry::with_declared_names`]. A registry built without the
+        /// declared set claims nothing, because a wrong "you never declared it"
+        /// is the same class of misdirection in the other direction.
+        undeclared: bool,
+    },
     /// At least one backend could not answer. Carries every error, so `doctor`
     /// and the degraded banner can say which backend failed and why.
     Failed(Vec<StoreError>),
@@ -132,7 +149,17 @@ impl Resolution {
     pub fn reason(&self) -> String {
         match self {
             Resolution::Found { .. } => "resolved".to_owned(),
-            Resolution::NotFound => "not found in any store".to_owned(),
+            // Two states, two sentences, and the difference is which file the
+            // reader should open. The declared name is absent from the place
+            // its declaration points at; the undeclared one points at nothing,
+            // so nothing was ever asked on its behalf beyond its own name.
+            // Neither sentence says a store HOLDS it — that is a fact no
+            // lookup for an undeclared name can have established.
+            Resolution::NotFound { undeclared: false } => "not found in any store".to_owned(),
+            Resolution::NotFound { undeclared: true } => "not declared in your config, so nothing \
+                 says where its value lives; no store had one under the name itself. Declare it \
+                 under \"secrets\", or write it there with `keyless put`"
+                .to_owned(),
             Resolution::Failed(errors) => errors
                 .iter()
                 .map(ToString::to_string)
@@ -155,6 +182,7 @@ pub struct Registry {
     routes: BTreeMap<String, String>,
     policy: Policy,
     default_store: Option<String>,
+    declared: Option<BTreeSet<String>>,
 }
 
 impl Registry {
@@ -166,6 +194,7 @@ impl Registry {
             routes: BTreeMap::new(),
             policy: Policy::default(),
             default_store: None,
+            declared: None,
         }
     }
 
@@ -188,6 +217,34 @@ impl Registry {
     pub fn with_default_store(mut self, store: Option<String>) -> Self {
         self.default_store = store;
         self
+    }
+
+    /// Every name the config behind this registry declares.
+    ///
+    /// A backend cannot supply this fact and must not be asked to invent it:
+    /// asked for a name it has no coordinate for, a store either says "I do not
+    /// have that" or spawns a lookup for the name itself. Both are indistinguishable
+    /// from a declared name that is genuinely absent, which is how a credential
+    /// sitting in the right vault gets reported as one the vault does not hold.
+    /// See [`Resolution::NotFound`].
+    ///
+    /// **Supplied only by a caller whose config decides where names live.** A
+    /// registry left without it reports [`Resolution::NotFound`] exactly as it
+    /// always did, because "you never declared this" said to somebody whose
+    /// declarations live elsewhere is a fresh wrong answer, not a fix.
+    #[must_use]
+    pub fn with_declared_names(mut self, declared: BTreeSet<String>) -> Self {
+        self.declared = Some(declared);
+        self
+    }
+
+    /// Whether the config is known to declare nothing for `name`.
+    ///
+    /// False when it declares one, and false when there is no config to ask.
+    fn undeclared(&self, name: &str) -> bool {
+        self.declared
+            .as_ref()
+            .is_some_and(|declared| !declared.contains(name))
     }
 
     /// Whether any backend is configured at all.
@@ -219,10 +276,11 @@ impl Registry {
             .or(self.default_store.as_ref())
             .map(String::as_str);
 
+        let undeclared = self.undeclared(name);
         let Some(chosen) = chosen else {
             return match self.stores.as_slice() {
-                [] => Resolution::NotFound,
-                [only] => Self::ask(only.as_ref(), name),
+                [] => Resolution::NotFound { undeclared },
+                [only] => Self::ask(only.as_ref(), name, undeclared),
                 several => Resolution::Ambiguous {
                     candidates: several.iter().map(|store| store.id().to_owned()).collect(),
                 },
@@ -230,7 +288,7 @@ impl Registry {
         };
 
         match self.stores.iter().find(|store| store.id() == chosen) {
-            Some(store) => Self::ask(store.as_ref(), name),
+            Some(store) => Self::ask(store.as_ref(), name, undeclared),
             // A name pinned to a backend that is absent or disabled must not
             // quietly fall through to a different one — that is the same leak
             // the policy exists to prevent, reached by a different route.
@@ -274,20 +332,22 @@ impl Registry {
         }
 
         if errors.is_empty() {
-            Resolution::NotFound
+            Resolution::NotFound {
+                undeclared: self.undeclared(name),
+            }
         } else {
             Resolution::Failed(errors)
         }
     }
 
     /// One backend, one question.
-    fn ask(store: &dyn Store, name: &str) -> Resolution {
+    fn ask(store: &dyn Store, name: &str, undeclared: bool) -> Resolution {
         match store.resolve(name) {
             Ok(Some(secret)) => Resolution::Found {
                 store: store.id().to_owned(),
                 secret,
             },
-            Ok(None) => Resolution::NotFound,
+            Ok(None) => Resolution::NotFound { undeclared },
             Err(error) => Resolution::Failed(vec![error]),
         }
     }
@@ -602,11 +662,23 @@ pub fn build(config: &Config, invocation: &Invocation) -> Built {
         }
     }
 
+    let mut registry = Registry::new(stores)
+        .with_routes(routes)
+        .with_policy(config.stores.policy)
+        .with_default_store(default_store);
+
+    // Withheld under the daemon, and only there. This config still lists names
+    // — `ls` and `doctor` read them from here — but it is the DAEMON's config
+    // that says where a name's value lives, so a name missing from this one is
+    // not evidence that nobody declared it. Telling a daemon user to declare it
+    // here would send them to edit a file that does not decide the question,
+    // which is the same fault as the message this distinction exists to fix.
+    if !config.stores.daemon.enabled {
+        registry = registry.with_declared_names(config.secrets.keys().cloned().collect());
+    }
+
     Built {
-        registry: Registry::new(stores)
-            .with_routes(routes)
-            .with_policy(config.stores.policy)
-            .with_default_store(default_store),
+        registry,
         warnings,
         notes,
     }
@@ -732,7 +804,7 @@ mod tests {
         );
         assert!(matches!(
             registry.resolve("DATABASE_URL"),
-            Resolution::NotFound
+            Resolution::NotFound { .. }
         ));
     }
 
@@ -824,7 +896,75 @@ mod tests {
             id: "a",
             value: None,
         })]);
-        assert!(matches!(registry.resolve("X"), Resolution::NotFound));
+        assert!(matches!(registry.resolve("X"), Resolution::NotFound { .. }));
+    }
+
+    // -----------------------------------------------------------------------
+    // "In a store" and "resolvable" are different states.
+    // -----------------------------------------------------------------------
+
+    /// One healthy backend that holds nothing, told which names the config
+    /// declares.
+    fn empty_store_declaring(declared: &[&str]) -> Registry {
+        Registry::new(vec![Box::new(Fixed {
+            id: "a",
+            value: None,
+        })])
+        .with_declared_names(declared.iter().map(|name| (*name).to_owned()).collect())
+    }
+
+    #[test]
+    fn a_name_the_config_never_declared_says_so_rather_than_reading_as_absent() {
+        // The incident: a credential really was in the vault, under the right
+        // item and the right field, and nothing had ever declared its name. The
+        // absence message sent its reader to the store to look for something
+        // the store was never asked about.
+        let reason = empty_store_declaring(&["DECLARED"])
+            .resolve("NEVER_DECLARED")
+            .reason();
+        assert!(
+            reason.contains("not declared in your config"),
+            "an undeclared name must say which file is missing the line: {reason}"
+        );
+        assert!(
+            reason.contains("Declare it under \"secrets\""),
+            "a diagnosis with no next action is the shape this report used to have: {reason}"
+        );
+        // The one thing it cannot know. Nothing was asked of any store on this
+        // name's behalf beyond the name itself, so a store holding it under
+        // some other coordinate is not a fact in evidence.
+        assert!(
+            !reason.contains("is in your store"),
+            "the message claimed a store holds it: {reason}"
+        );
+    }
+
+    #[test]
+    fn a_declared_name_that_no_store_holds_still_reads_as_a_plain_absence() {
+        // The negative control for the test above. This name HAS a declaration,
+        // so its coordinate was asked and came back empty — the store is the
+        // right place to look, and this message is the one that says so. If
+        // both cases start naming the config, the distinction is gone in the
+        // other direction and this test is what notices.
+        let reason = empty_store_declaring(&["DECLARED"])
+            .resolve("DECLARED")
+            .reason();
+        assert_eq!(reason, "not found in any store");
+    }
+
+    #[test]
+    fn a_registry_given_no_declarations_claims_nothing_about_them() {
+        // A registry built without the config's names — the daemon client, and
+        // every caller that constructs one directly — cannot tell the two
+        // states apart, and says the older, weaker thing rather than inventing
+        // the stronger one.
+        let reason = Registry::new(vec![Box::new(Fixed {
+            id: "a",
+            value: None,
+        })])
+        .resolve("NEVER_DECLARED")
+        .reason();
+        assert_eq!(reason, "not found in any store");
     }
 
     // -----------------------------------------------------------------------
@@ -961,7 +1101,7 @@ mod tests {
     #[test]
     fn an_empty_registry_reports_notfound_rather_than_panicking() {
         let registry = Registry::new(Vec::new());
-        assert!(matches!(registry.resolve("X"), Resolution::NotFound));
+        assert!(matches!(registry.resolve("X"), Resolution::NotFound { .. }));
         assert!(registry.is_empty());
     }
 

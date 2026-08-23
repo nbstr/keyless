@@ -131,7 +131,10 @@ pub(super) fn report_names(
                 format!("read back from {store}{}", delivered_suffix(config, name)),
                 None,
             ),
-            Resolution::NotFound => (
+            // Always `undeclared: false` here: the loop walks `config.secrets`,
+            // so every name this arm can see is declared by construction. That
+            // is what earns the word `declared` in the detail below.
+            Resolution::NotFound { .. } => (
                 Mark::NotSetUp,
                 "absent",
                 "declared here, and no store holds it".to_owned(),

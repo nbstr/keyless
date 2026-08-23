@@ -806,8 +806,9 @@ fn resolve_all(
     slots
         .into_iter()
         // Every slot is filled by one of the two arms above; this is the
-        // expression that says so without an `unwrap`.
-        .map(|slot| slot.unwrap_or(Resolution::NotFound))
+        // expression that says so without an `unwrap`. `undeclared: false`
+        // claims nothing about a config this expression never saw.
+        .map(|slot| slot.unwrap_or(Resolution::NotFound { undeclared: false }))
         .collect()
 }
 
