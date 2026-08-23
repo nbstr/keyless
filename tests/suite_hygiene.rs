@@ -86,17 +86,44 @@
 //! instance by creating its terminal's descriptors with the flag already set,
 //! which it can do because it opens them itself.
 //!
-//! debt: only the pty-shaped instance is closed. A pipe is created INSIDE
-//!       `Command::spawn`, so there is no seam to pass a flag through and the
-//!       fix is a different one: serialise every spawn in a test binary against
-//!       every other, the way `keyless::store::exec` already serialises the
-//!       library's own. Measured on macOS, four threads calling
-//!       `Command::output` beside six spawning children left a stray pipe in 36
-//!       of 4298 of them; the same probe inside `tests/hostile.rs`, which makes
-//!       four piped children a run, saw none in 1790 — so the mechanism is
-//!       real here and its exposure is not.
-//!       Upgrade trigger: a fixture that spawns through a pipe trips its
-//!       deadline on a loaded machine and passes alone.
+//! The flag is only the worse half of the class, and a descriptor that has it
+//! escapes too. `FD_CLOEXEC` is spent by an `exec`, never by a `fork`, so a
+//! close-on-exec descriptor still walks into every child forked while it is
+//! open and stays there until that child reaches its own `exec`. What it can do
+//! from inside that window depends on what it is: a write end of an executable
+//! file makes `execve` refuse the file with `ETXTBSY`, which is why
+//! `support::install_executable` creates a stub in a process this one's threads
+//! cannot fork a copy of rather than opening it here.
+
+// A plain comment and NOT a `//!` one, which is the difference between a marker
+// and a marker nobody harvests: the debt ledger strips a language's line-comment
+// prefix before it looks for the word, so `//` off `//! debt:` leaves `! debt:`
+// and matches nothing. The paragraph below is the ledger's input, not rustdoc's.
+//
+// debt: the pipe-shaped instance is the one still open. A terminal and an
+//       executable are opened by this suite, so each can be created somewhere
+//       a `fork` here cannot reach. A pipe cannot: it is created INSIDE
+//       `Command::spawn`, so there is no seam to pass a flag through and the
+//       fix is a different one — serialise every spawn in a test binary
+//       against every other, the way `keyless::store::exec` already serialises
+//       the library's own. Measured on macOS, four threads calling
+//       `Command::output` beside six spawning children left a stray pipe in 36
+//       of 4298 of them; the same probe inside `tests/hostile.rs`, which makes
+//       four piped children a run, saw none in 1790 — so the mechanism is
+//       real here and its exposure is not.
+//       Upgrade trigger: any descriptor this suite creates turns out to be
+//       reachable from a process it was never handed to. The class is a
+//       WINDOW, not a fixture shape and not a deadline: a `fork` on any thread
+//       copies the whole descriptor table, so the escape is identical whatever
+//       the descriptor is and only the symptom differs. Any one of these is
+//       this mechanism and is enough on its own: a fixture that waits out its
+//       deadline on an end-of-file and passes alone; an `execve` refused
+//       `ETXTBSY` on a file this suite has already finished writing; a path, a
+//       socket or a lock still held after the case that made it has ended; or
+//       any failure that reproduces under parallel cases and never at
+//       `--test-threads=1`. That last one is the discriminator the other three
+//       are read against, because nothing else in this suite is sensitive to
+//       thread count in that direction.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
