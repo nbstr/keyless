@@ -126,6 +126,22 @@ struct UnderTerminal {
     master: OwnedFd,
     seen: Arc<Mutex<Vec<u8>>>,
     reader: Option<JoinHandle<()>>,
+    /// The terminal as this test created it, read before anything was spawned.
+    ///
+    /// # A snapshot taken after the spawn is a race, not a baseline
+    ///
+    /// `keyless` puts this terminal in raw mode as part of the run, so "what it
+    /// looked like beforehand" stops being readable the moment the child is
+    /// alive. A case that spawns and *then* calls [`UnderTerminal::settings`]
+    /// is racing the process it is testing for the answer, and under a loaded
+    /// parallel run the process wins: the case then compares a correctly
+    /// restored terminal against a raw one and reports the restore as broken —
+    /// the exact inversion of what it is guarding.
+    ///
+    /// Reading it here removes the race rather than narrowing it. At this point
+    /// the pty exists and nothing else does, so there is no ordering for a
+    /// future reader to preserve.
+    pristine: Termios,
 }
 
 /// Guards `ptsname`, which answers out of a static buffer libc reuses.
@@ -254,6 +270,9 @@ fn start(args: &[&str], ownership: Ownership) -> UnderTerminal {
             command.pre_exec(take_the_terminal);
         }
     }
+    // Before the spawn, deliberately: see `UnderTerminal::pristine`.
+    let pristine = termios::tcgetattr(slave.as_fd()).expect("read the pristine terminal settings");
+
     let child = command.spawn().expect("the binary must run");
 
     // Read the master on a thread into a buffer the test can inspect as it
@@ -283,6 +302,7 @@ fn start(args: &[&str], ownership: Ownership) -> UnderTerminal {
         master,
         seen,
         reader: Some(reader),
+        pristine,
     }
 }
 
@@ -318,6 +338,13 @@ impl UnderTerminal {
             "`{needle}` never reached the terminal; it received: {:?}",
             self.text()
         );
+    }
+
+    /// The terminal as it was before `keyless` ran — the baseline a restore is
+    /// judged against. See [`UnderTerminal::pristine`] for why it is not read
+    /// on demand.
+    fn as_created(&self) -> &Termios {
+        &self.pristine
     }
 
     /// The current terminal settings, read through the test's own slave handle.
@@ -710,7 +737,7 @@ fn the_terminal_is_put_in_raw_mode_and_restored_exactly() {
                 "-c",
                 "printf 'ready>'; read ignored",
             ]);
-            let before = session.settings();
+            let before = session.as_created().clone();
             assert!(
                 before.local_flags.contains(LocalFlags::ICANON),
                 "the fixture must start in canonical mode or it proves nothing"
@@ -777,7 +804,7 @@ fn the_terminal_is_restored_when_the_child_dies_of_a_signal() {
                 "-c",
                 "printf 'ready>'; kill -TERM $$",
             ]);
-            let before = session.settings();
+            let before = session.as_created().clone();
             session.await_output("ready>");
 
             let code = session.wait_for_exit();
