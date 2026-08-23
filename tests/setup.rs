@@ -56,6 +56,23 @@ impl Machine {
         self.claude().join("settings.json")
     }
 
+    /// The agent instructions setup writes, at the path `setup` resolves.
+    fn skill(&self) -> PathBuf {
+        self.claude()
+            .join("skills")
+            .join("keyless")
+            .join("SKILL.md")
+    }
+
+    /// The guards' own config — the one file `disable`, `enable` and `observe`
+    /// live in, resolved from `XDG_CONFIG_HOME` exactly as the pack resolves it.
+    fn switch(&self) -> PathBuf {
+        self.root
+            .join("xdg-config")
+            .join("keyless")
+            .join("hooks.json")
+    }
+
     /// Run the binary with every path pointed inside this machine.
     fn run(&self, args: &[&str]) -> Output {
         Command::new(BIN)
@@ -174,12 +191,7 @@ fn setup_installs_everything_and_names_every_file_it_touches() {
         "the guards were not registered:\n{text}"
     );
     assert!(
-        machine
-            .claude()
-            .join("skills")
-            .join("keyless")
-            .join("SKILL.md")
-            .exists(),
+        machine.skill().exists(),
         "the agent instructions were not installed:\n{text}"
     );
 }
@@ -377,29 +389,33 @@ fn disable_works_before_anything_has_been_set_up() {
     let machine = Machine::fresh("disable-bare");
     let output = machine.run(&["disable"]);
     assert!(output.status.success(), "{}", out(&output));
-    let switch = machine
-        .root
-        .join("xdg-config")
-        .join("keyless")
-        .join("hooks.json");
+    let switch = machine.switch();
     assert!(switch.exists(), "no switch file was written");
     let text = std::fs::read_to_string(&switch).expect("read");
     assert!(text.contains("\"enabled\""), "{text}");
     // And the pack itself reads exactly that file, so the two agree. Asserted
     // through the pack's own loader rather than by eye.
-    assert!(pack_reads_disabled(&switch), "{text}");
+    assert_eq!(pack_reads(&switch), "disabled", "{text}");
 }
 
-/// Ask the hook pack's own config loader whether it considers itself off.
+/// Ask the hook pack's own config loader which of its three states it is in.
 ///
 /// The one assertion in this file that crosses the language boundary, and it is
 /// the one that matters most: a switch `keyless` writes and the pack does not
 /// read is a kill switch that kills nothing, and every other test here would
-/// still pass.
-fn pack_reads_disabled(switch: &Path) -> bool {
+/// still pass. The same argument applies to `observe`, which is the state where
+/// every check runs and none of them blocks — a `doctor` that calls that armed
+/// is telling somebody they are protected while nothing is refusing anything.
+///
+/// Answers with the pack's word — `disabled`, `observing` or `armed` — rather
+/// than a bool, because two of the three are not-armed and a bool would let them
+/// pass for each other.
+fn pack_reads(switch: &Path) -> String {
     let hooks = Path::new(env!("CARGO_MANIFEST_DIR")).join("hooks");
     let program = "import sys; from keyless_hooks.config import load; \
-                   print('disabled' if not load().enabled else 'armed')";
+                   cfg = load(); \
+                   print('disabled' if not cfg.enabled \
+                         else 'observing' if cfg.observe else 'armed')";
     let output = Command::new("python3")
         .arg("-c")
         .arg(program)
@@ -407,7 +423,7 @@ fn pack_reads_disabled(switch: &Path) -> bool {
         .env("KEYLESS_HOOKS_CONFIG", switch)
         .output()
         .expect("python3 must run");
-    String::from_utf8_lossy(&output.stdout).contains("disabled")
+    String::from_utf8_lossy(&output.stdout).trim().to_owned()
 }
 
 // ---------------------------------------------------------------------------
@@ -530,4 +546,249 @@ fn detected_reads_the_config_this_machine_actually_uses() {
             "`{store}` cannot reach proven in DETECTED, whatever the config says\n{text}"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// rule 3: it re-adds nothing you removed
+// ---------------------------------------------------------------------------
+
+/// Read the settings file, hand it to `edit`, write it back.
+fn amend_settings(machine: &Machine, edit: impl FnOnce(&mut serde_json::Value)) {
+    let mut settings = machine.settings_json();
+    edit(&mut settings);
+    std::fs::write(
+        machine.settings(),
+        serde_json::to_string_pretty(&settings).expect("serialize"),
+    )
+    .expect("write settings");
+}
+
+/// Every `permissions.allow` rule currently in the settings file.
+fn allow_rules(machine: &Machine) -> Vec<String> {
+    machine.settings_json()["permissions"]["allow"]
+        .as_array()
+        .map(|rules| {
+            rules
+                .iter()
+                .filter_map(|rule| rule.as_str().map(str::to_owned))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+#[test]
+fn what_you_removed_stays_removed_until_you_ask_for_it_back() {
+    // The rule the receipt exists for, at the level a person meets it. Without a
+    // record, "never installed" and "installed and then thrown out" are the same
+    // observation — an absent entry — and an installer that treats them alike
+    // overwrites a decision every time it runs.
+    //
+    // Both halves are asserted, because each alone has a way to pass while the
+    // behaviour is wrong: an installer that re-added nothing EVER would pass the
+    // first half, and one that re-added everything ALWAYS would pass the second.
+    let machine = Machine::fresh("removed-stays-removed").with_harness("{}");
+    machine.setup(&[]);
+
+    let rule = "Bash(keyless doctor:*)";
+    assert!(
+        allow_rules(&machine).iter().any(|have| have == rule),
+        "the first run installed no `{rule}`, so removing it proves nothing"
+    );
+    assert!(
+        machine.settings_json()["hooks"]["PostToolUse"].is_array(),
+        "the first run registered no PostToolUse handler"
+    );
+
+    // The person removes one of each kind by hand: a permission rule and a
+    // whole event's handler.
+    amend_settings(&machine, |settings| {
+        let allow = settings["permissions"]["allow"]
+            .as_array_mut()
+            .expect("an allow list");
+        allow.retain(|have| have != rule);
+        settings["hooks"]
+            .as_object_mut()
+            .expect("a hooks object")
+            .remove("PostToolUse");
+    });
+
+    let again = out(&machine.setup(&[]));
+    assert!(
+        allow_rules(&machine).iter().all(|have| have != rule),
+        "a plain re-run put back `{rule}`, which the person deleted:\n{again}"
+    );
+    assert!(
+        machine.settings_json()["hooks"]
+            .get("PostToolUse")
+            .is_none(),
+        "a plain re-run put back a handler the person deleted:\n{again}"
+    );
+    assert!(
+        again.contains("left alone"),
+        "the re-run restored nothing and did not say so either:\n{again}"
+    );
+
+    // And the way back is one word, said out loud.
+    let restored = out(&machine.setup(&["--restore"]));
+    assert!(
+        allow_rules(&machine).iter().any(|have| have == rule),
+        "--restore did not put back `{rule}`:\n{restored}"
+    );
+    assert!(
+        machine.settings_json()["hooks"]["PostToolUse"].is_array(),
+        "--restore did not put back the handler:\n{restored}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// the third state of the switch
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_pack_that_only_records_is_never_reported_as_armed() {
+    // `observe` is the state that reads as healthy and protects nothing: every
+    // check runs, the pack is registered, and NOTHING is blocked. A `doctor`
+    // that calls it armed is the same false green as one that calls a disabled
+    // install healthy — worse, in fact, because the registration is really
+    // there, so every other signal agrees with the wrong answer.
+    let machine = Machine::fresh("observing").with_harness("{}");
+    machine.setup(&[]);
+
+    let armed = out(&machine.run(&["doctor"]));
+    assert_eq!(
+        state_of(&armed, "guards"),
+        "proven",
+        "the guards were not armed to begin with, so switching them to \
+         recording-only proves nothing:\n{armed}"
+    );
+
+    std::fs::create_dir_all(machine.switch().parent().expect("a parent")).expect("mkdir");
+    std::fs::write(machine.switch(), "{\"observe\": true}\n").expect("write switch");
+
+    // The pack's own loader first: a state `keyless` invents and the pack does
+    // not implement would make every assertion below a report about nothing.
+    assert_eq!(pack_reads(&machine.switch()), "observing");
+
+    let recording = out(&machine.run(&["doctor"]));
+    assert_eq!(
+        state_of(&recording, "guards"),
+        "off",
+        "a pack that blocks nothing is reported as armed:\n{recording}"
+    );
+    assert!(
+        recording.contains("NOTHING is blocked"),
+        "the recording-only state is not named, so a reader cannot tell it from \
+         a healthy install:\n{recording}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// rule 2: it never clobbers
+// ---------------------------------------------------------------------------
+
+#[test]
+fn agent_instructions_somebody_took_over_survive_a_second_setup() {
+    // The file lives under the agent's own directory and a person is free to
+    // rewrite it. Setup wrote it once; the moment its content differs from what
+    // setup wrote, it is theirs, and replacing it would delete work with no way
+    // back.
+    let machine = Machine::fresh("skill-taken-over").with_harness("{}");
+    machine.setup(&[]);
+    assert!(
+        machine.skill().exists(),
+        "setup installed no agent instructions, so editing them proves nothing"
+    );
+
+    let theirs = "# keyless\n\nMy own notes, which nothing here may take away.\n";
+    std::fs::write(machine.skill(), theirs).expect("write skill");
+
+    let again = out(&machine.setup(&[]));
+    assert_eq!(
+        std::fs::read_to_string(machine.skill()).expect("read"),
+        theirs,
+        "setup overwrote instructions somebody had taken over:\n{again}"
+    );
+    assert_eq!(
+        state_of(&again, "skill"),
+        "off",
+        "the file was kept and the report claims it was installed:\n{again}"
+    );
+    assert!(
+        again.contains("not what setup wrote"),
+        "the report does not say why the file was left alone:\n{again}"
+    );
+}
+
+#[test]
+fn uninstall_takes_back_its_own_instructions_and_never_an_edited_copy() {
+    // Two machines, differing in one byte of a file, because the assertion is
+    // about the DIFFERENCE. The removal on its own passes on an uninstaller that
+    // deletes unconditionally; the keep on its own passes on one that has
+    // quietly stopped deleting anything at all.
+    let ours = Machine::fresh("skill-removed").with_harness("{}");
+    ours.setup(&[]);
+    let untouched = out(&ours.uninstall());
+    assert!(
+        !ours.skill().exists(),
+        "uninstall left behind the instructions it installed itself:\n{untouched}"
+    );
+
+    let theirs = Machine::fresh("skill-kept").with_harness("{}");
+    theirs.setup(&[]);
+    let edited = "# keyless\n\nEdited after setup wrote it.\n";
+    std::fs::write(theirs.skill(), edited).expect("write skill");
+
+    let kept = out(&theirs.uninstall());
+    assert_eq!(
+        std::fs::read_to_string(theirs.skill()).expect("read"),
+        edited,
+        "uninstall deleted a file somebody had edited:\n{kept}"
+    );
+    assert!(
+        kept.contains("edited since setup wrote it"),
+        "the file was kept and the report does not say so:\n{kept}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// a record it cannot read
+// ---------------------------------------------------------------------------
+
+#[test]
+fn setup_stops_rather_than_installing_over_a_record_it_cannot_read() {
+    // The receipt is the only thing that separates "never installed" from
+    // "installed and thrown out". Installing over one that will not parse
+    // discards that distinction silently and then writes a fresh record
+    // claiming everything present is ours — which hands the next uninstall a
+    // licence to delete entries this tool never created.
+    let machine = Machine::fresh("unreadable-receipt").with_harness("{}");
+    let before = std::fs::read_to_string(machine.settings()).expect("read");
+    std::fs::write(machine.receipt(), "{ not json").expect("write receipt");
+
+    let output = machine.setup(&[]);
+    let text = out(&output);
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "setup installed over a record it could not read:\n{text}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(machine.settings()).expect("read"),
+        before,
+        "setup edited the settings file after refusing to read its own record"
+    );
+    assert!(
+        !machine.config().exists(),
+        "setup wrote a config after refusing to read its own record"
+    );
+    assert_eq!(
+        std::fs::read_to_string(machine.receipt()).expect("read"),
+        "{ not json",
+        "setup overwrote the record it refused to read, which is the one file \
+         that could still be repaired by hand"
+    );
+    assert!(
+        text.contains("move it aside"),
+        "the refusal does not say how to get past it:\n{text}"
+    );
 }
