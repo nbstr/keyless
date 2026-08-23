@@ -108,13 +108,51 @@ backup="refs/backup/pre-scrub-${head_now}"
 git update-ref "$backup" HEAD
 echo "${grn}backup ref:${off} ${backup} -> ${head_now}"
 
-callback="m = message"$'\n'
+# The callback is Python, and PYTHON does the quoting -- not the shell.
+#
+# This used to interpolate with bash's `${var@Q}`. macOS ships bash 3.2, where
+# `${x@Q}` is a hard error but `${ARRAY[$i]@Q}` SILENTLY yields the raw value:
+# the subscript is parsed as arithmetic and the `@Q` is swallowed. The generated
+# code was therefore `m.replace(and reached 41 GB...)` with no quotes at all,
+# and filter-repo died on a SyntaxError from inside an exec. A quoting bug that
+# announces itself is fine; one that only announces itself on the OTHER shell is
+# how a rewrite of published history goes wrong.
+#
+# So: repr() from python3, which is the only thing that knows how to quote a
+# python literal, and no bash version to be wrong about.
 i=0
+callback_env=""
 while [ "$i" -lt "${#OLD[@]}" ]; do
-  callback+="m = m.replace(${OLD[$i]@Q}.encode(), ${NEW[$i]@Q}.encode())"$'\n'
+  export "SCRUB_OLD_${i}=${OLD[$i]}"
+  export "SCRUB_NEW_${i}=${NEW[$i]}"
   i=$((i + 1))
 done
-callback+="return m"
+export SCRUB_COUNT="${#OLD[@]}"
+
+callback=$(python3 -c '
+import os
+lines = ["m = message"]
+for i in range(int(os.environ["SCRUB_COUNT"])):
+    old = os.environ["SCRUB_OLD_%d" % i].encode()
+    new = os.environ["SCRUB_NEW_%d" % i].encode()
+    lines.append("m = m.replace(%r, %r)" % (old, new))
+lines.append("return m")
+print("\n".join(lines))
+') || { echo "${red}could not build the callback.${off}" >&2; exit 1; }
+
+# Compiled before it is trusted. filter-repo execs this inside a function body,
+# so a syntax error surfaces as a traceback from its internals rather than as
+# anything naming this script.
+python3 -c '
+import sys
+body = sys.stdin.read()
+src = "def _cb(message):\n" + "\n".join("  " + l for l in body.splitlines())
+compile(src, "<callback>", "exec")
+' <<< "$callback" || {
+  echo "${red}the generated callback is not valid python. Refusing to rewrite.${off}" >&2
+  echo "$callback" >&2
+  exit 1
+}
 
 git filter-repo --force --message-callback "$callback" || {
   echo "${red}filter-repo failed. History is unchanged; the backup ref is ${backup}.${off}" >&2
