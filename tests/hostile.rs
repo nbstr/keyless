@@ -81,6 +81,43 @@ fn hostile_security(dir: &Path, name: &str, body: &str) -> std::path::PathBuf {
     path
 }
 
+/// How long a marker another process owes us is waited for.
+///
+/// It separates no two behaviours, so it cannot be set to a number that makes a
+/// broken thing look sound — only to one that reports too early. See
+/// [`appeared`].
+const MARKER_PATIENCE: Duration = Duration::from_secs(20);
+
+/// Wait for a marker file another process writes, and say whether it arrived.
+///
+/// # Why waiting and sampling are different questions
+///
+/// A file a SEPARATE process creates is an EVENT, not a deadline. That process
+/// is racing nothing and will get there; what varies is when it is scheduled,
+/// and on a machine with more runnable work than it has cores that can be long
+/// after the call which raced it has already returned. Asking `exists()` once
+/// asks whether the event had happened by one particular instant, which is a
+/// question about the machine's load. Asking here asks whether it happened at
+/// all, which is the question the fixture actually has.
+///
+/// That distinction is the whole difference between a check that reds under
+/// contention and one that does not, and it is not the same trade as widening a
+/// threshold. [`MARKER_PATIENCE`] sits between nothing: a marker that is coming
+/// arrives, and one that is not coming never does. The number only has to be
+/// longer than a scheduling delay and shorter than the case's own [`within`]
+/// bound, and a wrong guess in either direction is visible as a red rather than
+/// as a wrong answer.
+fn appeared(marker: &Path) -> bool {
+    let started = Instant::now();
+    while started.elapsed() < MARKER_PATIENCE {
+        if marker.exists() {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    marker.exists()
+}
+
 /// A backend that hands back exactly the value it was built with.
 struct Hands(&'static str, String);
 
@@ -414,8 +451,19 @@ fn a_value_with_a_nul_byte_degrades_instead_of_killing_the_run() {
 
 #[test]
 fn a_value_too_large_for_arg_max_degrades_instead_of_killing_the_run() {
+    // A HANG bound, and not a measurement of anything. This case's cost is linear
+    // in the size of the value and every byte of it is paid by an unoptimized
+    // build, which makes it the most expensive case in the file by a wide margin
+    // — and on a machine with more runnable work than cores that cost stretches
+    // without limit. A wall clock cannot tell a case that is starved from one
+    // that is stalled, so no constant here is provably right and a tight one is
+    // simply a red test waiting for a busy afternoon. This one sits far past the
+    // case's own cost on purpose: the only job it has is to turn a stall into a
+    // named red rather than a suite that never returns, and being generous about
+    // that costs nothing except the time to report a hang that has already
+    // happened.
     within(
-        Duration::from_secs(90),
+        Duration::from_secs(300),
         "a_value_too_large_for_arg_max_degrades_instead_of_killing_the_run",
         || {
             // `E2BIG`, `Argument list too long`, exit 127, no child. Measured on macOS:
@@ -757,28 +805,101 @@ fn names_that_all_time_out_cost_one_deadline_and_not_one_each() {
             // Measured: three names, 36.03 s before the child ran. Thirty is five
             // minutes. The command does still run at the end of it, which is worse than
             // failing — nothing on screen says that waiting is the correct thing to do.
+            //
+            // # Why this is not a stopwatch
+            //
+            // The obvious check times the run and requires it to come in under some
+            // number between one deadline and N of them. **There is no such number on
+            // a machine that is busy.** A deadline is wall clock and does not stretch,
+            // so the sequential cost stays exactly where it is while the concurrent
+            // one grows with the contention until the two meet — and a threshold that
+            // has to sit BETWEEN two behaviours cannot be widened out of trouble, only
+            // replaced. This case timed six lookups against five seconds, and its own
+            // cost sat close enough to that line for ordinary contention to cross it.
+            //
+            // So the stubs answer the question themselves. Each registers its arrival
+            // and then waits for the other five, and only a rendezvous that COMPLETES
+            // writes the witness. Six lookups that overlap complete it in the time six
+            // shells take to start; six that take turns cannot complete it at all,
+            // because the first is killed at its own deadline long before the second
+            // is spawned. That is an EVENT, and an event reads the same on an idle
+            // machine and a saturated one.
+            //
+            // It is also a stricter question than the stopwatch asked, deliberately:
+            // a lookup pool that ran some of the names at a time would have come in
+            // under five seconds and still cost more than one deadline. Nothing here
+            // pools — `resolve_all` gives every binding its own thread — so the
+            // rendezvous is the property, not an approximation of it.
+            //
+            // # Why the rendezvous has two phases and not one
+            //
+            // Counting arrivals once is not enough, and the mistake is worth keeping
+            // written down because it looks correct and passes: a stub killed at its
+            // deadline leaves its arrival marker behind, so six arrivals ONE AFTER
+            // ANOTHER satisfy a count of six just as well as six at once. Measured
+            // against a deliberately sequential resolution, a single-phase rendezvous
+            // went green.
+            //
+            // The acknowledgement is what makes it a count of the LIVING. Writing one
+            // requires having already seen all six arrive, which cannot happen before
+            // the sixth is spawned — so six acknowledgements require six stubs that
+            // were all still alive at that instant, which is the property. A run that
+            // takes the names in turn, or in batches, gets at most one.
             let dir = scratch("sequential-resolution");
             let marker = dir.join("witness");
-            let stub = hostile_security(&dir, "security-slow", "sleep 120\n");
+            let live = dir.join("live");
+            let acked = dir.join("acked");
+            std::fs::create_dir_all(&live).expect("the rendezvous needs a directory");
+            std::fs::create_dir_all(&acked).expect("the rendezvous needs a directory");
+            let together = dir.join("all-six-at-once");
+            let stub = hostile_security(
+                &dir,
+                "security-rendezvous",
+                &format!(
+                    "case \"$1\" in\n\
+                     \x20 list-keychains) echo '\"/tmp/stub.keychain-db\"'; exit 0 ;;\n\
+                     esac\n\
+                     : > '{live}'/$$\n\
+                     n=0\n\
+                     while [ \"$n\" -lt 6 ]; do\n\
+                     \x20 set -- '{live}'/*\n\
+                     \x20 n=$#\n\
+                     \x20 [ \"$n\" -lt 6 ] && sleep 0.05\n\
+                     done\n\
+                     : > '{acked}'/$$\n\
+                     n=0\n\
+                     while [ \"$n\" -lt 6 ]; do\n\
+                     \x20 set -- '{acked}'/*\n\
+                     \x20 n=$#\n\
+                     \x20 [ \"$n\" -lt 6 ] && sleep 0.05\n\
+                     done\n\
+                     : > '{together}'\n\
+                     sleep 120\n",
+                    live = live.display(),
+                    acked = acked.display(),
+                    together = together.display(),
+                ),
+            );
 
+            // Long enough that six shells reach their first command inside it however
+            // busy the machine is, which is a one-sided requirement rather than a
+            // threshold — and short enough that the sequential shape this case exists
+            // to catch costs six of them and still reports through the assertion
+            // below rather than through the bound above.
             let registry = Registry::new(vec![Box::new(
-                KeychainStore::new(stub, "keyless".to_owned())
-                    .with_timeout(Duration::from_millis(1_500)),
+                KeychainStore::new(stub, "keyless".to_owned()).with_timeout(Duration::from_secs(4)),
             )]);
 
             let argv = witness(&marker, "A", 12);
-            let started = Instant::now();
-            let (outcome, _) = run_with(&registry, &["A", "B", "C", "D", "E", "F"], &argv, &[]);
-            let elapsed = started.elapsed();
+            let (outcome, notes) = run_with(&registry, &["A", "B", "C", "D", "E", "F"], &argv, &[]);
 
             assert_eq!(witnessed(&marker), "<unset>");
             assert_eq!(outcome.exit_code, 12);
             assert_eq!(outcome.unresolved.len(), 6);
-            // Six × 1.5 s is 9 s sequentially. Concurrently it is one deadline plus
-            // change. 5 s separates them by a wide margin in both directions.
             assert!(
-                elapsed < Duration::from_secs(5),
-                "resolution is still sequential: six 1.5 s deadlines took {elapsed:?}"
+                together.exists(),
+                "the six lookups never overlapped, so they are being taken in turn \
+                 and N names cost N deadlines again: {notes}"
             );
         },
     );
@@ -813,18 +934,39 @@ fn a_daemon_timeout_from_config_is_clamped() {
 // 8. A backend that takes the value and never reads it.
 // ---------------------------------------------------------------------------
 
+/// The deadline this case drives, and it is deliberately not a tight one.
+///
+/// # The deadline under test also kills the fixture
+///
+/// The holder can only take the read end once the shell has STARTED and forked
+/// it, and the shell it is forked from is the process this deadline kills. So a
+/// deadline shorter than a process start is one that destroys the fixture
+/// before it exists: nothing ever holds the pipe, the marker is never written,
+/// and the case reports a missing fixture — correctly, and about nothing — every
+/// time the machine is busy enough that starting a shell takes longer than the
+/// bound. That is what a fraction of a second bought, and no amount of waiting
+/// for the marker afterwards recovers it, because the process that would have
+/// written it was killed before it was forked.
+///
+/// The value is therefore chosen to be far longer than a process start rather
+/// than as short as the property allows. Nothing below is a measurement of this
+/// number: the property is that the write ends at THIS deadline instead of at
+/// the reader's convenience, and every bound below is expressed as a multiple of
+/// it so that the case says the same thing whatever it is set to.
+const WRITE_DEADLINE: Duration = Duration::from_secs(5);
+
 /// How long the holder keeps the read end if nobody tells it to let go.
 ///
-/// Long enough that the 5 s property assertion below cannot be satisfied by
-/// waiting the holder out — an unbounded write reports the elapsed time as this
-/// number, which is a red test with a sentence rather than a suite that never
-/// returns. Short enough that a crashed run leaves nothing lingering for long.
-const HOLDER_SECONDS: u64 = 25;
+/// Long enough that the property assertion below cannot be satisfied by waiting
+/// the holder out — an unbounded write reports the elapsed time as this number,
+/// which is a red test with a sentence rather than a suite that never returns.
+/// Short enough that a crashed run leaves nothing lingering for long.
+const HOLDER_SECONDS: u64 = 75;
 
 #[test]
 fn a_backend_that_never_reads_its_stdin_is_bounded_by_the_deadline() {
     within(
-        Duration::from_secs(60),
+        Duration::from_secs(180),
         "a_backend_that_never_reads_its_stdin_is_bounded_by_the_deadline",
         || {
             // `capture_with_input` is how a credential reaches a backend that WRITES:
@@ -877,31 +1019,41 @@ fn a_backend_that_never_reads_its_stdin_is_bounded_by_the_deadline() {
             let outcome = {
                 let mut command = std::process::Command::new("/bin/sh");
                 command.args(["-c", &script]);
-                capture_with_input(command, Duration::from_millis(300), &payload)
+                capture_with_input(command, WRITE_DEADLINE, &payload)
             };
             let elapsed = started.elapsed();
 
             // The fixture is checked before the property it enables. A holder that
             // never started would make everything below pass against an unbounded
             // write, which is exactly the failure this case exists to stop repeating.
+            //
+            // WAITED FOR rather than sampled, and that is the second half of what
+            // [`WRITE_DEADLINE`] is about. The holder takes the read end at the FORK,
+            // before its first command runs, and writing the marker is that first
+            // command — so the descriptor is held from an instant this test cannot
+            // observe, and the marker says only when the holder was next scheduled.
+            // Sampling it the moment the write ends asks whether the holder had been
+            // scheduled by then, which is a question about the machine's load;
+            // [`appeared`] asks whether it ran at all, which is the fixture's.
             assert!(
-                holding.exists(),
+                appeared(&holding),
                 "the holder never took the read end, so nothing was holding the pipe \
              open and this case proves nothing"
             );
 
-            // The property. 300 ms is the deadline; five seconds is far outside every
-            // scheduling accident and far inside the holder's own lifetime, so a write
-            // that waits for the READER rather than for the DEADLINE lands here with a
-            // number rather than hanging the suite.
+            // The property, stated as a multiple of the deadline rather than as a
+            // number of its own: a write that waits for the READER rather than for
+            // the DEADLINE has the holder's whole lifetime to run into, so it lands
+            // here with a number rather than hanging the suite.
             assert!(
-                elapsed < Duration::from_secs(5),
-                "the deadline did not reach the write: a 300 ms bound took {elapsed:?}"
+                elapsed < WRITE_DEADLINE * 5,
+                "the deadline did not reach the write: a {WRITE_DEADLINE:?} bound \
+             took {elapsed:?}"
             );
 
             // The second half of the fixture check, and it is only meaningful once the
-            // assertion above has passed: at 300 ms the holder cannot have finished
-            // unless it never ran at all.
+            // assertion above has passed: at one deadline the holder cannot have
+            // finished unless it never ran at all.
             assert!(
                 !released.exists(),
                 "the holder let go before the deadline, so the pipe was closed by \
