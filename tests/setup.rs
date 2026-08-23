@@ -792,3 +792,57 @@ fn setup_stops_rather_than_installing_over_a_record_it_cannot_read() {
         "the refusal does not say how to get past it:\n{text}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// the off switch, on a machine where something else went wrong first
+// ---------------------------------------------------------------------------
+
+#[test]
+fn the_off_switch_works_on_an_empty_config_file() {
+    // An absent config and an EMPTY one are different files and take different
+    // branches. Empty is what a half-finished write leaves behind, and JSON has
+    // no empty document — so the parse that treats the two alike refuses, and
+    // the one thing this verb may never do is fail. Somebody who cannot turn
+    // the guards off guts their settings file by hand instead.
+    let machine = Machine::fresh("switch-empty");
+    std::fs::create_dir_all(machine.switch().parent().expect("a parent")).expect("mkdir");
+    std::fs::write(machine.switch(), "").expect("write switch");
+
+    let output = machine.run(&["disable"]);
+    let text = out(&output);
+    assert!(
+        output.status.success(),
+        "the off switch failed on an empty config file:\n{text}"
+    );
+    assert_eq!(state_of(&text, "guards"), "off", "{text}");
+    // Through the pack's own loader, so this is the pack being off and not a
+    // sentence about being off.
+    assert_eq!(pack_reads(&machine.switch()), "disabled", "{text}");
+}
+
+#[test]
+fn re_enabling_says_whether_anything_actually_changed() {
+    // Two runs of `enable`, one of which turned something back on and one of
+    // which did nothing. Reporting both as the same event is a small lie with a
+    // specific cost: somebody checking whether their `disable` ever took effect
+    // reads "back on" from a command that changed nothing and concludes it had.
+    let machine = Machine::fresh("enable-twice");
+
+    machine.run(&["disable"]);
+    let back_on = out(&machine.run(&["enable"]));
+    assert!(
+        back_on.contains("back on"),
+        "enabling a disabled install does not say it changed anything:\n{back_on}"
+    );
+
+    let already = out(&machine.run(&["enable"]));
+    assert!(
+        already.contains("already on"),
+        "enabling an install that was never off claims it turned something \
+         back on:\n{already}"
+    );
+    // THE CONTROL. Both branches print a `proven` guards row, so the state word
+    // alone cannot tell them apart — which is exactly why the detail is the
+    // subject here.
+    assert_eq!(state_of(&already, "guards"), "proven", "{already}");
+}
