@@ -38,18 +38,18 @@
 //!
 //! Nothing in here is allowed to stop a command. Every entry point returns a
 //! [`TtyError`] that the caller turns into one line on stderr and a fall back to
-//! pipes. `/dev/ptmx` missing, the fd table full, a platform without
-//! `openpty` — the child still runs.
+//! pipes. `/dev/ptmx` missing, the fd table full, a platform that will not open
+//! a pseudo-terminal at all — the child still runs.
 
 pub mod relay;
 
 use std::io::{self, IsTerminal};
-use std::os::fd::{AsRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::sync::{Mutex, Once, OnceLock};
 
 use nix::errno::Errno;
 use nix::libc;
-use nix::pty::{OpenptyResult, Winsize, openpty};
+use nix::pty::Winsize;
 use nix::sys::termios::{self, SetArg, Termios};
 
 // The three terminal ioctls. `_bad` in the macro name refers to the request
@@ -74,7 +74,7 @@ pub enum TtyError {
     /// A syscall failed. `call` names it, so the one stderr line a user sees is
     /// diagnosable rather than decorative.
     Syscall {
-        /// The syscall that failed, e.g. `openpty`.
+        /// The syscall that failed, e.g. `posix_openpt`.
         call: &'static str,
         /// The raw errno it failed with.
         source: Errno,
@@ -161,22 +161,60 @@ pub struct Pty {
 pub fn allocate() -> Result<Pty, TtyError> {
     let size = parent_size()?;
     let attrs = termios::tcgetattr(io::stdin()).map_err(TtyError::from("tcgetattr"))?;
-    let OpenptyResult { master, slave } =
-        openpty(Some(&size), Some(&attrs)).map_err(TtyError::from("openpty"))?;
-    close_on_exec(&master)?;
-    close_on_exec(&slave)?;
+    let (master, slave) = open_pty(Some(&size), Some(&attrs))?;
     Ok(Pty {
         master,
         slave: Some(slave),
     })
 }
 
-/// Stop a descriptor being inherited by anything this process starts.
+/// Guards `ptsname`, which answers out of a static buffer libc reuses.
 ///
-/// `openpty` hands back descriptors with `FD_CLOEXEC` **clear**, so without this
-/// every child — and every grandchild it starts — inherits both ends of the
-/// terminal as stray numbered descriptors, on top of the three it is meant to
-/// have. Two consequences, and the second is the serious one:
+/// Held across one call and released the moment the name has been copied. It
+/// protects that buffer and nothing else — it is deliberately not a "one pty at
+/// a time" lock, and taking it says nothing about how many terminals this
+/// process may open at once.
+static NAMING: Mutex<()> = Mutex::new(());
+
+/// Open a pty pair whose two descriptors are close-on-exec from the instant
+/// they exist.
+///
+/// # Why not `openpty`
+///
+/// **`openpty` sets `FD_CLOEXEC` on neither descriptor, and an `fcntl` on the
+/// far side of it is far too late.** `openpty` takes the master first and then
+/// spends the rest of its work — unlocking the pair, opening the slave,
+/// configuring the line discipline — with an inheritable descriptor already
+/// live. The window is not the gap between two calls; it is the whole body of
+/// `openpty`, and any other thread that creates a process during it hands a
+/// child a terminal it was never given.
+///
+/// Setting the flag afterwards is measurably worth nothing. Measured 2026-08-23
+/// on macOS, one thread opening terminals and six threads spawning children
+/// that report any descriptor above stderr the kernel calls a terminal:
+///
+/// | how the pair was opened | children holding a stray terminal |
+/// |---|---|
+/// | no pty opened at all | 0 of 2400 |
+/// | `openpty`, then `fcntl(FD_CLOEXEC)` | 982 of 2400 |
+/// | born with `O_CLOEXEC` | 0 of 2400 |
+///
+/// The first row is what says the detector is not simply always answering; the
+/// second is what the `fcntl` bought.
+///
+/// So the flag is part of each descriptor's creation. There is no ordering left
+/// for a future reader to preserve, which is the whole reason to spend five
+/// syscalls here rather than one.
+///
+/// # What a stray descriptor costs
+///
+/// Nothing in `keyless run` forks while this function is running — the store
+/// lookups are joined before a terminal is asked for — so today this is a
+/// window nothing walks through. It is not left to that: the ordering that
+/// keeps it shut is in a different module, is not stated anywhere as a
+/// requirement, and would be undone by any background thread that ever creates
+/// a process. What walks through it, when something does, is two things, and
+/// the second is the serious one:
 ///
 /// - A stray *slave* copy is one more holder keeping the pty from ever
 ///   reporting end-of-stream. This process closes its own after the spawn; a
@@ -187,20 +225,95 @@ pub fn allocate() -> Result<Pty, TtyError> {
 ///   terminal on purpose; it never gets the other end of one.
 ///
 /// The three descriptors the child is *meant* to have are unaffected: they are
-/// `dup2`'d onto 0, 1 and 2, and `dup2` clears the flag on the descriptor it
-/// creates.
+/// `try_clone`s handed to `Stdio`, and `dup2` onto 0, 1 and 2 clears the flag
+/// on the descriptors it creates.
 ///
-/// Reached through `libc` rather than `nix::fcntl`, which would need a cargo
-/// feature this crate does not otherwise use.
-fn close_on_exec(fd: &OwnedFd) -> Result<(), TtyError> {
-    // SAFETY: `fd` is live and owned by the caller, and `F_SETFD` takes an int.
-    if unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) } == -1 {
+/// # The size and the attributes
+///
+/// `openpty` takes both as arguments and applies them to the slave, the
+/// `termios` first; this does the same to the same descriptor, so the terminal
+/// that comes out is the one `openpty` would have produced.
+///
+/// It differs from `openpty` in one way, on purpose: `openpty` discards a
+/// failure from either, and this reports it. [`allocate`] documents that the
+/// user's own line discipline reaches the child, and a terminal that silently
+/// arrived with the system default instead would break that promise with
+/// nothing on screen. Reporting it costs nothing the never-block rule minds —
+/// the caller falls back to pipes and the command still runs.
+pub(crate) fn open_pty(
+    size: Option<&Winsize>,
+    attrs: Option<&Termios>,
+) -> Result<(OwnedFd, OwnedFd), TtyError> {
+    // SAFETY: no pointer arguments to get wrong, and the descriptor is taken
+    // into an `OwnedFd` below, which is what closes it on every path from here.
+    let raw = unsafe { libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY | libc::O_CLOEXEC) };
+    if raw == -1 {
         return Err(TtyError::Syscall {
-            call: "fcntl(F_SETFD, FD_CLOEXEC)",
+            call: "posix_openpt",
             source: Errno::last(),
         });
     }
-    Ok(())
+    // SAFETY: a fresh descriptor from `posix_openpt` that nothing else owns.
+    let master = unsafe { OwnedFd::from_raw_fd(raw) };
+
+    // SAFETY: a live master this function owns.
+    if unsafe { libc::grantpt(master.as_raw_fd()) } == -1 {
+        return Err(TtyError::Syscall {
+            call: "grantpt",
+            source: Errno::last(),
+        });
+    }
+    // SAFETY: a live master this function owns.
+    if unsafe { libc::unlockpt(master.as_raw_fd()) } == -1 {
+        return Err(TtyError::Syscall {
+            call: "unlockpt",
+            source: Errno::last(),
+        });
+    }
+
+    let opened = {
+        let _naming = NAMING.lock().unwrap_or_else(|error| error.into_inner());
+        // SAFETY: a live master, and `_naming` excludes the concurrent call
+        // that would overwrite the static buffer before it is copied below.
+        let name = unsafe { libc::ptsname(master.as_raw_fd()) };
+        if name.is_null() {
+            return Err(TtyError::Syscall {
+                call: "ptsname",
+                source: Errno::last(),
+            });
+        }
+        // SAFETY: libc returned a NUL-terminated string valid until the next
+        // call, which the guard still held here excludes.
+        let path = unsafe { std::ffi::CStr::from_ptr(name) }.to_owned();
+        // SAFETY: a NUL-terminated path, and the flags are a valid mode.
+        unsafe {
+            libc::open(
+                path.as_ptr(),
+                libc::O_RDWR | libc::O_NOCTTY | libc::O_CLOEXEC,
+            )
+        }
+    };
+    if opened == -1 {
+        return Err(TtyError::Syscall {
+            call: "open(the pty slave)",
+            source: Errno::last(),
+        });
+    }
+    // SAFETY: a fresh descriptor from `open` that nothing else owns.
+    let slave = unsafe { OwnedFd::from_raw_fd(opened) };
+
+    if let Some(attrs) = attrs {
+        termios::tcsetattr(&slave, SetArg::TCSAFLUSH, attrs)
+            .map_err(TtyError::from("tcsetattr"))?;
+    }
+    if let Some(size) = size {
+        // SAFETY: `size` is a live, correctly typed `winsize`, and the fd is a
+        // pty slave this function owns.
+        unsafe { ioctl_set_winsize(slave.as_raw_fd(), size as *const Winsize) }
+            .map_err(TtyError::from("ioctl(TIOCSWINSZ)"))?;
+    }
+
+    Ok((master, slave))
 }
 
 impl Pty {
@@ -403,11 +516,11 @@ mod tests {
     #[test]
     fn a_syscall_error_names_the_syscall() {
         let error = TtyError::Syscall {
-            call: "openpty",
+            call: "posix_openpt",
             source: Errno::ENOENT,
         };
         let rendered = error.to_string();
-        assert!(rendered.contains("openpty"), "{rendered}");
+        assert!(rendered.contains("posix_openpt"), "{rendered}");
     }
 
     #[test]

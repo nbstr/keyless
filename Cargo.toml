@@ -29,7 +29,7 @@ serde_json = "1"
 # not reliable: the optimizer is allowed to delete a write to memory that is
 # never read again. This crate exists to make that write non-elidable.
 zeroize = "1"
-# The POSIX syscalls a pseudo-terminal needs: openpty, termios, the winsize
+# The POSIX syscalls a pseudo-terminal needs: termios, the winsize
 # ioctls, setsid/TIOCSCTTY, and sigwait. Hand-rolled FFI for those is not the
 # good kind of minimalism — a wrong `ioctl` request constant compiles, links,
 # and corrupts memory at runtime.
@@ -38,7 +38,7 @@ zeroize = "1"
 # false` is not spelled here because nix's default feature set is already
 # empty; the list below is additive, not a subtraction.
 nix = { version = "0.31", features = [
-    "term",    # openpty, Termios, cfmakeraw, tcgetattr/tcsetattr
+    "term",    # Winsize, Termios, cfmakeraw, tcgetattr/tcsetattr
     "signal",  # SigSet::wait (sigwait), killpg — no signal handler exists
     "process", # Pid, setsid
     "ioctl",   # TIOCGWINSZ / TIOCSWINSZ / TIOCSCTTY

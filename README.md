@@ -2073,7 +2073,7 @@ Five crates, in four rows, and each earns its place:
 | `clap` | argument parsing; the derive form keeps the verb set readable at a glance, which matters when the absence of a verb is a security property |
 | `serde` + `serde_json` | config parsing and audit rows — one format doing both jobs |
 | `zeroize` | the optimiser is permitted to delete a write to memory that is never read again, which is exactly what hand-rolled scrubbing is |
-| `nix` | the pty syscalls — `openpty`, `termios`, the three window/controlling-terminal `ioctl`s, `sigwait`, `pthread_kill`. Six of its 35 features are enabled |
+| `nix` | the pty syscalls — `termios`, the three window/controlling-terminal `ioctl`s, `sigwait`, `pthread_kill`. Six of its 35 features are enabled |
 
 `nix` is where hand-rolling stops being minimalism. A codec has a specification
 and published vectors, so owning one is cheap and checkable. An `ioctl` request

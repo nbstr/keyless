@@ -1320,11 +1320,16 @@ mod tests {
     #[test]
     fn releasing_the_pty_slave_lets_the_master_reach_end_of_stream() {
         use super::StdioPlan;
-        use nix::pty::{OpenptyResult, openpty};
         use std::io::Read;
 
-        let OpenptyResult { master, slave } =
-            openpty(None, None).expect("this platform must provide a pty");
+        // The crate's own opener rather than `openpty`, for the reason stated
+        // on it: `openpty` runs its whole body with inheritable descriptors
+        // live, and the lib test binary spawns children from other threads
+        // while this one runs. A slave that walked into one of them would keep
+        // this pty open and turn the read below into the timeout it is here to
+        // detect.
+        let (master, slave) =
+            crate::tty::open_pty(None, None).expect("this platform must provide a pty");
         let mut plan = StdioPlan::Pty(Some(slave));
         plan.release_slave();
 
