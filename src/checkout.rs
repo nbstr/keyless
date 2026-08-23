@@ -8,11 +8,11 @@
 //! WAS the source: nothing under `src/` is newer than the artefact, so cargo
 //! would not rebuild and the BUILD row is right to say so.
 //!
-//! Measured on the remote box, 2026-08-10. The checkout sat at `f5f11b5` while
-//! `master` was six commits ahead. The binary was built from `f5f11b5`, so no
+//! Measured on the remote box, 2026-08-10. The checkout sat at `81e7569` while
+//! `master` was six commits ahead. The binary was built from `81e7569`, so no
 //! source file was newer than it, and `keyless doctor` printed `build proven`
 //! with exit code 0 — correctly, by its own logic. That binary contained the
-//! `probe_command` defect fixed in `74b2435`, in which `doctor --probe`
+//! `probe_command` defect fixed in `3497ee1`, in which `doctor --probe`
 //! reported names as `proven — read back from infisical` while reading the
 //! caller's own exported environment and the store held nothing. A false green
 //! certified by a green row.
