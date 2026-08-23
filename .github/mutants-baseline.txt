@@ -2,17 +2,29 @@
 #
 # `scripts/mutants.sh` diffs this file against the survivors of a
 # real campaign, in both directions. A survivor missing from here is a guard
-# somebody lost. An entry here that no longer survives is a gap somebody closed
-# while this file still claimed it was open. Both are red.
+# somebody lost. An entry here that stopped surviving is EITHER a gap somebody
+# closed while this file still claimed it was open, OR a campaign in which a
+# test failed for a reason that was not the mutation — cargo-mutants judges by
+# the exit status of `cargo test` and cannot tell those apart. The script names
+# the failing test for each vanished entry, because that is the only thing that
+# separates them. Both are red; only one of them is fixed here.
+#
+# That script is the ONLY thing that records this file and the only thing that
+# checks it, so its flags are part of what these lines mean. Moving one is paid
+# for by re-recording this file in the same commit.
 #
 # FORMAT — one line per surviving mutation:
 #
 #     <count><TAB><path>: <the mutation cargo-mutants applied>
 #
 # The line and column are stripped on purpose and the count is what replaces
-# them. `mutants.yml` explains that choice in full; the short version is that a
-# key carrying a line number reds on a comment, and a gate that reds on a
-# comment gets deleted.
+# them: a key carrying a line number reds on a comment, and a gate that reds on
+# a comment gets deleted. The count is what keeps the collapse honest — two
+# identical mutations in one function are one key, so without it, closing one of
+# the two would leave this file unchanged and the gate silent. What the key
+# cannot see is one survivor closing while a second, identical one appears
+# elsewhere in the same function in the same commit. That is the price of not
+# reding on comments, and it is worth paying.
 #
 # This file describes the RUST crate. The python hook pack has its own,
 # unrelated mutation campaign in `hooks/tests/mutate.py`, and a count from that
@@ -123,18 +135,22 @@
 # a gate that nobody changed. Naming them here is the only way that red is
 # recognisable rather than alarming.
 #
-# The run that produced this file timed out on four, all of them in the two
-# loops that count:
+# One mutant times out, and it is a real infinite loop rather than a slow
+# machine:
 #
 #   src/audit/mod.rs:  replace -= with /= in AuditLog::write_locked
-#   src/mask/mod.rs:   replace += with -= in Masker::scan
-#   src/mask/mod.rs:   replace += with *= in Masker::scan   (two lines)
 #
-# The first is `argv_len -= 1` in the loop that shrinks an oversized row; the
-# rest are the scan cursor. Under `/=`, `*=` or a decrement the counter never
-# reaches its bound and the loop does not end. These are real infinite loops
-# rather than a slow machine, so they time out anywhere, and no test can turn
-# one into a normal failure.
+# That is `argv_len -= 1` in the loop that shrinks an oversized row. Under `/=`
+# the counter never reaches its bound and the loop does not end, so no test can
+# turn it into a normal failure and the clock is the only thing that can
+# classify it.
+#
+# THE FOUR `Masker::scan` COUNTER MUTATIONS ARE CAUGHT, NOT TIMED OUT, and they
+# are named here because the opposite is the intuitive guess and it is wrong.
+# `replace += with -=` and `replace += with *=`, on both of the cursor's two
+# lines, break masking rather than hang: 36 tests fail, and they fail at once
+# rather than running to any clock. A reader who expects them in this list and
+# does not find them has found the tests working, not a gap.
 #
 # ---------------------------------------------------------------------------
 # EQUIVALENT. The SHA-256 `Ch` and `Maj` functions, whose operands are chosen so

@@ -126,10 +126,28 @@ echo "${BOLD}mutants${OFF} ${DIM}scope: $SCOPE${OFF}"
 echo "${DIM}~40 minutes for the default scope, inside the pinned Linux, memory capped.${OFF}"
 echo "${DIM}The python hook pack is a SEPARATE campaign: hooks/tests/mutate.py${OFF}"
 
-# Flags IDENTICAL to the workflow that produced the baseline. The survivor set
-# is a property of the method as much as of the code: change `--jobs` or the
-# timeout multiplier and mutants move between "timed out" and "caught" for
-# reasons that have nothing to do with a test.
+# THE FLAGS ARE PART OF THE MEASUREMENT. The survivor set is a property of the
+# method as much as of the code: change `--jobs` or the timeout multiplier and
+# mutants move between "timed out" and "caught" for reasons that have nothing to
+# do with a test.
+#
+# This file is the only thing that records `.github/mutants-baseline.txt` and
+# the only thing that checks it. There is no second runner to disagree with, so
+# nothing outside this file constrains what is written below -- and nothing
+# outside it will notice a flag that moves the survivor set either. A flag
+# changed here is paid for by re-recording the baseline in the SAME commit.
+#
+# `--no-fail-fast` is not one of those flags, and that is worth writing down
+# because it looks obviously right and gets proposed again. cargo-mutants
+# classifies a mutant by the EXIT STATUS of `cargo test`, and fail-fast decides
+# only what runs AFTER something has already failed -- that is, only when the
+# status is already non-zero. The status is therefore invariant under it, and so
+# is the survivor set. Measured 2026-08-23 on a crate built for the question:
+# with one test failing for a reason unrelated to any mutation, the campaign
+# reports every mutant caught and exits 0, hiding three real survivors --
+# identically with the flag and without it. What the flag WOULD buy is every
+# caught mutant running the whole remaining suite after the failure that already
+# caught it, several hundred times over. It does not close the hole below.
 #
 # The output directory is DESTROYED first, and this is the most important line
 # in the file. cargo-mutants refused its arguments on 2026-08-22 and tested
@@ -211,7 +229,17 @@ BASELINE
 )
 
 if [ "$baseline" != "Success" ]; then
-  fail "the baseline never went green, so none of the $generated mutants was tested (cargo-mutants exit $status, baseline $baseline). THE SCOPE IS NOT THE PROBLEM: the suite fails in the UNMUTATED tree. The failing test is named in the log above; fix it, then re-run this."
+  fail "the baseline never went green, so none of the $generated mutants was tested (cargo-mutants exit $status, baseline $baseline). THE SCOPE IS NOT THE PROBLEM: the suite fails in the UNMUTATED tree."
+  cat >&2 <<'REDBASE'
+  The log names the FIRST failing target and no others -- cargo-mutants runs a
+  fail-fast `cargo test`, so a break spanning four targets reads as one and
+  costs a fresh campaign per fix. Get the whole list in one pass instead, in
+  this same container:
+
+      scripts/linux.sh cargo test --locked --no-fail-fast
+
+  Fix what that names, then re-run this.
+REDBASE
   gate_summary; exit 1
 fi
 
@@ -289,10 +317,81 @@ cat >&2 <<'WHY'
   A line only in survivors is a mutation NO TEST NOTICES: the code was changed
   and the suite stayed green. Write the guard, or -- if the mutant is genuinely
   equivalent -- add it to the baseline WITH a comment saying why.
-  A line only in expected is the opposite: a gap somebody closed while the
-  baseline still claims it is open. Delete that line.
+  A line only in expected STOPPED surviving, which has two opposite causes and
+  they are named below with the evidence that separates them. Do not delete the
+  line until you have read that.
   A changed COUNT on an otherwise identical line means one of several identical
   mutations in that function was closed, or a new one appeared.
 WHY
+
+# A baseline entry that stops surviving is EITHER a gap somebody closed OR a
+# test that failed for a reason having nothing to do with the mutation -- a
+# catch cargo-mutants recorded and did not earn. It judges a mutant by the EXIT
+# STATUS of `cargo test` and cannot tell those apart. Nothing about the diff can
+# either: both are the same missing line.
+#
+# WHICH TEST FAILED is the thing that separates them, and it is already on disk
+# in the mutant's own scenario log. Measured 2026-08-23: one test failing for an
+# environmental reason turned every survivor in a crate into a catch, and the
+# campaign exited 0. A reader told only "delete that line" deletes a true record
+# of an open gap and blinds this gate permanently, which is why the sentence
+# above no longer says it.
+python3 - "$out" "$GATE_LOG_DIR/expected.txt" "$GATE_LOG_DIR/survivors.txt" >&2 <<'WHOCAUGHT'
+import json, os, re, sys
+
+out, expected_path, survivors_path = sys.argv[1:4]
+ANSI = re.compile(r'\x1b\[[0-9;]*m')
+
+
+def keys(path):
+    found = set()
+    for raw in open(path):
+        raw = raw.strip()
+        if raw:
+            found.add(raw.split('\t', 1)[-1])
+    return found
+
+
+vanished = keys(expected_path) - keys(survivors_path)
+if not vanished:
+    sys.exit(0)
+
+print('  the entries that STOPPED surviving, and what failed in each run:')
+outcomes = json.load(open(os.path.join(out, 'outcomes.json')))['outcomes']
+reported = set()
+for outcome in outcomes:
+    scenario = outcome.get('scenario')
+    if not (isinstance(scenario, dict) and isinstance(scenario.get('Mutant'), dict)):
+        continue
+    if outcome.get('summary') != 'CaughtMutant':
+        continue
+    key = re.sub(r'^(.*?):[0-9]+:[0-9]+: ', r'\1: ',
+                 scenario['Mutant'].get('name', ''))
+    if key not in vanished:
+        continue
+    failed = []
+    try:
+        for line in open(os.path.join(out, outcome.get('log_path', '')),
+                         errors='replace'):
+            hit = re.match(r'^test (\S+) \.\.\. FAILED', ANSI.sub('', line).strip())
+            if hit and hit.group(1) not in failed:
+                failed.append(hit.group(1))
+    except OSError:
+        pass
+    reported.add(key)
+    print('    %s' % key)
+    print('      failing test: %s' % (', '.join(failed) if failed else
+          'none named -- the BUILD or the runner failed, not a test'))
+
+for key in sorted(vanished - reported):
+    print('    %s' % key)
+    print('      not tested at all this run -- it is neither a survivor nor a catch')
+
+print('  A test that plausibly covers that code means the gap really was closed:')
+print('  delete the line. A test in an unrelated module means this campaign was')
+print('  poisoned by a failure that is not about the mutation -- fix that test')
+print('  and re-run. The baseline is not the thing that is wrong in that case.')
+WHOCAUGHT
+
 echo "the survivors of this run are at $GATE_LOG_DIR/survivors.txt" >&2
 exit 1
