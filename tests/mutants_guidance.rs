@@ -73,7 +73,9 @@ fn the_baseline_hands_nobody_a_local_campaign_to_copy() {
         "`.github/mutants-baseline.txt` carries a bare runnable campaign again:\n  {}\n\
          The campaign of record is `scripts/mutants.sh`, which runs inside a \
          memory-capped Linux container; a bare invocation has no limit on it at \
-         all, and one reached 41 GB on this machine. It also cannot regenerate \
+         all, and a campaign deliberately compiles programs that are WRONG — a \
+         wrong program is entitled to allocate until something stops it, and \
+         without the cap nothing does. It also cannot regenerate \
          this file, whose survivors were measured on Linux. Point at the script \
          instead. Naming the tool in prose is fine — this only refuses an \
          indented command line.",
