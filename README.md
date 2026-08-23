@@ -750,10 +750,15 @@ stable; `keyless` resolves the volatile half at every lookup:
 Behind that, one `pass-cli item list --vault-name <VAULT> --output json` per run
 supplies this session's `share_id` and `id`, a fresh `pass://…` reference is
 built in memory, and the value comes back through `run` exactly as before. The
-listing is memoised for the life of the invocation — several names from one
-vault cost one listing — **in memory and never on disk**. A cache on disk that
-the client can read is a `get` verb with extra steps, and `keyless` does not
-offer one.
+listing is memoised — several names from one vault cost one listing — **in
+memory and never on disk**. A cache on disk that the client can read is a `get`
+verb with extra steps, and `keyless` does not offer one.
+
+A memoised listing also expires, after **60 seconds** by default, set with
+`listing_ttl_ms`. That is not a performance knob: the listing is where the trash
+rule below lives, so a listing reused forever goes on resolving an item somebody
+trashed — silently, and for as long as the process holding it stays alive. One
+`keyless run` finishes long before the expiry, so it pays nothing for the bound.
 
 Four rules, each of which degrades the name and never the command:
 
@@ -2005,8 +2010,9 @@ interpreter refusal removed, the local fallback restored, attestation moved to
 once-per-connection, and a malformed reply accepted — are each killed by a named
 test.
 
-The discovery and write verbs carry five more, each verified by making the
-mutation, confirming the byte change with `diff`, and running exactly one test:
+Five more come from the discovery and write verbs, and two from the Proton
+listing cache, each verified by making the mutation, confirming the byte change
+with `diff`, and running the test named beside it:
 
 | Mutation | Killed by |
 |---|---|
@@ -2015,6 +2021,8 @@ mutation, confirming the byte change with `diff`, and running exactly one test:
 | every listed item is reported `Active` | `stores::a_listing_reports_a_trashed_items_state_verbatim` |
 | `--projectId` is not passed through | `store::infisical::…::project_coordinates_are_passed_only_when_configured` |
 | the reader falls back to the manager's session directory | `store::proton::…::a_read_never_uses_the_manager_identity_even_when_one_is_configured` |
+| a vault listing never expires, so an item trashed after it was cached still resolves | `stores::a_listing_older_than_its_ttl_is_fetched_again_before_it_is_trusted` |
+| a vault listing expires instantly, which un-caches the listing rather than bounding it | `stores::a_lookup_inside_the_ttl_serves_the_cache_and_lists_nothing` |
 
 The second of those is the reason that test asserts on **exit code 2** — clap
 refusing the word — rather than on "the command failed". Under `Command::output()`

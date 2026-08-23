@@ -31,7 +31,8 @@
 mod support;
 
 use std::ffi::OsString;
-use std::path::Path;
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use keyless::State;
@@ -736,10 +737,18 @@ const TWO_LIVE_ITEMS: &str = r#"{"items":[
 
 /// A config whose names are addressed by vault, title and field.
 fn named_config(binary: &Path, secrets: &str) -> String {
+    named_config_extra(binary, secrets, "")
+}
+
+/// The same, with `proton_extra` spliced into the `stores.proton` block.
+///
+/// Written as raw JSON rather than as a typed builder so the tests below state
+/// the file an operator writes, which is the only form this crate promises.
+fn named_config_extra(binary: &Path, secrets: &str, proton_extra: &str) -> String {
     format!(
         r#"{{"stores":{{"keychain":{{"enabled":false}},
              "proton":{{"enabled":true,"binary":"{}","session_dir":"{SCOPED_SESSION_DIR}",
-                        "timeout_ms":60000}}}},
+                        "timeout_ms":60000{proton_extra}}}}},
             "secrets":{secrets}}}"#,
         binary.display()
     )
@@ -959,6 +968,125 @@ fn several_names_from_one_vault_cost_exactly_one_listing() {
         listing_count(&dir),
         1,
         "one vault was enumerated once per name instead of once per run"
+    );
+}
+
+/// A `pass-cli` stand-in whose vault CHANGES after its first listing: the item
+/// is `Active` the first time it is listed and `Trashed` every time after.
+///
+/// That is somebody emptying an item into the trash while a process that has
+/// already listed the vault is still alive — the one event a memoised listing
+/// cannot see, and the one the trash rule exists to catch.
+///
+/// Only `item list` is answered here. Everything else is handed to the ordinary
+/// stub in the same directory, so a lookup that gets as far as a value still
+/// records its argv, its reason and its reference where the tests above read
+/// them. The tally goes to the same `pass-cli.list.count` [`listing_count`]
+/// reads, so "was the vault listed again" is counted from the vendor's side.
+fn stub_pass_cli_trashed_after_first_listing(dir: &Path) -> PathBuf {
+    let delegate = stub_pass_cli_listing(dir, &Backend::Injects(PROTON_DECOY), &Listing::EMPTY);
+    let listed_once = dir.join("pass-cli.listed-once");
+    let path = dir.join("pass-cli-trashing-stub");
+    let body = format!(
+        "#!/bin/sh\n\
+         if [ \"$1\" = 'item' ] && [ \"$2\" = 'list' ]; then\n\
+         \x20 echo one >> '{count}'\n\
+         \x20 if [ -e '{flag}' ]; then\n\
+         \x20   printf '%s' '{trashed}'\n\
+         \x20 else\n\
+         \x20   : > '{flag}'\n\
+         \x20   printf '%s' '{live}'\n\
+         \x20 fi\n\
+         \x20 exit 0\n\
+         fi\n\
+         exec '{delegate}' \"$@\"\n",
+        count = dir.join("pass-cli.list.count").display(),
+        flag = listed_once.display(),
+        trashed = ONE_TRASHED_ITEM,
+        live = ONE_LIVE_ITEM,
+        delegate = delegate.display(),
+    );
+    std::fs::write(&path, body).expect("cannot write the trashing stub");
+    let mut mode = std::fs::metadata(&path)
+        .expect("cannot stat the trashing stub")
+        .permissions();
+    mode.set_mode(0o755);
+    std::fs::set_permissions(&path, mode).expect("cannot chmod the trashing stub");
+    path
+}
+
+#[test]
+fn a_listing_older_than_its_ttl_is_fetched_again_before_it_is_trusted() {
+    // The trash rule lives in the LISTING: the reference form has none, and
+    // `pass-cli run` resolves a trashed item happily — measured 2026-08-08, see
+    // `keyless::config::SecretRoute::reference`. So a listing that is memoised
+    // and never re-fetched is that rule switched off, silently, for as long as
+    // whatever holds this adapter stays alive: the item is in the trash and the
+    // cached record still says `Active`.
+    let dir = scratch("proton-listing-expiry");
+    let marker = dir.join("witness");
+    let stub = stub_pass_cli_trashed_after_first_listing(&dir);
+    let registry = registry_from(
+        &named_config_extra(&stub, DECOY_BY_NAME, r#","listing_ttl_ms":20"#),
+        &Reason::default(),
+    );
+
+    let (first, notes) = run_with(&registry, &["DECOY"], &witness(&marker, "DECOY", 0), &[]);
+    assert_eq!(first.state, State::Injected, "{notes}");
+    assert_eq!(witnessed(&marker), PROTON_DECOY);
+    assert_eq!(listing_count(&dir), 1);
+
+    // Past the TTL by a wide margin, so the assertion below is about expiry and
+    // not about how long a machine took to get here.
+    std::thread::sleep(Duration::from_millis(250));
+
+    let (second, notes) = run_with(&registry, &["DECOY"], &witness(&marker, "DECOY", 19), &[]);
+
+    assert_eq!(
+        witnessed(&marker),
+        "<unset>",
+        "a trashed item was injected out of a listing that predates the trashing"
+    );
+    assert_eq!(
+        listing_count(&dir),
+        2,
+        "the vault was never listed again, so nothing in this process can ever \
+         learn that an item was trashed"
+    );
+    assert_eq!(second.exit_code, 19, "the child's exit code must come back");
+    assert_eq!(second.state, State::Degraded);
+    assert!(notes.contains("trash"), "the banner must say why: {notes}");
+}
+
+#[test]
+fn a_lookup_inside_the_ttl_serves_the_cache_and_lists_nothing() {
+    // The other direction, and the control that keeps the test above honest: a
+    // TTL that expired instantly would satisfy it and would also undo the
+    // memoisation, turning N names into N vendor spawns and N audit entries.
+    //
+    // The stub answers a DIFFERENT vault on its second listing, so serving the
+    // first answer is positive evidence the cache was read — not the absence of
+    // evidence that it was not.
+    let dir = scratch("proton-listing-within-ttl");
+    let marker = dir.join("witness");
+    let stub = stub_pass_cli_trashed_after_first_listing(&dir);
+    // The default TTL, spelled by leaving it out: a default too short to
+    // survive two lookups in a row would fail here.
+    let registry = registry_from(&named_config(&stub, DECOY_BY_NAME), &Reason::default());
+
+    let (first, notes) = run_with(&registry, &["DECOY"], &witness(&marker, "DECOY", 0), &[]);
+    assert_eq!(first.state, State::Injected, "{notes}");
+    assert_eq!(witnessed(&marker), PROTON_DECOY);
+
+    let (second, notes) = run_with(&registry, &["DECOY"], &witness(&marker, "DECOY", 0), &[]);
+
+    assert_eq!(second.state, State::Injected, "{notes}");
+    assert_eq!(witnessed(&marker), PROTON_DECOY);
+    assert_eq!(
+        listing_count(&dir),
+        1,
+        "a second lookup inside the TTL listed the vault again, so the cache \
+         this adapter is built around is doing nothing"
     );
 }
 

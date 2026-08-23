@@ -65,13 +65,16 @@
 //!   believes they deleted. The filter is an **allowlist** on `Active` rather
 //!   than a denylist on `Trashed`: a state this build has never heard of must
 //!   fail closed.
-//! - **The listing is memoised for the life of the process, in memory only.**
-//!   One `keyless run` resolves several names, usually from one vault, and a
-//!   `ProtonStore` lives for exactly one invocation — so the cache turns N
-//!   spawns into one and can never be stale. There is deliberately no on-disk
-//!   cache: a cache the client can read is a `get` verb with extra steps.
-//!   Anything that keeps a `ProtonStore` alive across invocations — the daemon,
-//!   if it ever carries this adapter — has to give this cache a TTL first.
+//! - **The listing is memoised, in memory only, and it expires.** One `keyless
+//!   run` resolves several names, usually from one vault, so the cache turns N
+//!   spawns into one. It is reused only while it is younger than
+//!   [`crate::config::ProtonConfig::listing_ttl_ms`], because the listing is
+//!   also what carries the trash rule below: an entry kept indefinitely goes on
+//!   resolving an item somebody trashed an hour ago, and does it silently. A
+//!   run cannot outlive the default, so the memoisation costs nothing there;
+//!   the bound is what makes the adapter safe to hold open across commands.
+//!   There is deliberately no on-disk cache: a cache the client can read is a
+//!   `get` verb with extra steps.
 //!
 //! The `reference` form still resolves, unchanged. It is the escape hatch for an
 //! ambiguous title, and the wrong choice for everything else — it is fragile
@@ -156,7 +159,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 use zeroize::Zeroize;
@@ -1254,7 +1257,9 @@ pub struct ProtonStore {
     reason: Reason,
     /// name -> where its value lives.
     addresses: BTreeMap<String, Address>,
-    /// vault name -> that vault's items, for the life of this process.
+    /// How long a listing may be reused. See [`ProtonStore::cached_items`].
+    listing_ttl: Duration,
+    /// vault name -> that vault's items, until they expire.
     ///
     /// In memory and nowhere else. A cache on disk that the client can read is
     /// a `get` verb with extra steps, which is the one thing this tool does not
@@ -1267,7 +1272,40 @@ pub struct ProtonStore {
 /// The inner `Mutex` is the whole point: it is held across the vendor CLI spawn,
 /// so several names resolving from one vault at the same time produce one
 /// listing rather than one each. See [`ProtonStore::cached_items`].
-type VaultSlot = Arc<Mutex<Option<Arc<Vec<ItemRecord>>>>>;
+type VaultSlot = Arc<Mutex<Option<Listed>>>;
+
+/// One vault's items, and when they were fetched.
+///
+/// The timestamp is what makes the cache expire. Without it the entry is a
+/// statement about the vault that was true once and is never checked again —
+/// and the check it silently drops is the trash rule, since a trashed item is
+/// still listed and is refused only because a listing says `Trashed`.
+struct Listed {
+    items: Arc<Vec<ItemRecord>>,
+    at: Instant,
+}
+
+/// The longest a listing may be reused, whatever the config asks for.
+///
+/// A config is not a trusted input — it can arrive by `--config` or
+/// `KEYLESS_CONFIG` from whatever wrote the file — so `listing_ttl_ms` is
+/// clamped for the same reason `timeout_ms` is: without a ceiling it is the
+/// knob that turns the expiry off again, and an expiry that a number can
+/// disable is not a bound. Fifteen minutes is far above the default and far
+/// below "until somebody restarts it".
+pub const MAX_LISTING_TTL_MS: u64 = 900_000;
+
+/// A configured `listing_ttl_ms` as a duration, clamped to
+/// [`MAX_LISTING_TTL_MS`].
+#[must_use]
+pub const fn bounded_listing_ttl(milliseconds: u64) -> Duration {
+    let bounded = if milliseconds > MAX_LISTING_TTL_MS {
+        MAX_LISTING_TTL_MS
+    } else {
+        milliseconds
+    };
+    Duration::from_millis(bounded)
+}
 
 impl ProtonStore {
     /// Construct from a parsed config and the reason reads will be recorded under.
@@ -1292,6 +1330,7 @@ impl ProtonStore {
             timeout: crate::config::bounded_timeout(settings.timeout_ms),
             reason,
             addresses,
+            listing_ttl: bounded_listing_ttl(settings.listing_ttl_ms),
             listings: Mutex::new(BTreeMap::new()),
         }
     }
@@ -1443,6 +1482,26 @@ impl ProtonStore {
     ///
     /// A failed fetch leaves the slot empty, so a later name retries rather than
     /// inheriting a failure it did not cause.
+    ///
+    /// # Why the entry expires
+    ///
+    /// An entry is only reused while it is younger than
+    /// [`crate::config::ProtonConfig::listing_ttl_ms`]. A cache with no expiry
+    /// is a cache that can only be right about the moment it was filled, and
+    /// what it is asked about later includes **whether an item is in the trash**
+    /// — a question this adapter can answer only from a listing, because the
+    /// vendor resolves a trashed item's reference without complaint. Kept
+    /// forever, the entry does not merely go stale: it silently switches off the
+    /// one rule standing between a deleted credential and a child's environment,
+    /// for as long as whatever holds this adapter stays alive.
+    ///
+    /// A `keyless run` cannot reach the expiry — it resolves its names in one
+    /// burst and exits — so the memoisation this cache exists for is untouched;
+    /// see `several_names_from_one_vault_cost_exactly_one_listing`.
+    ///
+    /// An expired entry is replaced only by a fetch that succeeded. A refresh
+    /// that fails returns the failure, which degrades the lookup, rather than
+    /// falling back to the stale answer it was sent to replace.
     fn cached_items(
         &self,
         session_dir: &Path,
@@ -1451,11 +1510,16 @@ impl ProtonStore {
     ) -> Result<Arc<Vec<ItemRecord>>, StoreError> {
         let slot = Arc::clone(self.cache().entry(vault.to_owned()).or_default());
         let mut slot = slot.lock().unwrap_or_else(PoisonError::into_inner);
-        if let Some(cached) = slot.as_ref() {
-            return Ok(Arc::clone(cached));
+        if let Some(cached) = slot.as_ref()
+            && cached.at.elapsed() < self.listing_ttl
+        {
+            return Ok(Arc::clone(&cached.items));
         }
         let fetched = Arc::new(self.fetch_items(session_dir, vault, name)?);
-        *slot = Some(Arc::clone(&fetched));
+        *slot = Some(Listed {
+            items: Arc::clone(&fetched),
+            at: Instant::now(),
+        });
         Ok(fetched)
     }
 
@@ -1966,6 +2030,7 @@ mod tests {
     use crate::store::discover::Discover;
     use std::ffi::{OsStr, OsString};
     use std::path::Path;
+    use std::time::Duration;
 
     /// The session directory these tests pretend was configured.
     ///
@@ -2445,6 +2510,41 @@ mod tests {
         assert!(!record("Trashed").is_active());
         assert!(!record("PendingDeletion").is_active());
         assert!(!record("").is_active());
+    }
+
+    #[test]
+    fn a_listing_ttl_is_clamped_so_no_config_can_switch_the_expiry_off() {
+        // The trash rule above is only ever consulted against a listing, so a
+        // `listing_ttl_ms` big enough to outlive any process would delete that
+        // rule by arithmetic. Zero is the other end and is honest: list again
+        // every time.
+        assert_eq!(super::bounded_listing_ttl(0), Duration::ZERO);
+        assert_eq!(
+            super::bounded_listing_ttl(1_500),
+            Duration::from_millis(1500)
+        );
+        assert_eq!(
+            super::bounded_listing_ttl(super::MAX_LISTING_TTL_MS),
+            Duration::from_millis(super::MAX_LISTING_TTL_MS)
+        );
+        assert_eq!(
+            super::bounded_listing_ttl(u64::MAX),
+            Duration::from_millis(super::MAX_LISTING_TTL_MS),
+            "a config named a number large enough to mean `never`"
+        );
+    }
+
+    #[test]
+    fn the_default_config_gives_the_listing_cache_a_bounded_ttl() {
+        // The default is what every run and every future long-lived holder gets
+        // without asking, so it is the value that has to be bounded — not just
+        // the clamp that catches an operator naming a silly one.
+        let ttl = super::bounded_listing_ttl(crate::config::ProtonConfig::default().listing_ttl_ms);
+        assert!(ttl > Duration::ZERO, "the default lists again every lookup");
+        assert!(
+            ttl <= Duration::from_millis(super::MAX_LISTING_TTL_MS),
+            "the default is not bounded: {ttl:?}"
+        );
     }
 
     #[test]

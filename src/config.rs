@@ -344,6 +344,22 @@ pub struct ProtonConfig {
     /// How long one lookup may take before it degrades the run.
     #[serde(default = "default_timeout_ms")]
     pub timeout_ms: u64,
+    /// How long one vault's item listing may be reused before it is fetched
+    /// again, in milliseconds.
+    ///
+    /// **This is the staleness window of the trash rule**, not a performance
+    /// knob. The listing is what tells this adapter an item is in the trash —
+    /// [`SecretRoute::reference`] explains why the id form cannot — so a
+    /// listing kept past the moment somebody trashed an item resolves that item
+    /// as if it were live. One `keyless run` is a short-lived process and
+    /// cannot outlive the default; anything holding the adapter open across
+    /// commands is what this bound is for.
+    ///
+    /// `0` lists the vault again on every lookup. Clamped to
+    /// [`crate::store::proton::MAX_LISTING_TTL_MS`], so a config cannot switch
+    /// the expiry off by naming a large enough number.
+    #[serde(default = "default_listing_ttl_ms")]
+    pub listing_ttl_ms: u64,
     /// The helper that reads one variable out of the child environment.
     #[serde(default = "default_probe_binary")]
     pub probe_binary: ConfigPath,
@@ -359,6 +375,7 @@ impl Default for ProtonConfig {
             session_dir: None,
             manager: None,
             timeout_ms: default_timeout_ms(),
+            listing_ttl_ms: default_listing_ttl_ms(),
             probe_binary: default_probe_binary(),
             enabled: false,
         }
@@ -581,6 +598,22 @@ fn default_timeout_ms() -> u64 {
 
 /// Ten seconds, as a constant a store can reach without a config.
 pub const DEFAULT_TIMEOUT_MS: u64 = 10_000;
+
+/// Sixty seconds of listing reuse.
+///
+/// A `keyless run` resolves every name it was given in one burst that finishes
+/// in well under a second, so this never expires inside a run: the memoisation
+/// that turns N names into one vendor spawn is untouched. What it bounds is the
+/// other case — a process that holds the adapter open across commands, where a
+/// listing with no expiry means an item trashed after startup keeps resolving
+/// until somebody restarts it.
+///
+/// Sixty seconds is also what [`crate::daemon`] gives its own resolved-value
+/// cache, so the two staleness windows a name can sit behind are one number
+/// rather than two that drift apart.
+fn default_listing_ttl_ms() -> u64 {
+    60_000
+}
 
 /// `printenv NAME` writes one variable's value to stdout and nothing else. It
 /// is not a shell, so the name is an argument rather than something interpolated
