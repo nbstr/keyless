@@ -68,6 +68,35 @@
 //!   had to call `750` (a value under test in `tests/hostile.rs`) and `5000` (a
 //!   ceiling that broke) the same thing.
 //! * It scans SOURCE. A fixture that computes a timeout at runtime is not seen.
+//!
+//! # The other half of this class, which no deadline can classify
+//!
+//! A deadline reports that a fixture did not finish. It cannot say whether the
+//! fixture was merely slow or whether it was waiting on a descriptor a stranger
+//! is holding open — and in one process running its cases in parallel, the
+//! second happens. A descriptor that is not close-on-exec at the instant
+//! another thread forks walks into that child, and into the shell and the
+//! backgrounded grandchild it starts. The case that owns it then waits for an
+//! end-of-file only a process it has never heard of can send. This suite starts
+//! grandchildren that outlive their session by two minutes on purpose, so
+//! "until that stranger exits" is longer than every deadline in it.
+//!
+//! **A number cannot tell those apart, so raising one converts a diagnosable
+//! failure into a slower diagnosable failure.** `tests/pty.rs` closed its own
+//! instance by creating its terminal's descriptors with the flag already set,
+//! which it can do because it opens them itself.
+//!
+//! debt: only the pty-shaped instance is closed. A pipe is created INSIDE
+//!       `Command::spawn`, so there is no seam to pass a flag through and the
+//!       fix is a different one: serialise every spawn in a test binary against
+//!       every other, the way `keyless::store::exec` already serialises the
+//!       library's own. Measured on macOS, four threads calling
+//!       `Command::output` beside six spawning children left a stray pipe in 36
+//!       of 4298 of them; the same probe inside `tests/hostile.rs`, which makes
+//!       four piped children a run, saw none in 1790 — so the mechanism is
+//!       real here and its exposure is not.
+//!       Upgrade trigger: a fixture that spawns through a pipe trips its
+//!       deadline on a loaded machine and passes alone.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
