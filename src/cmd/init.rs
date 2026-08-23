@@ -359,15 +359,36 @@ fn report_hooks(
         .output();
     match output {
         Ok(done) if done.status.success() => {
-            row(
-                out,
-                style,
-                Mark::Proven,
-                "hooks",
-                9,
-                "proven",
-                &format!("installed by {}", installer.display()),
-            )?;
+            // 🔴 EXIT 0 IS NOT A REGISTRATION. The installer refuses to invent an
+            // agent harness that is not there: on a machine with no `~/.claude`
+            // it writes nothing, says so, and exits 0 — which is correct, and is
+            // not a failure. Read from the status alone, that printed a green
+            // `proven` directly above the installer's own "Nothing was written",
+            // so the word denied the sentence under it and the one flag that
+            // closes the guards hole reported success having closed nothing.
+            //
+            // The registration is therefore read BACK, through the same
+            // predicate the "already registered" row above uses. Two answers to
+            // "is the pack registered" have to come from one place, or this row
+            // and that one disagree on the same machine.
+            let (mark, state, detail) = if hooks_are_registered() {
+                (
+                    Mark::Proven,
+                    "proven",
+                    format!("installed by {}", installer.display()),
+                )
+            } else {
+                (
+                    Mark::NotSetUp,
+                    "absent",
+                    format!(
+                        "{} wrote nothing, so no pack is registered and nothing refuses a \
+                         command that would print a credential",
+                        installer.display()
+                    ),
+                )
+            };
+            row(out, style, mark, "hooks", 9, state, &detail)?;
             for line in String::from_utf8_lossy(&done.stdout).lines() {
                 verbatim(out, style, line)?;
             }
