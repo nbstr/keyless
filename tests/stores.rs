@@ -1598,6 +1598,17 @@ fn a_vault_whose_name_begins_with_a_dash_is_still_enumerable() {
 /// By subject rather than by an exact prefix: the row carries a mark, a state
 /// word and a detail, and pinning the whole spelling here would make every
 /// assertion below a test of the layout rather than of the finding.
+/// The state column of a rendered row: `<mark> <subject> <state> <detail>`.
+///
+/// Read as a whole column, because `unproven` CONTAINS `proven` — so
+/// `contains("proven")` passes on the one state it exists to exclude. Measured
+/// over this tree: every `proven` in the crate can be rewritten to `unproven`,
+/// leaving a green mark beside the word that denies it, and the suite stays
+/// green.
+fn state_of(row: &str) -> &str {
+    row.split_whitespace().nth(2).unwrap_or_default()
+}
+
 fn proton_row(report: &str) -> &str {
     report
         .lines()
@@ -1713,7 +1724,7 @@ fn doctor_reports_a_live_proton_session_as_ok() {
     let stub = stub_pass_cli_discovery(&dir, ONE_VAULT, LIVE_AND_TRASHED, "{}");
     let (report, code) = doctor_report(&dir, &proton_config(&stub));
 
-    assert!(proton_row(&report).contains("proven"), "{report}");
+    assert_eq!(state_of(proton_row(&report)), "proven", "{report}");
     // And never the word that was false. `ok` said "the binary answered" while
     // reading as "your secrets are reachable"; a row is green here only because
     // a read path came back.
@@ -1967,7 +1978,7 @@ fn a_session_that_answers_is_never_reported_as_half_written() {
     let stub = stub_pass_cli_discovery(&dir, ONE_VAULT, LIVE_AND_TRASHED, "{}");
     let (report, code) = doctor_report(&dir, &proton_config_at(&stub, &session_dir));
 
-    assert!(proton_row(&report).contains("proven"), "{report}");
+    assert_eq!(state_of(proton_row(&report)), "proven", "{report}");
     assert!(!report.contains("HALF-WRITTEN"), "{report}");
     assert_eq!(code, 0, "{report}");
 }

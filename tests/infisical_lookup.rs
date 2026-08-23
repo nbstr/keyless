@@ -174,6 +174,17 @@ fn text(output: &Output) -> (String, String) {
 }
 
 /// The one `NAMES` row, so an assertion cannot be satisfied by another section.
+/// The state column of a rendered row: `<mark> <subject> <state> <detail>`.
+///
+/// Read as a whole column, because `unproven` CONTAINS `proven` — so
+/// `contains("proven")` passes on the one state it exists to exclude. Measured
+/// over this tree: every `proven` in the crate can be rewritten to `unproven`,
+/// leaving a green mark beside the word that denies it, and the suite stays
+/// green.
+fn state_of(row: &str) -> &str {
+    row.split_whitespace().nth(2).unwrap_or_default()
+}
+
 fn names_row(out: &str, name: &str) -> String {
     out.lines()
         .skip_while(|line| !line.starts_with("NAMES"))
@@ -196,8 +207,9 @@ fn a_value_this_process_carries_is_never_reported_as_read_back_from_the_store() 
     // command — the ONLY difference is that this vendor holds the secret.
     let holding = config_for(&dir, &vendor_holding(&dir, NAME, FROM_THE_STORE), NAME);
     let (control, control_err) = text(&keyless(&holding, &["doctor", "--probe"]));
-    assert!(
-        names_row(&control, NAME).contains("proven"),
+    assert_eq!(
+        state_of(&names_row(&control, NAME)),
+        "proven",
         "a store that HOLDS the name must resolve it, or every assertion below \
          is satisfied by a lookup that cannot work at all: {control}{control_err}"
     );
@@ -350,8 +362,9 @@ fn a_forwarded_name_the_store_does_hold_still_resolves() {
     let (out, err) = text(&keyless_with_marked_path(&config, &["doctor", "--probe"]));
 
     let row = names_row(&out, "PATH");
-    assert!(
-        row.contains("proven"),
+    assert_eq!(
+        state_of(&row),
+        "proven",
         "a store that holds a forwarded name must still resolve it: {out}{err}"
     );
     assert!(
@@ -381,8 +394,9 @@ fn a_forwarded_name_this_machine_does_not_set_is_an_ordinary_secret() {
     let (out, err) = text(&output);
 
     let row = names_row(&out, "HTTPS_PROXY");
-    assert!(
-        row.contains("proven"),
+    assert_eq!(
+        state_of(&row),
+        "proven",
         "an unset forwarded name collides with nothing and must resolve: {out}{err}"
     );
     assert!(

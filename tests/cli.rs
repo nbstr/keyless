@@ -866,12 +866,14 @@ fn doctor_reports_a_healthy_setup_and_leaks_nothing() {
 
     let report = stdout_of(&output);
     assert!(report.contains("chain intact"), "report: {report}");
-    assert!(
-        row_for(&report, "keychain").contains("proven"),
+    assert_eq!(
+        state_of(row_for(&report, "keychain")),
+        "proven",
         "report: {report}"
     );
-    assert!(
-        row_for(&report, "DECOY").contains("proven"),
+    assert_eq!(
+        state_of(row_for(&report, "DECOY")),
+        "proven",
         "report: {report}"
     );
     // `ok` is the word this report no longer has anywhere. It was a verdict on
@@ -911,6 +913,17 @@ fn doctor_reports_a_broken_store_without_blocking_anything() {
 }
 
 /// The one report row whose subject is `subject`.
+/// The state column of a rendered row: `<mark> <subject> <state> <detail>`.
+///
+/// Read as a whole column, because `unproven` CONTAINS `proven` — so
+/// `contains("proven")` passes on the one state it exists to exclude. Measured
+/// over this tree: every `proven` in the crate can be rewritten to `unproven`,
+/// leaving a green mark beside the word that denies it, and the suite stays
+/// green.
+fn state_of(row: &str) -> &str {
+    row.split_whitespace().nth(2).unwrap_or_default()
+}
+
 fn row_for<'a>(report: &'a str, subject: &str) -> &'a str {
     report
         .lines()

@@ -448,6 +448,25 @@ mod tests {
         }
     }
 
+    /// A config and a registry in which `DECOY` actually resolves.
+    ///
+    /// [`Healthy`]'s id is not a backend the router knows, so under a bare
+    /// `{"secrets":{"DECOY":{}}}` the name goes to the DEFAULT store, which that
+    /// registry never constructed — the row reads `blocked`, nothing is asked,
+    /// and a case about what a probe reports is about a probe that never ran.
+    /// A case whose subject is the resolution has to be handed one.
+    fn resolving_decoy() -> (crate::config::ConfigLoad, Registry) {
+        let load = loaded(
+            r#"{"stores":{"keychain":{"enabled":true}},"secrets":{"DECOY":{"store":"keychain"}}}"#,
+        );
+        let registry = Registry::new(vec![Box::new(Named("keychain"))]).with_routes(
+            [("DECOY".to_owned(), "keychain".to_owned())]
+                .into_iter()
+                .collect(),
+        );
+        (load, registry)
+    }
+
     pub(super) fn loaded(json: &str) -> crate::config::ConfigLoad {
         let paths = Paths::under(Path::new("/nonexistent/keyless-doctor"));
         let mut load = Config::load(&paths.config);
@@ -465,6 +484,24 @@ mod tests {
     /// is a present one, wrapped.
     pub(super) fn flat(text: &str) -> String {
         text.split_whitespace().collect::<Vec<_>>().join(" ")
+    }
+
+    /// The state column of one rendered row: `<mark> <subject> <state> <detail>`.
+    ///
+    /// A state word is a WHOLE column, and reading it as one is the difference
+    /// between an assertion and a decoration. `unproven` CONTAINS `proven`, so
+    /// `contains("proven")` passes on the single state it exists to exclude —
+    /// and it is a live hole rather than a hypothetical one: every `proven` in
+    /// this crate can be rewritten to `unproven`, leaving a green `✔` beside the
+    /// word that denies it, and the whole suite stays green.
+    pub(super) fn state_of(text: &str, subject: &str) -> String {
+        text.lines()
+            .find(|line| line.split_whitespace().nth(1) == Some(subject))
+            .unwrap_or_else(|| panic!("no `{subject}` row in:\n{text}"))
+            .split_whitespace()
+            .nth(2)
+            .unwrap_or_default()
+            .to_owned()
     }
 
     #[test]
@@ -540,11 +577,14 @@ mod tests {
 
     #[test]
     fn probe_reports_presence_and_never_a_value() {
-        let load = loaded(r#"{"secrets":{"DECOY":{}}}"#);
-        let (text, code) = report(&load, Registry::new(vec![Box::new(Healthy)]), true);
+        let (load, registry) = resolving_decoy();
+        let (text, code) = report(&load, registry, true);
 
         assert!(text.contains("DECOY"), "{text}");
-        assert!(text.contains("proven"), "{text}");
+        // The DECOY row's own state column, not a `contains` over the report:
+        // every report carries `unproven` in SCOPE and in AUDIT, so
+        // `text.contains("proven")` was satisfied whatever the probed name did.
+        assert_eq!(state_of(&text, "DECOY"), "proven", "{text}");
         assert!(
             !text.contains("decoy-doctor-value"),
             "doctor leaked a value"
@@ -558,8 +598,11 @@ mod tests {
         // is a verdict on a MEASUREMENT. An expired token, an account-wide one
         // and somebody else's all resolve identically, so the word has to name
         // what was actually observed.
-        let load = loaded(r#"{"secrets":{"DECOY":{}}}"#);
-        let (text, _) = report(&load, Registry::new(vec![Box::new(Healthy)]), true);
+        let (load, registry) = resolving_decoy();
+        let (text, _) = report(&load, registry, true);
+        // The name must actually have resolved, or the absence below is the
+        // absence of a row rather than the absence of a word.
+        assert_eq!(state_of(&text, "DECOY"), "proven", "{text}");
         assert!(
             !text.contains(" ok"),
             "the report used `ok`, which is the word that was false: {text}"
@@ -680,7 +723,13 @@ mod tests {
         );
         let (text, code) = report(&load, registry, true);
 
-        assert!(text.contains("blocked"), "{text}");
+        // A state word is a WHOLE word in a row, not a substring of one:
+        // `contains("blocked")` also holds for `blockedX`, so it cannot fail on
+        // a change to the vocabulary and is not an assertion at all.
+        assert!(
+            text.split_whitespace().any(|word| word == "blocked"),
+            "no row carries `blocked` as its state word:\n{text}"
+        );
         assert_eq!(
             asked.load(Ordering::SeqCst),
             0,

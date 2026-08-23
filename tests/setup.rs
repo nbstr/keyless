@@ -125,6 +125,24 @@ fn out(output: &Output) -> String {
     )
 }
 
+/// The state column of the rendered row whose subject column says `subject`:
+/// `<mark> <subject> <state> <detail>`.
+///
+/// Read as a whole column, because `unproven` CONTAINS `proven` — so
+/// `contains("proven")` passes on the one state it exists to exclude. Measured
+/// over this tree: every `proven` in the crate can be rewritten to `unproven`,
+/// leaving a green mark beside the word that denies it, and the suite stays
+/// green.
+fn state_of(text: &str, subject: &str) -> String {
+    text.lines()
+        .find(|line| line.split_whitespace().nth(1) == Some(subject))
+        .unwrap_or_else(|| panic!("no `{subject}` row in:\n{text}"))
+        .split_whitespace()
+        .nth(2)
+        .unwrap_or_default()
+        .to_owned()
+}
+
 // ---------------------------------------------------------------------------
 // one command, and then the same command again
 // ---------------------------------------------------------------------------
@@ -344,7 +362,7 @@ fn disable_stops_the_guards_and_doctor_says_so_and_enable_undoes_it() {
     );
 
     let on = out(&machine.run(&["enable"]));
-    assert!(on.contains("proven"), "{on}");
+    assert_eq!(state_of(&on, "guards"), "proven", "{on}");
     let healthy = out(&machine.run(&["doctor"]));
     assert!(
         !healthy.contains("SWITCHED OFF"),
@@ -506,12 +524,9 @@ fn detected_reads_the_config_this_machine_actually_uses() {
 
     let text = out(&machine.run(&["init"]));
     for store in ["infisical", "proton"] {
-        let row = text
-            .lines()
-            .find(|line| line.contains(store))
-            .unwrap_or_default();
-        assert!(
-            row.contains("proven"),
+        assert_eq!(
+            state_of(&text, store),
+            "proven",
             "`{store}` cannot reach proven in DETECTED, whatever the config says\n{text}"
         );
     }
