@@ -16,6 +16,7 @@ said so.
 
 import json
 import os
+import resource
 import shutil
 import subprocess
 import sys
@@ -261,7 +262,12 @@ def run():
     s.check("a truncated module fails open", *_broken_tree())
 
     # ── cost: the curve, not a wall-clock second count ──────────────────────
-    s.check("cost stays sub-quadratic", *_cost_shape())
+    growth = _cost_growth()
+    # Both directions, because one of them alone passes vacuously. A growth
+    # figure that collapsed toward 1x would clear the ceiling while proving
+    # nothing at all, and that is what a broken instrument reads as.
+    s.check("the 4x workload costs measurably more", growth > 2.0, True)
+    s.check("cost stays sub-quadratic", growth < 8.0, True)
 
     return s
 
@@ -308,24 +314,79 @@ def _broken_tree():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
-def _cost_shape():
-    """Time at 4N must stay under ~6x time at N.
+def _cost_growth():
+    """How the pack's own work grows when the command it reads gets 4x longer.
 
-    An absolute second count measures the machine, not the code — one suite
-    asserting "under 5s" measured 5.38s and 9.39s on a loaded box. The shape of
-    the curve is the property: a quadratic pattern blows past 6x, and a linear
-    one lands near 4x.
+    Returned as a multiple, so the two ends of the property are named by the
+    figure itself: a linear scan lands near 4x and a quadratic one near 16x. The
+    ceiling sits at 8x, a doubling clear of each.
+
+    ⚠️ THE INSTRUMENT IS CPU TIME, NOT WALL CLOCK, AND THAT IS THE WHOLE POINT.
+
+    An absolute second count measures the machine rather than the code, which is
+    why this was never written as one. A wall-clock RATIO is the same fault
+    wearing a disguise: it holds two separately-taken samples, so on a machine
+    with other work on it the figure reports how evenly those two moments were
+    scheduled and not how the algorithm grows. The smaller sample swings hardest,
+    because a stall of a given length is a larger share of it — so an unchanged
+    scan reads well past 6x under ordinary contention, and no ceiling is both
+    quiet there and still able to tell 4x from 16x. That is not a threshold that
+    needs raising; it is the wrong instrument.
+
+    CPU time cannot be stretched that way. A process that loses the processor
+    accrues none of it, so oversubscription that multiplies the wall clock several
+    times over moves this figure by a few percent.
+
+    Two further rules, both of which `test_latency` learned first: the MINIMUM
+    across rounds is the closest estimate of what the work really costs, because
+    noise only ever adds; and the fixed cost of starting an interpreter is
+    subtracted, because it belongs to neither term of a growth figure and only
+    dilutes it toward 1x.
     """
-    import time
-    base = "export A=1 && cat notes.txt && grep -n 'x' file && " * 200
-    times = []
-    for factor in (1, 4):
-        text = base * factor
-        payload = bash(text)
-        t0 = time.perf_counter()
-        drive(payload)
-        times.append(time.perf_counter() - t0)
-    return (times[1] < times[0] * 6), True
+    unit = "export A=1 && cat notes.txt && grep -n 'x' file && "
+    cases = (("floor", bash("ls")),
+             ("1x", bash(unit * 200)),
+             ("4x", bash(unit * 800)))
+    best = {}
+    # Interleaved rather than case-after-case, because a machine's load drifts
+    # across the rounds and case-after-case hands each case a different era.
+    for _ in range(3):
+        for label, command in cases:
+            spent = _child_cpu(command)
+            if label not in best or spent < best[label]:
+                best[label] = spent
+    one = best["1x"] - best["floor"]
+    four = best["4x"] - best["floor"]
+    # A runaway at both sizes divides to a NaN, and every comparison against a NaN
+    # is false — including the ceiling, which would read as a pass. Say infinite.
+    if four == float("inf"):
+        return float("inf")
+    # A non-positive figure means the instrument broke, not the pack. Hand back a
+    # growth the lower bound refuses rather than dividing by it.
+    return four / one if one > 0 else 0.0
+
+
+def _child_cpu(command):
+    """User plus system CPU seconds the hook's own process spends on one call.
+
+    `RUSAGE_CHILDREN` accumulates across every child this process has reaped, so
+    a delta around one call is that call's alone only while nothing else is being
+    reaped beside it. `drive` starts the hook and waits for it, on this thread.
+
+    A call that never returns inside the harness timeout has by definition blown
+    past any ceiling a growth figure could carry, and reporting it as an infinite
+    cost keeps that a failed ASSERTION rather than a traceback out of the middle
+    of the battery. A genuinely quadratic scan reaches the timeout before it
+    reaches the ceiling, so this is the path that shape actually takes.
+    """
+    before = resource.getrusage(resource.RUSAGE_CHILDREN)
+    try:
+        drive(command)
+    except subprocess.TimeoutExpired:
+        return float("inf")
+    after = resource.getrusage(resource.RUSAGE_CHILDREN)
+    return ((after.ru_utime - before.ru_utime)
+            + (after.ru_stime - before.ru_stime))
 
 
 if __name__ == "__main__":
