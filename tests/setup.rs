@@ -8,18 +8,32 @@
 //! exists to fix was precisely that: two installers, each correct on its own,
 //! and nothing that put both on one machine.
 //!
-//! # How a fresh machine is simulated, and why not by moving `HOME`
+//! # How a fresh machine is simulated
 //!
-//! Every path this verb touches is nameable — `--config`, `--claude-dir`,
-//! `--receipt`, and `XDG_CONFIG_HOME` for the guards' switch — so a run can be
-//! aimed entirely inside a scratch directory while `HOME` stays exactly where it
-//! is.
+//! A machine is a directory, and `HOME` is redirected into it for every run —
+//! along with `--config`, `--audit`, `XDG_CONFIG_HOME` and `XDG_STATE_HOME`.
+//! Naming the paths a verb accepts as flags is not enough on its own: a verb
+//! that takes no flag for a path still resolves it, and it resolves it from
+//! `$HOME`. `keyless init` reads `~/.claude/settings.json` straight off `HOME`
+//! and honours no override at all, and `doctor`'s guards row reads whatever
+//! `--claude-dir` was not given to it. Both then report on the developer's own
+//! machine while claiming to describe the scratch one, which is a green that
+//! says nothing — the exact defect this suite exists to catch, wearing the
+//! costume of a passing test.
 //!
-//! **`HOME` is deliberately NOT redirected.** On macOS a process that runs with
-//! a rewritten `HOME` and then touches the keychain gets a modal dialog — with a
-//! destructive **Reset To Defaults** button — on the screen of whoever happens to
-//! be logged in. A test suite may not do that, so the isolation is explicit
-//! paths rather than a moved home directory.
+//! So the machine's agent directory lives at the default location *inside* the
+//! machine's own home, and every path resolves there whether the verb under
+//! test takes a flag for it or not.
+//!
+//! Redirecting `HOME` is safe against the keychain, which is the hazard that
+//! would otherwise rule it out: on macOS a process that runs `security` against
+//! a `HOME` with no login keychain gets a modal dialog — with a destructive
+//! **Reset To Defaults** button — on the screen of whoever is logged in. The
+//! keychain store refuses before it spawns anything when `$HOME/Library/
+//! Keychains` is absent, which a scratch home always is, and it skips the check
+//! entirely when the binary is one of this suite's stubs rather than the stock
+//! `/usr/bin/security`. No run from here can reach the real binary with a real
+//! home, so no run from here can raise that dialog.
 
 mod support;
 
@@ -37,7 +51,22 @@ struct Machine {
 
 impl Machine {
     fn fresh(tag: &str) -> Machine {
-        Machine { root: scratch(tag) }
+        let machine = Machine { root: scratch(tag) };
+        // Created rather than merely named: `HOME` pointing at nothing is a
+        // fourth machine state that no real one has, and it makes every path
+        // resolved from it unwritable for reasons the verb under test did not
+        // cause.
+        std::fs::create_dir_all(machine.home()).expect("mkdir");
+        machine
+    }
+
+    /// This machine's home directory.
+    ///
+    /// Every run gets it as `HOME`, so a path resolved from the environment
+    /// lands inside this machine instead of on the developer's own — see the
+    /// module header for why naming the flags is not enough on its own.
+    fn home(&self) -> PathBuf {
+        self.root.join("home")
     }
 
     fn config(&self) -> PathBuf {
@@ -48,8 +77,15 @@ impl Machine {
         self.root.join("setup-receipt.json")
     }
 
+    /// The agent harness's directory, at the location a harness actually uses.
+    ///
+    /// Under this machine's home rather than beside it, so the path
+    /// `--claude-dir` names and the path a verb resolves when nobody names one
+    /// are the SAME directory. Split, the two disagree silently: `setup`
+    /// installs into one and `doctor` reports on the other, and the report is
+    /// green about a machine the command never touched.
     fn claude(&self) -> PathBuf {
-        self.root.join("claude")
+        self.home().join(".claude")
     }
 
     fn settings(&self) -> PathBuf {
@@ -91,6 +127,10 @@ impl Machine {
             .arg(self.config())
             .arg("--audit")
             .arg(self.root.join("audit.jsonl"))
+            // What confines the paths NO flag names: `init` resolves the
+            // settings file from `HOME` alone, and `doctor` resolves the agent
+            // directory from it whenever `--claude-dir` is absent.
+            .env("HOME", self.home())
             // The guards' switch is resolved from XDG like everything else, so
             // this is what keeps `disable` out of the real one.
             .env("XDG_CONFIG_HOME", self.root.join("xdg-config"))
