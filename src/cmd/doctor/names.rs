@@ -221,3 +221,95 @@ fn report_extra_variables(config: &Config, style: Style, out: &mut dyn Write) ->
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    // The whole-report fixtures, so every assertion here is made against the
+    // text a person actually reads rather than against a helper's return value.
+    use crate::cmd::doctor::tests::{Named, flat, loaded, report, state_of};
+    use crate::store::Registry;
+
+    /// A registry with one live backend that holds every name it is asked for.
+    fn keychain() -> Registry {
+        Registry::new(vec![Box::new(Named("keychain"))]).with_routes(
+            [
+                ("ALPHA".to_owned(), "keychain".to_owned()),
+                ("BETA".to_owned(), "keychain".to_owned()),
+            ]
+            .into_iter()
+            .collect(),
+        )
+    }
+
+    #[test]
+    fn the_second_variable_note_is_printed_once_above_the_whole_list() {
+        // The sentence explains the list under it, so it belongs once, before
+        // the first row. Printed per row it is noise; printed not at all — which
+        // is what dropping the guard actually does — the list becomes a column
+        // of `-s NAME sets $X and $Y` lines with nothing saying what they are.
+        let load = loaded(
+            r#"{"stores":{"keychain":{"enabled":true}},
+                "secrets":{"ALPHA":{"store":"keychain","var":"ALPHA_TOKEN"},
+                           "BETA":{"store":"keychain","var":"BETA_TOKEN"}}}"#,
+        );
+        let (text, _) = report(&load, keychain(), false);
+        let flat = flat(&text);
+
+        assert_eq!(
+            flat.matches("these also arrive under a second variable")
+                .count(),
+            1,
+            "the explanation belongs exactly once, above the list it explains:\n{text}"
+        );
+        // Both rows, so the count above is a count over a real list rather than
+        // over a single line that happens to carry its own sentence.
+        assert!(
+            flat.contains("-s ALPHA sets $ALPHA and $ALPHA_TOKEN"),
+            "{text}"
+        );
+        assert!(
+            flat.contains("-s BETA sets $BETA and $BETA_TOKEN"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn a_proven_name_says_which_variables_the_child_will_actually_see() {
+        // The half of a proven row that is not about the lookup. `-s ALPHA`
+        // lands in `$ALPHA` and in every variable that name's own declaration
+        // answers to, and that fact is in no other output: `ls` cannot grow a
+        // fifth field, and a run that works prints nothing. Unasserted, the tail
+        // could be deleted or replaced with anything and the report stayed
+        // green while promising the wrong variable.
+        let load = loaded(
+            r#"{"stores":{"keychain":{"enabled":true}},
+                "secrets":{"ALPHA":{"store":"keychain","var":"ALPHA_TOKEN"}}}"#,
+        );
+        let (text, code) = report(&load, keychain(), true);
+
+        assert_eq!(state_of(&text, "ALPHA"), "proven", "{text}");
+        assert!(
+            flat(&text).contains("read back from keychain, delivered as $ALPHA and $ALPHA_TOKEN"),
+            "the row must name every variable the child will be handed: {text}"
+        );
+        assert_eq!(code, 0, "{text}");
+    }
+
+    #[test]
+    fn a_name_that_answers_to_nothing_else_carries_no_delivery_tail() {
+        // The control for the case above, which would otherwise pass on a row
+        // that appends a fixed sentence to every proven name. A name with no
+        // second variable has nothing to say here, and a tail that always
+        // appears would be a promise about a variable the child never gets.
+        let load = loaded(
+            r#"{"stores":{"keychain":{"enabled":true}},
+                "secrets":{"ALPHA":{"store":"keychain"}}}"#,
+        );
+        let (text, _) = report(&load, keychain(), true);
+        assert_eq!(state_of(&text, "ALPHA"), "proven", "{text}");
+        assert!(
+            !flat(&text).contains("delivered as"),
+            "a name with no second variable was given a delivery tail: {text}"
+        );
+    }
+}

@@ -521,25 +521,58 @@ mod tests {
         }
     }
 
+    /// The everyday fixture: a current build and nothing to note.
+    ///
+    /// Fixed rather than probed. See the field docs on
+    /// [`DoctorRequest::freshness`]: these cases are about names and stores, and
+    /// a real reading here made them a test of whoever's checkout happened to be
+    /// running them.
+    ///
+    /// `Current` rather than `NoSourceTree`: no source tree renders NO BUILD
+    /// section at all, and one case here asserts the section's POSITION, so the
+    /// quiet value would have deleted the thing it measures. `Current` renders
+    /// the section and contributes no problem, which is what every case reached
+    /// through this helper needs.
     pub(super) fn report(
         load: &crate::config::ConfigLoad,
         registry: Registry,
         probe: bool,
     ) -> (String, i32) {
+        report_over(load, &registry, probe, &Freshness::Current, &[])
+    }
+
+    /// A report whose BUILD verdict and notes the case chooses.
+    ///
+    /// Both are sections [`report`] deliberately holds quiet, and two cases here
+    /// need them: one counts what the whole report adds up to, and one asserts a
+    /// heading that must never appear over nothing.
+    fn report_over(
+        load: &crate::config::ConfigLoad,
+        registry: &Registry,
+        probe: bool,
+        freshness: &Freshness,
+        notes: &[String],
+    ) -> (String, i32) {
         let paths = Paths::under(Path::new("/nonexistent/keyless-doctor"));
         let audit = AuditLog::new(PathBuf::from("/nonexistent/keyless-doctor/audit.jsonl"));
-        render(&paths, load, &registry, &audit, probe)
+        render(&paths, load, registry, &audit, probe, freshness, notes)
     }
 
     /// One report, rendered plain. `Style::PLAIN` on purpose: every assertion
     /// here is about WORDS, and a coloured render wraps each one in escapes a
     /// `contains` cannot see through.
+    ///
+    /// The checkout verdict is the one fact no case varies: `NotBehind` renders
+    /// the row and costs no problem, so a case about the arithmetic below is
+    /// counting the sections it named rather than this one.
     fn render(
         paths: &Paths,
         load: &crate::config::ConfigLoad,
         registry: &Registry,
         audit: &AuditLog,
         probe: bool,
+        freshness: &Freshness,
+        notes: &[String],
     ) -> (String, i32) {
         let mut out: Vec<u8> = Vec::new();
         let code = doctor(
@@ -549,19 +582,9 @@ mod tests {
                 registry,
                 audit,
                 setup: None,
-                notes: &[],
+                notes,
                 probe,
-                // Fixed rather than probed. See the field docs: these cases are
-                // about names and stores, and a real reading here made them a
-                // test of whoever's checkout happened to be running them.
-                //
-                // `Current` + `NotBehind` rather than `NoSourceTree` for both:
-                // no source tree renders NO BUILD section at all, and one case
-                // here asserts the section's POSITION, so the quiet value would
-                // have deleted the thing it measures. This pair renders the
-                // section and contributes no problem, which is what every case
-                // reached through this helper needs.
-                freshness: &Freshness::Current,
+                freshness,
                 checkout: &Checkout::NotBehind {
                     upstream: String::new(),
                     ahead: 0,
@@ -792,7 +815,15 @@ mod tests {
         // The control: with the log intact, this exact call is clean. Without
         // it, an assertion below would pass for a `doctor` that reports a
         // problem no matter what it is given.
-        let (intact, code) = render(&paths, &load, &registry, &audit, false);
+        let (intact, code) = render(
+            &paths,
+            &load,
+            &registry,
+            &audit,
+            false,
+            &Freshness::Current,
+            &[],
+        );
         assert!(intact.contains("chain intact"), "{intact}");
         assert_eq!(code, 0, "an intact log must not be a problem: {intact}");
 
@@ -800,7 +831,15 @@ mod tests {
         let lines: Vec<&str> = raw.lines().collect();
         std::fs::write(&log_path, format!("{}\n{}\n", lines[0], lines[1])).expect("drop the last");
 
-        let (text, code) = render(&paths, &load, &registry, &audit, false);
+        let (text, code) = render(
+            &paths,
+            &load,
+            &registry,
+            &audit,
+            false,
+            &Freshness::Current,
+            &[],
+        );
         assert!(
             text.contains("truncated or replaced"),
             "a log with its last row removed was not reported: {text}"
@@ -821,5 +860,182 @@ mod tests {
         let load = loaded(r#"{"secrets":{"DECOY":{}}}"#);
         let (text, _) = report(&load, Registry::new(vec![Box::new(Healthy)]), true);
         assert!(!text.contains('\x1b'), "a redirected report was coloured");
+    }
+
+    #[test]
+    fn the_first_line_orients_the_reader_before_any_section() {
+        // The whole header could be deleted and every other case here stayed
+        // green: not one of them read the line above the sections. It is the
+        // line that says WHICH build is talking and WHICH file it read, which is
+        // the first thing wrong when two installs disagree — a report whose rows
+        // are all correct about somebody else's config is worse than no report.
+        let load = loaded(r#"{"secrets":{"DECOY":{},"OTHER":{}}}"#);
+        let (text, _) = report(&load, Registry::new(vec![Box::new(Healthy)]), false);
+        let first = text.lines().next().expect("a report has a first line");
+
+        assert!(first.contains(crate::NAME), "{first}");
+        assert!(
+            first.contains(env!("CARGO_PKG_VERSION")),
+            "the header must name the version that is answering: {first}"
+        );
+        assert!(
+            first.contains("keyless-doctor"),
+            "the header must name the config file it read: {first}"
+        );
+        assert!(
+            first.contains("2 name(s) declared"),
+            "the header must count what it found there: {first}"
+        );
+    }
+
+    /// A store that answers, and holds nothing.
+    ///
+    /// `Healthy` resolves every name, so a case that needs a name to come back
+    /// ABSENT — which is the cheapest way to make the NAMES section contribute
+    /// exactly one problem — cannot be built from it.
+    struct Absent;
+    impl Store for Absent {
+        fn id(&self) -> &str {
+            "keychain"
+        }
+        fn resolve(&self, _name: &str) -> Result<Option<Secret>, StoreError> {
+            Ok(None)
+        }
+        fn health(&self) -> Result<(), StoreError> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn the_trailing_count_is_the_number_of_problems_above_it() {
+        // The arithmetic itself. Every `problems +=` in this report could be a
+        // `*=` or a `-=` and the suite stayed green, because the only assertions
+        // on the count were `0` and `1` — and `0` survives a multiplication
+        // while `1` is reachable from several wrong sums. So both cases below
+        // are built to total exactly TWO, from two different pairs of sections,
+        // and both the printed number and the exit code are read.
+        //
+        // The exit code as well as the line: they are computed from the same
+        // counter, and a reader who scripts around `doctor` reads only one of
+        // them.
+
+        // A broken config, which is the pair BUILD + CONFIG. `Config::load` over
+        // a directory is a real `Unusable`, so nothing here has to construct an
+        // error by hand or write a file to be cleaned up.
+        let unreadable = Config::load(&std::env::temp_dir());
+        assert!(
+            unreadable.problem.is_some(),
+            "the fixture must actually be a config problem"
+        );
+        let (text, code) = report_over(
+            &unreadable,
+            &Registry::new(vec![Box::new(Named("keychain"))]),
+            false,
+            &Freshness::Stale {
+                newest: PathBuf::from("/somewhere/src/lib.rs"),
+            },
+            &[],
+        );
+        assert!(
+            text.contains("\n2 problem(s)."),
+            "a stale build and an unreadable config are two problems: {text}"
+        );
+        assert_eq!(code, 1, "{text}");
+
+        // And the pair BUILD + NAMES, which is counted through a different
+        // return value and a different loop.
+        let declared = loaded(
+            r#"{"stores":{"keychain":{"enabled":true}},"secrets":{"MISSING":{"store":"keychain"}}}"#,
+        );
+        let registry = Registry::new(vec![Box::new(Absent)]).with_routes(
+            [("MISSING".to_owned(), "keychain".to_owned())]
+                .into_iter()
+                .collect(),
+        );
+        let (text, code) = report_over(
+            &declared,
+            &registry,
+            true,
+            &Freshness::Stale {
+                newest: PathBuf::from("/somewhere/src/lib.rs"),
+            },
+            &[],
+        );
+        assert_eq!(
+            state_of(&text, "MISSING"),
+            "absent",
+            "the fixture must actually be a missing name: {text}"
+        );
+        assert!(
+            text.contains("\n2 problem(s)."),
+            "a stale build and one absent name are two problems: {text}"
+        );
+        assert_eq!(code, 1, "{text}");
+    }
+
+    #[test]
+    fn the_setup_action_is_offered_only_when_there_is_no_config_file_at_all() {
+        // Three states, and the action belongs to exactly one of them. Offering
+        // `setup` to somebody whose config is BROKEN sends them to a command
+        // that writes a new file over the one they need to fix; withholding it
+        // from somebody who has no file at all leaves the report saying `no
+        // config file yet` and nothing about what to do.
+        let paths = Paths::under(Path::new("/nonexistent/keyless-doctor"));
+        let offer = format!("{} setup detects your stores", crate::NAME);
+
+        let absent = Config::load(&paths.config);
+        let (text, _) = report(&absent, Registry::new(vec![Box::new(Healthy)]), false);
+        assert!(text.contains("no config file yet"), "{text}");
+        assert!(
+            flat(&text).contains(&offer),
+            "a machine with no config was not told how to get one: {text}"
+        );
+
+        let present = loaded(r#"{"secrets":{"DECOY":{}}}"#);
+        let (text, _) = report(&present, Registry::new(vec![Box::new(Healthy)]), false);
+        assert!(
+            !flat(&text).contains(&offer),
+            "a config that loaded was told to go and create one: {text}"
+        );
+
+        let unreadable = Config::load(&std::env::temp_dir());
+        let (text, _) = report(&unreadable, Registry::new(vec![Box::new(Healthy)]), false);
+        assert!(
+            !flat(&text).contains(&offer),
+            "a file that exists and will not parse is fixed where it is, not \
+             overwritten by `setup`: {text}"
+        );
+    }
+
+    #[test]
+    fn the_notes_heading_is_never_printed_over_nothing() {
+        // An empty heading is not a small cosmetic fault here: every other
+        // heading in this report introduces rows, so a `NOTES` with nothing
+        // under it reads as a note that failed to render — and sends the reader
+        // looking for the missing sentence.
+        let load = loaded(r#"{"secrets":{"DECOY":{}}}"#);
+        let registry = Registry::new(vec![Box::new(Healthy)]);
+
+        let (quiet, _) = report_over(&load, &registry, false, &Freshness::Current, &[]);
+        assert!(
+            !quiet.contains("NOTES"),
+            "a report with nothing to note printed the heading anyway: {quiet}"
+        );
+
+        // The control: the same call DOES print the section when there is
+        // something to put in it, so the absence above is the absence of notes
+        // rather than of the whole feature.
+        let (spoken, _) = report_over(
+            &load,
+            &registry,
+            false,
+            &Freshness::Current,
+            &["the daemon is serving every name".to_owned()],
+        );
+        assert!(spoken.contains("NOTES"), "{spoken}");
+        assert!(
+            flat(&spoken).contains("the daemon is serving every name"),
+            "{spoken}"
+        );
     }
 }
