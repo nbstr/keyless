@@ -285,6 +285,25 @@ mod daemon {
             }
         }
 
+        // A healthy store is not a store that will be asked. With two enabled,
+        // which one answers a name is decided here and nowhere else, so the
+        // decision is printed beside them rather than left to be inferred from
+        // a run that degrades later.
+        let _ = writeln!(
+            out,
+            "routing  {} policy, default {}, {} name(s) pinned",
+            match config.stores.policy {
+                keyless::config::Policy::Explicit => "explicit",
+                keyless::config::Policy::Ordered => "ordered",
+            },
+            config.stores.default_store.as_deref().unwrap_or("unset"),
+            config
+                .secrets
+                .values()
+                .filter(|route| route.store.is_some())
+                .count()
+        );
+
         let warnings = config.warnings();
         for warning in &warnings {
             let _ = writeln!(out, "warning  {warning}");

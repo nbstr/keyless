@@ -225,7 +225,17 @@ impl Resolver {
             // decision: the client cannot fix it and must not be able to,
             // because the client is the untrusted party. The daemon's operator
             // fixes it in the daemon's config.
-            ambiguous @ Resolution::Ambiguous { .. } => Outcome::Failed(ambiguous.reason()),
+            //
+            // Which is why the sentence says WHOSE config. The registry's own
+            // wording names `"store"` and `stores.default` without saying which
+            // file they belong in, and the reader of a degraded run is holding
+            // the wrong one: their session's pins were dropped on purpose by
+            // `store::build`, so editing them changes nothing at all.
+            ambiguous @ Resolution::Ambiguous { .. } => Outcome::Failed(format!(
+                "{} — in keylessd's own config file, not this session's; \
+                 a session cannot settle which of the daemon's stores a name means",
+                ambiguous.reason()
+            )),
         }
     }
 
@@ -292,6 +302,21 @@ mod tests {
             self.calls.fetch_add(1, Ordering::SeqCst);
             std::thread::sleep(self.delay);
             Ok(self.value.map(|v| Secret::new(v.to_owned())))
+        }
+        fn health(&self) -> Result<(), StoreError> {
+            Ok(())
+        }
+    }
+
+    /// A second store, so ambiguity has two candidates to name.
+    struct Named(&'static str);
+
+    impl Store for Named {
+        fn id(&self) -> &str {
+            self.0
+        }
+        fn resolve(&self, _name: &str) -> Result<Option<Secret>, StoreError> {
+            Ok(Some(Secret::new("decoy-two".to_owned())))
         }
         fn health(&self) -> Result<(), StoreError> {
             Ok(())
@@ -472,6 +497,30 @@ mod tests {
         resolver.clear_cache();
         let _ = resolver.resolve("X");
         assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn an_ambiguous_name_says_which_config_file_can_settle_it() {
+        // The remedy has to name the daemon's file. A reader who applies it to
+        // the session's config changes nothing — `store::build` drops a
+        // session's pins whenever the daemon is enabled — and then has a
+        // config that looks correct and a run that still degrades.
+        let registry = Registry::new(vec![
+            Box::new(Counting {
+                calls: Arc::new(AtomicU64::new(0)),
+                delay: Duration::ZERO,
+                value: Some("decoy-one"),
+            }),
+            Box::new(Named("other")),
+        ]);
+        match Resolver::new(registry, Duration::ZERO).resolve("DATABASE_URL") {
+            Outcome::Failed(reason) => {
+                assert!(reason.contains("keylessd"), "{reason}");
+                assert!(reason.contains("stores.default"), "{reason}");
+                assert!(!reason.contains("decoy-"), "the reason leaked a value");
+            }
+            other => panic!("expected a failure naming the candidates, got {other:?}"),
+        }
     }
 
     #[test]

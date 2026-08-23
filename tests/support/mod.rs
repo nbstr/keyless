@@ -695,6 +695,10 @@ pub fn daemon_config(dir: &Path) -> DaemonConfig {
             ..DaemonStores::default()
         },
         names: Vec::new(),
+        // One store, so nothing needs routing. The fixtures that DO run two
+        // stores build their config from JSON instead, because an unread key
+        // is dropped in silence and a struct literal cannot show that.
+        secrets: std::collections::BTreeMap::new(),
     }
 }
 

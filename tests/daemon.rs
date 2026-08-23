@@ -21,14 +21,15 @@ use std::time::Duration;
 use keyless::State;
 use keyless::audit::AuditLog;
 use keyless::cmd::run::{Binding, RunRequest, TtyPolicy, run};
+use keyless::daemon::config::DaemonConfig;
 use keyless::store::Invocation;
 use keyless::store::Store;
 use keyless::store::daemon::DaemonStore;
 use keyless::{ipc::protocol::Request, store};
 
 use support::{
-    DECOY_VALUE, client_config, daemon_config, echoes, policy_allowing_self, scratch, start_daemon,
-    witness, witnessed, write_secrets,
+    DECOY_VALUE, client_config, daemon_config, echoes, policy_allowing_self, scratch,
+    short_socket_path, slow_store_stub, start_daemon, witness, witnessed, write_secrets,
 };
 
 #[test]
@@ -377,5 +378,201 @@ fn a_second_request_on_one_connection_is_answered() {
     }
 
     drop(running);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ---------------------------------------------------------------------------
+// Which of the daemon's own stores answers a name.
+//
+// The daemon can be told to run two stores at once, and until it could also be
+// told which one a name means, that configuration was unusable: every unpinned
+// name came back `Ambiguous`, the client degraded, and the sentence it printed
+// told the operator to add a `"store"` key and a `stores.default` key that the
+// daemon's config file had no place to put. The advice named the SESSION
+// config's keys, from the wrong side of the uid boundary.
+//
+// These fixtures parse the daemon config from JSON rather than building the
+// struct, because that is the only way to prove a key is actually read: an
+// unknown key is dropped silently by serde, which is exactly how the remedy
+// used to evaporate.
+// ---------------------------------------------------------------------------
+
+/// A value only the keychain stub can produce, so a resolution that came from
+/// the file store cannot be mistaken for one that came from the keychain.
+const KEYCHAIN_VALUE: &str = "decoy-from-the-keychain-not-the-file-8817";
+
+/// A daemon config JSON with both stores enabled. Both hold `DECOY`, under
+/// different values, so which one answered is readable from the value alone.
+///
+/// `under_stores` and `at_top_level` are extra keys, each written with its
+/// leading comma, so a fixture says only the routing it is about.
+fn two_store_daemon(dir: &std::path::Path, under_stores: &str, at_top_level: &str) -> DaemonConfig {
+    let secrets = dir.join("secrets.json");
+    write_secrets(&secrets, &[("DECOY", DECOY_VALUE)]);
+    let stub = slow_store_stub(dir, KEYCHAIN_VALUE, 0);
+    let json = format!(
+        r#"{{"socket":{socket},
+             "audit":{audit},
+             "cache_ttl_seconds":0,
+             "idle_timeout_seconds":5,
+             "stores":{{"file":{{"enabled":true,"path":{file}}},
+                        "keychain":{{"enabled":true,"binary":{binary},
+                                     "keychain":{keychain}}}{under_stores}}}
+             {at_top_level}}}"#,
+        socket = json_path(&short_socket_path(dir)),
+        audit = json_path(&dir.join("audit.jsonl")),
+        file = json_path(&secrets),
+        binary = json_path(&stub),
+        keychain = json_path(&dir.join("stub.keychain-db")),
+    );
+    serde_json::from_str(&json).unwrap_or_else(|error| panic!("{error}\n{json}"))
+}
+
+fn json_path(path: &std::path::Path) -> String {
+    serde_json::to_string(&path.display().to_string()).expect("encode a path")
+}
+
+/// Resolve `DECOY` through a real daemon and a real client, and report what
+/// the child actually received plus everything the caller was told.
+fn through_the_daemon(config: &DaemonConfig, dir: &std::path::Path) -> (State, String, String) {
+    let running = start_daemon(config, policy_allowing_self());
+    let client = client_config(running.socket(), 3_000);
+    let built = store::build(&client, &Invocation::default());
+    let marker = dir.join("marker");
+
+    let mut notes: Vec<u8> = Vec::new();
+    let outcome = run(
+        RunRequest {
+            bindings: &[Binding::parse("DECOY").expect("valid")],
+            unusable: &[],
+            argv: &witness(&marker, "DECOY", 0),
+            registry: &built.registry,
+            audit: None,
+            warnings: &[],
+            tty: TtyPolicy::Pipes,
+        },
+        &mut notes,
+    )
+    .expect("run");
+
+    drop(running);
+    (
+        outcome.state,
+        witnessed(&marker),
+        String::from_utf8_lossy(&notes).into_owned(),
+    )
+}
+
+#[test]
+fn the_daemons_own_default_store_settles_a_two_store_ambiguity() {
+    // The remedy the ambiguity message prescribes, applied where the ambiguity
+    // actually is. Without a `stores.default` the daemon can read, this is a
+    // configuration that cannot be fixed from either side of the boundary.
+    let dir = scratch("daemon-two-store-default");
+    let config = two_store_daemon(&dir, r#","default":"keychain""#, "");
+    let (state, seen, _notes) = through_the_daemon(&config, &dir);
+
+    assert_eq!(
+        state,
+        State::Injected,
+        "the declared default did not answer"
+    );
+    assert_eq!(
+        seen, KEYCHAIN_VALUE,
+        "the default named the keychain and the file store answered"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_per_name_pin_in_the_daemons_config_reaches_exactly_the_store_it_names() {
+    // The name's own pin, and it outranks a default naming the other store —
+    // the same precedence the session config has, so an operator moving a
+    // route across the boundary does not have to learn a second vocabulary.
+    let dir = scratch("daemon-two-store-pin");
+    let config = two_store_daemon(
+        &dir,
+        r#","default":"keychain""#,
+        r#","secrets":{"DECOY":{"store":"file"}}"#,
+    );
+    let (state, seen, _notes) = through_the_daemon(&config, &dir);
+
+    assert_eq!(state, State::Injected, "the pinned store did not answer");
+    assert_eq!(seen, DECOY_VALUE, "the pin lost to the default store");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_daemon_pin_naming_a_store_that_is_not_enabled_still_fails() {
+    // The negative control. Routing must not become a way to reach a store by
+    // asking nicely: a pin whose store is off resolves to nothing at all,
+    // rather than falling through to the store that is on.
+    let dir = scratch("daemon-pin-absent");
+    let secrets = dir.join("secrets.json");
+    write_secrets(&secrets, &[("DECOY", DECOY_VALUE)]);
+    let json = format!(
+        r#"{{"socket":{socket},"audit":{audit},"cache_ttl_seconds":0,
+             "idle_timeout_seconds":5,
+             "stores":{{"file":{{"enabled":true,"path":{file}}}}},
+             "secrets":{{"DECOY":{{"store":"keychain"}}}}}}"#,
+        socket = json_path(&short_socket_path(&dir)),
+        audit = json_path(&dir.join("audit.jsonl")),
+        file = json_path(&secrets),
+    );
+    let config: DaemonConfig = serde_json::from_str(&json).expect("valid daemon config");
+    let (state, seen, _notes) = through_the_daemon(&config, &dir);
+
+    assert_eq!(
+        state,
+        State::Degraded,
+        "a pin to a disabled store handed out the enabled store's value"
+    );
+    assert_eq!(seen, "<unset>", "the child received a value anyway");
+    assert!(
+        config
+            .warnings()
+            .iter()
+            .any(|w| w.contains("DECOY -> keychain")),
+        "a route to a store that is off said nothing until a session degraded: {:?}",
+        config.warnings()
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn two_stores_and_no_route_at_all_is_still_ambiguous_rather_than_guessed() {
+    // Unchanged, and deliberately so: routing gives an operator a way to say
+    // which store a name means, never a way for the daemon to decide for them.
+    let dir = scratch("daemon-two-store-unrouted");
+    let config = two_store_daemon(&dir, "", "");
+    let (state, seen, notes) = through_the_daemon(&config, &dir);
+
+    assert_eq!(state, State::Degraded);
+    assert_eq!(seen, "<unset>");
+
+    // What the session is told has to name the file that can settle it. Its
+    // own config cannot: `store::build` drops a session's pins whenever the
+    // daemon is enabled, so a reader who applies this advice where they are
+    // standing changes nothing and the run degrades exactly as before.
+    assert!(
+        notes.contains("keylessd"),
+        "the remedy did not say whose config file it belongs to: {notes}"
+    );
+    assert!(
+        !notes.contains(DECOY_VALUE) && !notes.contains(KEYCHAIN_VALUE),
+        "the degraded banner carried a value"
+    );
+
+    // And the operator is told, before a single request arrives, rather than
+    // finding out from a session's degraded banner.
+    let said = config.warnings().join(" ");
+    assert!(
+        said.contains("stores.default"),
+        "a two-store daemon with no default warned about nothing: {said}"
+    );
+
     let _ = std::fs::remove_dir_all(&dir);
 }
