@@ -189,18 +189,20 @@ static NAMING: Mutex<()> = Mutex::new(());
 /// `openpty`, and any other thread that creates a process during it hands a
 /// child a terminal it was never given.
 ///
-/// Setting the flag afterwards is measurably worth nothing. Measured 2026-08-23
-/// on macOS, one thread opening terminals and six threads spawning children
-/// that report any descriptor above stderr the kernel calls a terminal:
+/// Setting the flag afterwards is worth nothing, and that is measured rather
+/// than argued. One thread opening terminals beside several threads spawning
+/// children, each child reporting any descriptor above stderr the kernel calls
+/// a terminal:
 ///
 /// | how the pair was opened | children holding a stray terminal |
 /// |---|---|
-/// | no pty opened at all | 0 of 2400 |
-/// | `openpty`, then `fcntl(FD_CLOEXEC)` | 982 of 2400 |
-/// | born with `O_CLOEXEC` | 0 of 2400 |
+/// | no pty opened at all | none |
+/// | `openpty`, then `fcntl(FD_CLOEXEC)` | a large fraction of them |
+/// | born with `O_CLOEXEC` | none |
 ///
 /// The first row is what says the detector is not simply always answering; the
-/// second is what the `fcntl` bought.
+/// second is what the `fcntl` bought, and it is indistinguishable from never
+/// setting the flag at all. `tests/pty.rs` holds the arrangement.
 ///
 /// So the flag is part of each descriptor's creation. There is no ordering left
 /// for a future reader to preserve, which is the whole reason to spend five

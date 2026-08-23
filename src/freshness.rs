@@ -3,15 +3,14 @@
 //! # The failure this exists to catch
 //!
 //! `keyless` on a developer's `PATH` is a symlink or a copy pointing at a build
-//! directory, and nothing rebuilds it. Measured on this machine 2026-08-10:
-//! `~/.local/bin/keyless` resolved to a binary built at 23:56 the previous day
-//! while `HEAD` was 09:17 that morning, and it has been **eleven commits**
-//! behind at one point in this project's history.
-//!
-//! It is not one machine's quirk. The remote box has the same shape —
-//! `/usr/local/bin/keyless` is a symlink into
-//! `~/projects/keyless-published/target/release/` — and on the same day its
-//! binary was four commits and eleven hours behind its own checkout.
+//! directory, and nothing rebuilds it. Staleness there is not an accident that
+//! befalls an unlucky install; it is what the arrangement produces by default.
+//! A build directory changes only when somebody runs `cargo build`, and nothing
+//! about invoking `keyless` runs one — so the binary reached through `PATH` is
+//! as old as the last build, however many commits ago that was, while the
+//! checkout beside it keeps moving. A developer install under a home directory
+//! and a system-wide one under `/usr/local/bin` have exactly the same shape,
+//! so neither is the safer of the two.
 //!
 //! Nothing about that looks wrong. The binary runs, answers, and reports its
 //! own health as fine — about code nobody is reading. The specific harm is not
@@ -22,8 +21,8 @@
 //!
 //! # A symlink is not the problem, and replacing it with a copy is not the fix
 //!
-//! Both machines point `PATH` at a build directory through a symlink, which is
-//! the SHORTER staleness window of the two available: it follows every
+//! Pointing `PATH` at a build directory through a symlink is the SHORTER
+//! staleness window of the two available: it follows every
 //! `cargo build --release`, where a copy is frozen at install time and moves
 //! only when somebody re-installs. The check below covers both, because
 //! [`std::env::current_exe`] resolves the link and reads the mtime of whatever
@@ -64,10 +63,10 @@
 //!
 //! - **Whether that source tree is itself current.** This is the big one, and
 //!   it is not a corner case: a checkout six commits behind builds a binary
-//!   that is `Current` by this rule, because the source WAS the source. The
-//!   remote box printed `build proven` for exactly that on 2026-08-10, over a
-//!   binary carrying a false green fixed six commits earlier. [`crate::checkout`]
-//!   is the other half and it answers only that question — the two are
+//!   that is `Current` by this rule, because the source WAS the source — and
+//!   `keyless doctor` prints `build proven` over it, correctly by its own
+//!   logic, while the program is missing every fix in those commits.
+//!   [`crate::checkout`] is the other half and it answers only that question — the two are
 //!   independent, and neither subsumes the other: an uncommitted edit moves an
 //!   mtime and moves no ref.
 //! - **A copy whose mtime was reset.** `install -p` preserves the build time;
@@ -78,11 +77,11 @@
 //! - **Which commit this is.** It reports that the binary is behind the tree, not
 //!   by how much. `git log` answers that and this does not try to.
 //! - **A second checkout.** It compares against the tree this binary was BUILT
-//!   from, which is the only tree it can name. The remote box holds two clones
-//!   and the one on `PATH` is built from `keyless-published`; work landing in
-//!   the sibling clone is invisible here, and would be invisible to an embedded
-//!   git sha for exactly the same reason. Nothing inside a binary can know about
-//!   a directory it was never compiled in.
+//!   from, which is the only tree it can name. Where two clones of this
+//!   repository sit side by side and only one of them built what is on `PATH`,
+//!   work landing in the sibling is invisible here — and would be invisible to
+//!   an embedded git sha for exactly the same reason. Nothing inside a binary
+//!   can know about a directory it was never compiled in.
 //! - **A machine with no source tree.** A binary installed from a release has
 //!   nothing to compare against, and this reports nothing at all rather than
 //!   inventing a verdict. Absence of a source tree is not a finding.

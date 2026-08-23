@@ -8,10 +8,11 @@
 //! WAS the source: nothing under `src/` is newer than the artefact, so cargo
 //! would not rebuild and the BUILD row is right to say so.
 //!
-//! Measured on the remote box, 2026-08-10. The checkout sat at `81e7569` while
-//! `master` was six commits ahead. The binary was built from `81e7569`, so no
-//! source file was newer than it, and `keyless doctor` printed `build proven`
-//! with exit code 0 — correctly, by its own logic. That binary contained the
+//! That is not a hypothetical, and this module exists because it happened. A
+//! checkout sat six commits behind `master`; the binary was built from it, so
+//! no source file was newer than the artefact, and `keyless doctor` printed
+//! `build proven` with exit code 0 — correctly, by its own logic. That binary
+//! contained the
 //! `probe_command` defect fixed in `3497ee1`, in which `doctor --probe`
 //! reported names as `proven — read back from infisical` while reading the
 //! caller's own exported environment and the store held nothing. A false green
@@ -74,9 +75,9 @@
 //!
 //! # Two clones on one machine
 //!
-//! The remote box holds `~/projects/keyless` and `~/projects/keyless-published`
-//! — identical in remote, branch and upstream, unlinked, and only the
-//! `/usr/local/bin/keyless` symlink names the second. This asks about
+//! Two clones of this repository can sit side by side — identical in remote,
+//! branch and upstream, unlinked — with only the installed symlink naming which
+//! of them built the binary on `PATH`. This asks about
 //! [`crate::freshness::source_dir`], the tree that BUILT the running binary,
 //! and never about the process's working directory. Work sitting in the
 //! sibling clone is invisible here and should be: the sibling did not build

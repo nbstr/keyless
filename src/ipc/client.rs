@@ -221,13 +221,13 @@ mod tests {
     /// into `Timeout`, and a case named for `Unreachable` goes red having found
     /// nothing whatever wrong with the code.
     ///
-    /// Measured 2026-08-09 on macOS, 14 cores, timing exactly that work — spawn,
-    /// failing connect, channel send — over 400 samples: **0.06 ms** worst idle,
-    /// and **16.89 ms** worst with 200 spinners and 48 fork-storms running, none
-    /// over 200 ms. So CPU contention alone does not explain it; the one red
-    /// observed came while the machine was under CRITICAL MEMORY pressure, a
-    /// regime spinners do not reproduce and one nobody should reproduce
-    /// deliberately on a shared machine.
+    /// That work — spawn, failing connect, channel send — is timed rather than
+    /// guessed at: it costs a small fraction of a millisecond on an idle
+    /// machine, and stays in the low tens of milliseconds with CPU spinners and
+    /// fork-storms saturating every core. Orders of magnitude under any bound
+    /// worth writing here. So CPU contention alone does not explain a red; what
+    /// does is CRITICAL MEMORY pressure, a regime spinners do not reproduce and
+    /// one nobody should reproduce deliberately on a shared machine.
     ///
     /// Twenty seconds is the floor `tests/suite_hygiene.rs` sets for a ceiling on
     /// work that must answer. It is still a bound, which is the half the name

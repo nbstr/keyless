@@ -245,9 +245,9 @@ impl KeychainStore {
     /// 🚨 **This is not politeness, it is the guard against a GUI dialog.** With
     /// `HOME` pointed at a directory holding no keychain, macOS cannot resolve a
     /// default keychain and the Security framework puts a MODAL window on the
-    /// user's screen — one whose buttons include **Reset To Defaults**. That
-    /// happened during a cold-start test on this machine, from a command nobody
-    /// thought could do anything but print.
+    /// user's screen — one whose buttons include **Reset To Defaults**. That is
+    /// what a cold start produces, from a command nobody thought could do
+    /// anything but print.
     ///
     /// A `stat` cannot open a window. So the check is a filesystem test that
     /// runs BEFORE any process exists, and the report degrades to "not set up"
