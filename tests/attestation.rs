@@ -34,24 +34,14 @@ use keyless::ipc::ffi::{live_code_hash, live_process};
 use keyless::ipc::peer::code_hash_of_file;
 
 use support::{
-    DECOY_VALUE, daemon_config, example_binary, own_identity, policy_allowing_self, scratch,
-    start_daemon, write_secrets,
+    DECOY_VALUE, daemon_config, example_binary, install_executable_copy, own_identity,
+    policy_allowing_self, scratch, start_daemon, write_secrets,
 };
 
 /// The SHA-256 of the decoy, which is what an authorised peer reports instead
 /// of the value itself.
 fn decoy_digest() -> String {
     keyless::mask::encodings::hex_lower(&keyless::audit::sha256::digest(DECOY_VALUE.as_bytes()))
-}
-
-/// Copy a binary, preserving the mode so it stays executable.
-fn install(from: &Path, to: &Path) {
-    std::fs::copy(from, to).expect("copy the peer");
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(to, std::fs::Permissions::from_mode(0o755)).expect("chmod");
-    }
 }
 
 /// Run a peer to completion and return its stdout line.
@@ -89,8 +79,8 @@ fn swap_attack(tag: &str, pinned: &str) -> String {
 
     let victim = dir.join("victim");
     let staged = dir.join("staged");
-    install(&alpha, &victim);
-    install(&beta, &staged);
+    install_executable_copy(&alpha, &victim);
+    install_executable_copy(&beta, &staged);
 
     let pinned_hash = match pinned {
         "alpha" => code_hash_of_file(&victim).expect("alpha is signed"),

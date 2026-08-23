@@ -41,7 +41,7 @@ mod support;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
-use support::scratch;
+use support::{install_executable, scratch};
 
 const BIN: &str = env!("CARGO_BIN_EXE_keyless");
 
@@ -71,15 +71,7 @@ const PATH_SUFFIX: &str = "/keyless-fixture-no-such-directory-C3";
 const PATH_FROM_THE_STORE: &str = "/keyless-fixture-the-store-said-this-D4";
 
 fn write_stub(dir: &Path, name: &str, body: &str) -> PathBuf {
-    let path = dir.join(name);
-    std::fs::write(&path, body).expect("cannot write the stand-in");
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
-            .expect("cannot chmod the stand-in");
-    }
-    path
+    install_executable(&dir.join(name), body)
 }
 
 /// The prologue every stand-in shares.

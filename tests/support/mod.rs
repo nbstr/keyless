@@ -25,6 +25,14 @@ mod short_socket;
 #[allow(unused_imports)]
 pub use short_socket::short_socket_path;
 
+/// Creating a file a case is going to execute. Its own file for the same reason
+/// as the two above: `tests/` builds executables in several binaries, and the
+/// shape it replaces — write it, then `chmod` it — is the one anybody writes
+/// from memory, so a second copy would drift straight back into it.
+mod executable;
+#[allow(unused_imports)]
+pub use executable::{install_executable, install_executable_copy};
+
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
@@ -129,10 +137,7 @@ pub fn stub_security(dir: &Path, behaviour: &Stub) -> PathBuf {
         }
     };
 
-    let path = dir.join("security-stub");
-    std::fs::write(&path, body).expect("cannot write the security stub");
-    make_executable(&path);
-    path
+    install_executable(&dir.join("security-stub"), &body)
 }
 
 /// How a fake network-backed CLI should behave.
@@ -460,22 +465,7 @@ pub fn recorded(path: &Path) -> String {
 }
 
 fn write_stub(dir: &Path, name: &str, body: &str) -> PathBuf {
-    let path = dir.join(name);
-    std::fs::write(&path, body).unwrap_or_else(|error| panic!("cannot write {name}: {error}"));
-    make_executable(&path);
-    path
-}
-
-fn make_executable(path: &Path) {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mut perms = std::fs::metadata(path)
-            .expect("cannot stat the stub")
-            .permissions();
-        perms.set_mode(0o755);
-        std::fs::set_permissions(path, perms).expect("cannot chmod the stub");
-    }
+    install_executable(&dir.join(name), body)
 }
 
 /// A child command that proves it ran.
@@ -805,12 +795,5 @@ pub fn slow_store_stub(dir: &Path, value: &str, millis: u64) -> PathBuf {
          esac\n\
          exit 1\n"
     );
-    let path = dir.join("security-slow");
-    std::fs::write(&path, body).expect("cannot write the slow stub");
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
-    }
-    path
+    install_executable(&dir.join("security-slow"), &body)
 }

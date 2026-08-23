@@ -31,7 +31,6 @@
 mod support;
 
 use std::ffi::OsString;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -42,8 +41,9 @@ use keyless::store::{self, Invocation, Registry};
 
 use support::{
     Backend, CONCEALED, INFISICAL_DECOY, Listing, NEIGHBOUR_KEY, PROTON_DECOY, SCOPED_SESSION_DIR,
-    listing_count, recorded, recorded_lines, run_with, scratch, stub_infisical, stub_pass_cli,
-    stub_pass_cli_discovery, stub_pass_cli_listing, witness, witness_env, witnessed, witnessed_env,
+    install_executable, listing_count, recorded, recorded_lines, run_with, scratch, stub_infisical,
+    stub_pass_cli, stub_pass_cli_discovery, stub_pass_cli_listing, witness, witness_env, witnessed,
+    witnessed_env,
 };
 
 /// Whether `argv` carries `flag`, in either of the two spellings clap accepts.
@@ -986,7 +986,6 @@ fn several_names_from_one_vault_cost_exactly_one_listing() {
 fn stub_pass_cli_trashed_after_first_listing(dir: &Path) -> PathBuf {
     let delegate = stub_pass_cli_listing(dir, &Backend::Injects(PROTON_DECOY), &Listing::EMPTY);
     let listed_once = dir.join("pass-cli.listed-once");
-    let path = dir.join("pass-cli-trashing-stub");
     let body = format!(
         "#!/bin/sh\n\
          if [ \"$1\" = 'item' ] && [ \"$2\" = 'list' ]; then\n\
@@ -1006,13 +1005,7 @@ fn stub_pass_cli_trashed_after_first_listing(dir: &Path) -> PathBuf {
         live = ONE_LIVE_ITEM,
         delegate = delegate.display(),
     );
-    std::fs::write(&path, body).expect("cannot write the trashing stub");
-    let mut mode = std::fs::metadata(&path)
-        .expect("cannot stat the trashing stub")
-        .permissions();
-    mode.set_mode(0o755);
-    std::fs::set_permissions(&path, mode).expect("cannot chmod the trashing stub");
-    path
+    install_executable(&dir.join("pass-cli-trashing-stub"), &body)
 }
 
 #[test]
