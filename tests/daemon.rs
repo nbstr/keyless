@@ -609,7 +609,7 @@ fn two_stores_and_no_route_at_all_is_still_ambiguous_rather_than_guessed() {
 // ---------------------------------------------------------------------------
 // A name nobody declared.
 //
-// `6291dee` taught the SESSION path to say `not declared in your config` where
+// `12a3896` taught the SESSION path to say `not declared in your config` where
 // it used to say `not found in any store`, and that reads like an ordering: ask
 // the config first, refuse, never touch a store. It is not one. That commit
 // changed a SENTENCE. The store is asked either way, on both paths, at the same

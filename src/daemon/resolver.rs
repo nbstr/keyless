@@ -223,7 +223,7 @@ impl Resolver {
             // under the coordinate its adapter derived from the name, and did
             // not have it. A session resolving the same undeclared name does
             // exactly the same thing and differs only in the sentence printed
-            // afterwards — `6291dee` changed that sentence, never the ordering,
+            // afterwards — `12a3896` changed that sentence, never the ordering,
             // which is why there is no refusal on the session side for this one
             // to be missing. `tests/daemon.rs` holds that down by watching the
             // store be asked, because it is not readable from here.

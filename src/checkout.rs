@@ -13,7 +13,7 @@
 //! no source file was newer than the artefact, and `keyless doctor` printed
 //! `build proven` with exit code 0 — correctly, by its own logic. That binary
 //! contained the
-//! `probe_command` defect fixed in `3497ee1`, in which `doctor --probe`
+//! `probe_command` defect fixed in `8550644`, in which `doctor --probe`
 //! reported names as `proven — read back from infisical` while reading the
 //! caller's own exported environment and the store held nothing. A false green
 //! certified by a green row.

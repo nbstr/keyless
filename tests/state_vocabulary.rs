@@ -26,7 +26,7 @@
 //! exists to exclude, and a green `+` printed beside the word that denies it
 //! passes it too.
 //!
-//! Measured on this tree before `8dc557b`: rewriting every `proven` the crate
+//! Measured on this tree before `b3e641b`: rewriting every `proven` the crate
 //! renders to `unproven` — 29 sites — left the whole suite green. Suffixing any
 //! word in the vocabulary, one word at a time, left it green as well: a
 //! `contains` check cannot see a boundary at either end, so `blockedX` satisfies
@@ -42,7 +42,7 @@
 //! That mutation is the negative control for this whole file, and it is cheap to
 //! re-run: give `status::row` a `let state = format!("{state}X");` and every
 //! state word in the report gains a suffix at once. Measured on this tree,
-//! **20 tests go red**. On the tree before `8dc557b`, none did.
+//! **20 tests go red**. On the tree before `b3e641b`, none did.
 //!
 //! Run it as `cargo test --no-fail-fast`. Without that flag the run stops at the
 //! first target that fails and reports a fraction of the count — nine, on this
@@ -52,7 +52,7 @@
 //!
 //! # Why a gate rather than a sweep
 //!
-//! The sweep happened: `8dc557b` tightened ten assertions by hand. It closed the
+//! The sweep happened: `b3e641b` tightened ten assertions by hand. It closed the
 //! instances and not the class — this scanner, run over the tree that commit
 //! produced, found ten more it had missed: six in `tests/` across four files,
 //! and four in the `#[cfg(test)]` modules under `src/cmd/doctor`. A sweep finds
@@ -149,7 +149,7 @@
 //! condition IS zero flags. So
 //! `the_scanner_flags_a_substring_check_and_spares_the_forms_that_are_safe` runs
 //! it against two fixtures written into this file: one that violates the rule in
-//! both of the shapes `8dc557b` had to fix, and one holding every safe form the
+//! both of the shapes `b3e641b` had to fix, and one holding every safe form the
 //! suite writes, including the negations and a doc comment that quotes the
 //! defect verbatim. Breaking the scanner reds that test before it can bless
 //! anything, and the corpus scan carries floors of its own for the same reason.
@@ -391,7 +391,7 @@ fn no_assertion_reads_a_state_word_as_a_substring() {
     );
 }
 
-/// Two violations, in the two shapes `8dc557b` had to fix by hand.
+/// Two violations, in the two shapes `b3e641b` had to fix by hand.
 const VIOLATING_FIXTURE: &str = r#"
 #[test]
 fn probe_reports_presence_and_never_a_value() {
