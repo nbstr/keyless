@@ -297,6 +297,13 @@ head_now=$(git rev-parse --short HEAD)
 remote_url=$(git remote get-url origin 2>/dev/null || echo "")
 bundle="$(cd .. && pwd)/keyless-pre-scrub-${head_now}.bundle"
 
+# What origin holds, read NOW, while it is still readable. `git filter-repo`
+# deletes every `refs/remotes/origin/*` as part of the rewrite, so after it runs
+# there is nothing left in this repository that remembers what was published --
+# and both instructions printed at the end need that value. Empty when there is
+# no such ref, and every use below tests for that rather than assuming it.
+origin_sha=$(git rev-parse --verify --quiet "refs/remotes/origin/${branch}" || echo "")
+
 # The table, in the environment, for every python step below. Exported once
 # because python is the only thing here that quotes a python literal correctly.
 i=0
@@ -482,37 +489,89 @@ fi
 # the worktree stays usable and the stash still pops, so neither earns a refusal
 # here.
 #
-# One is not covered, and what it guards is a promise this script PRINTS. The
-# undo at the end offers `git reset --hard origin/<branch>` as the convenient
-# alternative to the bundle, and that is an undo only while origin still holds
-# this history. On a branch ahead of its remote it succeeds, reports success,
-# and silently discards every commit origin never saw -- including, the first
-# time anyone runs this, the commit that fixed this script.
+# One is not covered, and what it guards is a promise this script PRINTS. Two of
+# the instructions at the end name origin, and both are read AFTER the rewrite
+# has deleted every `refs/remotes/origin/*`. Neither survives in its habitual
+# form, and each fails in a different direction.
 #
-# So the answer is not to refuse the rewrite. The rewrite is fine either way,
-# because the bundle holds every ref. The answer is to stop printing an
-# instruction that is wrong here: the shortcut is emitted only when origin
-# really does hold what is about to be rewritten, and the reader is told why it
-# is missing when it is. A warning beside a wrong command is not a fix; removing
-# the command is.
+# THE PUBLISH, which fails LOUDLY and therefore only wastes a run.
+# `git push --force-with-lease origin <branch>` with no expected value takes its
+# lease from the remote-tracking ref -- the one filter-repo has just deleted.
+# With nothing to lease against every first push is rejected for `stale info`,
+# and the recovery anyone reaches for is `git fetch origin`, which re-derives the
+# lease from whatever origin holds AT THAT MOMENT. That lease cannot refuse
+# anything: it is measured after the fact, so a push somebody else landed during
+# this run sits INSIDE the baseline instead of being caught by it. git's own
+# manual says so -- the bare form is "trivially defeated" by a background fetch,
+# and naming the value explicitly is the mitigation it prescribes.
+#
+# So the sha origin held before the rewrite is captured above, while it is still
+# readable, and named in the lease. `--force-with-lease=<refname>:<expect>`
+# needs no remote-tracking ref -- "we do not even have to have such a
+# remote-tracking branch when this form is used" -- which is what makes it run
+# at the moment it is printed, and it means one thing exactly: overwrite only if
+# origin is still the history this run measured and rewrote.
+#
+# What that lease does NOT do, because a guarded-looking command that guards
+# nothing is the failure this script exists to refuse. It says nothing about
+# whether the rewrite was correct. It protects this one ref and no other. And it
+# is not a backup: the commits it overwrites survive in the bundle and nowhere
+# else. With no origin ref to read, there is no lease to take, and the plain
+# `--force` is printed with that reason rather than a lease decided by a value
+# fetched after the fact.
+#
+# THE UNDO SHORTCUT, which fails SILENTLY and is therefore the dangerous one.
+# `git reset --hard origin/<branch>` is an undo only in the window between this
+# script finishing and the push landing. Run after the push it resets onto the
+# history that was just published: it succeeds, it reports success, and it
+# leaves the scrub in place -- the same shape as the backup ref this script
+# refuses to write, except that here the command which closes the window is
+# printed three lines above it. Naming the sha instead makes the window enforce
+# itself. While origin still holds the old history the fetch brings that object
+# back and the reset lands on it; once origin has been overwritten the object is
+# not there to resolve and the command fails outright rather than quietly
+# restoring the scrub.
+#
+# The `ahead` check stays, and it guards a different hazard that naming the sha
+# does not touch: on a branch ahead of its remote, resetting to what origin held
+# discards every commit origin never saw -- including, the first time anyone
+# runs this, the commit that fixed this script. That sha resolves, so the reset
+# would succeed. The shortcut is withheld entirely there, and the reader is told
+# why. A warning beside a wrong command is not a fix; removing the command is.
 origin_undo=""
-if [ -n "$remote_url" ] && git rev-parse --verify --quiet "refs/remotes/origin/${branch}" > /dev/null; then
+if [ -n "$remote_url" ] && [ -n "$origin_sha" ]; then
   ahead=$(git rev-list --count "refs/remotes/origin/${branch}..HEAD")
   # Defaulted to 1, not 0. If the count could not be read, the honest answer is
   # that origin is not known to hold this history, and the shortcut is withheld.
   # An undo printed on a guess is the failure this whole block exists to remove.
   if [ "${ahead:-1}" -eq 0 ]; then
-    origin_undo=$'\n             or, while origin still holds the old history:\n             git fetch origin && git reset --hard origin/'"${branch}"
+    origin_undo=$'\n             or, while origin still holds the old history -- and it says so by\n             failing rather than by succeeding once origin no longer does:\n             git fetch origin && git reset --hard '"${origin_sha}"
   else
     echo "${red}note: ${branch} is ${ahead} commit(s) ahead of origin/${branch}.${off}"
     echo "${dim}  The bundle below is the ONLY undo for this run. The usual"
-    echo "  'git reset --hard origin/${branch}' shortcut is not printed at the end,"
-    echo "  because running it would discard those ${ahead} commit(s) as well as"
-    echo "  the rewrite.${off}"
+    echo "  reset-to-what-origin-held shortcut is not printed at the end, because"
+    echo "  running it would discard those ${ahead} commit(s) as well as the"
+    echo "  rewrite.${off}"
   fi
 else
   echo "${dim}note: no origin/${branch} to fall back on. The bundle below is the"
   echo "  only undo for this run.${off}"
+fi
+
+# The publish line, decided here for the same reason: `origin_sha` is readable
+# now and gone by the time it is printed.
+if [ -z "$remote_url" ]; then
+  publish_block="  Publish    there is no origin remote, so there is nothing to publish to."
+elif [ -n "$origin_sha" ]; then
+  publish_block="  Publish    git push --force-with-lease=refs/heads/${branch}:${origin_sha} origin ${branch}
+             the lease is the sha origin held before this run: the push lands
+             only if nobody else has moved ${branch} since."
+else
+  publish_block="  Publish    git push --force origin ${branch}
+             there was no origin/${branch} to read before the rewrite, so there
+             is no value to lease against and this overwrites whatever origin
+             holds. A lease taken from a fetch after the fact would guard
+             nothing, so none is offered."
 fi
 
 # ---- the safety net, which has to survive the rewrite --------------------
@@ -756,7 +815,7 @@ cat <<EOF
 ${grn}Done, locally.${off} Nothing has been pushed.
 
   Review     git log --oneline | head
-  Publish    git push --force-with-lease origin ${branch}
+${publish_block}
 
   Undo       git fetch "${bundle}" 'refs/heads/${branch}:refs/restore/${branch}' \\
                && git reset --hard refs/restore/${branch}
