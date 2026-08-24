@@ -23,6 +23,27 @@
 # deleted, and the undo printed at the end is one that was tested by running it.
 #
 # ---------------------------------------------------------------------------
+# This script is not interactive and `git filter-repo` is
+# ---------------------------------------------------------------------------
+#
+# Every run of filter-repo leaves `.git/filter-repo/`, and a later run that
+# finds it does one of two things WITHOUT being asked to: under a day old, it
+# silently treats the new run as a CONTINUATION of the old one; older than that,
+# it stops and prompts on stdin. There is no terminal here, so the prompt is an
+# `EOFError` traceback out of filter-repo's sanity check -- which is how a real
+# run of this script died, after the bundle was written and the stale backup
+# refs were dropped.
+#
+# `--force` does not cover it. It is passed below, it was passed then, and the
+# prompt fired anyway: the Already-Ran branch runs before `--force` is consulted
+# and is not guarded by it.
+#
+# The traceback was the SAFE half of that behaviour. It refused, at the sanity
+# check, before a ref had moved. The continuation is the dangerous half, and it
+# exits 0 -- see the note above the rewrite for what it does to the commit map
+# and therefore to the citation repair below.
+#
+# ---------------------------------------------------------------------------
 # What it changes, and what it repairs
 # ---------------------------------------------------------------------------
 #
@@ -442,6 +463,55 @@ if [ "$APPLY" -eq 0 ]; then
   exit 0
 fi
 
+# ---- the one check `--force` waives that this script still needs ----------
+#
+# `--force` on the rewrite below is not optional. filter-repo refuses any
+# repository that does not look freshly cloned, and this one has its own
+# history, more than one pack and hundreds of loose objects. But `--force`
+# waives the WHOLE sanity check -- a dozen separate refusals -- not the one
+# standing in the way, so each of them has to be accounted for here rather than
+# dropped quietly.
+#
+# Most are already covered or turned out not to be hazards. The dirty-tree,
+# untracked-file and staged-change refusals are subsumed by the
+# `git status --porcelain` check above, which is stricter and fires earlier.
+# The freshly-packed, one-remote and single-reflog-entry refusals are the
+# fresh-clone heuristic itself, which is exactly what `--force` exists to waive.
+# A second worktree and a stash were both checked by running the rewrite with
+# each present: filter-repo maps them onto the new history like any other ref,
+# the worktree stays usable and the stash still pops, so neither earns a refusal
+# here.
+#
+# One is not covered, and what it guards is a promise this script PRINTS. The
+# undo at the end offers `git reset --hard origin/<branch>` as the convenient
+# alternative to the bundle, and that is an undo only while origin still holds
+# this history. On a branch ahead of its remote it succeeds, reports success,
+# and silently discards every commit origin never saw -- including, the first
+# time anyone runs this, the commit that fixed this script.
+#
+# So the answer is not to refuse the rewrite. The rewrite is fine either way,
+# because the bundle holds every ref. The answer is to stop printing an
+# instruction that is wrong here: the shortcut is emitted only when origin
+# really does hold what is about to be rewritten, and the reader is told why it
+# is missing when it is. A warning beside a wrong command is not a fix; removing
+# the command is.
+origin_undo=""
+if [ -n "$remote_url" ] && git rev-parse --verify --quiet "refs/remotes/origin/${branch}" > /dev/null; then
+  ahead=$(git rev-list --count "refs/remotes/origin/${branch}..HEAD")
+  if [ "" -eq 0 ]; then
+    origin_undo=$'\n             or, while origin still holds the old history:\n             git fetch origin && git reset --hard origin/'"${branch}"
+  else
+    echo "${red}note: ${branch} is ${ahead} commit(s) ahead of origin/${branch}.${off}"
+    echo "${dim}  The bundle below is the ONLY undo for this run. The usual"
+    echo "  'git reset --hard origin/${branch}' shortcut is not printed at the end,"
+    echo "  because running it would discard those ${ahead} commit(s) as well as"
+    echo "  the rewrite.${off}"
+  fi
+else
+  echo "${dim}note: no origin/${branch} to fall back on. The bundle below is the"
+  echo "  only undo for this run.${off}"
+fi
+
 # ---- the safety net, which has to survive the rewrite --------------------
 #
 # Deleted first. A stale bundle from an earlier run is a file that makes a
@@ -515,10 +585,50 @@ compile(src, "<callback>", "exec")
   exit 1
 }
 
-git filter-repo --force --message-callback "$callback" || {
+# FRESH, never a continuation -- and the difference is silent, so it is decided
+# here rather than left to filter-repo's own default.
+#
+# `.git/filter-repo/already_ran` is left by every earlier run. Finding it,
+# filter-repo either prompts (an EOFError here) or, when it is under a day old,
+# treats this run as a CONTINUATION without asking. A continuation COMPOSES the
+# stored map with this run's, so `commit-map` comes back keyed by the hashes
+# history had before the EARLIER run.
+#
+# Nothing downstream speaks those hashes. The citations in tracked files and the
+# shas in `KNOWN_UNSCRUBBED` all name commits in the history that is here now.
+# The repair below looks each cited hash up as a KEY of the map, and under a
+# continuation there is no such key, so it `continue`s: no repair printed, exit
+# 0, and a citation left resolving to nothing in published history. Measured by
+# replaying this repository's own filter-repo state into a clone: 97 of the 124
+# map keys named objects the repository did not contain, and the hash cited in
+# `src/checkout.rs` was not a key at all.
+#
+# Removing the file is precisely what filter-repo does when a human answers N --
+# `os.remove(ran_path)`, and nothing else. The other metadata files stay: a
+# fresh run opens each of them 'bw' and rewrites it, so no part of the old map
+# can reach the repair step.
+ran=.git/filter-repo/already_ran
+if [ -f "$ran" ]; then
+  echo "${dim}dropping ${ran}: this is a fresh rewrite of the history that is"
+  echo "  here, not a continuation of an earlier one.${off}"
+  rm -f "$ran" || {
+    echo "${red}could not remove ${ran}. Nothing has been rewritten.${off}" >&2
+    exit 1
+  }
+fi
+
+# stdin closed on purpose. Every prompt filter-repo can reach is a hang in a
+# script with no terminal; with no stdin they fail fast instead. The only other
+# prompt in this version needs --sensitive-data-removal, which is never passed
+# here, so with `already_ran` gone there is no reachable prompt left at all.
+git filter-repo --force --message-callback "$callback" < /dev/null || {
   echo "${red}filter-repo failed. Restore with the bundle:${off}" >&2
   echo "    git fetch \"${bundle}\" 'refs/heads/${branch}:refs/restore/${branch}'" >&2
   echo "    git reset --hard refs/restore/${branch}" >&2
+  echo "${dim}    The bundle is kept rather than cleaned up: a failure here can land" >&2
+  echo "    either side of the first ref moving, and it is the only copy of the" >&2
+  echo "    refs/backup/* entries dropped above. It is spent once ${head_now} is no" >&2
+  echo "    longer this repository's HEAD.${off}" >&2
   exit 1
 }
 
@@ -647,10 +757,7 @@ ${grn}Done, locally.${off} Nothing has been pushed.
 
   Undo       git fetch "${bundle}" 'refs/heads/${branch}:refs/restore/${branch}' \\
                && git reset --hard refs/restore/${branch}
-
-             or, while origin still holds the old history:
-             git fetch origin && git reset --hard origin/${branch}
-
+${origin_undo}
 There is deliberately NO backup ref to reset onto. filter-repo rewrites
 refs/backup/* along with everything else, so one would name a commit in the
 NEW history and undo nothing while appearing to work.
