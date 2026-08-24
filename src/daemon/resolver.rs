@@ -207,9 +207,26 @@ impl Resolver {
         self.upstream_calls.fetch_add(1, Ordering::Relaxed);
         match self.registry.resolve(name) {
             Resolution::Found { secret, .. } => Outcome::Found(Arc::new(secret)),
-            // Both shapes of absence collapse here on purpose: `Absent` carries
-            // no text, and the client renders the reason from ITS config, which
-            // is the one a client's `-s NAME` was spelled against.
+            // One shape of absence arrives here, not two, and the wildcard is
+            // what records that rather than a collapse of two live cases:
+            // [`crate::daemon::config::DaemonConfig::registry`] never calls
+            // [`Registry::with_declared_names`], so `undeclared` is false on
+            // this side always.
+            //
+            // That is not an omission. The daemon has no declared population to
+            // check a name against — `names` is the allowlist for the `names`
+            // verb, `secrets` is routing read only for its `store` key — so what
+            // the daemon serves is whatever its store holds, and asking the
+            // store is how it finds out.
+            //
+            // Which makes `Absent` the accurate word here: a store was asked,
+            // under the coordinate its adapter derived from the name, and did
+            // not have it. A session resolving the same undeclared name does
+            // exactly the same thing and differs only in the sentence printed
+            // afterwards — `6291dee` changed that sentence, never the ordering,
+            // which is why there is no refusal on the session side for this one
+            // to be missing. `tests/daemon.rs` holds that down by watching the
+            // store be asked, because it is not readable from here.
             Resolution::NotFound { .. } => Outcome::Absent,
             Resolution::Failed(errors) => Outcome::Failed(
                 errors

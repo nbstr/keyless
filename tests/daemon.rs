@@ -14,6 +14,7 @@
 
 mod support;
 
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::Barrier;
 use std::time::Duration;
@@ -601,6 +602,131 @@ fn two_stores_and_no_route_at_all_is_still_ambiguous_rather_than_guessed() {
         said.contains("stores.default"),
         "a two-store daemon with no default warned about nothing: {said}"
     );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ---------------------------------------------------------------------------
+// A name nobody declared.
+//
+// `6291dee` taught the SESSION path to say `not declared in your config` where
+// it used to say `not found in any store`, and that reads like an ordering: ask
+// the config first, refuse, never touch a store. It is not one. That commit
+// changed a SENTENCE. The store is asked either way, on both paths, at the same
+// coordinate — the adapter derives an undeclared name's account from the name
+// itself — and the sentence it produced says so out loud: `no store had one
+// under the name itself`.
+//
+// So the daemon has nothing to be brought into line with, and its `absent` row
+// is the accurate one: a store WAS asked and did not have it. The reason that
+// took an experiment to establish rather than a read is that nothing in the
+// tree could be pointed at. This is the thing to point at.
+//
+// It is also why the daemon cannot refuse an undeclared name even if it wanted
+// to: it has no declared population to check one against. `DaemonConfig::names`
+// is the allowlist for the `names` VERB — what the daemon will admit to
+// knowing, opt-in because enumeration is a leak — and `DaemonConfig::secrets`
+// is routing, read only for its `store` key and needed only when more than one
+// store is configured. The installer writes neither. What the daemon serves is
+// whatever its store holds, and asking the store is how it finds out.
+// ---------------------------------------------------------------------------
+
+/// A `security` stand-in that records the account it was asked for.
+///
+/// Recording the ACCOUNT rather than the whole command line is the point: the
+/// account is the coordinate the adapter derived, and derived-from-the-name is
+/// the property under test.
+fn recording_store_stub(dir: &Path, log: &Path, holds: &str, value: &str) -> PathBuf {
+    let body = format!(
+        "#!/bin/sh\n\
+         account=''\n\
+         while [ $# -gt 0 ]; do\n\
+         \x20 case \"$1\" in\n\
+         \x20   -a) account=\"$2\"; shift 2 ;;\n\
+         \x20   *) shift ;;\n\
+         \x20 esac\n\
+         done\n\
+         printf '%s\\n' \"$account\" >> '{log}'\n\
+         if [ \"$account\" = '{holds}' ]; then printf '%s\\n' '{value}'; exit 0; fi\n\
+         exit 44\n",
+        log = log.display(),
+    );
+    support::install_executable(&dir.join("security-recording"), &body)
+}
+
+/// The `decision` on the one row that named `name`.
+fn decision_for(rows: &str, name: &str) -> String {
+    let mut found: Vec<String> = Vec::new();
+    for line in rows.lines() {
+        let row: serde_json::Value = serde_json::from_str(line).expect("an audit row is JSON");
+        let names = row["names"].as_array().expect("a row carries names");
+        if names.len() == 1 && names[0].as_str() == Some(name) {
+            found.push(
+                row["decision"]
+                    .as_str()
+                    .expect("a row carries a decision")
+                    .to_owned(),
+            );
+        }
+    }
+    assert_eq!(found.len(), 1, "rows naming {name} in:\n{rows}");
+    found.remove(0)
+}
+
+#[test]
+fn a_name_nobody_declared_is_asked_of_the_store_exactly_as_a_declared_one_is() {
+    let dir = scratch("daemon-undeclared");
+    let asked = dir.join("accounts-asked");
+
+    let mut config = daemon_config(&dir);
+    // No cache, so every resolve below is a real question put to the store
+    // rather than a repeat served from memory.
+    config.cache_ttl_seconds = 0;
+    // One store, and a keychain rather than the file store, because the
+    // keychain is the adapter that derives a coordinate from the name. The
+    // file store looks a name up in a map and derives nothing.
+    config.stores.file.enabled = false;
+    config.stores.keychain.enabled = true;
+    config.stores.keychain.binary = recording_store_stub(&dir, &asked, "HELD", DECOY_VALUE).into();
+
+    let running = start_daemon(&config, policy_allowing_self());
+    let store = DaemonStore::new(running.socket().to_path_buf(), Duration::from_secs(10));
+
+    // The control that matters more than the subject: a name the store holds
+    // is served, and nothing about it changes.
+    let served = store
+        .resolve("HELD")
+        .expect("resolve")
+        .expect("a value must come back");
+    assert_eq!(served.expose(), DECOY_VALUE);
+
+    // The subject. `None` is the wire's `absent`.
+    assert!(
+        store
+            .resolve("NEVER_DECLARED_BY_ANYBODY")
+            .expect("resolve")
+            .is_none()
+    );
+
+    drop(running);
+
+    // The observation. Both names reached the store, and the undeclared one
+    // reached it under itself — which is what makes `absent` a report of what a
+    // store said rather than a guess made without asking.
+    let accounts = std::fs::read_to_string(&asked).expect("the stub recorded what it was asked");
+    assert_eq!(
+        accounts.lines().collect::<Vec<_>>(),
+        ["HELD", "NEVER_DECLARED_BY_ANYBODY"],
+        "the store was not asked for both names, in order: {accounts:?}"
+    );
+
+    // And the rows say the two apart, by the words they already use. Compared
+    // whole rather than by `contains`: `absent` is a substring of nothing here
+    // today, and a decision word that gained a suffix would satisfy a
+    // `contains` while meaning something else.
+    let rows = std::fs::read_to_string(&config.audit).expect("read the audit log");
+    assert_eq!(decision_for(&rows, "HELD"), "allow");
+    assert_eq!(decision_for(&rows, "NEVER_DECLARED_BY_ANYBODY"), "absent");
 
     let _ = std::fs::remove_dir_all(&dir);
 }
