@@ -37,9 +37,10 @@ would report a clean tree exactly like a clean tree does:
 
 **Commit messages are scanned here too, and they are the surface every other
 guard in this repository is blind to.** The Rust guard next door reads `src/`,
-`tests/`, `hooks/`, `site/` and the README; nothing read a commit body, and five
-messages in this history carry a transcript total, a corpus size or a
-keychain-item count. A commit body is prose, and this is the only prose grammar
+`tests/`, `hooks/`, `site/` and the README; nothing read a commit body, and a
+commit body is where this repository's own census claims — a transcript total, a
+corpus size, a keychain-item count — survived longest, unread by any gate at
+all. A commit body is prose, and this is the only prose grammar
 in the repository — a second copy in Rust would be two graders that drift apart.
 See `KNOWN_UNSCRUBBED` for the ratchet that empties as the queued history
 rewrite lands, and `check_message_file` for the same grammar as a `commit-msg`
@@ -489,16 +490,22 @@ def claims_in_message(body):
 #
 # Emptying the list needs the remedy this file's own `check_message_file`
 # prints — keep the reasoning and drop the number, or say what the number is a
-# property OF — applied by hand to each engineering record, during a history
-# rewrite. A machine cannot choose which figure is a property of the check and
-# which is a census of the machine that ran it.
+# property OF — written out by hand, once per engineering record, because a
+# machine cannot choose which figure is a property of the check and which is a
+# census of the machine that ran it. Those hand-written replacements live in
+# `scripts/scrub-history.sh` as its substitution table, and that script empties
+# this list as part of the rewrite that makes the emptying true. It refuses to
+# rewrite anything unless the grammar and this list agree exactly on which
+# commits are guilty AND its table is proven to clear every one of them, so the
+# list is never emptied ahead of the fix — which would forgive nothing that is
+# gone and guard nothing that is left.
 #
-# 🔴 THIS LIST GREW AFTER THE GATE EXISTED, AND THE MECHANISM THAT ALLOWED IT IS
-# STILL IN PLACE. `install/commit-msg.sh` is the same grammar as a hook that
-# fires BEFORE the message is written, and it is installed by hand or not at
-# all — a clone's `.git/hooks/` starts empty, so the default posture of this
-# repository is a gate that can only speak once the message is unrewritable.
-# Install it in every clone that commits:
+# 🔴 A MESSAGE CAN STILL REACH THIS LIST, BECAUSE THE MECHANISM THAT LET THE
+# EXISTING ENTRIES IN IS STILL IN PLACE. `install/commit-msg.sh` is the same
+# grammar as a hook that fires BEFORE the message is written, and it is
+# installed by hand or not at all — a clone's `.git/hooks/` starts empty, so the
+# default posture of this repository is a gate that can only speak once the
+# message is unrewritable. Install it in every clone that commits:
 #
 #     ln -sf ../../install/commit-msg.sh .git/hooks/commit-msg
 KNOWN_UNSCRUBBED = [
