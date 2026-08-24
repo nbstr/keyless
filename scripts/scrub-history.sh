@@ -498,7 +498,10 @@ fi
 origin_undo=""
 if [ -n "$remote_url" ] && git rev-parse --verify --quiet "refs/remotes/origin/${branch}" > /dev/null; then
   ahead=$(git rev-list --count "refs/remotes/origin/${branch}..HEAD")
-  if [ "" -eq 0 ]; then
+  # Defaulted to 1, not 0. If the count could not be read, the honest answer is
+  # that origin is not known to hold this history, and the shortcut is withheld.
+  # An undo printed on a guess is the failure this whole block exists to remove.
+  if [ "${ahead:-1}" -eq 0 ]; then
     origin_undo=$'\n             or, while origin still holds the old history:\n             git fetch origin && git reset --hard origin/'"${branch}"
   else
     echo "${red}note: ${branch} is ${ahead} commit(s) ahead of origin/${branch}.${off}"
