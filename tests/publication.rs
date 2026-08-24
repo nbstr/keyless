@@ -9,7 +9,7 @@
 //! runs and passes exactly like one holding a decoy. The reviewer found it, and
 //! a review that has to run twice is not a control.
 //!
-//! # The rule the three scanners below share
+//! # The rule the four scanners below share
 //!
 //! IDENTITY is kept and must never be touched here: who built this, under what
 //! name, with what judgement, and what they got wrong. The MIT copyright, the
@@ -21,16 +21,17 @@
 //! "Built by nab" — no, and that is an attribution, so it stays. "The default
 //! session saw two vaults" — no, and that is an inventory, so it goes.
 //!
-//! Three scanners, because inventory reaches source in three different shapes:
+//! Four scanners, because inventory reaches source in four different shapes:
 //!
 //! | scanner | shape | control |
 //! |---|---|---|
 //! | [`every_coordinate_is_an_allowlisted_decoy`] | a vault, item, share, account or service name | [`the_coordinate_scanner_can_actually_fail`] |
 //! | [`no_source_file_speaks_about_the_authors_own_machine`] | prose that makes a claim about the machine it was written on | [`the_deixis_scanner_can_actually_fail`] |
 //! | [`every_record_timestamp_is_an_allowlisted_fixture`] | a wall-clock instant transcribed out of a real record | [`the_timestamp_scanner_can_actually_fail`] |
+//! | [`no_published_file_names_somebodys_home_directory`] | a path rooted at one person's home directory | [`the_home_directory_scanner_can_actually_fail`] |
 //!
-//! …and one corpus, because all three of them read the WORKING TREE, and a
-//! published repository is not its working tree. The same three grammars run a
+//! …and one corpus, because all four of them read the WORKING TREE, and a
+//! published repository is not its working tree. The same four grammars run a
 //! second time over every blob any ref can reach — see the section headed *The
 //! history* at the foot of this file, and
 //! [`the_history_walk_sees_a_leak_that_is_only_in_history`] for the control that
@@ -92,15 +93,26 @@
 //!   the real leak here, which was spelled `saw two vaults` in words. A gate
 //!   that refuses correct work gets deleted, so this file does not carry one;
 //!   the same grammar stays where it measured clean, over `hooks/` prose.
+//!
+//!   That was re-measured when Scanner 4 was added, over the whole tree and in
+//!   both the line and the paragraph search scopes. It still finds the same
+//!   thing: fewer than one hit in six is a real measurement of one machine, and
+//!   the rest are `Property 1 of 4`, `6 of 13 encodings`, a byte offset and an
+//!   argv slice. What DOES separate cleanly is deixis and a home directory,
+//!   which is why the two scanners that shipped are grammars over words and
+//!   paths rather than over numbers.
 //! - **What is already in the history.** The walk NAMES it and stops it growing;
-//!   it cannot remove it. Three lists exist to carry that residue —
-//!   [`HISTORICAL_COORDINATES`], [`HISTORICAL_INSTANTS`] and
-//!   [`HISTORY_DEIXIS_RATCHET`]. Two of the three are EMPTY: the rewrite that
-//!   removes a class empties its list, and the both-direction check then makes
-//!   the walk assert the class is gone rather than forgiven. The one remaining
-//!   entry is an instant that no longer appears in any published file. Read a
-//!   green walk as "nothing outside these lists", never as "the lists are
-//!   empty" — check them.
+//!   it cannot remove it. Four lists exist to carry that residue —
+//!   [`HISTORICAL_COORDINATES`], [`HISTORICAL_INSTANTS`],
+//!   [`HISTORY_DEIXIS_RATCHET`] and [`HISTORY_HOME_PATH_RATCHET`]. One of the
+//!   four is EMPTY: the rewrite that removes a class empties its list, and the
+//!   both-direction check then makes the walk assert the class is gone rather
+//!   than forgiven. Read a green walk as "nothing outside these lists", never
+//!   as "the lists are empty" — check them.
+//!
+//!   The two ratchets are NOT residue somebody declined to clean. Both were
+//!   filled by the change that added their grammars, over blobs written while
+//!   nothing was looking; every one of those paths is clean at `HEAD`.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -776,6 +788,42 @@ fn a_decoy_item_id_still_begins_with_a_dash() {
 /// `their author's machine` is not caught either, and that is also deliberate:
 /// `hooks/install.py` uses it to describe shipped hook configs in general. The
 /// definite article is the discrimination, and it has to be read.
+///
+/// # The two shapes added after this list first shipped, and why bare `this
+/// machine` still is not one of them
+///
+/// The list above was written and the tree went green while `src/freshness.rs`
+/// opened with a dated reading of one particular machine and `src/checkout.rs`,
+/// `install/install.sh` and `src/freshness.rs` all named a second one. Neither
+/// sentence matched a phrase here, and both are the class this scanner is for.
+/// So two shapes are added, each of them narrow on purpose:
+///
+/// - **A PROVENANCE VERB bound to `this machine`.** `measured on this machine`
+///   is a reading somebody took standing at one keyboard; `~20 agent sessions
+///   on this machine can append at once` is a property of whatever machine is
+///   running the tool. Both spell `this machine`, and only the verb tells them
+///   apart. So the verb is what is matched, and the bare phrase stays legal —
+///   the same discrimination the paragraph above makes with `the` against
+///   `their`, and for the same reason: a rule that refused the second sentence
+///   would be switched off within a week.
+/// - **A NAME for a machine.** `the remote box` identifies one host that is not
+///   the reader's, so nothing it is said to have done is checkable by anybody.
+///   A tool other people run has no second machine to refer to, which is what
+///   makes these safe to forbid outright rather than only beside a verb.
+///
+// debt: this grammar gates the TREE and the HISTORY, and not a commit message.
+//       Watched refusing: `install/commit-msg.sh` exits 1 on a census claim and
+//       exits 0 on `Measured on the remote box`, because the message gate in
+//       `hooks/tests/test_publication.py` owns the census grammar and only
+//       that one. Ceiling: a message may still say what no file may.
+//       The fix is NOT a copy of this list in Python — the header of this file
+//       forbids two graders that drift apart, and it is right. It is to make
+//       one of the two the single owner of the deixis grammar and have the
+//       other call it, which is a cross-language move and larger than the
+//       sweep that found this.
+//       Upgrade trigger: a commit message lands carrying a machine name or a
+//       home directory. `KNOWN_UNSCRUBBED` next door is where that becomes
+//       visible, and it growing is the signal.
 const MACHINE_DEIXIS: &[&str] = &[
     "machine this was built",
     "machine this was written",
@@ -791,6 +839,18 @@ const MACHINE_DEIXIS: &[&str] = &[
     "the maintainer's own machine",
     "nab's",
     "on nab's",
+    // A reading taken at one keyboard. The verb is the whole discrimination —
+    // see the section above for why the bare phrase is not here.
+    "measured on this machine",
+    "measured on this box",
+    "observed on this machine",
+    "observed on this box",
+    "happened on this machine",
+    // A name for a machine that is not the reader's.
+    "the remote box",
+    "the build box",
+    "the dev box",
+    "my box",
 ];
 
 /// Files allowed to contain the phrases above.
@@ -869,6 +929,28 @@ fn the_deixis_scanner_can_actually_fail() {
         deixis_in("most shipped hook configs only work on their author's machine").is_empty(),
         "`their author's machine` is a statement about other people's configs"
     );
+
+    // The two shapes that were in the tree while this scanner was green, in the
+    // spelling they were really written in — with the magnitudes invented, for
+    // the reason the header gives.
+    assert!(
+        !deixis_in("Measured on this machine 2000-01-01: the binary was older than the tree")
+            .is_empty(),
+        "a dated reading of one machine must be an offence"
+    );
+    assert!(
+        !deixis_in("The remote box has the same shape").is_empty(),
+        "naming a second machine must be an offence"
+    );
+
+    // And the sentence a verb-free rule would have to refuse in order to catch
+    // them. It is correct writing about whatever machine is running the tool,
+    // it is in this crate today, and a gate that refused it would be deleted.
+    assert!(
+        deixis_in("how loaded this machine has to be before a passing test reports a failure")
+            .is_empty(),
+        "`this machine` without a provenance verb is a property of the host, not a reading"
+    );
 }
 
 #[test]
@@ -908,6 +990,193 @@ fn the_guards_own_exemption_is_a_real_exemption() {
         deixis_in(&text).is_empty(),
         "the deixis list has grown far enough to refuse a bare copyright line, \
          which would make this guard delete the attribution it exists to protect"
+    );
+
+    // Scanner 4's exemption, held to the same standard. The history walk skips
+    // this file's own blobs, which is only safe while scanning it still finds
+    // something: an extractor that had stopped matching would make that skip
+    // indistinguishable from a clean file, and every home-directory verdict
+    // above would be worthless.
+    assert!(
+        !home_paths_in(&read(&guard_path())).is_empty(),
+        "this guard no longer contains the home directories it plants, so the \
+         home-path matcher has stopped matching"
+    );
+
+    // And the sibling, which is NOT exempt from Scanner 4 because it commits no
+    // offence. Asserted rather than assumed: the day it grows one, this says so
+    // instead of the history walk reding on a file nobody was watching.
+    assert!(
+        home_paths_in(&read(&sibling)).is_empty(),
+        "the Python sibling now carries a home directory. Scanner 4 grants it no \
+         exemption, so either the path is a real leak or it needs one stated here."
+    );
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// Scanner 4 — somebody's home directory
+// ───────────────────────────────────────────────────────────────────────────
+
+/// The names a home directory may be spelled with in a published file.
+///
+/// A path rooted at a home directory says who was sitting at the machine. It is
+/// the same class as a vault coordinate and it is spelled two ways: absolute
+/// (`/Users/<name>/…`, `/home/<name>/…`) and tilde (`~/<something>`). Both were
+/// in this tree while every scanner above was green — one of them in `tests/`,
+/// which no sweep had ever covered.
+///
+/// **Absolute is an allowlist of METAVARIABLES**, because a real login name is
+/// the offence and a documentation stand-in is not. The README writes
+/// `/Users/you/.config/keyless/config.json` and means "wherever your home is";
+/// anything else in that position is a name.
+const HOME_SEGMENT_METAVARIABLES: &[&str] = &[
+    "you", "your", "user", "username", "me", "someone", "<user>", "<you>", "<name>", "home",
+];
+
+/// The tilde spellings this repository legitimately writes.
+///
+/// **A dot-segment is exempt without being listed**, and that is the rule that
+/// makes this grammar shippable rather than noisy. `~/.config`, `~/.cargo/bin`,
+/// `~/.ssh/id_*`, `~/.keyless-pass-session` and the rest of the credential
+/// estate this tool exists to talk about are locations that mean the same thing
+/// in everybody's home. A home directory's own name never begins with a dot, so
+/// exempting the dot-segments costs nothing and removes the entire body of
+/// correct writing at once.
+///
+/// What is left is a `~/` followed by an ordinary directory name, and each one
+/// has to be answered for out loud — the argument this file's header already
+/// makes for an allowlist over a denylist. There are five, and each is legal
+/// for a reason a reader can check without knowing whose machine it was:
+///
+/// - `~/Library` is a macOS location, identical in every account.
+/// - `~/work` is the README's own placeholder for a project directory.
+/// - `~/foo`, `~/README.md` and `~/no-home-here` are fixture inputs: strings fed
+///   to a resolver in order to watch what it does with them.
+///
+/// A sixth entry would have been `~/projects/…`, which is where this grammar
+/// came from. It is a real directory on a real machine and it is exactly what
+/// this list must never grow to hold.
+const HOME_TILDE_SEGMENTS: &[&str] = &["Library", "work", "foo", "README.md", "no-home-here"];
+
+/// Is this byte part of a path segment rather than a separator?
+fn is_segment_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b'-' | b'+' | b'<' | b'>')
+}
+
+/// The segment starting at `from`, and where it ends.
+fn segment_at(bytes: &[u8], from: usize) -> (String, usize) {
+    let mut end = from;
+    while end < bytes.len() && is_segment_byte(bytes[end]) {
+        end += 1;
+    }
+    (String::from_utf8_lossy(&bytes[from..end]).into_owned(), end)
+}
+
+/// Every home-directory reference a published file may not carry.
+///
+/// Deliberately NOT a regex and deliberately case-sensitive on the two roots:
+/// `/Users/` and `/home/` are the spellings the two platforms use, and lowering
+/// the whole text first would make `~/library` and `~/Library` the same string
+/// in an allowlist whose entries name real directories.
+fn home_paths_in(text: &str) -> Vec<String> {
+    let bytes = text.as_bytes();
+    let mut found = Vec::new();
+
+    for root in ["/Users/", "/home/"] {
+        let mut from = 0;
+        while let Some(offset) = text[from..].find(root) {
+            let start = from + offset;
+            let (segment, end) = segment_at(bytes, start + root.len());
+            // `/home/` with nothing after it is a prefix in prose, not a path.
+            if !segment.is_empty()
+                && !HOME_SEGMENT_METAVARIABLES.contains(&segment.to_lowercase().as_str())
+            {
+                found.push(format!("{root}{segment}"));
+            }
+            from = end.max(start + 1);
+        }
+    }
+
+    let mut from = 0;
+    while let Some(offset) = text[from..].find("~/") {
+        let start = from + offset;
+        let (segment, end) = segment_at(bytes, start + 2);
+        if !segment.is_empty()
+            && !segment.starts_with('.')
+            && !HOME_TILDE_SEGMENTS.contains(&segment.as_str())
+        {
+            found.push(format!("~/{segment}"));
+        }
+        from = end.max(start + 1);
+    }
+
+    found
+}
+
+#[test]
+fn no_published_file_names_somebodys_home_directory() {
+    let mut offenders: Vec<String> = Vec::new();
+
+    for (path, source) in &tree().text {
+        let relative = shown(path);
+        for hit in home_paths_in(source) {
+            offenders.push(format!("{relative}: `{hit}`"));
+        }
+    }
+
+    assert!(
+        offenders.is_empty(),
+        "a published file is rooted at somebody's home directory.\n\
+         A real login name goes; a metavariable (`/Users/you/…`) or a location that means \
+         the same thing in every account (`~/.config/…`) stays. If this one really is \
+         neither, it belongs in HOME_TILDE_SEGMENTS with a reason a reader can check.\n  {}",
+        offenders.join("\n  ")
+    );
+}
+
+#[test]
+fn the_home_directory_scanner_can_actually_fail() {
+    // The two spellings that were really in this tree, with the name replaced
+    // by an invented one — carrying the real one in order to forbid it is the
+    // disclosure this file exists to prevent.
+    for planted in [
+        "/Users/qwilfish/.keyless-pass-session/.session/session.json",
+        "/home/qwilfish/src/keyless",
+        "a symlink into ~/projects/keyless-published/target/release/",
+    ] {
+        assert!(
+            !home_paths_in(planted).is_empty(),
+            "`{planted}` is a home directory and was not read as one"
+        );
+    }
+
+    // And every exemption, which must survive. Without these the grammar would
+    // refuse the README, the config documentation and six fixtures at once,
+    // which is the failure that ends with the gate deleted.
+    for exempt in [
+        "keyless 0.1.0   /Users/you/.config/keyless/config.json",
+        "\"cwd\":\"/Users/You/src/app\"",
+        "`cargo install` writes to ~/.cargo/bin",
+        "~/.config/keyless/config.json",
+        "PROTON_PASS_SESSION_DIR=~/.keyless-pass-session",
+        "\"config_dir\": \"~/work/api\"",
+        "~/Library/Application Support",
+        "the resolver is handed ~/foo and ~/no-home-here",
+        "under /home/ on Linux",
+    ] {
+        assert!(
+            home_paths_in(exempt).is_empty(),
+            "`{exempt}` is correct writing and was refused"
+        );
+    }
+
+    // A segment is read to its end rather than by prefix, or `~/.cargo` would
+    // clear `~/.cargoes-of-mine` too and a real directory could hide behind a
+    // legal one.
+    assert_eq!(home_paths_in("~/Libraryish/notes"), vec!["~/Libraryish"]);
+    assert_eq!(
+        home_paths_in("/Users/younger/keyless"),
+        vec!["/Users/younger"]
     );
 }
 
@@ -1230,7 +1499,7 @@ fn nothing_published_is_beyond_the_reach_of_the_grammars() {
     let unreadable: Vec<String> = tree().binary.iter().map(|path| shown(path)).collect();
     assert!(
         unreadable.is_empty(),
-        "a published file is not text, so none of the three grammars reads it: \
+        "a published file is not text, so none of the four grammars reads it: \
          {unreadable:?}.\n\
          Nothing in this repository is meant to be binary. If one has to be, say \
          so out loud rather than letting the scan step over it."
@@ -1340,7 +1609,7 @@ fn the_tree_corpus_covers_every_path_in_the_published_commit() {
     assert!(
         missing.is_empty(),
         "a path in the published commit is in no corpus: {missing:?}.\n\
-         Every file git publishes is read by the three grammars or is named as \
+         Every file git publishes is read by the four grammars or is named as \
          binary. There is no third outcome, and a file reaching one would be \
          invisible to this gate until somebody committed it."
     );
@@ -1357,7 +1626,7 @@ fn the_tree_corpus_covers_every_path_in_the_published_commit() {
 }
 
 // ───────────────────────────────────────────────────────────────────────────
-// The history — the same three grammars, over every blob a ref can reach
+// The history — the same four grammars, over every blob a ref can reach
 // ───────────────────────────────────────────────────────────────────────────
 //
 // # The defect this closes, which is a defect in the GATES and not in the tree
@@ -1405,7 +1674,7 @@ fn the_tree_corpus_covers_every_path_in_the_published_commit() {
 // Here, in the file that already owns the coordinate allowlist, the instant
 // allowlist and the deixis phrase list. The alternative was
 // `hooks/tests/test_publication.py`, which already walks the history for commit
-// MESSAGES — and it would have had to carry a second copy of all three
+// MESSAGES — and it would have had to carry a second copy of all four
 // grammars. Two graders drift, and the one that drifts is the one nobody reads.
 // The split stays where it was: this file owns the coordinate, instant and
 // deixis grammars over BOTH surfaces; that file owns the census grammar over
@@ -1636,11 +1905,48 @@ const GUARD_PLANTS: &[&str] = &[
 /// exception the header of this file states.
 ///
 /// Emptying it takes a rewrite of every sha in this repository, because a blob
-/// is immutable and there is no smaller edit that reaches one. That rewrite has
-/// run. Refilling this list is therefore never the fix for a red gate: a NEW
-/// offending blob is one you can still delete from the working tree, and the
-/// assertion below says so in its own failure message.
-const HISTORY_DEIXIS_RATCHET: &[&str] = &[];
+/// is immutable and there is no smaller edit that reaches one. Refilling it is
+/// therefore never the fix for a red gate: a NEW offending blob is one you can
+/// still delete from the working tree, and the assertion below says so in its
+/// own failure message.
+///
+/// **There is exactly one other way an entry gets here, and it is the way these
+/// six did: the GRAMMAR widened.** `MACHINE_DEIXIS` grew two shapes it had been
+/// silent on, and blobs written before that were immediately in scope. The
+/// working tree was fixed in the same change — nothing below is still in a
+/// published file — but a blob cannot be. Distinguishing the two cases is the
+/// author's job and it is not automatable: what the gate can check, and does,
+/// is that no entry outlives the offence it was added for.
+const HISTORY_DEIXIS_RATCHET: &[&str] = &[
+    "15da4d88fa3043fe0a6119800d0e5b63f8093404",
+    "5fd0ad5fa50364423e67f4617dff6d42d55df856",
+    "91cfe82e74d19830452260c6bd740b8c70416b28",
+    "c3a9dc2cab367e5f60b4c8cd900ae621d7478893",
+    "cdc09047c6bd7b4aca6f466a9fb86d5405afde91",
+    "d19c5f901317ea8a923f13ba6fdb0d9398954516",
+];
+
+/// Blobs that carry somebody's home directory and can no longer be edited.
+///
+/// The same ratchet as [`HISTORY_DEIXIS_RATCHET`], for Scanner 4, checked in
+/// the same two directions by
+/// [`historical_home_directories_are_confined_to_a_shrinking_ratchet`]. It is
+/// populated for the same reason: the grammar did not exist when these blobs
+/// were written.
+const HISTORY_HOME_PATH_RATCHET: &[&str] = &[
+    "001d5fb7021a4a81cd46ff3cd72b93de9bd7da0f",
+    "0583cd8d3e4b410ffb23a5c8810cbcef4362f1ce",
+    "1239a323c19e288cecacd0e54e4526d1a073ea08",
+    "42f5988371e0d05ef8b43d1b624e0abda01d6485",
+    "5fd0ad5fa50364423e67f4617dff6d42d55df856",
+    "84a5d58614ceec4a2f3965fd59cec75445fa40df",
+    "91cfe82e74d19830452260c6bd740b8c70416b28",
+    "c3a9dc2cab367e5f60b4c8cd900ae621d7478893",
+    "cdc09047c6bd7b4aca6f466a9fb86d5405afde91",
+    "d19c5f901317ea8a923f13ba6fdb0d9398954516",
+    "e02c38d91c92fad29c457daf203db790ba7b6867",
+    "fb106a867b181056aa31c7ec3120f1a58c4cfb4f",
+];
 
 /// What the history walk found, and how much of it there was to find.
 struct HistoryFindings {
@@ -1662,9 +1968,12 @@ struct HistoryFindings {
     instant_offenders: Vec<String>,
     /// sha -> the phrases it carries, for the ratchet.
     deixis: BTreeMap<String, Vec<&'static str>>,
+    /// Every blob carrying a home-directory path, keyed by sha. Same shape and
+    /// same reason as `deixis`.
+    home_paths: BTreeMap<String, Vec<String>>,
 }
 
-/// Run all three grammars over every blob `repo` publishes.
+/// Run all four grammars over every blob `repo` publishes.
 fn scan_history(repo: &Path) -> HistoryFindings {
     let commits = git_must(repo, &["rev-list", "--all", "--count"])
         .trim()
@@ -1684,6 +1993,7 @@ fn scan_history(repo: &Path) -> HistoryFindings {
         coordinate_offenders: Vec::new(),
         instant_offenders: Vec::new(),
         deixis: BTreeMap::new(),
+        home_paths: BTreeMap::new(),
     };
 
     for (sha, paths, bytes) in reachable_blobs(repo) {
@@ -1748,6 +2058,28 @@ fn scan_history(repo: &Path) -> HistoryFindings {
             let phrases = deixis_in(&text);
             if !phrases.is_empty() {
                 findings.deixis.insert(sha.clone(), phrases);
+            }
+        }
+
+        // THIS FILE IS EXEMPT FROM SCANNER 4, and the first version of this
+        // walk was not — it asserted that the plants in
+        // `the_home_directory_scanner_can_actually_fail` were harmless because
+        // the login name in them is invented. That is wrong twice over. The
+        // grammar reads a POSITION, not a name, so `/Users/qwilfish` offends
+        // exactly as loudly as a real one; and the plants are what make the
+        // scanner provable, so every future version of this file would write a
+        // fresh blob carrying them, with a fresh sha that no ratchet can hold.
+        // A gate that reds on its own control is a gate somebody deletes.
+        //
+        // The Python sibling gets no exemption here, unlike in the deixis walk
+        // above: it carries no home path, so forgiving it would be a hole that
+        // could never be observed to work. Only this file offends, and
+        // `the_guards_own_exemption_is_a_real_exemption` proves it still does.
+        let is_this_guard = !paths.is_empty() && paths.iter().all(|path| path == guard);
+        if !is_this_guard {
+            let homes = home_paths_in(&text);
+            if !homes.is_empty() {
+                findings.home_paths.insert(sha.clone(), homes);
             }
         }
     }
@@ -1872,6 +2204,45 @@ fn historical_machine_deixis_is_confined_to_a_shrinking_ratchet() {
          offends, so the rewrite that removes this class has landed. Delete \
          these entries — a forgiveness for something that is gone is how a \
          ratchet becomes a permanent hole.\n  {stale:?}"
+    );
+}
+
+#[test]
+fn historical_home_directories_are_confined_to_a_shrinking_ratchet() {
+    let found = history();
+    let offending: BTreeSet<&str> = found.home_paths.keys().map(String::as_str).collect();
+    let ratchet: BTreeSet<&str> = HISTORY_HOME_PATH_RATCHET.iter().copied().collect();
+
+    let new: Vec<String> = offending
+        .difference(&ratchet)
+        .map(|sha| {
+            let hits = found
+                .home_paths
+                .get(*sha)
+                .expect("a scanned blob")
+                .join(", ");
+            format!("{}: {hits}", &sha[..12.min(sha.len())])
+        })
+        .collect();
+    assert!(
+        new.is_empty(),
+        "a blob in the published history is rooted at somebody's home \
+         directory, and it is not one of the ones already stuck there.\n\
+         A NEW commit writes a NEW blob, so this is almost certainly a path \
+         you can still delete from the working tree before it is committed.\n  {}",
+        new.join("\n  ")
+    );
+
+    let stale: Vec<&str> = ratchet
+        .iter()
+        .copied()
+        .filter(|sha| !found.blob_shas.contains(*sha) || !offending.contains(*sha))
+        .collect();
+    assert!(
+        stale.is_empty(),
+        "an entry in HISTORY_HOME_PATH_RATCHET is unreachable or no longer \
+         offends, so the rewrite that removes this class has landed. Delete \
+         these entries.\n  {stale:?}"
     );
 }
 
