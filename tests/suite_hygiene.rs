@@ -106,11 +106,11 @@
 //       `Command::spawn`, so there is no seam to pass a flag through and the
 //       fix is a different one — serialise every spawn in a test binary
 //       against every other, the way `keyless::store::exec` already serialises
-//       the library's own. Measured on macOS, four threads calling
-//       `Command::output` beside six spawning children left a stray pipe in 36
-//       of 4298 of them; the same probe inside `tests/hostile.rs`, which makes
-//       four piped children a run, saw none in 1790 — so the mechanism is
-//       real here and its exposure is not.
+//       the library's own. Under a probe — several threads calling
+//       `Command::output` beside several more spawning children — a stray pipe
+//       does escape, in a small fraction of the children; the same probe inside
+//       `tests/hostile.rs`, which makes four piped children a run, never saw
+//       one. So the mechanism is real here and its exposure is not.
 //       Upgrade trigger: any descriptor this suite creates turns out to be
 //       reachable from a process it was never handed to. The class is a
 //       WINDOW, not a fixture shape and not a deadline: a `fork` on any thread

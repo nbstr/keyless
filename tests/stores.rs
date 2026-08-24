@@ -1775,12 +1775,12 @@ fn a_proton_store_with_no_session_directory_is_unhealthy_without_spawning_anythi
 // ---------------------------------------------------------------------------
 // Property: an interrupted session write is NAMED, never called plain absent.
 //
-// The incident, 2026-08-10: a fleet of agents was killed by session limits, and
-// one of them was a `keyless run` whose `pass-cli` child was mid-write. It left
-// `/Users/nab/.keyless-pass-session/.session/session.json` (118 bytes, where a
-// healthy sibling directory's is 393) beside a zero-byte
-// `session.tmp.28182.0`, same second. One killed process stranded the whole
-// store, and `doctor` reported `absent` — true, and it sends a reader to
+// The incident this reproduces: an agent fleet was killed mid-run, and one of
+// the casualties was a `keyless run` whose `pass-cli` child was part-way
+// through writing its session. It left a `.session/session.json` short enough
+// to be a partial write beside a zero-byte `session.tmp.<pid>.<n>` stamped in
+// the same second. One killed process stranded the whole store, and `doctor`
+// reported `absent` — true, and it sends a reader to
 // `pass-cli login`, which hits the DEFAULT session, answers `Already
 // authenticated`, and changes nothing.
 //

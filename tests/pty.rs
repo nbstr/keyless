@@ -187,11 +187,12 @@ static NAMING: Mutex<()> = Mutex::new(());
 /// live. The window is not the nanosecond between two calls; it is the whole
 /// body of `openpty`.
 ///
-/// Measured on macOS: one thread allocating terminals this way, six threads
-/// spawning children, and **3547 of 6244 children came out holding a terminal
-/// they were never given** — statistically identical to the 3524 of 6267 from
-/// a control that never set the flag at all. Setting it afterwards bought
-/// nothing. Born with `O_CLOEXEC`: 0 of 6394.
+/// That is measured rather than argued: one thread allocating terminals this
+/// way beside several threads spawning children, and **a large fraction of
+/// those children come out holding a terminal they were never given** — at a
+/// rate statistically indistinguishable from a control that never sets the
+/// flag at all. Setting it afterwards buys nothing. Born with `O_CLOEXEC`, not
+/// one child in any arm holds a stray terminal.
 ///
 /// So the flag is part of each descriptor's creation. There is no ordering for
 /// a future reader to preserve and no lock for one to forget, which is the
