@@ -102,9 +102,9 @@ fi
 # blind to a source tree that is ITSELF old. A checkout six commits behind
 # builds a binary that is fresh by that rule — nothing under src/ is newer than
 # the artefact — and installs a program missing every fix in those six commits.
-# Measured 2026-08-10 on the remote box: `keyless doctor` printed `build proven`
-# over a binary carrying a lookup that answered from the caller's own
-# environment, fixed six commits earlier.
+# That is not a hypothetical: `keyless doctor` prints `build proven` over a
+# binary carrying a lookup that answers from the caller's own environment,
+# because the tree it was built from is behind the branch it tracks.
 #
 # `keyless doctor` asks the same question of the tree the running binary was
 # built from. This asks it at the one moment somebody is standing here, which is
