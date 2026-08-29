@@ -616,6 +616,118 @@ struct Coordinates {
     key: String,
 }
 
+/// Where the vendor CLI's own login comes from, for a caller that carries none.
+///
+/// # Why this exists at all
+///
+/// A session spawns `infisical` and inherits whatever login the CLI already has
+/// — on macOS, an item in the calling user's login keychain. A daemon cannot:
+/// a login keychain belongs to the uid that unlocked it, so a daemon uid has an
+/// empty one, and giving that uid a home directory does not change that. The
+/// answer is a machine identity, which the CLI reads from `INFISICAL_*`
+/// variables in its environment.
+///
+/// # Where the value must NOT come from
+///
+/// **Not the launchd plist.** It is installed world-readable, so an
+/// `EnvironmentVariables` entry holding a token would put the credential that
+/// unlocks the whole vault in a file every user on the machine can read — the
+/// exact hole this project exists to close, re-opened by its own installer.
+///
+/// **Not `keylessd.json`.** Same reason in a different file: the daemon's config
+/// names coordinates, and there is no field in it a value fits in.
+///
+/// So it comes from a [`Store`] the daemon reads under its own uid, which is a
+/// mode-`0600` file [`crate::store::file::FileStore`] refuses to read if
+/// anybody else could. The config names the variable and the entry; the value
+/// never appears in anything an operator opens.
+///
+/// # Read per lookup, not held
+///
+/// The values are resolved when a lookup is about to spawn the vendor, and
+/// dropped with the [`Secret`]s that carry them. A rotated credential therefore
+/// takes effect without restarting the daemon, and nothing keeps a plaintext
+/// copy between calls. One copy does outlive the `Secret`: the one
+/// [`std::process::Command`] holds for the spawn, which is the same residency
+/// the forwarded variables beside it already have.
+pub struct VendorCredentials {
+    source: Box<dyn Store>,
+    names: BTreeMap<String, String>,
+}
+
+impl VendorCredentials {
+    /// Read the values for `names` — vendor variable to entry name — out of
+    /// `source`.
+    #[must_use]
+    pub fn new(source: Box<dyn Store>, names: BTreeMap<String, String>) -> Self {
+        VendorCredentials { source, names }
+    }
+
+    /// The named variables this adapter will not set, in the order it reads them.
+    ///
+    /// Only `INFISICAL_*` is accepted. Without that bound the field is a
+    /// general "set any variable on a child process, as the daemon's uid"
+    /// primitive: `PATH` would choose which binary the vendor is, and `HOME`
+    /// would choose which login it finds. Neither is a thing a credential
+    /// mapping needs to express.
+    ///
+    /// An associated function on the map rather than a method, so a config can
+    /// be checked before a store is built from it.
+    #[must_use]
+    pub fn refused(names: &BTreeMap<String, String>) -> Vec<String> {
+        names
+            .keys()
+            .filter(|variable| !variable.starts_with(FORWARDED_PREFIX))
+            .cloned()
+            .collect()
+    }
+
+    /// Every named value, or the sentence saying which one could not be read.
+    fn resolve(&self) -> Result<Vec<(String, Secret)>, StoreError> {
+        if let Some(variable) = Self::refused(&self.names).first() {
+            return Err(StoreError::Misconfigured {
+                store: STORE_ID.to_owned(),
+                detail: format!(
+                    "`{variable}` is named as an Infisical credential and is not an \
+                     `{FORWARDED_PREFIX}*` variable. Only the vendor's own credential \
+                     variables may be set this way; anything else would choose which \
+                     binary runs or which login it finds"
+                ),
+            });
+        }
+
+        let mut resolved = Vec::with_capacity(self.names.len());
+        for (variable, name) in &self.names {
+            match self.source.resolve(name) {
+                Ok(Some(secret)) => resolved.push((variable.clone(), secret)),
+                // Named and missing is a misconfiguration, not an absence: the
+                // operator wrote down where the credential lives and it is not
+                // there, so every Infisical name degrades and the message says
+                // which entry to write rather than which vault to search.
+                Ok(None) => {
+                    return Err(StoreError::Misconfigured {
+                        store: STORE_ID.to_owned(),
+                        detail: format!(
+                            "the Infisical credential `{variable}` is declared to live in \
+                             `{name}` of the `{}` store, which holds no such entry",
+                            self.source.id()
+                        ),
+                    });
+                }
+                Err(error) => {
+                    return Err(StoreError::Misconfigured {
+                        store: STORE_ID.to_owned(),
+                        detail: format!(
+                            "the Infisical credential `{variable}` could not be read: {error}"
+                        ),
+                    });
+                }
+            }
+        }
+        Ok(resolved)
+    }
+}
+
 /// Reads one secret at a time through `infisical run`.
 pub struct InfisicalStore {
     binary: PathBuf,
@@ -624,6 +736,7 @@ pub struct InfisicalStore {
     project_id: Option<String>,
     config_dir: Option<PathBuf>,
     timeout: Duration,
+    credentials: Option<VendorCredentials>,
 }
 
 impl InfisicalStore {
@@ -662,6 +775,26 @@ impl InfisicalStore {
             project_id: None,
             config_dir: None,
             timeout: crate::config::bounded_timeout(crate::config::DEFAULT_TIMEOUT_MS),
+            credentials: None,
+        }
+    }
+
+    /// Supply the vendor's own login, for a process that carries none.
+    ///
+    /// `None` leaves the vendor authenticating from whatever `INFISICAL_*` this
+    /// process already has, which is what a session does. See
+    /// [`VendorCredentials`].
+    #[must_use]
+    pub fn with_vendor_credentials(mut self, credentials: Option<VendorCredentials>) -> Self {
+        self.credentials = credentials;
+        self
+    }
+
+    /// The vendor's login, resolved now, or nothing when none was configured.
+    fn vendor_credentials(&self) -> Result<Vec<(String, Secret)>, StoreError> {
+        match &self.credentials {
+            Some(credentials) => credentials.resolve(),
+            None => Ok(Vec::new()),
         }
     }
 
@@ -725,10 +858,16 @@ impl InfisicalStore {
     /// `--expand=false` is deliberately NOT passed here, unlike in the listing:
     /// expansion rewrites values, a value is precisely what this path is for,
     /// and a secret that references another is the vendor's own feature.
-    fn probe_command(&self, at: &Coordinates) -> Command {
+    fn probe_command(&self, at: &Coordinates, credentials: &[(String, Secret)]) -> Command {
         let mut command = Command::new(&self.binary);
         command.env_clear();
         command.envs(forwarded_vars());
+        // After the forwarded set, so a configured credential wins over one
+        // this process happens to carry. Which of two logins answered must be
+        // decided by the config, not by what launchd left in the environment.
+        for (variable, secret) in credentials {
+            command.env(variable, secret.expose());
+        }
         command.arg("run");
         command.arg(format!("--env={}", at.env));
         command.arg(format!("--path={}", at.path));
@@ -767,10 +906,18 @@ impl InfisicalStore {
     ///
     /// `probe` is the `keyless` binary itself. It is passed in rather than
     /// resolved here so a test can point it somewhere it can observe.
-    fn names_command(&self, at: &Location, probe: &std::path::Path) -> Command {
+    fn names_command(
+        &self,
+        at: &Location,
+        probe: &std::path::Path,
+        credentials: &[(String, Secret)],
+    ) -> Command {
         let mut command = Command::new(&self.binary);
         command.env_clear();
         command.envs(forwarded_vars());
+        for (variable, secret) in credentials {
+            command.env(variable, secret.expose());
+        }
         command.arg("run");
         command.arg(format!("--env={}", at.env));
         command.arg(format!("--path={}", at.path));
@@ -808,8 +955,11 @@ impl InfisicalStore {
             .into_iter()
             .map(|(name, _)| name.to_string_lossy().into_owned())
             .collect();
-        let captured = capture(self.names_command(at, probe), self.timeout)
-            .map_err(|error| self.unreachable(&error))?;
+        let captured = capture(
+            self.names_command(at, probe, &self.vendor_credentials()?),
+            self.timeout,
+        )
+        .map_err(|error| self.unreachable(&error))?;
 
         if !captured.status.success() {
             // stderr only, as everywhere in this crate. Measured against
@@ -874,8 +1024,11 @@ impl Store for InfisicalStore {
         // rather than against a second reading of a variable that could have
         // changed in between.
         let forwarded = forwarded_value(&at.key);
-        let mut captured = capture(self.probe_command(&at), self.timeout)
-            .map_err(|error| self.unreachable(&error))?;
+        let mut captured = capture(
+            self.probe_command(&at, &self.vendor_credentials()?),
+            self.timeout,
+        )
+        .map_err(|error| self.unreachable(&error))?;
 
         if !captured.status.success() {
             // stdout is empty on every failure path the CLI has, so reading it
@@ -940,8 +1093,11 @@ impl Store for InfisicalStore {
                  `keyless run --env <slug>` per command",
             ));
         };
-        let captured = capture(self.probe_command(&at), self.timeout)
-            .map_err(|error| self.unreachable(&error))?;
+        let captured = capture(
+            self.probe_command(&at, &self.vendor_credentials()?),
+            self.timeout,
+        )
+        .map_err(|error| self.unreachable(&error))?;
 
         if captured.status.success() {
             Ok(())
@@ -1065,7 +1221,7 @@ mod tests {
         let at = store
             .coordinates(name)
             .expect("this fixture must supply an environment");
-        let command = store.probe_command(&at);
+        let command = store.probe_command(&at, &[]);
         std::iter::once(command.get_program())
             .chain(command.get_args())
             .map(OsStr::to_string_lossy)
@@ -1326,7 +1482,7 @@ mod tests {
     /// The argv of the listing probe, rendered without running it.
     fn listing_argv(store: &InfisicalStore, spec: &str) -> Vec<String> {
         let at = Location::parse(spec, "/").expect("this fixture supplies an environment");
-        let command = store.names_command(&at, std::path::Path::new("/opt/keyless"));
+        let command = store.names_command(&at, std::path::Path::new("/opt/keyless"), &[]);
         std::iter::once(command.get_program())
             .chain(command.get_args())
             .map(OsStr::to_string_lossy)
@@ -1425,7 +1581,7 @@ mod tests {
         // would show up as though the store held it.
         let store = store_from("{}");
         let at = Location::parse("dev", "/").expect("valid");
-        let command = store.names_command(&at, std::path::Path::new("/opt/keyless"));
+        let command = store.names_command(&at, std::path::Path::new("/opt/keyless"), &[]);
         for (name, _) in command.get_envs() {
             let name = name.to_string_lossy().into_owned();
             assert!(

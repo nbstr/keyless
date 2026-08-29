@@ -38,8 +38,8 @@ use keyless::daemon::config::DaemonConfig;
 use keyless::store::{self, Invocation, Resolution};
 
 use support::{
-    Backend, INFISICAL_DECOY, client_config, policy_allowing_self, scratch, short_socket_path,
-    start_daemon, stub_infisical,
+    Backend, INFISICAL_DECOY, client_config, install_executable, policy_allowing_self, scratch,
+    short_socket_path, start_daemon, stub_infisical, write_secrets,
 };
 
 /// The one name the daemon's config declares, with an environment.
@@ -53,6 +53,42 @@ const NO_ENV: &str = "FIXTURE_WITHOUT_AN_ENVIRONMENT";
 
 /// The environment the one declared name states. Not a real slug anywhere.
 const SLUG: &str = "fixture-env";
+
+/// The entry, in the daemon's own credential file, that holds the vendor login.
+const IDENTITY_ENTRY: &str = "FIXTURE_MACHINE_IDENTITY";
+
+/// The stand-in machine identity. Distinct from every other decoy here, so
+/// "which value is this?" is a question every assertion below can ask, and long
+/// enough that a grep for it in any output means a real leak.
+const IDENTITY_DECOY: &str = "decoy-Mid5-machine-identity-never-real-0404";
+
+/// Where a credential-carrying stand-in records the login it was handed.
+fn vendor_token(dir: &Path) -> std::path::PathBuf {
+    dir.join("vendor-token")
+}
+
+/// A stand-in vendor that records the login it was given, then injects.
+///
+/// `stub_infisical` records argv only, and argv is exactly where a credential
+/// must never be. This one reads it from the place it is supposed to arrive —
+/// the child environment — and writes it to a file, so the test can ask whether
+/// it got there without the adapter being the one that says so.
+///
+/// `${VAR-ABSENT}` rather than `${VAR:-ABSENT}`, so a variable that arrived
+/// EMPTY is told apart from one that never arrived at all.
+fn stub_infisical_recording_login(dir: &Path) -> std::path::PathBuf {
+    let body = format!(
+        "#!/bin/sh\n\
+         printf '%s\\n' \"$@\" > '{argv}'\n\
+         printf '%s' \"${{INFISICAL_TOKEN-ABSENT}}\" > '{token}'\n\
+         while [ \"$1\" != \"--\" ] && [ $# -gt 0 ]; do shift; done\n\
+         shift\n\
+         exec /usr/bin/env \"$2={INFISICAL_DECOY}\" \"$1\" \"$2\"\n",
+        argv = vendor_argv(dir).display(),
+        token = vendor_token(dir).display(),
+    );
+    install_executable(&dir.join("infisical-records-login"), &body)
+}
 
 /// Where the stand-in vendor records the argv it was spawned with.
 ///
@@ -86,6 +122,202 @@ fn daemon_config_with_infisical(dir: &Path, vendor: &Path) -> DaemonConfig {
         vendor = vendor.display(),
     ))
     .expect("valid daemon config")
+}
+
+/// The same daemon, plus a machine identity read out of its own `0600` file.
+///
+/// The credential file is a file of its OWN, which is the arrangement being
+/// asserted: anything in the file the `file` store serves is a name an attested
+/// client can ask for, so a login kept there would be handed to any session that
+/// guessed its label.
+fn daemon_config_with_credential(dir: &Path, vendor: &Path) -> DaemonConfig {
+    let credentials = dir.join("infisical-credentials.json");
+    write_secrets(&credentials, &[(IDENTITY_ENTRY, IDENTITY_DECOY)]);
+    serde_json::from_str(&format!(
+        r#"{{"socket":"{socket}","audit":"{audit}",
+             "cache_ttl_seconds":0,"idle_timeout_seconds":5,
+             "stores":{{"infisical":{{"enabled":true,"binary":"{vendor}",
+                                      "timeout_ms":60000,
+                                      "credentials_file":"{credentials}",
+                                      "credentials":{{"INFISICAL_TOKEN":"{IDENTITY_ENTRY}"}}}}}},
+             "secrets":{{"{DECLARED}":{{"store":"infisical","env":"{SLUG}"}}}}}}"#,
+        socket = short_socket_path(dir).display(),
+        audit = dir.join("audit.jsonl").display(),
+        vendor = vendor.display(),
+        credentials = credentials.display(),
+    ))
+    .expect("valid daemon config")
+}
+
+// ---------------------------------------------------------------------------
+// The vendor's own login: where it comes from, and everywhere it must not go.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn the_machine_identity_reaches_the_vendor_and_no_other_surface() {
+    // A daemon cannot inherit a login the way a session does — a login keychain
+    // belongs to the uid that unlocked it. So the credential is read from the
+    // daemon's own mode-0600 file at lookup time and set on the vendor's child.
+    // This asserts both halves: that it arrives, and that it appears in nothing
+    // else the daemon writes or says.
+    let dir = scratch("daemon-infisical-identity");
+    let vendor = stub_infisical_recording_login(&dir);
+    let config = daemon_config_with_credential(&dir, &vendor);
+    let running = start_daemon(&config, policy_allowing_self());
+
+    let client = client_config(running.socket(), 3_000);
+    let registry = store::build(&client, &Invocation::default()).registry;
+
+    let reason = match registry.resolve(DECLARED) {
+        Resolution::Found { secret, .. } => {
+            assert_eq!(secret.expose(), INFISICAL_DECOY);
+            "resolved".to_owned()
+        }
+        other => panic!(
+            "the lookup must work, or nothing below is tested: {}",
+            other.reason()
+        ),
+    };
+
+    // It arrived, read from the child's environment by the vendor itself rather
+    // than from the adapter's own account of what it set.
+    assert_eq!(
+        support::recorded(&vendor_token(&dir)),
+        IDENTITY_DECOY,
+        "the machine identity did not reach the vendor"
+    );
+
+    // And nowhere else. argv is the one this project exists to keep clean, and
+    // the audit log is the one the caller cannot edit afterwards.
+    let spawned = support::recorded_lines(&vendor_argv(&dir));
+    assert!(
+        !spawned.iter().any(|arg| arg.contains(IDENTITY_DECOY)),
+        "the credential was put on the vendor's command line: {spawned:?}"
+    );
+    let audit = std::fs::read_to_string(dir.join("audit.jsonl")).expect("the daemon wrote a row");
+    assert!(
+        !audit.contains(IDENTITY_DECOY),
+        "the credential reached the audit log"
+    );
+    assert!(!reason.contains(IDENTITY_DECOY), "{reason}");
+
+    // The point of a file of its own: the credential is not a name the daemon
+    // serves. Asked for by its own entry name over the socket, it is not there.
+    match registry.resolve(IDENTITY_ENTRY) {
+        Resolution::Found { secret, .. } => {
+            assert_ne!(
+                secret.expose(),
+                IDENTITY_DECOY,
+                "the machine identity was served to a client that asked for it by name"
+            );
+        }
+        other => assert!(
+            !other.reason().contains(IDENTITY_DECOY),
+            "the credential leaked through a refusal: {}",
+            other.reason()
+        ),
+    }
+
+    drop(running);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_credential_the_daemons_file_does_not_hold_degrades_without_a_spawn() {
+    // The operator wrote down where the login lives and it is not there. That
+    // is a misconfiguration, not an absence: every Infisical name degrades, the
+    // message names the entry to write, and no vendor process is created — so
+    // an unauthenticated lookup is never attempted against a real vault.
+    let dir = scratch("daemon-infisical-identity-missing");
+    let vendor = stub_infisical_recording_login(&dir);
+    let config = daemon_config_with_credential(&dir, &vendor);
+    // Same config, same file, with the one entry it names removed. Rewritten
+    // rather than deleted, so the failure is a missing ENTRY and not a missing
+    // file — the two have different messages and this is the one that is easy
+    // to report as the other.
+    write_secrets(
+        &dir.join("infisical-credentials.json"),
+        &[("FIXTURE_SOMETHING_ELSE", IDENTITY_DECOY)],
+    );
+    let running = start_daemon(&config, policy_allowing_self());
+
+    let client = client_config(running.socket(), 3_000);
+    let registry = store::build(&client, &Invocation::default()).registry;
+
+    assert!(
+        !vendor_argv(&dir).exists(),
+        "the scratch directory is dirty"
+    );
+    let reason = registry.resolve(DECLARED).reason();
+    assert!(
+        !vendor_argv(&dir).exists(),
+        "the vendor was spawned with no login: {:?}",
+        support::recorded_lines(&vendor_argv(&dir))
+    );
+    assert!(reason.contains(IDENTITY_ENTRY), "{reason}");
+    assert!(reason.contains("INFISICAL_TOKEN"), "{reason}");
+    assert!(
+        !reason.contains(IDENTITY_DECOY),
+        "the refusal carried the value it could not attribute: {reason}"
+    );
+
+    drop(running);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_credential_variable_that_is_not_the_vendors_own_is_refused() {
+    // Without the `INFISICAL_*` bound this field is a general "set any variable
+    // on a child process, as the daemon's uid" primitive: `PATH` would choose
+    // which binary the vendor is and `HOME` would choose which login it finds.
+    // Neither is a thing a credential mapping needs to say.
+    let dir = scratch("daemon-infisical-identity-refused");
+    let vendor = stub_infisical_recording_login(&dir);
+    let credentials = dir.join("infisical-credentials.json");
+    write_secrets(&credentials, &[(IDENTITY_ENTRY, IDENTITY_DECOY)]);
+    let config: DaemonConfig = serde_json::from_str(&format!(
+        r#"{{"socket":"{socket}","audit":"{audit}",
+             "cache_ttl_seconds":0,"idle_timeout_seconds":5,
+             "stores":{{"infisical":{{"enabled":true,"binary":"{vendor}",
+                                      "timeout_ms":60000,
+                                      "credentials_file":"{credentials}",
+                                      "credentials":{{"PATH":"{IDENTITY_ENTRY}"}}}}}},
+             "secrets":{{"{DECLARED}":{{"store":"infisical","env":"{SLUG}"}}}}}}"#,
+        socket = short_socket_path(&dir).display(),
+        audit = dir.join("audit.jsonl").display(),
+        vendor = vendor.display(),
+        credentials = credentials.display(),
+    ))
+    .expect("valid daemon config");
+
+    // Said at startup, so an operator finds out while reading the daemon's own
+    // output rather than while reading a degraded run a week later.
+    let said = config.warnings().join(" ");
+    assert!(said.contains("not `INFISICAL_*`"), "{said}");
+    assert!(said.contains("PATH"), "{said}");
+
+    let running = start_daemon(&config, policy_allowing_self());
+    let client = client_config(running.socket(), 3_000);
+    let registry = store::build(&client, &Invocation::default()).registry;
+
+    assert!(
+        !vendor_argv(&dir).exists(),
+        "the scratch directory is dirty"
+    );
+    let reason = registry.resolve(DECLARED).reason();
+    assert!(
+        !vendor_argv(&dir).exists(),
+        "a refused credential variable still reached a spawn: {:?}",
+        support::recorded_lines(&vendor_argv(&dir))
+    );
+    assert!(reason.contains("PATH"), "{reason}");
+    assert!(
+        !reason.contains(IDENTITY_DECOY),
+        "the refusal carried a value: {reason}"
+    );
+
+    drop(running);
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]

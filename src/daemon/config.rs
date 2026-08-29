@@ -40,7 +40,7 @@ use crate::error::ConfigError;
 use crate::ipc::peer::decode_hex;
 use crate::paths::ConfigPath;
 use crate::store::file::FileStore;
-use crate::store::infisical::{InfisicalStore, Routing};
+use crate::store::infisical::{InfisicalStore, Routing, VendorCredentials};
 use crate::store::keychain::KeychainStore;
 use crate::store::{Registry, Store};
 
@@ -247,6 +247,29 @@ pub struct DaemonInfisicalConfig {
     /// The helper that reads one variable out of the child environment.
     #[serde(default = "default_probe_binary")]
     pub probe_binary: ConfigPath,
+    /// The vendor's own login: which `INFISICAL_*` variable holds it, and which
+    /// entry of [`DaemonInfisicalConfig::credentials_file`] its value is in.
+    ///
+    /// **Names, never values.** This file holds coordinates, exactly as a
+    /// session's does, and there is no field here a token fits in — which is
+    /// what lets `keylessd.json` be readable by whoever administers the machine.
+    /// See [`crate::store::infisical::VendorCredentials`] for why the daemon
+    /// needs this at all and why the plist is the wrong place for it.
+    ///
+    /// Only `INFISICAL_*` is accepted. A variable named here that is not one is
+    /// refused by every lookup, and said out loud by [`DaemonConfig::warnings`].
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub credentials: BTreeMap<String, String>,
+    /// The mode-`0600` file those values live in.
+    ///
+    /// **A file of its own by default, beside the secrets file rather than
+    /// inside it.** Anything in the file the `file` store serves is a name an
+    /// attested client can ask for by name — so a machine identity kept there
+    /// would be handed to any session that guessed its label, which is the
+    /// opposite of moving the credential behind the boundary. Pointing this at
+    /// the same file is possible and is warned about.
+    #[serde(default = "default_infisical_credentials_file")]
+    pub credentials_file: ConfigPath,
 }
 
 impl Default for DaemonInfisicalConfig {
@@ -259,6 +282,8 @@ impl Default for DaemonInfisicalConfig {
             config_dir: None,
             timeout_ms: default_timeout_ms(),
             probe_binary: default_probe_binary(),
+            credentials: BTreeMap::new(),
+            credentials_file: default_infisical_credentials_file(),
         }
     }
 }
@@ -272,6 +297,19 @@ fn default_audit() -> ConfigPath {
         PathBuf::from("/usr/local/var/log")
             .join(crate::NAME)
             .join("audit.jsonl"),
+    )
+}
+
+/// Where the vendor's own machine identity lives, by default.
+///
+/// A sibling of the secrets file rather than the same file: see
+/// [`DaemonInfisicalConfig::credentials_file`] for why sharing one would make
+/// the credential servable over the socket under its own name.
+fn default_infisical_credentials_file() -> ConfigPath {
+    ConfigPath::from(
+        PathBuf::from("/usr/local/var/lib")
+            .join(crate::NAME)
+            .join("infisical.json"),
     )
 }
 
@@ -405,6 +443,26 @@ impl DaemonConfig {
         Routing::without_invocation_env(&self.secrets, &self.stores.infisical.path)
     }
 
+    /// The vendor's own login, read out of the daemon's own file.
+    ///
+    /// Deliberately a [`FileStore`] of its own rather than the registry the
+    /// daemon serves names from: the credential must not become a name a client
+    /// can ask for, and it needs the mode check no other backend has.
+    ///
+    /// `None` when nothing is declared, which leaves the vendor authenticating
+    /// from whatever the daemon's own environment carries — nearly nothing,
+    /// under launchd.
+    fn vendor_credentials(&self) -> Option<VendorCredentials> {
+        let settings = &self.stores.infisical;
+        if settings.credentials.is_empty() {
+            return None;
+        }
+        Some(VendorCredentials::new(
+            Box::new(FileStore::new(settings.credentials_file.to_path_buf())),
+            settings.credentials.clone(),
+        ))
+    }
+
     /// Whether any declared name states an Infisical environment.
     ///
     /// Read off [`DaemonConfig::infisical_routing`] rather than off `secrets`
@@ -484,7 +542,8 @@ impl DaemonConfig {
                         .config_dir
                         .as_deref()
                         .map(|path| path.to_path_buf()),
-                ),
+                )
+                .with_vendor_credentials(self.vendor_credentials()),
             ));
         }
         Registry::new(stores)
@@ -526,6 +585,44 @@ impl DaemonConfig {
                  environment and there is deliberately no default"
                     .to_owned(),
             );
+        }
+
+        let refused = VendorCredentials::refused(&self.stores.infisical.credentials);
+        if !refused.is_empty() {
+            warnings.push(format!(
+                "these Infisical credential variables are refused because they are not \
+                 `INFISICAL_*`, and every Infisical lookup will degrade while they are \
+                 named: {}",
+                refused.join(", ")
+            ));
+        }
+
+        // The one arrangement that quietly undoes the point of moving the
+        // credential behind the boundary. Everything in the file store is a
+        // name an attested client can ask for, so a machine identity kept there
+        // is handed out to any session that guesses its label.
+        if !self.stores.infisical.credentials.is_empty()
+            && self.stores.file.enabled
+            && self.stores.infisical.credentials_file.to_path_buf()
+                == self.stores.file.path.to_path_buf()
+        {
+            warnings.push(format!(
+                "the Infisical credential file is the same file the `file` store serves, so \
+                 {} {} a name any attested client can ask for; put the credential in a file \
+                 of its own and name it in `stores.infisical.credentials_file`",
+                self.stores
+                    .infisical
+                    .credentials
+                    .values()
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                if self.stores.infisical.credentials.len() == 1 {
+                    "is"
+                } else {
+                    "are"
+                }
+            ));
         }
         if self.stores.keychain.enabled && self.stores.keychain.keychain.is_none() {
             warnings.push(
@@ -907,6 +1004,60 @@ mod tests {
         )
         .warnings();
         assert!(quiet.is_empty(), "{quiet:?}");
+    }
+
+    #[test]
+    fn keeping_the_vendor_login_in_the_served_secrets_file_is_warned_about() {
+        // The arrangement that quietly undoes the point of moving the
+        // credential behind the boundary: everything in the file store is a
+        // name an attested client can ask for, so a machine identity kept
+        // there is handed to any session that guesses its label.
+        let config = parse(
+            r#"{"stores":{"file":{"enabled":true,"path":"/tmp/keyless-test/secrets.json"},
+                          "infisical":{"enabled":true,
+                                       "credentials_file":"/tmp/keyless-test/secrets.json",
+                                       "credentials":{"INFISICAL_TOKEN":"MACHINE_IDENTITY"}}},
+                "secrets":{"DATABASE_URL":{"env":"staging","store":"infisical"}}}"#,
+        );
+        let said = config.warnings().join(" ");
+        assert!(said.contains("same file the `file` store serves"), "{said}");
+        assert!(said.contains("MACHINE_IDENTITY"), "{said}");
+
+        // The negative control: a file of its own — the default arrangement —
+        // says nothing. Without it the warning could be firing on every config
+        // that names a credential at all.
+        let separate = parse(
+            r#"{"peer":{"allow_uids":[501],
+                "allow_images":["00112233445566778899aabbccddeeff00112233"]},
+                "stores":{"file":{"enabled":true,"path":"/tmp/keyless-test/secrets.json"},
+                          "infisical":{"enabled":true,"default":"file",
+                                       "credentials_file":"/tmp/keyless-test/infisical.json",
+                                       "credentials":{"INFISICAL_TOKEN":"MACHINE_IDENTITY"}},
+                          "default":"file"},
+                "secrets":{"DATABASE_URL":{"env":"staging","store":"infisical"}}}"#,
+        )
+        .warnings();
+        assert!(separate.is_empty(), "{separate:?}");
+    }
+
+    #[test]
+    fn a_credential_variable_outside_the_vendors_own_prefix_is_named_at_startup() {
+        let said = parse(
+            r#"{"stores":{"infisical":{"enabled":true,
+                                       "credentials":{"PATH":"X","INFISICAL_TOKEN":"Y"}}},
+                "secrets":{"DATABASE_URL":{"env":"staging"}}}"#,
+        )
+        .warnings()
+        .join(" ");
+        assert!(said.contains("not `INFISICAL_*`"), "{said}");
+        assert!(said.contains("PATH"), "{said}");
+        // The negative control, in the same sentence: the variable that IS the
+        // vendor's own must not be listed as refused, or the warning is just
+        // "you named credentials" and says nothing.
+        assert!(
+            !said.contains("INFISICAL_TOKEN"),
+            "an accepted variable was reported as refused: {said}"
+        );
     }
 
     #[test]
