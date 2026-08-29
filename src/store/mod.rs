@@ -583,17 +583,32 @@ pub fn build(config: &Config, invocation: &Invocation) -> Built {
         .collect();
 
         if !explicit.is_empty() {
+            // The two halves are no longer the same story, and saying they are
+            // would be a wrong fact in the one place a user reads on every
+            // command. `keylessd` carries the Infisical adapter: those names are
+            // moved, not lost, and the sentence has to say where to. It carries
+            // no Proton adapter: those names have nowhere to go yet, and that is
+            // a different instruction.
+            let remedy = match (
+                config.stores.infisical.enabled,
+                config.stores.proton.enabled,
+            ) {
+                (true, false) => {
+                    "declare them under `secrets` in `keylessd.json`, with an \"env\", and \
+                     enable `stores.infisical` there"
+                }
+                (false, true) => "`keylessd` does not carry that adapter yet",
+                _ => {
+                    "declare the Infisical ones under `secrets` in `keylessd.json`, with an \
+                     \"env\"; `keylessd` does not carry the Proton adapter yet"
+                }
+            };
             warnings.push(format!(
                 "the daemon is enabled, so {} {} not used locally: a local fallback would hand \
                  out more secrets when the daemon stops, not fewer. Names that live there must \
-                 be served by the daemon's own config, and `keylessd` does not carry {} yet",
+                 be served by the daemon's own config — {remedy}",
                 explicit.join(" and "),
                 if explicit.len() == 1 { "is" } else { "are" },
-                if explicit.len() == 1 {
-                    "that adapter"
-                } else {
-                    "those adapters"
-                }
             ));
         }
 
@@ -1011,6 +1026,52 @@ mod tests {
                 "dropping {backend} must be said out loud: {said}"
             );
         }
+    }
+
+    #[test]
+    fn the_suppression_warning_says_where_a_suppressed_backends_names_can_go() {
+        // A suppression is only actionable if the sentence says what to do
+        // next, and the two backends now have DIFFERENT next steps: `keylessd`
+        // carries the Infisical adapter, so those names move into its config;
+        // it carries no Proton adapter, so those names have nowhere to go yet.
+        // One sentence covering both would have to be wrong about one of them.
+        let infisical_only = registered(&config_from(
+            r#"{"stores":{"infisical":{"enabled":true},"daemon":{"enabled":true}}}"#,
+        ))
+        .1
+        .join(" ");
+        assert!(
+            infisical_only.contains("keylessd.json"),
+            "an Infisical name has somewhere to go and the warning must name it: {infisical_only}"
+        );
+        assert!(
+            !infisical_only.contains("does not carry"),
+            "the adapter exists, so this must not say it does not: {infisical_only}"
+        );
+
+        let proton_only = registered(&config_from(
+            r#"{"stores":{"proton":{"enabled":true},"daemon":{"enabled":true}}}"#,
+        ))
+        .1
+        .join(" ");
+        assert!(
+            proton_only.contains("does not carry that adapter yet"),
+            "a Proton name has nowhere to go and the warning must say so: {proton_only}"
+        );
+
+        // Both at once: each half keeps its own instruction rather than one
+        // being flattened into the other's.
+        let both = registered(&config_from(
+            r#"{"stores":{"infisical":{"enabled":true},"proton":{"enabled":true},
+                          "daemon":{"enabled":true}}}"#,
+        ))
+        .1
+        .join(" ");
+        assert!(both.contains("keylessd.json"), "{both}");
+        assert!(
+            both.contains("does not carry the Proton adapter yet"),
+            "{both}"
+        );
     }
 
     #[test]

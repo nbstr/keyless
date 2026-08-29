@@ -40,7 +40,7 @@ use crate::error::ConfigError;
 use crate::ipc::peer::decode_hex;
 use crate::paths::ConfigPath;
 use crate::store::file::FileStore;
-use crate::store::infisical::Routing;
+use crate::store::infisical::{InfisicalStore, Routing};
 use crate::store::keychain::KeychainStore;
 use crate::store::{Registry, Store};
 
@@ -128,6 +128,9 @@ pub struct DaemonStores {
     /// A keychain the daemon's uid owns.
     #[serde(default)]
     pub keychain: DaemonKeychainConfig,
+    /// Infisical, reached through the vendor CLI under the daemon's own uid.
+    #[serde(default)]
+    pub infisical: DaemonInfisicalConfig,
     /// How a name that pins no store chooses one. See [`crate::config::Policy`].
     ///
     /// The strict one by default, on the daemon exactly as on a session: the
@@ -203,6 +206,63 @@ impl Default for DaemonKeychainConfig {
     }
 }
 
+/// Settings for the Infisical backend, on the daemon's side of the boundary.
+///
+/// Separate from [`crate::config::InfisicalConfig`] for one reason, and it is
+/// the reason this adapter can be hosted here at all: **that type has an `env`
+/// field and this one does not.** The session's is dead — kept only so a config
+/// that still sets it can be told so — but a daemon-side copy of it would be a
+/// key an operator could write to give every name an environment, which is
+/// exactly the "any invented name resolves against production" hazard that
+/// motivated removing it. Here there is no field to write. See
+/// [`DaemonConfig::infisical_routing`].
+///
+/// Everything else is a coordinate or a knob, spelled as the session config
+/// spells it, so a setting moved across the boundary keeps its name.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct DaemonInfisicalConfig {
+    /// Off unless asked for.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Path to, or name of, the `infisical` binary.
+    ///
+    /// **Worth an absolute path here.** A launchd daemon's `PATH` is whatever
+    /// launchd hands it, not a login shell's, so the bare name a session
+    /// resolves happily may resolve to nothing under the daemon.
+    #[serde(default = "default_infisical_binary")]
+    pub binary: ConfigPath,
+    /// Folder used by a name that declares none. The vendor's own `/`.
+    #[serde(default = "default_infisical_path")]
+    pub path: String,
+    /// Project id. See [`crate::store::infisical::InfisicalStore::in_project`]
+    /// for why a daemon usually needs this or `config_dir`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<String>,
+    /// Directory holding `.infisical.json`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config_dir: Option<ConfigPath>,
+    /// How long one lookup may take before it degrades the run.
+    #[serde(default = "default_timeout_ms")]
+    pub timeout_ms: u64,
+    /// The helper that reads one variable out of the child environment.
+    #[serde(default = "default_probe_binary")]
+    pub probe_binary: ConfigPath,
+}
+
+impl Default for DaemonInfisicalConfig {
+    fn default() -> Self {
+        DaemonInfisicalConfig {
+            enabled: false,
+            binary: default_infisical_binary(),
+            path: default_infisical_path(),
+            project_id: None,
+            config_dir: None,
+            timeout_ms: default_timeout_ms(),
+            probe_binary: default_probe_binary(),
+        }
+    }
+}
+
 fn default_socket() -> ConfigPath {
     ConfigPath::from(crate::ipc::default_socket_path())
 }
@@ -237,6 +297,25 @@ fn default_service() -> String {
 
 fn default_security_binary() -> ConfigPath {
     ConfigPath::from("/usr/bin/security")
+}
+
+// The three below are the session config's own defaults, reached rather than
+// re-spelled: a second literal here would be free to drift, and the drift would
+// be invisible because both spellings resolve.
+fn default_infisical_binary() -> ConfigPath {
+    crate::config::default_infisical_binary()
+}
+
+fn default_infisical_path() -> String {
+    crate::config::default_infisical_path()
+}
+
+fn default_probe_binary() -> ConfigPath {
+    crate::config::default_probe_binary()
+}
+
+const fn default_timeout_ms() -> u64 {
+    crate::config::DEFAULT_TIMEOUT_MS
 }
 
 impl DaemonConfig {
@@ -323,7 +402,19 @@ impl DaemonConfig {
     /// coordinates are treated differently.
     #[must_use]
     pub fn infisical_routing(&self) -> Routing {
-        Routing::without_invocation_env(&self.secrets, &crate::config::default_infisical_path())
+        Routing::without_invocation_env(&self.secrets, &self.stores.infisical.path)
+    }
+
+    /// Whether any declared name states an Infisical environment.
+    ///
+    /// Read off [`DaemonConfig::infisical_routing`] rather than off `secrets`
+    /// directly, so this asks the same question a lookup asks. A second walk of
+    /// the map is how a warning stops matching the behaviour it warns about.
+    fn declares_any_infisical_environment(&self) -> bool {
+        let routing = self.infisical_routing();
+        self.secrets
+            .keys()
+            .any(|name| routing.route(name).env.is_some())
     }
 
     /// Which name is pinned to which store, by store id.
@@ -375,6 +466,27 @@ impl DaemonConfig {
                 ),
             ));
         }
+        if self.stores.infisical.enabled {
+            let settings = &self.stores.infisical;
+            stores.push(Box::new(
+                InfisicalStore::new(
+                    settings.binary.to_path_buf(),
+                    settings.probe_binary.to_path_buf(),
+                    // The environment-free routing, and the only one this side
+                    // ever builds. See `infisical_routing` for why the absence
+                    // is what makes hosting this adapter here safe.
+                    self.infisical_routing(),
+                )
+                .with_timeout(settings.timeout_ms)
+                .in_project(
+                    settings.project_id.clone(),
+                    settings
+                        .config_dir
+                        .as_deref()
+                        .map(|path| path.to_path_buf()),
+                ),
+            ));
+        }
         Registry::new(stores)
             .with_routes(self.routes())
             .with_policy(self.stores.policy)
@@ -397,8 +509,23 @@ impl DaemonConfig {
                     .to_owned(),
             );
         }
-        if !self.stores.file.enabled && !self.stores.keychain.enabled {
+        if !self.stores.file.enabled
+            && !self.stores.keychain.enabled
+            && !self.stores.infisical.enabled
+        {
             warnings.push("no store is enabled, so no name can resolve".to_owned());
+        }
+        if self.stores.infisical.enabled && !self.declares_any_infisical_environment() {
+            // The operator-facing form of the rule in `infisical_routing`. Left
+            // unsaid, the first anyone hears of it is every Infisical name
+            // degrading with a sentence about a config key, and nothing having
+            // mentioned it while the config was being written.
+            warnings.push(
+                "the Infisical store is enabled and no name under `secrets` declares an \
+                 \"env\", so no name can resolve against it: a daemon has no invocation \
+                 environment and there is deliberately no default"
+                    .to_owned(),
+            );
         }
         if self.stores.keychain.enabled && self.stores.keychain.keychain.is_none() {
             warnings.push(
@@ -711,6 +838,75 @@ mod tests {
             .route("A_NAME_NOBODY_EVER_DECLARED");
         assert_eq!(route.path, "/");
         assert_eq!(route.key, "A_NAME_NOBODY_EVER_DECLARED");
+    }
+
+    #[test]
+    fn enabling_infisical_registers_it_and_leaves_the_other_stores_alone() {
+        let config = parse(
+            r#"{"stores":{"infisical":{"enabled":true,
+                                       "binary":"/nonexistent/keyless-test/infisical"}},
+                "secrets":{"DATABASE_URL":{"env":"staging"}}}"#,
+        );
+        let registry = config.registry();
+        let ids: Vec<&str> = registry.stores().iter().map(|store| store.id()).collect();
+        assert_eq!(ids, ["infisical"]);
+
+        // The negative control: with the branch removed the registry is empty,
+        // and an empty registry answers `not found in any store` — which reads
+        // as a working lookup that came back empty rather than as an absent
+        // adapter. Asking for the store id is what tells them apart.
+        assert_eq!(parse("{}").registry().stores().len(), 0);
+    }
+
+    #[test]
+    fn an_undeclared_name_reaches_no_vendor_because_it_has_no_environment() {
+        // The whole safety argument, at the level this file can assert it: the
+        // binary does not exist, so a lookup that SPAWNED would report the
+        // store unavailable. A refusal that names the missing environment is a
+        // lookup that never happened. `tests/daemon_infisical.rs` proves the
+        // absence of the spawn itself, against a stand-in that records its argv.
+        let config = parse(
+            r#"{"stores":{"infisical":{"enabled":true,
+                                       "binary":"/nonexistent/keyless-test/infisical"}},
+                "secrets":{"DECLARED":{"env":"staging"}}}"#,
+        );
+        let registry = config.registry();
+
+        let invented = registry.resolve("A_NAME_NOBODY_EVER_DECLARED").reason();
+        assert!(invented.contains("was not asked"), "{invented}");
+        assert!(
+            !invented.contains("unavailable"),
+            "the vendor was reached for a name nobody declared: {invented}"
+        );
+
+        // And the control that stops the above being satisfied by a store that
+        // cannot look anything up: a DECLARED name does reach for the binary.
+        let declared = registry.resolve("DECLARED").reason();
+        assert!(
+            declared.contains("unavailable"),
+            "a declared name must actually be looked up: {declared}"
+        );
+    }
+
+    #[test]
+    fn an_infisical_store_with_no_environment_anywhere_is_warned_about() {
+        let said = parse(
+            r#"{"stores":{"infisical":{"enabled":true}},
+                             "secrets":{"DATABASE_URL":{}}}"#,
+        )
+        .warnings()
+        .join(" ");
+        assert!(said.contains("no name can resolve against it"), "{said}");
+
+        // The negative control: one name with an environment silences it.
+        let quiet = parse(
+            r#"{"peer":{"allow_uids":[501],
+                "allow_images":["00112233445566778899aabbccddeeff00112233"]},
+                "stores":{"infisical":{"enabled":true}},
+                "secrets":{"DATABASE_URL":{"env":"staging"}}}"#,
+        )
+        .warnings();
+        assert!(quiet.is_empty(), "{quiet:?}");
     }
 
     #[test]

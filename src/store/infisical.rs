@@ -631,17 +631,59 @@ impl InfisicalStore {
     #[must_use]
     pub fn from_config(config: &Config, invocation_env: Option<&str>) -> Self {
         let settings = &config.stores.infisical;
-        InfisicalStore {
-            binary: settings.binary.to_path_buf(),
-            probe_binary: settings.probe_binary.to_path_buf(),
-            routing: Routing::from_config(config, invocation_env),
-            project_id: settings.project_id.clone(),
-            config_dir: settings
+        InfisicalStore::new(
+            settings.binary.to_path_buf(),
+            settings.probe_binary.to_path_buf(),
+            Routing::from_config(config, invocation_env),
+        )
+        .with_timeout(settings.timeout_ms)
+        .in_project(
+            settings.project_id.clone(),
+            settings
                 .config_dir
                 .as_deref()
                 .map(|path| path.to_path_buf()),
-            timeout: crate::config::bounded_timeout(settings.timeout_ms),
+        )
+    }
+
+    /// Construct from explicit parts.
+    ///
+    /// For a caller whose configuration is not a session's — the daemon, which
+    /// reads its own file and builds its [`Routing`] with
+    /// [`Routing::without_invocation_env`]. Shaped like
+    /// [`crate::store::keychain::KeychainStore::new`] beside it, so the two
+    /// daemon-side constructions read the same way.
+    #[must_use]
+    pub fn new(binary: PathBuf, probe_binary: PathBuf, routing: Routing) -> Self {
+        InfisicalStore {
+            binary,
+            probe_binary,
+            routing,
+            project_id: None,
+            config_dir: None,
+            timeout: crate::config::bounded_timeout(crate::config::DEFAULT_TIMEOUT_MS),
         }
+    }
+
+    /// Bound one lookup, in milliseconds. Clamped by
+    /// [`crate::config::bounded_timeout`], so a config cannot switch the
+    /// deadline off by naming a large enough number.
+    #[must_use]
+    pub fn with_timeout(mut self, timeout_ms: u64) -> Self {
+        self.timeout = crate::config::bounded_timeout(timeout_ms);
+        self
+    }
+
+    /// Name the project, for when the working directory has no `.infisical.json`.
+    ///
+    /// **A daemon's working directory is `/`**, so it never walks up into a
+    /// checkout the way a session does. One of these two is what makes a
+    /// daemon-hosted lookup resolvable at all.
+    #[must_use]
+    pub fn in_project(mut self, project_id: Option<String>, config_dir: Option<PathBuf>) -> Self {
+        self.project_id = project_id;
+        self.config_dir = config_dir;
+        self
     }
 
     /// The coordinates for a name, or the sentence saying why there are none.

@@ -573,7 +573,7 @@ fn default_security_binary() -> ConfigPath {
     ConfigPath::from("/usr/bin/security")
 }
 
-fn default_infisical_binary() -> ConfigPath {
+pub(crate) fn default_infisical_binary() -> ConfigPath {
     ConfigPath::from("infisical")
 }
 
@@ -624,7 +624,7 @@ fn default_listing_ttl_ms() -> u64 {
 /// `printenv NAME` writes one variable's value to stdout and nothing else. It
 /// is not a shell, so the name is an argument rather than something interpolated
 /// into a command line.
-fn default_probe_binary() -> ConfigPath {
+pub(crate) fn default_probe_binary() -> ConfigPath {
     ConfigPath::from("/usr/bin/printenv")
 }
 
