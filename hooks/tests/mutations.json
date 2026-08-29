@@ -614,5 +614,40 @@
     "file": "keyless_hooks/registry.py",
     "find": "        (\"KL-DEST\",   \"PreToolUse\", BLOCK,   dest_write.run),",
     "replace": "        (\"KL-DEST\",   \"PreToolUse\", WARN,   dest_write.run),"
+  },
+  {
+    "id": "M89-assign-gap-matches-a-newline",
+    "why": "The gap between a key's separator and its value must not cross a line. With `\\s` there, a key with an EMPTY value takes the NEXT line's key as its value; in a file this pack rewrites, the substitution then replaces a key NAME with a reference to a different variable, silently, under a message announcing a repair. Reproduced through the live hook on a .github/workflows/*.yml, a .env.example and a reusable workflow's secrets block on 2026-08-29.",
+    "file": "keyless_hooks/fingerprint.py",
+    "find": "    r\"[\\\"']?[^\\S\\n]*[:=][^\\S\\n]*\"",
+    "replace": "    r\"[\\\"']?\\s*[:=]\\s*\""
+  },
+  {
+    "id": "M90-one-line-guard-removed",
+    "why": "`_one_line` is the same rule as M89's gap, enforced on the FINDING rather than in the pattern so a later pattern edit cannot reopen the class quietly. Disarming it has to be visible on its own, or it is a comment with a function around it.",
+    "file": "keyless_hooks/fingerprint.py",
+    "find": "    if \"\\n\" in text[value_start:value_end]:\n        return False\n    if keyword_start is None:\n        return True\n    return \"\\n\" not in text[keyword_start:value_start]",
+    "replace": "    return True  # M90: the one-line invariant, disarmed"
+  },
+  {
+    "id": "M91-quote-defeats-the-member-path-exemption",
+    "why": "A quote gates the TERMINATOR test only. Gating the member-path test on it inverts the check: an unquoted reference is left alone and the SAME reference in quotes is rewritten. That is how `token: \"secrets.GITHUB_TOKEN\"` became `token: \"${TOKEN}\"` in a workflow while the unquoted spelling beside it survived.",
+    "file": "keyless_hooks/fingerprint.py",
+    "find": "    if not _is_member_path(value):\n        return False\n    if not quoted:\n        return True",
+    "replace": "    if quoted:\n        return False\n    if not _is_member_path(value):\n        return False"
+  },
+  {
+    "id": "M92-quoted-head-list-opened",
+    "why": "The quoted member-path exemption is a CLOSED head list. Opening it to any head makes `TOKEN = \"abcdefgh.ijklmnop.qrstuvwx\"` — a dotted opaque literal — read as a reference. That is the adversarial row that caught this exemption the first time it was written without a list.",
+    "file": "keyless_hooks/fingerprint.py",
+    "find": "    return value.split(\".\", 1)[0].lower() in _QUOTED_REF_HEADS",
+    "replace": "    return True  # M92: any head clears a quoted dotted value"
+  },
+  {
+    "id": "M93-rewrite-may-reshape-the-file",
+    "why": "`_line_preserved` is the last net under the two in `fingerprint`: a rewrite replaces a VALUE and may never change the shape of the file. Making it constant-true lets a scanner defect through as a silent edit instead of a refusal, which is the failure this section exists to make impossible.",
+    "file": "keyless_hooks/checks/literal_write.py",
+    "find": "    return before.count(\"\\n\") == after.count(\"\\n\")",
+    "replace": "    return True  # M93: the line-structure invariant, disarmed"
   }
 ]

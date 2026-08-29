@@ -674,6 +674,112 @@ WRITE_REFERENCE_RESIDUAL = (
     "unqualified identifier at end of line",
     "await login({\n  password" + _REF_CO + "E2E_LOGIN_PASSWORD\n});\n")
 
+# ── the file types this check REWRITES, where a wrong match corrupts ────────
+#
+# Every row above is driven into a `.ts`, where the wrong answer is a message.
+# These are driven into the files whose reader expands `${NAME}` — a workflow, a
+# `.env` template, a Terraform file — where the wrong answer is a SUBSTITUTION,
+# applied to the bytes on disk, announced as a repair. That is the one place this
+# check can do damage nobody sees, and until 2026-08-29 it had no rows here.
+#
+# Two defects were live. Both are asserted as fixed, and both are driven as whole
+# files rather than as fragments, because both needed a SECOND LINE to appear:
+#
+#   1. the gap between a key's separator and its value matched a NEWLINE, so a
+#      key with an empty value took the NEXT line's key as its value — and the
+#      substitution then replaced a key NAME with `${a-different-variable}`.
+#      Reproduced through the live hook on a `.github/workflows/*.yml`.
+#   2. quoting a reference DEFEATED the member-path exemption, so
+#      `token: "secrets.X"` was rewritten while `token: secrets.X` was not.
+#
+# Spelled in fragments for the reason the file already gives: this suite is
+# written through KL-WRITE, and a row that arrives on disk as `${NAME}` asserts
+# the opposite of what it was written to assert, with the suite still green.
+_SEC = "secret" + "s."
+_VAR = "var" + "."
+_VAL = "Values" + "."
+
+WRITE_REWRITABLE_FALSE_POSITIVES = [
+    ("workflow, a declared key with no value",
+     ".github/workflows/ci.yml",
+     "name: CI\nenv:\n  GITHUB_TOKEN:\n  NODE_VERSION: 20\n"),
+    ("workflow, a reusable-workflow secrets block",
+     ".github/workflows/reuse.yml",
+     "    secrets:\n      npm_token:\n      docker_password:\n"),
+    ("dotenv template, keys with no values",
+     ".env.example",
+     "API_TOKEN=\nDATABASE_PASSWORD=\nSTRIPE_SECRET_KEY=\n"),
+    ("workflow, a quoted Actions context",
+     ".github/workflows/pub.yml",
+     "        with:\n          token: \"" + _SEC + "GITHUB_TOKEN\"\n"),
+    ("workflow, an unquoted Actions context",
+     ".github/workflows/pub2.yml",
+     "        with:\n          token: " + _SEC + "GITHUB_TOKEN\n"),
+    ("workflow, the expression form",
+     ".github/workflows/pub3.yml",
+     "        with:\n          password: ${" + "{ " + _SEC + "DOCKERHUB_TOKEN }" + "}\n"),
+    ("terraform, a quoted variable reference",
+     "main.tf",
+     "  password = \"" + _VAR + "database_password\"\n"),
+    ("helm values, a quoted template reference",
+     "values.yaml",
+     "  password: \"" + _VAL + "db.password\"\n"),
+    ("compose, environment names with no values",
+     "docker-compose.yml",
+     "    environment:\n      - API_TOKEN\n      - DATABASE_PASSWORD\n"),
+    ("k8s, a secret named rather than held",
+     "k8s/deploy.yaml",
+     "        env:\n          - name: DB_PASSWORD\n            valueFrom:\n"
+     "              secretKeyRef:\n                name: db-credentials\n"
+     "                key: password\n"),
+]
+
+# The control the list above cannot supply. Every row is the SAME file type with
+# a value that really is a credential: it must still be rewritten, and the
+# literal must be gone. Without these, a check that stopped matching in
+# rewritable files entirely would keep every row above green.
+WRITE_REWRITABLE_TRUE_POSITIVES = [
+    ("workflow, a vendor literal", ".github/workflows/ci.yml",
+     "        with:\n          token: %s\n", "github_pat"),
+    # `deploy.env` and not `.env`: a write into `.env` itself is refused by
+    # KL-DEST before KL-WRITE is ever asked, so that spelling would assert a
+    # different check's verdict and read as this one's.
+    ("dotenv, a vendor literal", "deploy.env",
+     "AWS_ACCESS_KEY=\nAWS_SECRET_ACCESS_KEY=%s\n", "aws_key"),
+    ("terraform, a vendor literal", "main.tf",
+     "  api_key = \"%s\"\n", "stripe"),
+    ("compose, a vendor literal", "docker-compose.yml",
+     "    environment:\n      SLACK_TOKEN: %s\n", "slack"),
+]
+
+# The LIMIT of the quoted exemption, asserted so a change to it is a decision.
+# A quoted dotted value is read as a reference only when its head names one of
+# the namespaces in `fingerprint._QUOTED_REF_HEADS`. That admits an opaque tail
+# behind a listed head — and nothing separates it from a literal but the value's
+# own randomness, which is the same residual class this module already documents.
+#
+# It is strictly NARROWER than the exemption that was already there: the same
+# value UNQUOTED is exempt behind ANY head, and was before this row existed.
+# Both halves are asserted, so a fix that closed one by closing both is visible.
+WRITE_QUOTED_HEAD_LIMIT = ("config.<opaque>", "config." + "a1b2c3d4e5f6a7b8c9d0")
+WRITE_QUOTED_HEAD_CONTROL = ("zzqqxx.<opaque>", "zzqqxx." + "a1b2c3d4e5f6a7b8c9d0")
+
+# Each pattern's gap, driven directly. The hook cannot prove these: two
+# independent nets stop a cross-line match, so removing either one leaves the
+# other producing the right verdict and the suite green. Each row is paired with
+# a same-line control, so a pattern that stopped matching entirely fails too.
+_OPAQUE = "Xq7v" + "Tz2K" + "d91L" + "mW3n"
+NEWLINE_SPAN = {
+    "assign": "API_TOKEN=\nDATABASE_PASSWORD=\n",
+    "bearer": "Authorization: Bearer\n" + _OPAQUE + "\n",
+    "flag": "--token\n" + _OPAQUE + "\n",
+}
+SAME_LINE = {
+    "assign": "API_TOKEN=" + _OPAQUE,
+    "bearer": "Authorization: Bearer " + _OPAQUE,
+    "flag": "--token " + _OPAQUE,
+}
+
 # ── source files that must not be REFUSED ───────────────────────────────────
 #
 # The refusal fires on a VENDOR shape in a file whose reader expands nothing, and
@@ -784,6 +890,13 @@ EXPECTED_CHECKS = (len(SAFE) + len(PREFIX_REFUSES) + 1 + 3 * len(HELP_CONTROL)
                    + len(ASSIGN_TRUE_POSITIVES)
                    + 2 * len(ASSIGN_VALUE_CONTROL) + 2 * len(ASSIGN_POSITION_CONTROL)
                    + 2 * len(WRITE_REFERENCE_FALSE_POSITIVES) + 3
+                   # rewritable destinations: silent + unchanged + same lines per
+                   # row, then 3 per reachability control, then the quoted-head
+                   # limit and its control, then 3 `_line_preserved` units
+                   + 3 * len(WRITE_REWRITABLE_FALSE_POSITIVES)
+                   + 3 * len(WRITE_REWRITABLE_TRUE_POSITIVES) + 2 + 3
+                   # each net alone: 2 per pattern gap, then 3 `_one_line` units
+                   + 2 * len(NEWLINE_SPAN) + 3
                    + 2 * len(ASSIGN_NAME_COLLAPSE)
                    # source near-misses: silent, plus one reachability control
                    + len(WRITE_SOURCE_NEAR_MISSES) + 2
@@ -959,6 +1072,94 @@ def run():
     v = drive(write(os.path.join(root, "residual.env"), content))
     s.check("KL-WRITE control: the residual shape still rewrites where it resolves",
             "${" + "PASSWORD}" in (v.updated or {}).get("content", ""), True)
+
+    from keyless_hooks import fingerprint
+    from keyless_hooks.checks import literal_write
+
+    # ── KL-WRITE in a file it REWRITES: the wrong answer edits the disk ──────
+    #
+    # Three assertions per row, and the third is the one the previous section
+    # cannot make. In a `.ts` a wrong match produces a message; here it produces
+    # bytes. So: the verdict is silent, the content is byte-identical, AND the
+    # line structure is unchanged — the last because the defect this section was
+    # written for did not add or remove text, it replaced a key on the FOLLOWING
+    # line, which a length check would not have seen.
+    for label, name, content in WRITE_REWRITABLE_FALSE_POSITIVES:
+        v = drive(write(os.path.join(root, name), content))
+        s.check("KL-WRITE leaves a rewritable file alone: %s" % label,
+                v.kind, "silent")
+        got = (v.updated or {}).get("content", content)
+        s.check("KL-WRITE changed no byte: %s" % label, got, content)
+        s.check("KL-WRITE preserved every line: %s" % label,
+                got.split("\n"), content.split("\n"))
+
+    # The control. Same file types, a value that really IS a credential: still
+    # rewritten, literal gone, and the rewrite still confined to the value — the
+    # line count is the cheapest proof of that and it is asserted on the OUTPUT,
+    # so a substitution that ran past its line fails here even if it fired
+    # correctly. A list of silences with no reachable positive proves nothing.
+    for label, name, template, decoy in WRITE_REWRITABLE_TRUE_POSITIVES:
+        content = template % DECOY[decoy]
+        v = drive(write(os.path.join(root, name), content))
+        s.check("KL-WRITE control: still rewrites %s" % label, v.kind, "rewrite")
+        got = (v.updated or {}).get("content", "")
+        s.check("KL-WRITE control: literal is gone from %s" % label,
+                DECOY[decoy] in got, False)
+        s.check("KL-WRITE control: the rewrite stayed on its line, %s" % label,
+                got.count("\n"), content.count("\n"))
+
+    # The limit of the quoted exemption, and its control, asserted as a pair.
+    # The first is a KNOWN MISS this suite records rather than claims to have
+    # closed; the second proves the exemption is a closed head list and not a
+    # blanket "anything dotted". A fix that closed both would fail the second.
+    label, value = WRITE_QUOTED_HEAD_LIMIT
+    s.check("KL-WRITE limit: a listed head clears a quoted dotted value: %s" % label,
+            fingerprint.scan("password" + _REF_CO + '"' + value + '"\n'), [])
+    label, value = WRITE_QUOTED_HEAD_CONTROL
+    s.check("KL-WRITE control: an unlisted head does not: %s" % label,
+            [f.kind for f in fingerprint.scan("password" + _REF_CO + '"' + value + '"\n')],
+            ["named_credential"])
+
+    # ── each net, on its own ────────────────────────────────────────────────
+    #
+    # There are two independent defences against a match that crosses a line —
+    # the gap in the PATTERN, and `_one_line` on the FINDING — and defence in
+    # depth makes both unprovable through the hook: disarm either one and the
+    # other still produces the correct verdict, so a suite that only drives the
+    # hook stays green with a net removed. Measured: the mutation campaign's
+    # M89 and M90 both ESCAPED until these units existed.
+    #
+    # So each net is asserted where nothing else can cover for it, and each has
+    # its own control: a rule that stopped matching altogether would satisfy the
+    # "does not cross a line" half and fail the "still matches on one line" half.
+    for label, rx in (("assign", fingerprint._ASSIGN),
+                      ("bearer", fingerprint._BEARER),
+                      ("flag", fingerprint._FLAG)):
+        s.check("pattern %s does not cross a line" % label,
+                rx.search(NEWLINE_SPAN[label]) is None, True)
+        s.check("pattern %s control: it still matches on one line" % label,
+                rx.search(SAME_LINE[label]) is not None, True)
+
+    s.check("one-line: a keyword on the previous line is not a finding",
+            fingerprint._one_line("a:\nbcd", 0, 3, 6), False)
+    s.check("one-line: a value carrying a newline is not a finding",
+            fingerprint._one_line("a: b\nc", 0, 3, 6), False)
+    s.check("one-line control: a key and value on one line is a finding",
+            fingerprint._one_line("a: bcd", 0, 3, 6), True)
+
+    # ── the rewrite may replace a VALUE and may never reshape a FILE ─────────
+    #
+    # `_line_preserved` is the third net under the two in `fingerprint`, and the
+    # only one that does not have to be right about WHY a substitution went
+    # wrong. Asserted directly, because the path that reaches it in the hook is
+    # reachable only from a broken scanner — that is `mutations.json`'s job, and
+    # this is the unit it drives.
+    s.check("line-preserved: an in-line substitution is sound",
+            literal_write._line_preserved("a: X\nb: 2\n", "a: ${A}\nb: 2\n"), True)
+    s.check("line-preserved: a substitution that eats a line is not",
+            literal_write._line_preserved("a:\nb: 2\n", "a: ${A} 2\n"), False)
+    s.check("line-preserved: one that adds a line is not",
+            literal_write._line_preserved("a: X\n", "a: ${A}\n\n"), False)
 
     # ── the refusal must not reach ordinary source ──────────────────────────
     for label, content in WRITE_SOURCE_NEAR_MISSES:

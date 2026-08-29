@@ -94,13 +94,17 @@ _URL_AUTH = re.compile(r"[a-zA-Z][a-zA-Z0-9+.-]{1,15}://[^\s/:@]{1,64}:([^\s/@\"
 
 # `Authorization: Bearer …` and its siblings, in a header, a curl flag, or a
 # config file.
+#
+# Horizontal whitespace and not `\s` in every gap below. See "a key and its value
+# share a line", under `_ASSIGN`.
 _BEARER = re.compile(
-    r"(?i)authorization\s*:\s*(?:bearer|token|basic)\s+([A-Za-z0-9._~+/=-]{16,})")
+    r"(?i)authorization[^\S\n]*:[^\S\n]*(?:bearer|token|basic)[^\S\n]+"
+    r"([A-Za-z0-9._~+/=-]{16,})")
 
 # A credential passed as a command-line flag.
 _FLAG = re.compile(
     r"(?i)--?(?:token|api[_-]?key|apikey|password|secret|auth[_-]?token)"
-    r"(?:[= ]|\s+)([A-Za-z0-9._~+/=-]{16,})")
+    r"(?:[= ]|[^\S\n]+)([A-Za-z0-9._~+/=-]{16,})")
 
 # A credential-named key assigned an opaque value. The keyword is matched
 # directly with a lookbehind rather than by scanning a wildcard prefix, because
@@ -128,8 +132,34 @@ _ASSIGN = re.compile(
     r"(?P<kw>token|secret_key|secret-key|secret|pgpassword|password|passwd|apikey|"
     r"api_key|api-key|access_key|access-key|private_key|private-key|signing_key|"
     r"signing-key|encryption_key|encryption-key|credentials?|auth_token|auth-token)"
-    r"[\"']?\s*[:=]\s*"
+    r"[\"']?[^\S\n]*[:=][^\S\n]*"
     r"(?:\"([^\"\n]{12,256})\"|'([^'\n]{12,256})'|([A-Za-z0-9+/_.=~-]{12,256}))")
+
+# ── a key and its value share a line, and the gap must say so ──────────────
+#
+# Every gap above is `[^\S\n]` — horizontal whitespace — where it used to be
+# `\s`. `\s` matches a NEWLINE, so a key with an EMPTY value ran past the end of
+# its own line and took the NEXT line's key as its value. In a file this pack
+# rewrites, that substitution then replaced a key NAME with a reference to a
+# different variable, silently, under a message announcing a repair:
+#
+#     env:                            env:
+#       GITHUB_TOKEN:          ->       GITHUB_TOKEN:
+#       NODE_VERSION: 20                ${GITHUB_TOKEN}: 20
+#
+# Measured 2026-08-29 through the live hook on a `.github/workflows/*.yml`, and
+# reproducible in `.env.example` (`API_TOKEN=` on one line, the next key on the
+# next), in a reusable workflow's `secrets:` block, and in any INI or TOML with a
+# declared-but-unset key. All four are file types whose reader expands `${NAME}`,
+# which is exactly the set this check rewrites rather than reports.
+#
+# The horizontal-only gap costs nothing real: no format on the rewrite list puts
+# a scalar on the line after its key without a block indicator, and a block
+# scalar carries no `12,256`-character run of value characters on the separator
+# line to match in the first place.
+#
+# `_one_line` below is the same rule again, enforced on the FINDING rather than
+# in the pattern, so a future pattern edit cannot reopen the class quietly.
 
 # Values that are shaped like a credential and are not one. Checked before any
 # finding is reported, because a scanner that rewrites `${DB_PASSWORD}` into
@@ -186,11 +216,38 @@ def _too_plain(value):
 #   a code TERMINATOR         `credentials: PushConfig,`  `token = getToken(`
 #   a member PATH             `this.secret` = `config.secret`
 #
-# **A quoted value is always a literal.** Whatever it holds, someone spelled it,
-# so the two tests that read the value's own SHAPE require it to be UNQUOTED —
-# and `TOKEN = "abc.def.ghi"`, the JWT this exemption must never admit, is a
-# literal by that line alone. The substitution test runs before it, because a
-# quoted `$( … )` is still assembled at run time and still was never typed.
+# **A quoted value is a literal, with ONE exemption, and the exemption is a
+# closed list.** `"…",` says the comma belongs to the enclosing code rather than
+# to the value, so the TERMINATOR test needs the value unquoted and gets it. The
+# MEMBER-PATH test used to need it unquoted too, and that inverted the check:
+#
+#     token: secrets.GITHUB_TOKEN        left alone
+#     token: "secrets.GITHUB_TOKEN"      ->  token: "${TOKEN}"
+#
+# The unquoted spelling is exempt because the grammar itself says it is an
+# expression. The quoted one is a string someone typed, so exempting it needs
+# POSITIVE evidence that the string names something — and `a.b.c` in quotes is
+# not that evidence on its own. `TOKEN = "abcdefgh.ijklmnop.qrstuvwx"` is a
+# dotted opaque triple and it is a literal; the adversarial suite drives that row
+# and it went red the first time this exemption was written without a head list.
+#
+# So the head is enumerated. These are the namespaces a REFERENCE is written
+# against in the file types this check rewrites, where quoting the reference is
+# ordinary and the string is resolved by the file's own reader or by the code
+# around it. A head outside the list keeps the old behaviour — the quoted value
+# is a literal — which is the direction that fails toward catching.
+_QUOTED_REF_HEADS = frozenset([
+    # GitHub Actions contexts
+    "secrets", "vars", "env", "github", "inputs", "needs", "steps", "job",
+    "jobs", "matrix", "runner", "strategy",
+    # Terraform / OpenTofu
+    "var", "local", "locals", "data", "module", "each", "path",
+    # Helm / Kubernetes templating
+    "values", "release", "chart",
+    # ordinary code, where a config file quotes an accessor
+    "process", "os", "environ", "config", "settings", "self", "this", "props",
+    "state", "ctx", "context",
+])
 _SEGMENT = re.compile(r"^[A-Za-z_$][A-Za-z0-9_$]*$")
 
 # Characters that end an EXPRESSION and cannot end a bare value in any data
@@ -270,14 +327,22 @@ def _is_reference(text, start, end):
         # ONE proof that KL-ASSIGN's expansion-blanking is load-bearing rather
         # than decorative, and clearing it here would make the proof vacuous.
         return True
-    if start > 0 and text[start - 1] in "\"'`":
-        return False
-    if (text[end] if end < len(text) else "") in _CODE_END:
+    quoted = start > 0 and text[start - 1] in "\"'`"
+    if not quoted and (text[end] if end < len(text) else "") in _CODE_END:
         # `token` = `getAuthToken(`, `credentials: PushConfig,`, `secret: KEY)`.
         # The match is an expression in a programming language, so the credential
         # word in front of it is a field name and not a key holding a value.
+        #
+        # Gated on the value being UNQUOTED: after `"…"` the comma belongs to the
+        # enclosing code, so it says nothing about what is inside the quotes.
         return True
-    return _is_member_path(text[start:end])
+    if not _is_member_path(value):
+        return False
+    if not quoted:
+        return True
+    # Quoted: a dotted string needs a head that NAMES a namespace before it is
+    # read as a reference. See `_QUOTED_REF_HEADS`.
+    return value.split(".", 1)[0].lower() in _QUOTED_REF_HEADS
 
 
 def _name_left_of(text, offset, end=None):
@@ -307,7 +372,8 @@ def _name_left_of(text, offset, end=None):
     return cleaned if cleaned and not cleaned[0].isdigit() else ""
 
 
-_ASSIGN_LEFT = re.compile(r"([A-Za-z_][A-Za-z0-9_.-]{0,63})[\"']?\s*[:=]\s*[\"']?$")
+_ASSIGN_LEFT = re.compile(
+    r"([A-Za-z_][A-Za-z0-9_.-]{0,63})[\"']?[^\S\n]*[:=][^\S\n]*[\"']?$")
 
 
 def _assigned_name(text, value_start):
@@ -322,6 +388,26 @@ def _assigned_name(text, value_start):
         return ""
     cleaned = re.sub(r"[^A-Za-z0-9]+", "_", m.group(1)).strip("_").upper()
     return cleaned if cleaned and not cleaned[0].isdigit() else ""
+
+
+def _one_line(text, keyword_start, value_start, value_end):
+    """A finding must live on ONE line, keyword and value together.
+
+    The same rule the gaps in `_ASSIGN`, `_BEARER` and `_FLAG` already enforce,
+    stated a second time on the finding itself. It is not redundant: the patterns
+    are edited far more often than this function, and a `\\s` reintroduced in one
+    of those gaps reopens exactly the class that silently rewrote a YAML key into
+    a reference to a different variable. Here the same mistake produces a dropped
+    finding — a miss, which is the direction this module is allowed to fail in —
+    instead of a corrupted file announced as a repair.
+
+    `keyword_start` is `None` for a shape that carries no keyword.
+    """
+    if "\n" in text[value_start:value_end]:
+        return False
+    if keyword_start is None:
+        return True
+    return "\n" not in text[keyword_start:value_start]
 
 
 def scan(text, limit=64):
@@ -347,6 +433,8 @@ def scan(text, limit=64):
             value = m.group(1)
             if _is_placeholder(value) or _too_plain(value):
                 continue
+            if not _one_line(text, m.start(), m.start(1), m.end(1)):
+                continue
             raw.append((m.start(1), m.end(1), kind, ""))
             if len(raw) >= limit:
                 break
@@ -356,6 +444,8 @@ def scan(text, limit=64):
         if _is_placeholder(value) or _too_plain(value):
             continue
         gi = 2 if m.group(2) is not None else (3 if m.group(3) is not None else 4)
+        if not _one_line(text, m.start("kw"), m.start(gi), m.end(gi)):
+            continue
         if _is_reference(text, m.start(gi), m.end(gi)):
             continue
         raw.append((m.start(gi), m.end(gi), "named_credential",

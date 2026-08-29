@@ -75,11 +75,44 @@ reads the destination and picks its instrument:
 | prose or plain data — `.md`, `.txt`, `.csv` | any | **rewrite** — there is no grammar to break |
 | anything else — a program, a manifest, a data document, an unknown type | a **vendor** shape (`AKIA…`, `ghp_…`, a private-key header) | **deny** — the shape is proof on its own |
 | anything else | only a **name-keyed** match (`password: <opaque>`) | **warn**, and the write goes through UNTOUCHED |
+| any | a substitution that would not preserve the file's LINE STRUCTURE | **deny** — see below |
 
-The last row is the one worth defending. That rule cannot separate a literal from
-an identifier that merely looks opaque — `password`: `E2E_LOGIN_PASSWORD` — so
-refusing would refuse ordinary source edits and substituting would corrupt them.
-Reporting it is the only act that is right whichever of the two it was.
+The name-keyed row is the one worth defending. That rule cannot separate a
+literal from an identifier that merely looks opaque — `password`:
+`E2E_LOGIN_PASSWORD` — so refusing would refuse ordinary source edits and
+substituting would corrupt them. Reporting it is the only act that is right
+whichever of the two it was.
+
+**A rewrite replaces a VALUE. It may never reshape a file, and the last row is
+that rule with a refusal behind it.** The substitution is checked against the
+text it came from before it is emitted, and a rewrite whose line structure does
+not match the input is refused rather than applied — the message says so, and
+says it is a scanner defect rather than a problem with the write. A silent skip
+there would let the literal through, which is the one direction this check must
+never fail in; a silent application is what this rule exists to stop.
+
+That rule is not theoretical. Until 2026-08-29 the gap between a key's separator
+and its value matched a NEWLINE, so a key declared with an EMPTY value ran past
+the end of its own line and took the NEXT line's key as its value:
+
+```yaml
+env:                          env:
+  GITHUB_TOKEN:          ->     GITHUB_TOKEN:
+  NODE_VERSION: 20              ${GITHUB_TOKEN}: 20
+```
+
+A key name replaced by a reference to a different variable, in a file type this
+check rewrites, announced as a repair. The same shape reproduced in a
+`.env.example` template, in a reusable workflow's `secrets:` block, and in any
+INI or TOML carrying a declared-but-unset key. Every gap in the patterns is now
+horizontal whitespace, `_one_line` enforces the same rule on the finding so a
+later pattern edit cannot reopen it quietly, and the line-structure check above
+is the third net under both.
+
+Both pattern-level and finding-level nets are asserted DIRECTLY in the suite as
+well as through the hook. Driving the hook alone cannot prove either: disarm one
+and the other still returns the right verdict, so the suite stays green with a
+net removed — measured, as two escaped mutations, before those units existed.
 
 An unknown extension is treated as *not* expanding. That is the direction that
 fails safe: the worst outcome of guessing wrong is a message instead of a
@@ -530,6 +563,20 @@ Measured on Claude Code 2.1.223, not inferred:
   reach it — an entropy floor, a `:` versus `=` separator, "the same word
   appears elsewhere in this file" — were each measured dropping a real
   credential.
+- **A QUOTED dotted value is read as a reference only behind a listed head.**
+  `token: "secrets.GITHUB_TOKEN"` used to be rewritten while the unquoted
+  spelling beside it was left alone, because the quote gated the member-path
+  exemption as well as the terminator test. It gates the terminator test only
+  now, and the member-path exemption applies to a quoted value when its head
+  names one of the namespaces in `fingerprint._QUOTED_REF_HEADS` — the GitHub
+  Actions contexts, Terraform, Helm, and the accessors a config file quotes.
+  The cost is stated rather than hidden: an OPAQUE tail behind a listed head
+  (a `password` key holding `config.` plus an opaque tail, in quotes) is
+  exempt, and nothing separates it from a literal but the value's own
+  randomness — the same residual class as above. It is
+  strictly NARROWER than what was already exempt, because the same value
+  unquoted is exempt behind ANY head and was before this rule existed. Both
+  halves carry a row, so closing one by closing both is visible.
 - **The file-type table is a table, and a table is never complete.** `targets.py`
   enumerates the readers that expand `${NAME}` and the file types that have no
   grammar to break; everything else is treated as a program. A type missing from

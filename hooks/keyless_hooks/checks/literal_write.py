@@ -68,12 +68,34 @@ def _slot_key(addr):
     return addr if isinstance(addr, str) else addr[-1]
 
 
+def _line_preserved(before, after):
+    """A substitution replaces a VALUE. It never changes the shape of the file.
+
+    The one structural claim a rewrite makes that nothing else here checks: the
+    text that comes back has the same lines as the text that went in. A finding
+    whose span ran past the end of its own line broke it — the substitution
+    landed on the NEXT line's key and replaced a key NAME with a reference to a
+    different variable, and the message called that a repair.
+
+    `fingerprint` closes that class twice over. This is the third place, and it
+    is the one that does not have to be right about WHY: whatever a future
+    pattern does, if the rewrite would not preserve the line structure it is not
+    a rewrite this check is allowed to make, and the call is refused instead.
+
+    Refused, never dropped. A silent skip here would let the write through with
+    the literal intact, which is the one direction this check must never fail in.
+    """
+    return before.count("\n") == after.count("\n")
+
+
 def run(payload, cfg):
     if payload.event != "PreToolUse" or payload.tool not in _TOOLS:
         return None
 
     changes = {}
     kinds = []
+    sites = []
+    unsafe = []
     for addr, value in payload.text_slots():
         if _slot_key(addr) == "old_string":
             # `old_string` must keep matching what is on disk. Rewriting it makes
@@ -86,8 +108,19 @@ def run(payload, cfg):
         new_value, findings = fingerprint.redact(value)
         if not findings:
             continue
+        if not _line_preserved(value, new_value):
+            unsafe.append(_slot_key(addr))
+            continue
         changes[addr] = new_value
         kinds.extend(f.kind for f in findings)
+        for f in findings:
+            sites.append("%s line %d" % (_slot_key(addr),
+                                         value.count("\n", 0, f.start) + 1))
+
+    if unsafe:
+        return ("deny", _unsound_message(payload.file_path, sorted(set(unsafe))),
+                {"reason": "rewrite_would_not_preserve_lines",
+                 "fields": sorted(set(unsafe))})
 
     if not changes:
         return None
@@ -97,7 +130,7 @@ def run(payload, cfg):
     shapes = sorted(set(kinds))
 
     if targets.rewritable(target):
-        return ("rewrite", _rewrite_message(target, kinds, shapes, fields),
+        return ("rewrite", _rewrite_message(target, kinds, shapes, fields, sites),
                 payload.rebuild(changes))
 
     detail = {"shapes": shapes[:8], "fields": fields,
@@ -115,21 +148,46 @@ def _named(target):
     return target or "the file being written"
 
 
-def _rewrite_message(target, kinds, shapes, fields):
+def _rewrite_message(target, kinds, shapes, fields, sites):
     return (
-        "[%s] %d credential-shaped literal(s) in this write were replaced with "
-        "`${NAME}` references before it reached disk. Shapes matched: %s. Fields "
-        "rewritten: %s. The write itself proceeded — %s does not contain the "
-        "literal.\n\n"
-        "To make the file work, supply the value at run time instead of storing "
-        "it:\n"
+        "[%s] This write was CHANGED before it reached disk: %d credential-shaped "
+        "literal(s) were replaced with `${NAME}` references. You did not ask for "
+        "that substitution — read it before you build on it.\n\n"
+        "  file      %s\n"
+        "  shapes    %s\n"
+        "  fields    %s\n"
+        "  at        %s\n\n"
+        "%s now holds `${NAME}` where those values were. To make it work, supply "
+        "the value at run time instead of storing it:\n"
         "%s\n\n"
-        "If a match was not a credential — a fixture, a test vector, a public "
-        "identifier — the substitution is wrong and the correct fix is to re-write "
-        "the file with that value spelled so it is not credential-shaped, or to "
-        "add its file to `allowed` in ~/.config/keyless/hooks.json."
-        % (CHECK, len(kinds), ", ".join(shapes), ", ".join(fields), _named(target),
-           _RUN_LINE))
+        "If a match was NOT a credential — a variable NAME, a fixture, a test "
+        "vector, a public identifier — then the substitution is wrong and the file "
+        "on disk is now wrong. Re-write it with that value spelled so it is not "
+        "credential-shaped, or add its path to `allowed` in "
+        "~/.config/keyless/hooks.json, which stops the substitution for that file."
+        % (CHECK, len(kinds), _named(target), ", ".join(shapes), ", ".join(fields),
+           "; ".join(sites) if sites else "unknown", _named(target), _RUN_LINE))
+
+
+def _unsound_message(target, fields):
+    return (
+        "[%s] Refused. A credential-shaped literal is in this write, and the "
+        "substitution that would remove it does not preserve the file's line "
+        "structure — so applying it would edit text this check did not match.\n\n"
+        "  file      %s\n"
+        "  fields    %s\n\n"
+        "Nothing was written and nothing was changed. This check may rewrite a "
+        "VALUE; it may never reshape a file, and it refuses rather than guessing "
+        "which of the two it is about to do.\n\n"
+        "This is a defect in the scanner, not in your write. What to do now:\n\n"
+        "  * if the value IS a credential, supply it at run time instead:\n"
+        "%s\n"
+        "  * if it is not, spell it so it is not credential-shaped, or add this "
+        "path to `allowed` in ~/.config/keyless/hooks.json.\n\n"
+        "Either way the scanner should be reported: this message means a pattern "
+        "matched across a line boundary, which `fingerprint._one_line` exists to "
+        "prevent."
+        % (CHECK, _named(target), ", ".join(fields), _RUN_LINE))
 
 
 def _deny_message(target, kinds, shapes):
