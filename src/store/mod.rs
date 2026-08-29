@@ -503,7 +503,7 @@ pub struct Built {
 /// The point of the daemon is that killing it must get you *fewer* secrets,
 /// never more. Leave any local backend registered beside it, and the moment the
 /// daemon stops answering `run` reaches for that backend instead — with the
-/// session's own uid, its own login keychain, its own `~/.infisical/.token`.
+/// session's own uid, and every login that uid already holds.
 /// That is not a fallback. It is the hole the daemon exists to close, re-opening
 /// itself automatically whenever the thing closing it goes away, and anyone able
 /// to stop a process could choose it.

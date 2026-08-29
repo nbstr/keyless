@@ -84,10 +84,22 @@
 //!
 //! # What this adapter never touches
 //!
-//! `~/.infisical/.token`, `~/.infisical/.client-id`, and the encrypted cache in
-//! `~/.infisical/secrets-backup/`. The login belongs to the CLI and is inherited
-//! by spawning it. There is no code path here that opens a file under
-//! `~/.infisical`, and no config field in which a token would fit.
+//! **The vendor's login, wherever the vendor keeps it.** Measured against
+//! 0.43.124: it is an item in the system keyring, not a file — `infisical vault`
+//! is the verb that chooses where — and the state directory beside it holds
+//! project settings, an update check and an encrypted backup cache, none of
+//! which this adapter opens either.
+//!
+//! Where it lives is the vendor's business precisely because nothing here reads
+//! it. A session's login is inherited by spawning the CLI as the session's own
+//! uid; there is no code path that opens the vendor's state and no config field
+//! in which a token would fit.
+//!
+//! A daemon has no such login to inherit — a keyring item belongs to the uid
+//! that unlocked it — so it hands the vendor a machine identity instead, read at
+//! spawn time out of a store on its own side of the boundary. That is still not
+//! a token in a config file: see [`VendorCredentials`], which names an entry and
+//! never holds a value.
 //!
 //! # There is no default environment, and that is the point
 //!
@@ -181,10 +193,11 @@
 //! Being *nearly* safe is how this class of bug ships.
 //!
 //! The REST API returns JSON, where a typed `secretKey` field could not carry a
-//! fragment of a value — but reaching it needs a credential, and `keyless` has
-//! none. This adapter authenticates by spawning the vendor's CLI and inheriting
-//! its login; there is no code path here that opens a file under `~/.infisical`,
-//! and no config field a token fits in. An HTTP client would also be the first
+//! fragment of a value — but reaching it needs a credential to be held and
+//! spoken, and this adapter never holds one: it spawns the vendor's CLI, which
+//! either has its own login or is handed a machine identity it reads out of its
+//! environment. Neither is a value this crate parses, stores, or has a config
+//! field for. An HTTP client would also be the first
 //! network stack in a crate whose whole dependency list is five crates and
 //! whose auditability is the product. So the API is the wrong trade here, not
 //! an unexamined one.
@@ -270,6 +283,20 @@ pub struct Routing {
     default_path: String,
     invocation_env: Option<String>,
     routes: BTreeMap<String, Route>,
+    /// Whether the caller of THIS process could have named an environment.
+    ///
+    /// Not a setting and not readable from any config file: it is decided by
+    /// which constructor ran, because it is a fact about the host rather than
+    /// about a configuration. A session's caller can pass
+    /// `keyless run --env <slug>`; a daemon's caller cannot, because the wire
+    /// protocol has no field for one.
+    ///
+    /// It changes exactly one thing — the sentence in
+    /// [`Routing::missing_env_detail`] — and it must never come to change what
+    /// resolves. Telling a daemon user to pass a flag their client cannot send
+    /// is a remedy that reads as correct and does nothing, which is how somebody
+    /// spends an afternoon editing the wrong config file.
+    caller_can_name_an_environment: bool,
 }
 
 impl Routing {
@@ -281,6 +308,7 @@ impl Routing {
             &config.secrets,
             &settings.path,
             invocation_env.map(str::to_owned),
+            true,
         )
     }
 
@@ -311,7 +339,7 @@ impl Routing {
         secrets: &BTreeMap<String, SecretRoute>,
         default_path: &str,
     ) -> Self {
-        Self::build(secrets, default_path, None)
+        Self::build(secrets, default_path, None, false)
     }
 
     /// The shared projection: declared routes, resolved against the defaults.
@@ -319,6 +347,7 @@ impl Routing {
         secrets: &BTreeMap<String, SecretRoute>,
         default_path: &str,
         invocation_env: Option<String>,
+        caller_can_name_an_environment: bool,
     ) -> Self {
         let routes = secrets
             .iter()
@@ -342,6 +371,47 @@ impl Routing {
             default_path: default_path.to_owned(),
             invocation_env,
             routes,
+            caller_can_name_an_environment,
+        }
+    }
+
+    /// Why a name with no environment cannot be looked up, and how to fix it
+    /// **here**.
+    ///
+    /// Written once, because this sentence is the whole migration: a config that
+    /// used to lean on a machine-wide default gets these words instead of a
+    /// value from the wrong environment, and it has to be good enough to act on
+    /// without anybody explaining it.
+    ///
+    /// Two versions, and the difference is which file the reader should open.
+    /// A session has two ways to supply an environment and the sentence offers
+    /// both. A daemon's caller has neither: its per-name `env` lives in
+    /// `keylessd.json`, which the calling user cannot write, and `--env` cannot
+    /// cross the socket. Offering a session's remedy there would send the reader
+    /// to edit a file that does not decide the question — the same fault as the
+    /// ambiguity message in [`crate::daemon::resolver`], fixed the same way and
+    /// in the same words.
+    #[must_use]
+    pub fn missing_env_detail(&self, name: &str) -> String {
+        if self.caller_can_name_an_environment {
+            format!(
+                "`{name}` has no Infisical environment. Infisical requires one on every \
+                 call and `keyless` does not default it, because a default resolves a \
+                 name you never declared against whichever environment this machine \
+                 happens to name. Give it one: put \"env\": \"staging\" on \"{name}\" \
+                 under `secrets`, or pass `keyless run --env staging` for the whole \
+                 command. A name's own `env` wins over the flag."
+            )
+        } else {
+            format!(
+                "`{name}` has no Infisical environment. Infisical requires one on every \
+                 call and `keylessd` does not default it, because a default resolves a \
+                 name you never declared against whichever environment this machine \
+                 happens to name. Give it one where the daemon reads it: put \
+                 \"env\": \"staging\" on \"{name}\" under `secrets` in keylessd's own \
+                 config file, not this session's — a session cannot name an environment \
+                 for a daemon, because that would be a client choosing its own tenant."
+            )
         }
     }
 
@@ -415,23 +485,6 @@ impl Routing {
             })
         })
     }
-}
-
-/// Why a name with no environment cannot be looked up, and both ways to fix it.
-///
-/// Written once, because this sentence is the whole migration: a config that
-/// used to lean on a machine-wide default gets these words instead of a value
-/// from the wrong environment, and it has to be good enough to act on without
-/// anybody explaining it.
-fn missing_env_detail(name: &str) -> String {
-    format!(
-        "`{name}` has no Infisical environment. Infisical requires one on every \
-         call and `keyless` does not default it, because a default resolves a \
-         name you never declared against whichever environment this machine \
-         happens to name. Give it one: put \"env\": \"staging\" on \"{name}\" \
-         under `secrets`, or pass `keyless run --env staging` for the whole \
-         command. A name's own `env` wins over the flag."
-    )
 }
 
 /// The subcommand the listing probe runs `keyless` as.
@@ -831,7 +884,7 @@ impl InfisicalStore {
                 path: route.path,
                 key: route.key,
             }),
-            None => Err(self.misconfigured(missing_env_detail(name))),
+            None => Err(self.misconfigured(self.routing.missing_env_detail(name))),
         }
     }
 
@@ -1191,7 +1244,7 @@ impl Discover for InfisicalStore {
 #[cfg(test)]
 mod tests {
     use super::{
-        CHILD_EXIT_MARKER, FORWARDED_EXACT, InfisicalStore, Location, NO_ENV, Routing,
+        BTreeMap, CHILD_EXIT_MARKER, FORWARDED_EXACT, InfisicalStore, Location, NO_ENV, Routing,
         TELEMETRY_OFF, is_forwarded,
     };
     use crate::config::Config;
@@ -1255,6 +1308,33 @@ mod tests {
         assert!(said.contains("DATABASE_URL"), "{said}");
         assert!(said.contains("env"), "{said}");
         assert!(said.contains("--env"), "{said}");
+    }
+
+    #[test]
+    fn a_daemon_hosted_name_is_told_which_config_file_can_settle_it() {
+        // The session's remedy is inert behind a daemon: `--env` cannot cross
+        // the socket, and the `secrets` the reader is holding was dropped on
+        // purpose by `store::build`. A reader who applies it changes nothing and
+        // then has a config that looks correct and a run that still degrades —
+        // which is the exact fault the ambiguity message already fixes, so this
+        // is fixed in the same words.
+        let routing = Routing::without_invocation_env(&BTreeMap::new(), "/");
+        let said = routing.missing_env_detail("DATABASE_URL");
+        assert!(said.contains("keylessd's own config file"), "{said}");
+        assert!(said.contains("not this session's"), "{said}");
+        assert!(
+            !said.contains("--env"),
+            "a daemon's caller cannot pass a flag, so offering one is a remedy \
+             that reads as correct and does nothing: {said}"
+        );
+
+        // The negative control: a session gets both of ITS remedies, and is not
+        // sent to a file it does not own. Without this the assertions above
+        // would be satisfied by one sentence for everybody.
+        let session = Routing::from_config(&config_from("{}"), None);
+        let said = session.missing_env_detail("DATABASE_URL");
+        assert!(said.contains("keyless run --env staging"), "{said}");
+        assert!(!said.contains("keylessd"), "{said}");
     }
 
     #[test]

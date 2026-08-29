@@ -207,9 +207,10 @@ impl Default for KeychainConfig {
 
 /// Infisical settings.
 ///
-/// Everything here is a coordinate or a knob. The login itself is the CLI's:
-/// `keyless` never reads `~/.infisical/.token`, never reads the encrypted
-/// backup cache beside it, and has no field in which to put a token.
+/// Everything here is a coordinate or a knob. The login itself is the CLI's,
+/// kept wherever the CLI keeps it — a system-keyring item, for the version this
+/// adapter was measured against. `keyless` reads none of it, opens nothing in
+/// the vendor's state directory, and has no field in which to put a token.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct InfisicalConfig {
     /// Path to, or name of, the `infisical` binary.

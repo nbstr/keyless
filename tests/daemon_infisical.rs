@@ -404,6 +404,17 @@ fn a_declared_name_with_no_environment_reaches_no_vendor_process_either() {
     );
     assert!(reason.contains("was not asked"), "{reason}");
     assert!(reason.contains(NO_ENV), "{reason}");
+    // The remedy has to name the file that can actually settle it. A reader who
+    // applies a session's remedy changes nothing — `--env` cannot cross this
+    // socket and `store::build` dropped their own `secrets` pins on purpose —
+    // and is then holding a config that looks correct beside a run that still
+    // degrades. Asserted over the socket rather than on the routing, because
+    // this is a statement about what a degraded session actually reads.
+    assert!(reason.contains("keylessd's own config file"), "{reason}");
+    assert!(
+        !reason.contains("--env"),
+        "the degrade offered a flag this client cannot send: {reason}"
+    );
 
     drop(running);
     let _ = std::fs::remove_dir_all(&dir);

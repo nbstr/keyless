@@ -590,9 +590,55 @@ report left your machine — see [No telemetry](#no-telemetry). It also pins
 too and a value of `stdout` there would interleave log lines with the value
 being read.
 
-`keyless` never opens `~/.infisical/.token`, `~/.infisical/.client-id`, or the
-encrypted cache beside them. The login belongs to the CLI and is inherited by
-spawning it; there is no config field a token fits in.
+`keyless` never opens the vendor's login, wherever the vendor keeps it — a
+system-keyring item, for the version this adapter was measured against — nor the
+project settings and encrypted cache in its state directory. A session's login
+belongs to the CLI and is inherited by spawning it; there is no config field a
+token fits in.
+
+A daemon has no such login to inherit, because a keyring item belongs to the uid
+that unlocked it. It hands the vendor a machine identity instead — see
+[Infisical behind the daemon](#infisical-behind-the-daemon).
+
+#### Infisical behind the daemon
+
+`keylessd` carries this adapter. Enable it under `stores.infisical` in
+`keylessd.json`, give every name its own `env` under `secrets` there, and name
+where the machine identity lives:
+
+```json
+{
+  "stores": {
+    "infisical": {
+      "enabled": true,
+      "binary": "/opt/homebrew/bin/infisical",
+      "project_id": "<your project id>",
+      "credentials_file": "/usr/local/var/lib/keyless/infisical.json",
+      "credentials": { "INFISICAL_TOKEN": "MACHINE_IDENTITY" }
+    }
+  },
+  "secrets": { "DATABASE_URL": { "store": "infisical", "env": "staging" } }
+}
+```
+
+`credentials` maps a variable the vendor CLI reads to an **entry name** in a
+mode-`0600` file the daemon owns. The value is never in this config, never in
+the launchd plist — which is installed world-readable — and never in argv. It is
+read at spawn time and dropped with the lookup, so rotating it needs no restart.
+
+Three things this arrangement is deliberately strict about:
+
+- **Its own file, not the one the `file` store serves.** Anything in that file
+  is a name an attested client can ask for, so a machine identity kept there
+  would be handed to any session that guessed its label. Sharing one file works
+  and is warned about by name.
+- **`INFISICAL_*` only.** Unbounded, the field sets any variable on a child
+  process as the daemon's uid: `PATH` would choose which binary the vendor is,
+  `HOME` which login it finds.
+- **No environment the daemon can supply.** There is no `env` key in the daemon's
+  Infisical settings and no field for one on the wire, so a name that declares
+  none is refused before anything is spawned. That is the whole reason this
+  adapter is safer here than in a session — see below.
 
 #### An environment is required, and has no default
 
@@ -614,6 +660,14 @@ So an environment comes from exactly two places, most specific first:
 |---|---|
 | the name's own `env` under `secrets` | that name, everywhere |
 | `keyless run --env <slug>` | every name in that run declaring none |
+
+**Behind the daemon there is only the first**, and that is a security property
+rather than a missing feature. The protocol carries a name and no environment,
+so a client cannot say which tenant it means — and a name that appears nowhere
+in `keylessd.json` therefore has no environment at all, which is what stops an
+invented name becoming a real query against a real vault. A daemon-side degrade
+says so, and points at the daemon's config rather than offering a flag the
+client cannot send.
 
 **Neither, and the lookup does not happen.** Nothing is spawned and no network
 call is made — a missing environment is a lookup that never happened, not one
@@ -1023,10 +1077,12 @@ Three things that follow, none of them hidden:
   is one value, so a config entry needs a `key` and never a `field`.
 
 The REST API would return JSON, where a typed `secretKey` could not carry a
-fragment of a value — but reaching it needs a credential `keyless` does not have.
-This tool authenticates by spawning the vendor's CLI and inheriting its login; it
-opens no file under `~/.infisical`, has no config field a token fits in, and
-carries no HTTP client.
+fragment of a value — but reaching it needs a credential to be held and spoken,
+and `keyless` never holds one. It spawns the vendor's CLI, which either has its
+own login or is handed a machine identity it reads out of its environment;
+neither is a value this tool parses or stores, it opens nothing in the vendor's
+state directory, it has no config field a token fits in, and it carries no HTTP
+client.
 
 ### Two backends say why they cannot do this
 
@@ -1189,8 +1245,8 @@ advisory.**
 The only thing on this machine that can hold a credential your uid cannot reach
 is [`keylessd`](#keylessd--the-uid-boundary), behind a second uid. So the
 enforced version of this split is "the manager token lives on the daemon's
-side", and it is not built: `keylessd` carries a file store and a keychain store,
-no Proton adapter, and the protocol has no write operation.
+side", and it is not built: `keylessd` carries no Proton adapter, and the
+protocol has no write operation.
 
 Given that, **`keyless` refuses every local write while the daemon is enabled**
 rather than reaching around it:
@@ -1859,20 +1915,22 @@ Deliberately out of scope, with the seams left clean:
 - **More backends.** `Store` is one trait with one method. Adding 1Password,
   Bitwarden or Vault means implementing it and registering it in `store::build`;
   `run` never learns which backend answered, and neither does the daemon.
-- **Infisical and Proton Pass *behind* the daemon.** This is a gap with teeth,
-  so it is stated rather than buried. Enabling the daemon suppresses every local
-  backend — that is the [rule](#many-sessions-at-once) that keeps a fallback from
-  re-opening the hole — but `keylessd`'s own store set is the file store and the
-  keychain. So a user who resolves names through Infisical today and switches the
-  daemon on will find those names **degrading**, loudly, with a warning naming
-  the suppressed backend.
-  Closing it means giving `keylessd` the same two adapters plus a decision about
-  what reason it records, which is a change worth making on its own rather than
-  inside a merge. It also needs an answer for `run --env`: the protocol carries a
-  name and nothing else, so an Infisical name served by the daemon would have to
-  declare its own `env` in the daemon's config, or the request would have to
-  carry one — and a client naming its own environment is a client choosing its
-  own tenant, which is the decision the daemon exists to take away from it.
+- **Proton Pass *behind* the daemon.** This is a gap with teeth, so it is stated
+  rather than buried. Enabling the daemon suppresses every local backend — that
+  is the [rule](#many-sessions-at-once) that keeps a fallback from re-opening the
+  hole — and `keylessd` has no Proton adapter to serve those names instead. So a
+  user who resolves names through Proton today and switches the daemon on will
+  find them **degrading**, loudly, with a warning naming the suppressed backend.
+  Closing it needs more than the adapter. `pass-cli` links `Security.framework`
+  and its **login** demonstrably needs the logging-in user's keychain, so whether
+  a daemon uid can `run` against a session directory at all is the first
+  unanswered question — and the second is that `pass-cli` may rewrite its session
+  store on any invocation, which makes a stripped environment, exactly what
+  launchd hands a daemon, able to destroy a web-login session outright. Both are
+  measurements, not opinions, and neither has been taken. It also needs a
+  decision about the mandatory audit reason: the daemon would have to synthesise
+  one from what it can verify — the peer's uid and pid, and the name — because
+  the request's `argv` is a claim and this tool never reads a claim as a fact.
 - **A write operation on the daemon, and the manager identity behind its uid.**
   This is the same gap read from the write side, and it is the one that makes the
   [reader/manager split](#what-the-split-is-and-what-it-is-not) advisory rather
