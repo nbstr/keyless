@@ -40,6 +40,7 @@ use crate::error::ConfigError;
 use crate::ipc::peer::decode_hex;
 use crate::paths::ConfigPath;
 use crate::store::file::FileStore;
+use crate::store::infisical::Routing;
 use crate::store::keychain::KeychainStore;
 use crate::store::{Registry, Store};
 
@@ -75,11 +76,18 @@ pub struct DaemonConfig {
     ///
     /// Deliberately [`crate::config::SecretRoute`], the same type and the same
     /// spelling the session's config uses, because this is the same decision
-    /// moved across the uid boundary rather than a second mechanism. Only
-    /// `store` is read here — the per-backend coordinate fields belong to
-    /// adapters the daemon does not carry — and reusing the type means a route
-    /// an operator moves from a session config into `keylessd.json` keeps
-    /// working instead of being silently dropped as an unknown key.
+    /// moved across the uid boundary rather than a second mechanism. Reusing
+    /// the type means a route an operator moves from a session config into
+    /// `keylessd.json` keeps working instead of being silently dropped as an
+    /// unknown key.
+    ///
+    /// `store` decides which of the daemon's backends answers a name; `env`,
+    /// `path` and `key` are the Infisical coordinates that backend looks the
+    /// name up at, read by [`DaemonConfig::infisical_routing`]. The remaining
+    /// fields describe adapters the daemon does not carry and are ignored.
+    ///
+    /// **`env` here is the ONLY place a daemon-hosted lookup can get an
+    /// Infisical environment from.** See [`DaemonConfig::infisical_routing`].
     #[serde(default)]
     pub secrets: BTreeMap<String, SecretRoute>,
 }
@@ -286,10 +294,43 @@ impl DaemonConfig {
         Ok(policy)
     }
 
+    /// Where each name lives inside Infisical, with **no environment of the
+    /// daemon's own** anywhere behind it.
+    ///
+    /// # The whole security argument for hosting this adapter here
+    ///
+    /// The measured hazard of the Infisical adapter is that a caller-supplied
+    /// name becomes a key lookup at the root of whatever environment is in
+    /// scope: given one, an invented name spawns the vendor and asks a real
+    /// vault for it. On a session that environment can come from
+    /// `keyless run --env <slug>`, which is the caller's own word.
+    ///
+    /// A daemon cannot be told one. [`crate::ipc::protocol::Request`] carries
+    /// `v`, `op`, `name`, `cwd` and `argv` and no environment field, so there
+    /// is nothing on the wire to read — and this method supplies none either,
+    /// which is why it calls the constructor that has no parameter for it. A
+    /// name resolves only against the `env` an operator wrote beside it under
+    /// `secrets`, in a file the calling user cannot write. Every other name is
+    /// refused before a process is spawned or a packet is sent.
+    ///
+    /// **There is deliberately no daemon-level default environment, and `env`
+    /// must never join the wire protocol.** Both would restore the hazard on
+    /// the untrusted side of the uid boundary, and both would look like they
+    /// worked: a wrong environment answers with a real, plausible value.
+    ///
+    /// The folder path is defaulted to the vendor's own `/`, which invents
+    /// nothing — see [`crate::config::InfisicalConfig::path`] for why the two
+    /// coordinates are treated differently.
+    #[must_use]
+    pub fn infisical_routing(&self) -> Routing {
+        Routing::without_invocation_env(&self.secrets, &crate::config::default_infisical_path())
+    }
+
     /// Which name is pinned to which store, by store id.
     ///
-    /// Only [`SecretRoute::store`] is read: the rest of that type describes
-    /// coordinates inside backends the daemon does not carry.
+    /// Only [`SecretRoute::store`] is read here: the coordinate fields beside
+    /// it say where a name lives *inside* a backend, which is
+    /// [`DaemonConfig::infisical_routing`]'s question rather than this one's.
     fn routes(&self) -> BTreeMap<String, String> {
         self.secrets
             .iter()
@@ -595,6 +636,81 @@ mod tests {
         // two-store warning is about ambiguity, so it does not fire.
         let said = config.warnings().join(" ");
         assert!(!said.contains("stores.default"), "{said}");
+    }
+
+    // -----------------------------------------------------------------------
+    // The Infisical coordinates, and the environment the daemon cannot have.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn a_names_own_coordinates_are_read_from_the_daemons_own_config() {
+        // `env`, `path` and `key` parsed into `SecretRoute` long before
+        // anything read them. This is the projection that starts reading them,
+        // and it must produce exactly what was written down.
+        let config = parse(
+            r#"{"secrets":{"DATABASE_URL":{"store":"infisical","env":"staging",
+                                           "path":"/backend","key":"PG_URL"}}}"#,
+        );
+        let route = config.infisical_routing().route("DATABASE_URL");
+        assert_eq!(route.env.as_deref(), Some("staging"));
+        assert_eq!(route.path, "/backend");
+        assert_eq!(route.key, "PG_URL");
+    }
+
+    #[test]
+    fn a_declared_name_that_states_no_environment_gets_none() {
+        // Not an error here — it is a route with nothing to look up, and the
+        // adapter turns that into a refusal that spawns nothing.
+        let config = parse(r#"{"secrets":{"DATABASE_URL":{"store":"infisical"}}}"#);
+        assert_eq!(config.infisical_routing().route("DATABASE_URL").env, None);
+    }
+
+    #[test]
+    fn no_daemon_config_key_supplies_a_default_infisical_environment() {
+        // The rule this whole adapter's daemon port rests on, asserted the way
+        // `there_is_no_config_key_that_permits_interpreted_callers` asserts
+        // its own: a future key spelled any of these ways is dropped by serde,
+        // so what matters is that the PARSED config cannot express one and the
+        // routing built from it hands an undeclared name no environment.
+        //
+        // Every spelling below is one somebody reaching for a default would
+        // try, including the session config's own dead `stores.infisical.env`.
+        let config = parse(
+            r#"{"stores":{"infisical":{"env":"prod"},"env":"prod","default_env":"prod"},
+                "env":"prod","infisical_env":"prod",
+                "secrets":{"DECLARED":{"store":"infisical","env":"staging"}}}"#,
+        );
+        let rendered = serde_json::to_string(&config).expect("serialize");
+        for spelling in ["prod", "default_env", "infisical_env"] {
+            assert!(
+                !rendered.contains(spelling),
+                "`{spelling}` survived the parse: {rendered}"
+            );
+        }
+
+        let routing = config.infisical_routing();
+        // The negative control, and it is not decoration: without it every
+        // assertion here would be satisfied by a routing that resolves nothing
+        // at all, which is not the property being claimed.
+        assert_eq!(routing.route("DECLARED").env.as_deref(), Some("staging"));
+        assert_eq!(
+            routing.route("A_NAME_NOBODY_EVER_DECLARED").env,
+            None,
+            "a name the daemon's config never declared must have no environment, \
+             or it becomes a key lookup against a real vault"
+        );
+    }
+
+    #[test]
+    fn an_undeclared_name_takes_the_vendors_own_folder_and_its_own_key() {
+        // The other two coordinates ARE defaulted, and the asymmetry is the
+        // point: a wrong folder can only miss inside an environment somebody
+        // named, and with no environment the lookup never happens anyway.
+        let route = parse("{}")
+            .infisical_routing()
+            .route("A_NAME_NOBODY_EVER_DECLARED");
+        assert_eq!(route.path, "/");
+        assert_eq!(route.key, "A_NAME_NOBODY_EVER_DECLARED");
     }
 
     #[test]

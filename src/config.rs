@@ -577,7 +577,13 @@ fn default_infisical_binary() -> ConfigPath {
     ConfigPath::from("infisical")
 }
 
-fn default_infisical_path() -> String {
+/// The vendor's own default folder, and the only coordinate `keyless` defaults.
+///
+/// `pub(crate)` because the daemon's config declares no folder of its own and
+/// must default it to the same thing a session does. A second literal `/`
+/// written over there would be free to drift from this one, and the drift would
+/// be invisible: both spellings resolve, against different folders.
+pub(crate) fn default_infisical_path() -> String {
     "/".to_owned()
 }
 

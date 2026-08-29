@@ -194,7 +194,7 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::time::Duration;
 
-use crate::config::Config;
+use crate::config::{Config, SecretRoute};
 use crate::error::StoreError;
 use crate::secret::Secret;
 use crate::store::Store;
@@ -277,9 +277,50 @@ impl Routing {
     #[must_use]
     pub fn from_config(config: &Config, invocation_env: Option<&str>) -> Self {
         let settings = &config.stores.infisical;
-        let invocation_env = invocation_env.map(str::to_owned);
-        let routes = config
-            .secrets
+        Self::build(
+            &config.secrets,
+            &settings.path,
+            invocation_env.map(str::to_owned),
+        )
+    }
+
+    /// A routing that has no invocation environment and cannot be given one.
+    ///
+    /// **The absence is the security property, and it is a constructor rather
+    /// than a `None` argument so that no call site can supply one by editing a
+    /// parameter.** With no invocation environment, a name that declares no
+    /// `env` of its own has no environment at all, and
+    /// [`InfisicalStore::coordinates`] refuses it before anything is spawned —
+    /// so a caller-supplied name that appears in no config reaches neither a
+    /// process nor the network. Measured: with an invocation environment, an
+    /// invented name spawns the vendor as
+    /// `run --env=<slug> --path=/ … -- printenv <that name>`; without one, no
+    /// vendor process is created at all.
+    ///
+    /// This is what the daemon uses. Its wire protocol carries no environment
+    /// field ([`crate::ipc::protocol::Request`]), so there is nothing for a
+    /// client to say and nothing for the daemon to pass on — which turns the
+    /// adapter's worst historical hazard, an invented name resolving against
+    /// production, into something the daemon cannot express.
+    ///
+    /// Do not add an environment parameter here, and do not give the daemon a
+    /// default environment to fill in: the precondition is negative and free,
+    /// and an option is a thing somebody sets at 2am to make a name resolve.
+    #[must_use]
+    pub fn without_invocation_env(
+        secrets: &BTreeMap<String, SecretRoute>,
+        default_path: &str,
+    ) -> Self {
+        Self::build(secrets, default_path, None)
+    }
+
+    /// The shared projection: declared routes, resolved against the defaults.
+    fn build(
+        secrets: &BTreeMap<String, SecretRoute>,
+        default_path: &str,
+        invocation_env: Option<String>,
+    ) -> Self {
+        let routes = secrets
             .iter()
             .map(|(name, route)| {
                 let resolved = Route {
@@ -287,7 +328,10 @@ impl Routing {
                     // blanket for names that say nothing; a name that states
                     // where it lives must not be repainted by it.
                     env: route.env.clone().or_else(|| invocation_env.clone()),
-                    path: route.path.clone().unwrap_or_else(|| settings.path.clone()),
+                    path: route
+                        .path
+                        .clone()
+                        .unwrap_or_else(|| default_path.to_owned()),
                     key: route.key.clone().unwrap_or_else(|| name.clone()),
                 };
                 (name.clone(), resolved)
@@ -295,7 +339,7 @@ impl Routing {
             .collect();
 
         Routing {
-            default_path: settings.path.clone(),
+            default_path: default_path.to_owned(),
             invocation_env,
             routes,
         }
