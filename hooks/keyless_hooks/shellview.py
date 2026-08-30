@@ -22,8 +22,10 @@ import re
 __all__ = [
     "strip_quoted", "strip_heredocs", "heredocs", "Heredoc", "stripped",
     "statement_spans", "statements", "head_of", "head_or_wrapper", "words",
-    "candidate_operands", "file_operands", "expand_local_assignments",
-    "interpreter_payloads", "rest_after_head", "first_positional", "delegated_head",
+    "candidate_operands", "file_operands", "file_operands_spanned",
+    "expand_local_assignments",
+    "interpreter_payloads", "rest_after_head", "first_positional",
+    "positional_span", "delegated_head",
     "flatten_substitutions", "substitution_payloads",
     "assignment_split", "is_wrapper",
 ]
@@ -523,6 +525,27 @@ def file_operands(stmt, head, interpreters):
       docker compose up` is an environment assignment for a program that has
       every right to read it.
     """
+    return [cand for cand, _start in file_operands_spanned(stmt, head, interpreters)]
+
+
+def file_operands_spanned(stmt, head, interpreters):
+    """`file_operands`, each candidate paired with the start offset of the TOKEN
+    it was extracted from.
+
+    The offset is provenance, and one caller needs it. The first positional of a
+    pattern tool is a regex, a script or a filter — never a path — and neither is
+    any fragment `candidate_operands` carves out of it. Comparing the candidate
+    STRING against the pattern cannot express that, in either direction:
+
+        grep -E "^.*\\bcf\\b" log      `.*` is a fragment of the pattern, not the
+                                       whole of it, so a string comparison misses
+                                       it and the glob expands against the cwd
+        grep .env .env                 the same string in both roles, and the
+                                       SECOND one really is a read
+
+    Offsets are into `strip_heredocs(stmt)`, which preserves length, so they are
+    `stmt` coordinates and align with `positional_span`.
+    """
     if not stmt:
         return []
     body = strip_heredocs(stmt)
@@ -536,17 +559,18 @@ def file_operands(stmt, head, interpreters):
         if quoted:
             inner = tok.replace("'", " ").replace('"', " ")
             if executes or len(inner.split()) == 1:
-                out.extend(candidate_operands(inner))
+                out.extend((c, start) for c in candidate_operands(inner))
             if collapsed and not any(c.isspace() for c in collapsed):
-                out.extend(candidate_operands(collapsed))
+                out.extend((c, start) for c in candidate_operands(collapsed))
         else:
-            out.extend(candidate_operands(tok))
+            out.extend((c, start) for c in candidate_operands(tok))
         if past_head and "=" in collapsed and "==" not in collapsed:
             # `==` is a COMPARISON, never a flag assignment. Splitting on it turns
             # the jq filter `.name=="staging.env"` into the operand `staging.env`,
             # which matches `*.env` and refuses a filter as a credential file.
             # `dd if=.env` and `--file=.env` have a single `=` and are unaffected.
-            out.extend(candidate_operands(collapsed.rsplit("=", 1)[1]))
+            out.extend((c, start)
+                       for c in candidate_operands(collapsed.rsplit("=", 1)[1]))
         if not past_head and not _REDIRECT_TOKEN.match(tok) and \
                 not _ASSIGN_PREFIX.match(tok) and not tok.startswith("-"):
             past_head = True
@@ -663,17 +687,43 @@ def first_positional(stmt):
     a path and there is nothing to skip. "" is also the answer when the statement
     has no positional at all; both mean "skip nothing", which is the safe default.
     """
+    return positional_span(stmt)[0]
+
+
+def positional_span(stmt, index=0):
+    """The `index`-th non-flag word after the head, with its offset into `stmt`.
+
+    `("", -1)` when a flag supplied the pattern, when there is no such positional,
+    or when the statement has no head — all of which mean "skip nothing", the safe
+    default.
+
+    `index` exists for a head whose own first positional is a SUBCOMMAND rather
+    than an argument: `git grep -nE "<re>"` puts the pattern one place further
+    along, and reading position 0 there yields the word `grep`.
+
+    Offsets are into `strip_heredocs(stmt)` so they align with
+    `file_operands_spanned`, which is the only reason this returns one at all.
+    """
     if not stmt:
-        return ""
-    rest = rest_after_head(stmt)
+        return "", -1
+    body = strip_heredocs(stmt)
+    _name, end, _wrapper = _walk_head(body)
+    if end < 0:
+        return "", -1
+    tail = body[end:]
+    rest = tail.strip()
     if not rest or _PATTERN_FROM_FLAG.search(rest):
-        return ""
-    for start, end in words(rest):
-        tok = rest[start:end]
+        return "", -1
+    offset = end + (len(tail) - len(tail.lstrip()))
+    seen = 0
+    for start, stop in words(rest):
+        tok = rest[start:stop]
         if tok.startswith("-") or _ASSIGN_PREFIX.match(tok) or _REDIRECT_TOKEN.match(tok):
             continue
-        return _unquote(tok)
-    return ""
+        if seen == index:
+            return _unquote(tok), offset + start
+        seen += 1
+    return "", -1
 
 
 # Operands that introduce a PROGRAM inside a statement whose own head reads

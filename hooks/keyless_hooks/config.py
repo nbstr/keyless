@@ -100,13 +100,45 @@ DEFAULT_NON_READERS = [
 # expanding it against the real filesystem is what made `grep '.*'` read as a
 # request for every dotfile in the directory, `.npmrc` and `.env` included.
 #
-# Only the GLOB EXPANSION is withheld for these heads. A literal path is still
-# matched, so `grep TOKEN .env` and `jq -r .k ~/.cckeys.json` are refused exactly
-# as before — and those two shapes are the bulk of what this pack genuinely
-# catches, so the exemption below had to be surgical rather than a blanket rule.
+# ONLY THE GLOB EXPANSION IS WITHHELD, and only for the pattern token. A literal
+# path is still matched everywhere, so `grep TOKEN .env` and
+# `jq -r .k ~/.cckeys.json` are refused exactly as before — those two shapes are
+# the bulk of what this pack genuinely catches.
+#
+# That asymmetry is a safety property, not a detail. Dropping the pattern token's
+# candidates outright was tried and it allowed `grep EMAIL= /tmp/e2e.env`: the
+# pattern `EMAIL=` is shaped like an assignment, the positional walk skips it as
+# one, and the FILE becomes "the pattern". While only expansion is withheld, that
+# mis-identification costs a false positive or a missed glob; while the candidate
+# is dropped, it costs the credential.
+#
+# The exemption covers the whole token, keyed on POSITION — see
+# `shellview.positional_span`. Keying it on the candidate's STRING exempted only
+# the candidate equal to the whole pattern, and `candidate_operands` carves
+# fragments out of every token: `"(if|\?).*\b(x|y)\b"` yields `.*` on its own,
+# which then expanded against the cwd onto every dotfile in it. A string
+# comparison also cannot tell the two roles in `grep .env .env` apart.
+#
+# The interpreters below are on this list for their `-c`/`-e` FLAG payloads. Their
+# first positional is a SCRIPT PATH the interpreter opens and executes, so it is a
+# genuine read and `checks/file_read` deliberately withholds the exemption from
+# them — `python3 .env` is still refused.
 DEFAULT_PATTERN_TOOLS = [
     "grep", "egrep", "fgrep", "rg", "ag", "ack", "sed", "awk", "jq", "yq",
     "python", "python2", "python3", "perl", "ruby", "node",
+]
+
+# Heads whose own first positional is a SUBCOMMAND, and whose pattern therefore
+# sits one place further along. `git grep -nE "<re>" -- <pathspec>` is the whole
+# of the observed evidence; `hg` and `jj` spell the same verb the same way and are
+# listed for the sibling sweep rather than because either was measured.
+#
+# Spelled as a pair rather than by adding `git` to the list above, which would be
+# wrong in both directions: it would exempt the first positional of
+# `git show HEAD:.npmrc` — a real read — while still reading the pattern of
+# `git grep` as the word `grep`.
+DEFAULT_PATTERN_SUBCOMMANDS = [
+    "git grep", "hg grep", "jj grep",
 ]
 
 # Programs whose ARGUMENT is a program. A quoted string is data everywhere else
@@ -277,8 +309,8 @@ DEFAULT_SECRET_SEGMENT_PAIRS = [
 
 class Config(object):
     __slots__ = ("protected", "allowed", "non_readers", "interpreters", "vault_verbs",
-                 "pattern_tools", "secret_segments", "secret_pairs", "enabled",
-                 "observe", "errors")
+                 "pattern_tools", "pattern_subcommands", "secret_segments",
+                 "secret_pairs", "enabled", "observe", "errors")
 
     def __init__(self, **kw):
         self.protected = kw.get("protected", list(DEFAULT_PROTECTED))
@@ -286,6 +318,8 @@ class Config(object):
         self.non_readers = frozenset(kw.get("non_readers", DEFAULT_NON_READERS))
         self.interpreters = frozenset(kw.get("interpreters", DEFAULT_INTERPRETERS))
         self.pattern_tools = frozenset(kw.get("pattern_tools", DEFAULT_PATTERN_TOOLS))
+        self.pattern_subcommands = frozenset(
+            kw.get("pattern_subcommands", DEFAULT_PATTERN_SUBCOMMANDS))
         self.vault_verbs = kw.get("vault_verbs", list(DEFAULT_VAULT_VERBS))
         self.secret_segments = frozenset(kw.get("secret_segments", DEFAULT_SECRET_SEGMENTS))
         self.secret_pairs = kw.get("secret_pairs", list(DEFAULT_SECRET_SEGMENT_PAIRS))
@@ -338,6 +372,8 @@ def load(cwd=""):
         non_readers=_merge_list(DEFAULT_NON_READERS, patch, "non_readers"),
         interpreters=_merge_list(DEFAULT_INTERPRETERS, patch, "interpreters"),
         pattern_tools=_merge_list(DEFAULT_PATTERN_TOOLS, patch, "pattern_tools"),
+        pattern_subcommands=_merge_list(DEFAULT_PATTERN_SUBCOMMANDS, patch,
+                                        "pattern_subcommands"),
         vault_verbs=_merge_list(DEFAULT_VAULT_VERBS, patch, "vault_verbs"),
         secret_segments=_merge_list(DEFAULT_SECRET_SEGMENTS, patch, "secret_segments"),
         secret_pairs=DEFAULT_SECRET_SEGMENT_PAIRS,

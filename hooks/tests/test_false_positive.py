@@ -258,6 +258,27 @@ FILE_FALSE_POSITIVES_REGEX_CWD = [
     "awk '/.*/ {print}' notes.txt",
     # A non-greedy regex. Same class, one character longer.
     "grep -oP '.*?' notes.txt",
+    # ── the pattern's FRAGMENTS, not the pattern ────────────────────────────
+    #
+    # Every case above has `.*` as the WHOLE first positional, which the
+    # string-comparison exemption could see. `candidate_operands` carves
+    # fragments out of every token, so the moment the regex is longer than its
+    # metacharacter blob the candidate `.*` is no longer equal to the pattern,
+    # the exemption misses it, and it expands against the cwd onto `.npmrc`.
+    #
+    # The first of these is verbatim what a lane was refused on, and it is the
+    # single most ordinary command shape an agent runs. Replayed against a body
+    # of real Bash commands, this class was a large minority of every KL-FILE
+    # deny — a rate no gate survives, because a `git grep` with a regex is not a
+    # rare spelling an operator can be asked to avoid.
+    "grep -rnE \"(if|\\?|&&|\\|\\|).*\\b(requireReview|startPaused)\\b\" src/",
+    "grep -inE 'cloudflare|^.*\\bcf\\b' notes.txt",
+    "sed 's/.*\\(rows=.*\\)/\\1/' notes.txt",
+    # A head whose own first positional is a SUBCOMMAND. Reading position 0 here
+    # yields the word `grep`, so the pattern was never exempt at all and the
+    # metacharacter blob expanded onto the cwd's dotfiles.
+    "git grep -nE \".*\"",
+    "git grep -nE \"(if|\\?|&&|\\|\\|).*\\b(requireReview|startPaused)\\b\"",
 ]
 
 FILE_FALSE_POSITIVES = [
@@ -327,6 +348,49 @@ FILE_TRUE_POSITIVES = [
     # Unexpanded substitutions: the literal still carries a protected basename.
     "grep -n KEY $W/packages/prisma-db/.env",
     "python3 -c \"open('$d/.claude.json')\"",
+    # ── what the pattern-token exemption must NOT swallow ───────────────────
+    #
+    # The same string in both roles. This is why the exemption is keyed on the
+    # token's OFFSET and not on its text: a string comparison exempts every
+    # candidate spelled `.env`, including the second one, which really is a read.
+    # This case is the whole argument for `positional_span` over `first_positional`.
+    "grep .env .env",
+    # An INTERPRETER's first positional is a script it opens and executes, not a
+    # pattern. `python3`/`node` are on `pattern_tools` for their `-c`/`-e`
+    # payloads only, and extending the exemption to position 0 would have opened
+    # a real read on every one of them.
+    "python3 .env",
+    "node .env",
+    # After a recognised subcommand, the pathspec is still a path.
+    "git grep TOKEN .npmrc",
+    # `git` alone never earns the exemption — only the listed PAIR does — or a
+    # first positional that is a real read would be exempted too.
+    "git grep -nE \"TOKEN\" .npmrc",
+    # A PATTERN shaped like an assignment. The positional walk skips `EMAIL=` as
+    # an assignment prefix and calls the FILE the pattern — so this row is here
+    # to hold the consequence of that mistake to a missed glob rather than a
+    # missed read. It went SILENT the one time the exemption dropped the token's
+    # candidates instead of only their glob expansion, and this is the assertion
+    # that caught it.
+    "grep EMAIL= /tmp/e2e.env",
+]
+
+# A LITERAL fragment carved out of a pattern is a KNOWN, DELIBERATE false
+# positive, and it is recorded here rather than fixed.
+#
+#     grep -n 'dotenv\|\.env' app.mjs      refused; opens no credential file
+#
+# `candidate_operands` yields `.env` out of that regex and it matches the
+# protected list by name, so no amount of withholding GLOB expansion reaches it.
+# The only fix is to drop the pattern token's candidates outright, and the
+# `grep EMAIL=` row above is what that costs: a pattern this walk mis-identifies
+# then exempts a real file. A false positive on a regex that happens to spell a
+# protected basename is the cheaper of the two, so it stays.
+#
+# Reopening this needs a pattern-argument identification that cannot be fooled by
+# an assignment-shaped or flag-shaped pattern — not a wider exemption.
+FILE_KNOWN_FALSE_POSITIVES = [
+    "grep -n 'dotenv\\|\\.env' notes.txt",
 ]
 
 # ── an ESCAPED shell metacharacter is an argument, never a separator ────────
