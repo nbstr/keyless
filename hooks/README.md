@@ -348,6 +348,7 @@ fail-open:
   "allowed_add": ["fixtures/*.env"],
   "vault_verbs_add": [["myvault", "^get\\b", "myvault run -- <cmd>", null]],
   "pattern_tools_add": ["mygrep"],
+  "pattern_subcommands_add": ["mytool search"],
   "observe": false
 }
 ```
@@ -372,11 +373,36 @@ find-generic-password` prints attributes until `-w` is added.
 
 `pattern_tools` is the list of programs whose FIRST positional argument is a
 pattern, a script or a filter rather than a path: `grep`, `sed`, `awk`, `jq` and
-the interpreters. That one operand is exempt from filesystem glob expansion, so
+the interpreters. That operand is exempt from filesystem glob expansion, so
 `grep -rn '.*' src/` is a regex rather than a request for every dotfile in the
 directory. Only the first positional, and only when no `-e`/`-f`/`--regexp`/
 `--file` flag supplied the pattern from elsewhere — `grep -n KEY prod.*` and
 `grep -f patterns.txt prod.env` are both still reads.
+
+The exemption covers the whole pattern TOKEN, including every fragment carved
+out of it. A regex is rarely just its metacharacters: `grep -rnE
+"(if|\?).*\b(x|y)\b" apps/` yields the candidate `.*` on its own, which is not
+equal to the pattern, and it expanded against the working directory onto every
+dotfile there. The token is identified by POSITION rather than by text, because
+`grep .env .env` spells a pattern and a real read the same way.
+
+`pattern_subcommands` is for a head whose own first positional is a SUBCOMMAND,
+so the pattern sits one place further along — `git grep -nE "<re>" -- <pathspec>`
+is the observed case. It is spelled as the PAIR `git grep`, never as `git`, or
+`git show HEAD:.npmrc` would earn the exemption too. The pathspec after the
+pattern is still a path, so `git grep TOKEN .npmrc` is still refused.
+
+**Only the glob expansion is ever withheld, never the literal match**, and that
+asymmetry is a safety property rather than a detail. Dropping the pattern token's
+candidates outright allowed `grep EMAIL= /tmp/e2e.env`: the pattern `EMAIL=` is
+shaped like an assignment, the positional walk skips it as one, and the FILE
+becomes "the pattern". While only expansion is withheld, that mis-identification
+costs a false positive; while the candidate is dropped, it costs the credential.
+
+The cost of that choice is one known, deliberate false positive: a literal
+fragment inside a regex — `grep -n 'dotenv\|\.env' app.mjs` — is still refused,
+because `.env` matches the protected list by name and no amount of withholding
+glob expansion reaches it.
 
 ---
 
