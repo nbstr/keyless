@@ -179,6 +179,8 @@ ATTACKS = [
                          "cat > app.ts <<'EOF'\nconst password = \"%s\";\nEOF"
                          % DECOY["generic"],
                          "a NAME-keyed match into a file that expands nothing"),
+    ("git_history",      "git show HEAD:.npmrc",
+                         "a protected path read out of git history"),
 ]
 
 # Rows that are NOT blocked, with the reason each is structurally out of reach.
@@ -213,6 +215,30 @@ SURVIVORS = {
                             "reference nothing resolves into a file that has to "
                             "parse. It is reported, which is the only act that is "
                             "right whichever of the two it was.",
+    "git_history": "the bytes are read out of the object store, so the path need "
+                   "not exist in the working tree at all and the filesystem "
+                   "questions this pack asks — does it resolve, does it exist, "
+                   "what does this glob expand to — all answer about the wrong "
+                   "thing. The question would have to be whether a PATHSPEC names "
+                   "a protected file at any ref.\n"
+                   "\n"
+                   "                   Deliberately NOT built, on measurement rather than on "
+                   "difficulty. No repository on this machine tracks a file "
+                   "matching a protected pattern, none ever committed one, and "
+                   "replayed over a body of real commands, every `git show`, "
+                   "`git log`, `git diff`, `git grep`, `git cat-file`, "
+                   "`git stash`, `git restore` and `git checkout` invocation named "
+                   "no protected path at all. `git archive` and `git blame` were "
+                   "not invoked once, so a rule covering them would be untested "
+                   "surface on a blocking check.\n"
+                   "\n"
+                   "                   The population is empty and the shapes are among the most "
+                   "common commands run here, so a pathspec predicate would add "
+                   "false-positive risk to ordinary git work to guard nothing. "
+                   "Reopen it when a credential is actually committed — and note "
+                   "that a TRACKED credential is a larger incident than a read, "
+                   "whose remedy is rotation and a history rewrite, not a gate "
+                   "that makes the bytes slightly harder to print.",
 }
 
 
