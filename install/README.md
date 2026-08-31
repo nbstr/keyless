@@ -137,6 +137,102 @@ everything is working.
 
 ---
 
+## Serving names out of Infisical
+
+Optional. Skip it if you do not use Infisical; nothing above depends on it and
+the installer does not enable it.
+
+A session reaches Infisical by spawning the vendor CLI, which finds the login
+already in the calling user's keychain. **The daemon cannot do that.** A login
+keychain belongs to the uid that unlocked it, so the daemon's uid has an empty
+one, and giving that uid a home directory does not change it. The daemon uses a
+**machine identity** instead: a client id and a client secret you create in
+Infisical, scoped to the environments you are willing to let it read, and
+revocable there.
+
+### Why a client secret and not a token
+
+`infisical run` authenticates with `INFISICAL_TOKEN` and with nothing else.
+Given a client id and client secret in its environment it ignores both and
+tries to open a browser login, which under launchd fails with a message about a
+login flow. So a token is the only thing a lookup can use — and a token
+expires.
+
+A daemon has nobody to prompt when that happens. What you would see is every
+Infisical name degrading, at an hour nobody chose, with your commands still
+running and their environments simply missing the values. So the daemon stores
+the **identity** and mints its own token per lookup, which is one extra round
+trip and never expires.
+
+The price is a long-lived credential on a disk, and the whole of what bounds it
+is one file's mode and one file's owner. Which is why `keylessd check` verifies
+both rather than checking that the file exists.
+
+### Setting it up
+
+Add the store to `/usr/local/etc/keyless/keylessd.json`. Coordinates only —
+there is no field in this file that a credential fits in:
+
+```json
+"infisical": {
+  "enabled": true,
+  "binary": "/absolute/path/to/infisical",
+  "domain": "https://<your-region>.infisical.com",
+  "project_id": "<your-project-id>",
+  "credentials_file": "/usr/local/var/lib/keyless/infisical.json",
+  "credentials": {
+    "INFISICAL_UNIVERSAL_AUTH_CLIENT_ID": "MACHINE_IDENTITY_CLIENT_ID",
+    "INFISICAL_UNIVERSAL_AUTH_CLIENT_SECRET": "MACHINE_IDENTITY_CLIENT_SECRET"
+  }
+}
+```
+
+Three of those are easy to get wrong and quiet about it:
+
+- **`binary` should be absolute.** launchd hands a daemon its own `PATH`, not a
+  login shell's, so the bare name that resolves for you may resolve to nothing
+  for the daemon.
+- **`domain` is the region.** The CLI defaults to the US cloud. An identity
+  created in another region has no account there, and what you read is a
+  refusal about your credentials rather than about your region.
+- **Every name needs its own `env`.** The daemon has no default environment and
+  will not invent one — that is deliberate, and it is what stops a name nobody
+  declared resolving against production. A name without one is refused before
+  anything is spawned.
+
+```json
+"secrets": {
+  "DATABASE_URL": { "store": "infisical", "env": "<slug>", "path": "/backend" }
+}
+```
+
+Then put the identity in the daemon's own file. This prompts, echoes nothing,
+and takes no value on the command line — so the credential is in no shell
+history and in no process table:
+
+```console
+$ sudo keylessd credential --name MACHINE_IDENTITY_CLIENT_ID
+$ sudo keylessd credential --name MACHINE_IDENTITY_CLIENT_SECRET
+$ keylessd check --config /usr/local/etc/keyless/keylessd.json
+```
+
+`check` prints two separate rows about this, and they answer different
+questions. `identity` is about the file: does it exist, is it `0600`, is it
+owned by the uid the daemon runs as. `store infisical` is about the tenant:
+does Infisical accept the login. A credential that is refused says so and never
+reports a name as missing — those two are the outcomes that must never be
+confused, because one means "fix your login" and the other means "look in
+another vault".
+
+### Removing it
+
+`install/uninstall.sh` deletes the credential file, unlike the secrets store
+beside it. The store may be your only copy of something; this file never is,
+because the identity lives at the vendor. **Revoke it there as well** — deleting
+the copy is not revoking the credential.
+
+---
+
 ## Re-pinning after an upgrade
 
 The allowlist holds the **code hash** of the `keyless` binary. Rebuilding it

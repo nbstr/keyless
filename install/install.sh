@@ -246,6 +246,11 @@ note "The audit log. 0640: you read it, you cannot write it. That asymmetry
 # is what the hash chain needs in order to mean anything."
 step install -m 0640 -o "$DAEMON_USER" -g "$ACCESS_GROUP" /dev/null "$LOG_DIR/audit.jsonl"
 
+note "The daemon's own vendor login. 0600, its own file, and EMPTY: this script
+# never asks you for a credential and never holds one. See the Infisical step at
+# the end for how the value gets in without passing through a command line."
+step install -m 0600 -o "$DAEMON_USER" -g "$ACCESS_GROUP" /dev/null "$LIB_DIR/infisical.json"
+
 # --- the policy ------------------------------------------------------------
 
 note "Pin the client. The hash is of the binary's code signature, and it is
@@ -330,6 +335,68 @@ cat <<'NEXT'
 #      keyless doctor
 #      keylessd check --config /usr/local/etc/keyless/keylessd.json
 #      keylessd verify --config /usr/local/etc/keyless/keylessd.json
+#
+# ---------------------------------------------------------------------------
+# OPTIONAL: serve names out of Infisical as well
+# ---------------------------------------------------------------------------
+#
+# Skip all of this if you do not use Infisical. Nothing above depends on it and
+# the daemon does not enable it by default.
+#
+# A session reaches Infisical by spawning the vendor CLI and inheriting the
+# login already in its own keychain. The daemon cannot: a login keychain belongs
+# to the uid that unlocked it, so the daemon's uid has an empty one, and giving
+# it a home directory does not change that. It uses a MACHINE IDENTITY instead —
+# a client id and a client secret you create in Infisical, scoped to the
+# environments you want the daemon to be able to read and revocable there.
+#
+# a. Add the store to /usr/local/etc/keyless/keylessd.json. Coordinates only;
+#    there is no field in this file a credential fits in:
+#
+#      "infisical": {
+#        "enabled": true,
+#        "binary": "/absolute/path/to/infisical",
+#        "domain": "https://<your-region>.infisical.com",
+#        "project_id": "<your-project-id>",
+#        "credentials_file": "/usr/local/var/lib/keyless/infisical.json",
+#        "credentials": {
+#          "INFISICAL_UNIVERSAL_AUTH_CLIENT_ID": "MACHINE_IDENTITY_CLIENT_ID",
+#          "INFISICAL_UNIVERSAL_AUTH_CLIENT_SECRET": "MACHINE_IDENTITY_CLIENT_SECRET"
+#        }
+#      }
+#
+#    An ABSOLUTE path for "binary": launchd hands a daemon its own PATH, not a
+#    login shell's, so the bare name a session resolves may resolve to nothing.
+#
+#    "domain" matters and is quiet when it is wrong: the CLI defaults to the US
+#    cloud, and an identity created in another region simply has no account
+#    there. Name the region you created the identity in.
+#
+#    Every name you want served needs its own "env" under "secrets" — the daemon
+#    has no default environment and will not invent one:
+#
+#      "secrets": { "DATABASE_URL": { "store": "infisical", "env": "<slug>",
+#                                     "path": "/backend" } }
+#
+# b. Put the identity in the daemon's own file. This prompts, echoes nothing,
+#    and takes no value on the command line — so the credential is in no shell
+#    history and in no process table:
+#
+#      sudo keylessd credential --name MACHINE_IDENTITY_CLIENT_ID
+#      sudo keylessd credential --name MACHINE_IDENTITY_CLIENT_SECRET
+#
+# c. Check it. `identity` reports the file's mode and owner, and the
+#    `store infisical` row is the login actually being accepted by your tenant:
+#
+#      keylessd check --config /usr/local/etc/keyless/keylessd.json
+#
+# WHY A CLIENT SECRET AND NOT A TOKEN. An access token is smaller and expires;
+# a daemon has nobody to prompt when it does, and what you would see is every
+# Infisical name quietly degrading at an hour nobody chose. With the identity
+# on disk the daemon mints its own token per lookup and never asks you again.
+# The credential file's 0600 mode and its owner ARE the boundary that makes
+# that safe, which is why `keylessd check` verifies both rather than merely
+# checking the file is there.
 #
 NEXT
 

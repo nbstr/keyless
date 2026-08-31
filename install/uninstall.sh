@@ -25,6 +25,15 @@
 #
 # Both paths are printed at the end so you can deal with them deliberately.
 #
+# The daemon's own vendor login IS removed, and the asymmetry is the point. It
+# is not anybody's only copy of anything — the identity exists at the vendor,
+# where you created it and where you can revoke it — so nothing is lost by
+# deleting it, while leaving a long-lived credential behind on a machine that
+# no longer has a daemon to use it is a landmine with no upside.
+#
+# Deleting the file is not revoking the credential. Revoke the machine identity
+# at the vendor too; that is the half no script here can do.
+#
 set -euo pipefail
 
 COMMIT=0
@@ -60,6 +69,7 @@ step rm -f "$RUN_DIR/keylessd.sock"
 step rm -f /usr/local/bin/keylessd
 step rm -f /usr/local/bin/keyless
 step rm -rf "$CONF_DIR"
+step rm -f "$LIB_DIR/infisical.json"
 step dscl . -delete "/Users/$DAEMON_USER"
 step dseditgroup -o delete "$ACCESS_GROUP"
 
@@ -70,6 +80,10 @@ cat <<KEPT
 #   $LOG_DIR/audit.jsonl          the record of what was asked for, and by what
 #   $LOG_DIR/audit.jsonl.anchor   which row that record ends on
 #   $LIB_DIR/secrets.json         possibly your only copy of migrated credentials
+#
+# Removed above: $LIB_DIR/infisical.json, the daemon's own vendor login. If you
+# gave it an Infisical machine identity, REVOKE that identity at the vendor now.
+# The file is gone from this machine and the credential is not dead until you do.
 #
 # Keep the anchor with the log or drop both. It is the only thing that says how
 # long the log is supposed to be, so a log kept without it can lose rows from
