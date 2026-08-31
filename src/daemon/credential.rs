@@ -331,8 +331,15 @@ fn proton_token(config: &super::config::DaemonConfig, out: &mut dyn io::Write) -
     let mut sound = true;
 
     match token_shape(settings.credentials_file.as_path(), &settings.credentials) {
-        Ok(detail) => writeln!(out, "token    ok {detail}")?,
-        Err(detail) => {
+        Shape::Sound(detail) => writeln!(out, "token    ok {detail}")?,
+        // Not `ok`. The `identity` row above has already reported why the file
+        // could not be read, and a second red row for one fault teaches a
+        // reader that two problems can mean one problem — but `ok` beside a
+        // thing nothing looked at is the exact false green this report exists
+        // to remove. `unproven` is what the report already says elsewhere for
+        // a question nobody could ask.
+        Shape::Unread(detail) => writeln!(out, "token    unproven {detail}")?,
+        Shape::Wrong(detail) => {
             writeln!(out, "token    PROBLEM {detail}")?;
             sound = false;
         }
@@ -385,54 +392,76 @@ fn proton_token(config: &super::config::DaemonConfig, out: &mut dyn io::Write) -
     Ok(sound)
 }
 
+/// What could be established about the value in the credential file.
+///
+/// Three outcomes, not two, and the third is the point: a question that could
+/// not be asked must not render as one that passed. See [`token_shape`].
+enum Shape {
+    /// It is shaped like an agent token.
+    Sound(String),
+    /// Nothing was read. Either the boundary refused this process, or the
+    /// `identity` row above has already said what is wrong with the file.
+    Unread(String),
+    /// It was read and it is not a token.
+    Wrong(String),
+}
+
 /// Whether what is in the credential file is shaped like an agent token.
 ///
 /// Reads the value and reports only structure — see
 /// [`proton::classify_token`], which is where the rules and the vendor's own
 /// wording live. Nothing here ever renders any part of it.
 ///
-/// # Errors
+/// # Why the mode is checked here as well as in `inspect`
 ///
-/// The sentence naming the fault, or the reason the check could not be made.
-/// A permission error is not a fault: it is the `0600` boundary working, and
-/// it is what an operator running this unprivileged will get.
-fn token_shape(path: &Path, declared: &BTreeMap<String, String>) -> Result<String, String> {
+/// Not to report it twice — [`Shape::Unread`] deliberately defers to the
+/// `identity` row for that. It is because this function opens the file with
+/// [`fs::read`] rather than through [`crate::store::file::FileStore`], which
+/// would refuse a file anybody else can read. Without the check, `check` would
+/// read a credential file at a mode the daemon itself refuses, and report `ok`
+/// on the contents of a file no lookup can use.
+fn token_shape(path: &Path, declared: &BTreeMap<String, String>) -> Shape {
     let Some(entry) = declared.get(proton::TOKEN_VAR) else {
-        return Err(format!(
+        return Shape::Wrong(format!(
             "`stores.proton.credentials` names no `{}`, so the daemon has no token to \
              re-establish its session with",
             proton::TOKEN_VAR
         ));
     };
 
+    let deferred = || {
+        Shape::Unread(format!(
+            "the value in {} was not read — see the `identity` row above, which says why",
+            path.display()
+        ))
+    };
+
+    match fs::metadata(path) {
+        Ok(meta) if meta.permissions().mode() & 0o7777 != MODE => return deferred(),
+        Ok(_) => {}
+        Err(_) => return deferred(),
+    }
+
     let mut bytes = match fs::read(path) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
-            return Ok(format!(
-                "shape unread — this process cannot open {}, which is what {MODE:04o} under \
-                 another uid means; run `sudo {} check` to have it checked",
+            // The boundary, working. Said plainly rather than counted as a
+            // fault: this is what an operator running `check` unprivileged
+            // gets, and it is the arrangement they were asked to create.
+            return Shape::Unread(format!(
+                "this process cannot open {}, which is what {MODE:04o} under another uid \
+                 means; run `sudo {} check` to have the shape checked",
                 path.display(),
                 crate::DAEMON_NAME
             ));
         }
-        // Everything else about this file is the `identity` row's to report,
-        // and it has already said it. A second sentence about the same fault
-        // teaches a reader that two red rows can mean one problem.
-        Err(_) => {
-            return Ok(format!(
-                "shape unread — see the `identity` row for {}",
-                path.display()
-            ));
-        }
+        Err(_) => return deferred(),
     };
     let contents = crate::store::file::classify(&bytes);
     bytes.zeroize();
 
     let Contents::Entries(mut entries) = contents else {
-        return Ok(format!(
-            "shape unread — see the `identity` row for {}",
-            path.display()
-        ));
+        return deferred();
     };
     let held = entries.get(entry).cloned();
     for value in entries.values_mut() {
@@ -440,7 +469,7 @@ fn token_shape(path: &Path, declared: &BTreeMap<String, String>) -> Result<Strin
     }
 
     let Some(mut value) = held else {
-        return Err(format!(
+        return Shape::Wrong(format!(
             "`{}` is declared to live in `{entry}` of {}, which holds no such entry",
             proton::TOKEN_VAR,
             path.display()
@@ -450,12 +479,12 @@ fn token_shape(path: &Path, declared: &BTreeMap<String, String>) -> Result<Strin
     value.zeroize();
 
     match verdict {
-        Ok(()) => Ok(format!(
+        Ok(()) => Shape::Sound(format!(
             "`{entry}` is shaped like an agent token. Whether Proton Pass accepts it is the \
              `store {}` row below",
             proton::STORE_ID
         )),
-        Err(detail) => Err(format!(
+        Err(detail) => Shape::Wrong(format!(
             "`{entry}` in {} is not an agent token: {detail}. Nothing about the value is \
              printed here",
             path.display()
@@ -769,6 +798,23 @@ mod tests {
         let (absent, sound) = rows(&proton_config(&dir, ""));
         assert!(!sound, "{absent}");
         assert!(absent.contains("does not exist"), "{absent}");
+        // And the shape row over a file nothing read says so. `ok` there would
+        // be the exact false green this report exists to remove: a verdict on
+        // a value nobody looked at.
+        assert_eq!(state(token_rows(&absent)[0]), Some("unproven"), "{absent}");
+
+        // 1b. PRESENT AND WIDE OPEN. `identity` reports the mode; the shape row
+        //     must not report `ok` on the contents of a file the daemon's own
+        //     store would refuse to open. This one is easy to get wrong,
+        //     because this function reads the file directly rather than through
+        //     that store.
+        write_token_file(&dir, &[("TOKEN", TOKEN_DECOY)]);
+        fs::set_permissions(dir.join("proton.json"), fs::Permissions::from_mode(0o644))
+            .expect("widen");
+        let (wide, sound) = rows(&proton_config(&dir, ""));
+        assert!(!sound, "{wide}");
+        assert!(wide.contains("mode 0644"), "{wide}");
+        assert_eq!(state(token_rows(&wide)[0]), Some("unproven"), "{wide}");
 
         // 2. MALFORMED. Present, 0600, one entry, and what is in it is not a
         //    token — a token's NAME, which is the most plausible paste of all.
