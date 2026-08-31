@@ -192,6 +192,22 @@ impl Policy {
         self.images.len()
     }
 
+    /// Whether this code identity is one of the pinned images.
+    ///
+    /// A narrower question than [`Policy::judge`], and deliberately so: that
+    /// one decides about a live peer, which has a uid and may be an
+    /// interpreter. This one is asked about a FILE — by
+    /// [`crate::daemon::shadow`], which wants to know whether a binary sitting
+    /// on `PATH` is the image this daemon accepts. A file has no uid to judge
+    /// and is not running, so applying the rest of the policy to it would
+    /// answer a question nobody asked.
+    ///
+    /// It reads the same set `judge` reads, so the two cannot drift.
+    #[must_use]
+    pub fn pins_image(&self, code_hash: &[u8; CDHASH_LEN]) -> bool {
+        self.images.contains(code_hash)
+    }
+
     /// Apply the policy to an identified peer.
     #[must_use]
     pub fn judge(&self, peer: &PeerIdentity) -> Option<Denial> {

@@ -45,6 +45,7 @@ pub mod check;
 pub mod config;
 pub mod credential;
 pub mod resolver;
+pub mod shadow;
 
 use std::io::{self, Write};
 use std::os::fd::AsFd;

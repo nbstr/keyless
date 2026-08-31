@@ -280,10 +280,24 @@ mod daemon {
             Err(error) => return fail(&error.to_string()),
         };
 
+        // Asking the world is the caller's job, so the walk of PATH happens
+        // here and the report is handed its answer. `daemon::shadow` says why:
+        // a report that read the environment itself would make every test that
+        // went through it a test of the machine it ran on, and the PATH under
+        // test is the whole subject.
+        //
+        // The policy is passed only when it parsed. A config whose pins are
+        // malformed has no pin set to compare a file against, and the policy
+        // row above has already said so.
+        let client = keyless::daemon::shadow::look(
+            std::env::var_os("PATH").as_deref(),
+            config.policy().ok().as_ref(),
+        );
+
         // The whole report, and its verdict, are `daemon::check`'s. What is
         // left here is the exit code, which is the one thing a library cannot
         // decide for a binary.
-        match check_report(&config, config_path, &mut io::stdout()) {
+        match check_report(&config, config_path, &client, &mut io::stdout()) {
             Ok(true) => ExitCode::SUCCESS,
             Ok(false) => ExitCode::FAILURE,
             Err(error) => fail(&format!("the report could not be written: {error}")),
