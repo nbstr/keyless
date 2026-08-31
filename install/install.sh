@@ -229,6 +229,164 @@ step install -d -m 0755 "$BIN_DIR"
 step install -p -m 0755 "$REPO/target/release/keyless" "$BIN_DIR/keyless"
 step install -p -m 0755 "$REPO/target/release/keylessd" "$BIN_DIR/keylessd"
 
+# --- the same program, reached before the one just installed ---------------
+#
+# Placing a binary in $BIN_DIR does not make it the one a shell runs. A second
+# copy earlier on PATH wins, and the two failures that produces both name
+# something else:
+#
+#   - The old copy simply lacks whatever landed since it was built. Measured:
+#     `keylessd credential --name ...` answered `unrecognized subcommand` from a
+#     copy ten days old while the binary carrying that verb sat here, unreached.
+#     The error names a missing feature, so the first hypothesis is a bad build.
+#   - Worse, and quieter: the config below pins the CODE HASH of the client
+#     installed above. A different binary has a different hash, so the daemon
+#     refuses it — and the refusal reads as a broken pin, which sends somebody
+#     to re-pin a file that was already pinned correctly.
+#
+# WHAT ESTABLISHES THAT A FILE HERE IS OURS, AND WHY IT IS NOT THE FILE
+#
+# Nothing about the bytes can say it. A hash comparison identifies the binary
+# just built and identifies nothing else, so a stale build of ours and a
+# stranger's program of the same name are the same answer to it. Running the
+# candidate and reading its subcommands is worse than useless: an old build
+# fails that test precisely BECAUSE it is old, which is the defect.
+#
+# `cargo install` writes down what it did. `<CARGO_HOME>/.crates.toml` maps a
+# package to the binary names it put in `<CARGO_HOME>/bin`, and it is the record
+# `cargo uninstall` itself reads. That is provenance rather than resemblance, it
+# survives the build being old, and it is the only thing here allowed to select
+# a file for removal. Anything else found is REPORTED and never touched: it is
+# somebody's file, and this script does not delete files it cannot identify.
+#
+# WHY THE REMOVAL IS `cargo uninstall` AND NOT `rm`
+#
+# `rm` leaves cargo's ledger claiming the binary is still installed, so the next
+# `cargo install` short-circuits and the shadow comes back. The package's own
+# verb removes both binaries and the record together. It runs as the operator,
+# never as root: those files are theirs, and CARGO_HOME is derived from the
+# candidate's own path rather than from $HOME, which under sudo is root's.
+#
+# WHAT THIS CANNOT SEE, SAID RATHER THAN IMPLIED
+#
+# The PATH walked here is this process's. The operator's NEXT shell may resolve
+# differently, and a shell that has already looked a name up keeps using its
+# answer until `hash -r`. So this can only ever MISS a shadow and can never
+# invent one — and it is not the whole of the fix: `keylessd check` asks the
+# same question against the pin, in the operator's own shell, every time
+# somebody runs it because something is already wrong.
+
+# Find what is reached before $2 on the PATH in $1, one finding per line:
+#
+#   cargo <CARGO_HOME> <file>   cargo's ledger says this package installed it
+#   foreign <file>              something else of that name; not ours to touch
+#   unreachable <dir>           $2 is not on that PATH at all
+#
+# `cargo_recorded` is nested so this whole function is one liftable block —
+# `tests/install_scripts.rs` executes it verbatim against a fabricated PATH,
+# which is the only way to test a resolution rule without installing anything.
+find_shadows() {
+  local search="$1" install_dir="$2" name dir candidate bin_dir cargo_home
+  local -a dirs=()
+
+  cargo_recorded() {
+    local file="$1" want home
+    want="$(basename "$file")"
+    home="$(dirname "$(dirname "$file")")"
+    if [[ "$(basename "$(dirname "$file")")" != "bin" ]]; then return 1; fi
+    if [[ ! -r "$home/.crates.toml" ]]; then return 1; fi
+    # A line reads: "<package> <version> (<source>)" = ["bin", "bin"]. The
+    # 9-character prefix test is what keeps `keyless-ui` from matching
+    # `keyless`, and it is the difference between removing our install and
+    # removing somebody else's crate.
+    awk -v want="$want" -F'" = ' '
+      substr($1, 1, 9) == "\"keyless " && index($2, "\"" want "\"") { found = 1 }
+      END { exit(found ? 0 : 1) }
+    ' "$home/.crates.toml"
+  }
+
+  # Split on `:` through `read`, never by word-splitting `$PATH`: an entry
+  # holding a glob character expands under word splitting and stops naming the
+  # directory it came from.
+  #
+  # The trailing newline is load-bearing. `read` returns non-zero on a final
+  # line that has none, so the loop drops it — and the entry it drops is the
+  # LAST one on PATH, which is exactly where a system-wide install directory
+  # sits. Measured without it: the install directory went unseen, so every walk
+  # reported it as not on PATH and no shadow was ever found.
+  while IFS= read -r dir; do dirs+=("$dir"); done < <(printf '%s\n' "$search" | tr ':' '\n')
+
+  local reachable=0
+  if [[ ${#dirs[@]} -gt 0 ]]; then
+    for dir in "${dirs[@]}"; do
+      if [[ "$dir" == "$install_dir" ]]; then reachable=1; fi
+    done
+  fi
+  if [[ $reachable -eq 0 ]]; then
+    # Nothing is shadowing anything, because nothing installed here is reached
+    # at all. Removing another copy in this state would leave the operator with
+    # no `keyless` on PATH whatsoever, which is worse than the shadow.
+    printf 'unreachable\t%s\n' "$install_dir"
+    return 0
+  fi
+
+  for name in keyless keylessd; do
+    if [[ ${#dirs[@]} -eq 0 ]]; then continue; fi
+    for dir in "${dirs[@]}"; do
+      if [[ "$dir" == "$install_dir" ]]; then break; fi
+      if [[ -z "$dir" ]]; then continue; fi
+      candidate="$dir/$name"
+      if [[ ! -f "$candidate" || ! -x "$candidate" ]]; then continue; fi
+      if cargo_recorded "$candidate"; then
+        bin_dir="$(dirname "$candidate")"
+        cargo_home="$(dirname "$bin_dir")"
+        printf 'cargo\t%s\t%s\n' "$cargo_home" "$candidate"
+      else
+        printf 'foreign\t%s\n' "$candidate"
+      fi
+    done
+  done
+  return 0
+} # end find_shadows
+
+note "Anything named keyless reached before $BIN_DIR. A shell runs the first
+# one it finds, which is not made the one placed above by placing it there."
+
+SHADOW_HOMES=""
+while IFS=$'\t' read -r kind first rest; do
+  case "$kind" in
+    unreachable)
+      printf '# %s is not on the PATH this script can see, so nothing installed there\n' "$first"
+      printf '# is reached. Add it to PATH; nothing else here is touched while that holds.\n'
+      ;;
+    cargo)
+      printf '# %s is reached before %s, and cargo records it as this package.\n' "$rest" "$BIN_DIR"
+      case "$SHADOW_HOMES" in
+        *"|$first|"*) ;;
+        *) SHADOW_HOMES="$SHADOW_HOMES|$first|" ;;
+      esac
+      ;;
+    foreign)
+      printf '# %s is reached before %s and nothing here can say what it is, so it\n' "$first" "$BIN_DIR"
+      printf '# is left alone. Put %s ahead of it on PATH, then run `hash -r`.\n' "$BIN_DIR"
+      ;;
+  esac
+done < <(find_shadows "${PATH:-}" "$BIN_DIR")
+
+# One removal per cargo home, because `cargo uninstall` takes the package and
+# removes every binary of it at once. Through `step`, so the dry run prints the
+# command the commit run executes — this must not be a step that only appears
+# when it is too late to read it.
+if [[ -n "$SHADOW_HOMES" ]]; then
+  printf '# Removed below, by cargo itself, so its ledger stops claiming they are\n'
+  printf '# installed. Run `hash -r` afterwards: a shell keeps resolving a path it has\n'
+  printf '# already looked up, including one that no longer exists.\n'
+  while IFS= read -r home; do
+    if [[ -z "$home" ]]; then continue; fi
+    step sudo -u "$TARGET_USER" env "CARGO_HOME=$home" "$home/bin/cargo" uninstall keyless
+  done < <(printf '%s' "$SHADOW_HOMES" | tr '|' '\n' | sort -u)
+fi # end shadow removal
+
 # --- directories -----------------------------------------------------------
 
 note "Directories. The socket's parent is NOT writable by you: if it were, you

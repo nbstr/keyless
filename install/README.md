@@ -140,6 +140,42 @@ installed and every session is still reading the keychain directly — and
 nothing else in the tool would ever say so, because from `run`'s point of view
 everything is working.
 
+`check`'s `client` row is the other one. It walks your `PATH` for `keyless` and
+compares each one it finds against `peer.allow_images`, which is the only place
+that holds both halves of the question — see below.
+
+---
+
+## Two copies of the same program
+
+Putting `keyless` in `/usr/local/bin` does not make it the one your shell runs.
+A second copy earlier on `PATH` wins, and it is a different binary with a
+different code hash, so the daemon refuses it. Both symptoms name something
+else:
+
+- the old copy simply lacks whatever landed since it was built, so a verb that
+  exists answers `unrecognized subcommand` and reads as a bad build;
+- the refusal reads `` `keyless` is not a pinned client ``, which reads as a
+  broken pin and sends you to re-pin a file that was already pinned correctly.
+
+The installer walks `PATH` and reports anything named `keyless` or `keylessd`
+reached before `/usr/local/bin`, in the dry run and in the commit run alike. It
+removes exactly one class of them, and only through `cargo uninstall keyless`:
+a copy `<CARGO_HOME>/.crates.toml` records as this package's. That file is
+cargo's own ledger, so it is provenance rather than resemblance, it survives the
+copy being old — which is the whole difficulty, since being old is the defect —
+and `rm` would leave the ledger claiming the binary is still installed, which
+brings the shadow back on the next `cargo install`.
+
+**Anything else of that name is reported and never touched.** No property of the
+bytes distinguishes a stale build of ours from somebody else's program, so the
+installer does not guess, and neither does `check`.
+
+Neither of them sees the whole of it. A `PATH` is one process's, and a shell
+that has already looked a name up keeps its answer until you run `hash -r`. So
+both can MISS a shadow and neither can invent one — and `check` is the half that
+runs in your own shell, whenever something is already wrong.
+
 ---
 
 ## Serving names out of Infisical

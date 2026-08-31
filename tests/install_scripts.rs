@@ -446,3 +446,190 @@ fn an_existing_config_is_left_alone_and_the_new_pin_is_printed_instead() {
 fn file_name(path: &str) -> &str {
     path.rsplit_once('/').map_or(path, |(_, name)| name)
 }
+
+// ---------------------------------------------------------------------------
+// The same program, reached before the one just installed
+// ---------------------------------------------------------------------------
+//
+// The failure measured on a real install: `/usr/local/bin/keyless` and
+// `/usr/local/bin/keylessd` placed, and a `cargo install` copy sitting earlier
+// on PATH. `sudo keylessd credential --name ...` answered `unrecognized
+// subcommand` from the old copy, and the pinned client the daemon accepts was
+// never the one a shell ran. Both symptoms name something else.
+//
+// Whether the installer FINDS that, and what it does about it, is not readable
+// off the text: the answer depends on a PATH, a directory layout and a cargo
+// ledger. So the block is lifted and executed against a fabricated scene, in
+// the dry-run mode whose printed list is the commit run's list by construction
+// of `step`.
+
+/// The whole shadow block, from the walk to the removal it plans.
+fn shadow_block() -> String {
+    block(&installer(), "find_shadows() {", "fi # end shadow removal")
+}
+
+/// A scene with three directories: what the installer placed, a cargo home
+/// whose ledger records this package, and a stranger's binary of the same name
+/// that nothing records at all.
+struct Scene {
+    root: std::path::PathBuf,
+    installed: std::path::PathBuf,
+    cargo_home: std::path::PathBuf,
+    stranger: std::path::PathBuf,
+}
+
+impl Scene {
+    fn build(tag: &str) -> Scene {
+        let root = scratch(tag);
+        let installed = root.join("installed");
+        let cargo_home = root.join("cargo");
+        let stranger = root.join("stranger");
+        for dir in [&installed, &cargo_home.join("bin"), &stranger] {
+            std::fs::create_dir_all(dir).expect("scene");
+        }
+        for (dir, names) in [
+            (&installed, &["keyless", "keylessd"][..]),
+            (&cargo_home.join("bin"), &["keyless", "keylessd"][..]),
+            (&stranger, &["keyless"][..]),
+        ] {
+            for name in names {
+                let file = dir.join(name);
+                std::fs::write(&file, b"#!/bin/sh\nexit 0\n").expect("binary");
+                std::fs::set_permissions(
+                    &file,
+                    <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755),
+                )
+                .expect("chmod");
+            }
+        }
+        // Cargo's own record of what it installed where. This, and nothing
+        // about the bytes, is what allows a file to be selected for removal.
+        std::fs::write(
+            cargo_home.join(".crates.toml"),
+            "[v1]\n\"keyless 0.1.0 (path+file:///src)\" = [\"keyless\", \"keylessd\"]\n",
+        )
+        .expect("ledger");
+        Scene {
+            root,
+            installed,
+            cargo_home,
+            stranger,
+        }
+    }
+
+    /// Run the lifted block as a dry run over `order`, and return what it
+    /// printed. `/usr/bin` and `/bin` are on the PATH because the block calls
+    /// `dirname`, `basename`, `awk`, `tr` and `sort`.
+    fn plan(&self, order: &[&std::path::Path]) -> String {
+        let path = order
+            .iter()
+            .map(|dir| dir.display().to_string())
+            .collect::<Vec<_>>()
+            .join(":");
+        bash(&format!(
+            "set -euo pipefail\n\
+             COMMIT=0\n\
+             TARGET_USER=an-operator\n\
+             BIN_DIR={installed:?}\n\
+             PATH={path:?}:/usr/bin:/bin\n\
+             note() {{ printf '\\n# %s\\n' \"$*\"; }}\n\
+             step() {{ if [[ $COMMIT -eq 1 ]]; then printf '+ %s\\n' \"$*\" >&2; \"$@\"; \
+                       else printf '  %s\\n' \"$*\"; fi; }}\n\
+             {block}",
+            installed = self.installed,
+            block = shadow_block(),
+        ))
+    }
+}
+
+impl Drop for Scene {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.root);
+    }
+}
+
+#[test]
+fn a_cargo_copy_ahead_of_the_install_is_removed_by_the_verb_that_owns_it() {
+    let scene = Scene::build("shadow-cargo");
+    let plan = scene.plan(&[&scene.cargo_home.join("bin"), &scene.installed]);
+
+    assert!(
+        plan.contains(&format!(
+            "sudo -u an-operator env CARGO_HOME={home} {home}/bin/cargo uninstall keyless",
+            home = scene.cargo_home.display()
+        )),
+        "the installer planned no removal for a copy cargo's own ledger records: {plan}"
+    );
+    // `cargo uninstall` takes the package and removes every binary of it, so
+    // two shadowed names must not plan two removals.
+    assert_eq!(
+        plan.matches("cargo uninstall keyless").count(),
+        1,
+        "one package, one removal: {plan}"
+    );
+}
+
+#[test]
+fn a_binary_of_that_name_nothing_records_is_named_and_never_removed() {
+    // The constraint that outranks the fix: somebody else's `keyless` is their
+    // file. It is reported, it is not selected, and the file itself is still
+    // there afterwards — a plan that quietly widened to it would pass a text
+    // assertion and fail this one.
+    let scene = Scene::build("shadow-foreign");
+    let stranger = scene.stranger.join("keyless");
+    let before = std::fs::read(&stranger).expect("fixture");
+
+    let plan = scene.plan(&[&scene.stranger, &scene.installed]);
+
+    assert!(
+        plan.contains(&stranger.display().to_string()),
+        "a shadowing binary went unmentioned: {plan}"
+    );
+    assert!(
+        !plan.contains("uninstall"),
+        "a removal was planned for a file nothing here can identify: {plan}"
+    );
+    assert!(stranger.exists(), "the file was removed: {plan}");
+    assert_eq!(before, std::fs::read(&stranger).expect("fixture"), "{plan}");
+}
+
+#[test]
+fn nothing_is_planned_when_the_installed_one_is_reached_first() {
+    // The control, and the idempotence claim in one: the same three
+    // directories, with the install directory at the front. A second run of
+    // the installer on a machine it already fixed must not thrash.
+    let scene = Scene::build("shadow-none");
+    let plan = scene.plan(&[
+        &scene.installed,
+        &scene.cargo_home.join("bin"),
+        &scene.stranger,
+    ]);
+
+    assert!(
+        !plan.contains("uninstall"),
+        "a removal was planned for copies that shadow nothing: {plan}"
+    );
+    assert!(
+        !plan.contains(&scene.stranger.display().to_string()),
+        "a binary reached after the installed one was reported as shadowing it: {plan}"
+    );
+}
+
+#[test]
+fn an_install_directory_that_is_not_on_path_removes_nothing() {
+    // Here every other copy is "earlier" than an install nothing reaches, and
+    // removing them would leave the operator with no keyless on PATH at all —
+    // strictly worse than the shadow. The finding is real and the action is
+    // not the same one.
+    let scene = Scene::build("shadow-unreachable");
+    let plan = scene.plan(&[&scene.cargo_home.join("bin"), &scene.stranger]);
+
+    assert!(
+        !plan.contains("uninstall"),
+        "copies were removed while the install itself was unreachable: {plan}"
+    );
+    assert!(
+        plan.contains(&scene.installed.display().to_string()),
+        "the report did not name the directory nothing reaches: {plan}"
+    );
+}
