@@ -71,6 +71,12 @@ step rm -f /usr/local/bin/keyless
 step rm -rf "$CONF_DIR"
 step rm -f "$LIB_DIR/infisical.json"
 step rm -f "$LIB_DIR/onepassword.json"
+step rm -f "$LIB_DIR/proton.json"
+# The session store and the local key that decrypts it. Removed together and
+# not one without the other: a key left beside a deleted store is useless, and
+# a store left beside a deleted key is a directory `pass-cli` will FORCE A
+# LOGOUT over the next time anything points at it.
+step rm -rf "$LIB_DIR/proton-session"
 step dscl . -delete "/Users/$DAEMON_USER"
 step dseditgroup -o delete "$ACCESS_GROUP"
 
@@ -82,10 +88,17 @@ cat <<KEPT
 #   $LOG_DIR/audit.jsonl.anchor   which row that record ends on
 #   $LIB_DIR/secrets.json         possibly your only copy of migrated credentials
 #
-# Removed above: $LIB_DIR/infisical.json and $LIB_DIR/onepassword.json, the
-# daemon's own vendor logins. If you gave it an Infisical machine identity or a
-# 1Password service account, REVOKE that identity at the vendor now. The file is
-# gone from this machine and the credential is not dead until you do.
+# Removed above: $LIB_DIR/infisical.json, $LIB_DIR/onepassword.json,
+# $LIB_DIR/proton.json and $LIB_DIR/proton-session -- the daemon's own vendor
+# logins and the Proton session store beside one of them. If you gave it an
+# Infisical machine identity, a 1Password service account or a Proton agent
+# token, REVOKE that identity at the vendor now. The files are gone from this
+# machine and the credentials are not dead until you do.
+#
+# The Proton one is the one most likely to be forgotten, because it is the only
+# one that would have died on its own: an agent token expires, so an unrevoked
+# one is a working credential with a date on it rather than a permanent one.
+# That is a smaller window, not a closed one.
 #
 # Keep the anchor with the log or drop both. It is the only thing that says how
 # long the log is supposed to be, so a log kept without it can lose rows from

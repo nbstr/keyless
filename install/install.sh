@@ -431,10 +431,18 @@ place_state_file 0640 "$LOG_DIR/audit.jsonl"
 
 note "The daemon's own vendor logins. 0600, one file per vendor, and EMPTY on a
 # first install: this script never asks you for a credential and never holds
-# one. See the Infisical and 1Password steps at the end for how a value gets in
-# without passing through a command line."
+# one. See the vendor steps at the end for how a value gets in without passing
+# through a command line."
 place_state_file 0600 "$LIB_DIR/infisical.json"
 place_state_file 0600 "$LIB_DIR/onepassword.json"
+place_state_file 0600 "$LIB_DIR/proton.json"
+
+note "Proton Pass keeps its logged-in identity in a DIRECTORY, not a file, and
+# it writes to that directory on invocations that only read. 0700 under the
+# daemon: the session store and the local key that decrypts it both live in
+# here, and the key is the whole of what stands between anyone on this machine
+# and the vault. Nothing is logged in yet -- see the Proton step at the end."
+step install -d -m 0700 -o "$DAEMON_USER" -g "$ACCESS_GROUP" "$LIB_DIR/proton-session"
 
 # --- the policy ------------------------------------------------------------
 
@@ -678,6 +686,105 @@ cat <<'NEXT'
 #    `store onepassword` row is the vendor accepting the token for THAT vault:
 #
 #      keylessd check --config /usr/local/etc/keyless/keylessd.json
+#
+# ---------------------------------------------------------------------------
+# OPTIONAL: serve names out of Proton Pass as well
+# ---------------------------------------------------------------------------
+#
+# Skip all of this if you do not use Proton Pass. Nothing above depends on it.
+#
+# Proton keeps ONE logged-in identity per session DIRECTORY, chosen by
+# PROTON_PASS_SESSION_DIR. A session inherits whichever identity the person at
+# the keyboard logged in; the daemon is given one of its own, at
+# $LIB_DIR/proton-session, created above and readable by nobody else.
+#
+# Two things about that directory decide whether any of this works.
+#
+# It must be WRITABLE by the daemon. `pass-cli` rewrites its session store on
+# invocations that only read, so a read-only directory is not a safer version
+# of this arrangement -- it is a broken one.
+#
+# And the daemon must be able to find the LOCAL KEY that directory is
+# encrypted with. By default that key lives in a login keyring, and a keyring
+# belongs to the uid that unlocked it: a daemon uid has none. Asked for a key
+# it cannot find beside a session store that exists, `pass-cli` FORCES A LOGOUT
+# and reinitialises the store. So the daemon always sets a key provider, and
+# `keyring` is not a value keylessd.json will accept -- it refuses to start
+# rather than run that way. `fs` keeps the key in the session directory beside
+# the store, at the same 0600 under the same uid.
+#
+# a. Create a VIEWER-role agent token at the vendor, scoped to exactly the one
+#    vault the daemon may read. `agent create` prints it once:
+#
+#    No PROTON_PASS_SESSION_DIR on this one: it runs as your ACCOUNT, in
+#    whichever session your own login lives in, not as the agent it mints and
+#    not as the daemon.
+#
+#      pass-cli agent create <name> --expiration <duration> --vault <VAULT>
+#
+#    One command, with --vault, because viewer is what `create` grants.
+#
+#    Viewer, not editor. With the daemon enabled, keyless refuses every write
+#    for every store, so an editor token here would be a larger prize with no
+#    way to be used. Write down the day it expires -- step (c) needs it, and
+#    the vendor cannot be asked later.
+#
+# b. Log the daemon's own session in, AS the daemon, with that token. The token
+#    is a value, so it goes in the environment and never in an argument:
+#
+#      sudo -u $DAEMON_USER env \
+#        PROTON_PASS_SESSION_DIR=$LIB_DIR/proton-session \
+#        PROTON_PASS_KEY_PROVIDER=fs \
+#        PROTON_PASS_PERSONAL_ACCESS_TOKEN=<the token agent create printed> \
+#        pass-cli login
+#
+#    As the daemon, because whoever runs this owns the files it creates, and a
+#    session store the daemon cannot open is a failure that reads exactly like
+#    a wrong token.
+#
+# c. Add the store to /usr/local/etc/keyless/keylessd.json. Coordinates only;
+#    there is no field in this file a credential fits in:
+#
+#      "proton": {
+#        "enabled": true,
+#        "binary": "/absolute/path/to/pass-cli",
+#        "session_dir": "$LIB_DIR/proton-session",
+#        "key_provider": "fs",
+#        "token_expires": "<YYYY-MM-DD, the day step (a) printed>",
+#        "credentials_file": "$LIB_DIR/proton.json",
+#        "credentials": { "PROTON_PASS_PERSONAL_ACCESS_TOKEN": "AGENT_TOKEN" }
+#      }
+#
+#    "session_dir" is required and is never defaulted: with none, the vendor
+#    falls back to a location derived from the caller's home, which for a
+#    daemon uid is either nothing or something nobody meant to be a credential
+#    store. Every Proton name degrades instead, and startup says so.
+#
+#    "token_expires" is a date you write down, not one anything can discover.
+#    The vendor's refusal reads the same for an expired token, a revoked one
+#    and a mistyped one, so without it the first symptom of expiry is every
+#    Proton name degrading at an hour nobody chose. `check` reports the days
+#    remaining and turns red a month out.
+#
+#    Each name is an item in that vault, by vault name, title and field. None
+#    of the three is defaulted, and that is what makes an invented name cost
+#    nothing: with no address there is no query, so no vendor process runs and
+#    no audit entry is written at Proton for a name nobody declared.
+#
+#      "secrets": { "OPENAI_API_KEY": { "store": "proton", "vault": "<VAULT>",
+#                                       "item": "<title>", "field": "password" } }
+#
+# d. Put the token in the daemon's own file too. The session above holds a
+#    login; this is what re-establishes it if the vendor ever drops it, which
+#    it does without warning. Prompts, echoes nothing, takes no value on the
+#    command line:
+#
+#      sudo keylessd credential --store proton --name AGENT_TOKEN
+#
+# e. Check it. `identity` reports the file, the two `token` rows report what is
+#    IN it and when it stops, and `store proton` is the vendor accepting it:
+#
+#      sudo keylessd check --config /usr/local/etc/keyless/keylessd.json
 #
 NEXT
 

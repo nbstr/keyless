@@ -85,7 +85,77 @@ fn credential_paths() -> Vec<String> {
             .to_path_buf()
             .display()
             .to_string(),
+        config
+            .stores
+            .proton
+            .credentials_file
+            .to_path_buf()
+            .display()
+            .to_string(),
     ]
+}
+
+/// The directory the Proton adapter's logged-in identity lives in.
+///
+/// Not a credential FILE, and that is the point of a separate assertion:
+/// `pass-cli` keeps a session store and — under the `fs` key provider — the
+/// local key that decrypts it, side by side in a directory. The credential
+/// file beside it holds the token that can re-establish that session; the
+/// directory holds the session itself. Both have to be created, both have to
+/// be the daemon's, and both have to be removed.
+const PROTON_SESSION_DIR: &str = "proton-session";
+
+#[test]
+fn the_installer_creates_the_proton_session_directory_and_shuts_it_to_everyone_else() {
+    // 0700, not 0755. Under the `fs` key provider the local encryption key is
+    // a file inside this directory, so a directory anyone can list is a
+    // directory anyone can reach the key through — and the key is the whole of
+    // what stands between a reader and the vault.
+    let script = installer();
+    let expected = format!(
+        r#"step install -d -m 0700 -o "$DAEMON_USER" -g "$ACCESS_GROUP" "$LIB_DIR/{PROTON_SESSION_DIR}""#
+    );
+    assert!(
+        script.contains(&expected),
+        "install/install.sh does not create the daemon's Proton session directory at 0700 \
+         owned by the daemon. Expected this line:\n  {expected}"
+    );
+
+    // And the config's own default points at it, or the installer creates a
+    // directory nothing will ever look in.
+    let config: DaemonConfig = serde_json::from_str(&format!(
+        r#"{{"stores":{{"proton":{{"enabled":true,
+             "session_dir":"/usr/local/var/lib/keyless/{PROTON_SESSION_DIR}"}}}}}}"#
+    ))
+    .expect("a valid daemon config");
+    let declared = config
+        .stores
+        .proton
+        .session_dir
+        .expect("the fixture states one")
+        .to_path_buf();
+    assert!(
+        script.contains(&format!(
+            r#"LIB_DIR="{}""#,
+            declared.parent().expect("a parent").display()
+        )),
+        "install/install.sh's LIB_DIR is not the directory {} is in",
+        declared.display()
+    );
+}
+
+#[test]
+fn the_uninstaller_removes_the_proton_session_and_not_only_its_token() {
+    // Together, and never one without the other. A key left beside a deleted
+    // store is useless; a store left beside a deleted key is a directory
+    // `pass-cli` forces a logout over the next time anything points at it.
+    let script = uninstaller();
+    let expected = format!(r#"step rm -rf "$LIB_DIR/{PROTON_SESSION_DIR}""#);
+    assert!(
+        script.contains(&expected),
+        "install/uninstall.sh leaves the daemon's Proton session behind. Expected this \
+         line:\n  {expected}"
+    );
 }
 
 #[test]
@@ -326,6 +396,11 @@ fn a_second_install_does_not_empty_the_files_the_first_one_left_behind() {
             0o600,
             r#"{"SERVICE_ACCOUNT":"decoy-service-account-0031"}"#,
         ),
+        (
+            "proton.json",
+            0o600,
+            r#"{"AGENT_TOKEN":"decoy-agent-token-0031"}"#,
+        ),
     ];
     for (name, _, body) in placed {
         std::fs::write(dir.join(name), body).expect("seed");
@@ -344,7 +419,8 @@ fn a_second_install_does_not_empty_the_files_the_first_one_left_behind() {
          place_state_file 0600 {dir:?}/secrets.json\n\
          place_state_file 0640 {dir:?}/audit.jsonl\n\
          place_state_file 0600 {dir:?}/infisical.json\n\
-         place_state_file 0600 {dir:?}/onepassword.json\n",
+         place_state_file 0600 {dir:?}/onepassword.json\n\
+         place_state_file 0600 {dir:?}/proton.json\n",
         preamble(&dir)
     ));
 
@@ -377,7 +453,8 @@ fn a_first_install_still_creates_each_file_empty_and_shut() {
         "{}{helper}\n\
          place_state_file 0600 {dir:?}/secrets.json\n\
          place_state_file 0640 {dir:?}/audit.jsonl\n\
-         place_state_file 0600 {dir:?}/onepassword.json\n",
+         place_state_file 0600 {dir:?}/onepassword.json\n\
+         place_state_file 0600 {dir:?}/proton.json\n",
         preamble(&dir)
     ));
 
@@ -385,6 +462,7 @@ fn a_first_install_still_creates_each_file_empty_and_shut() {
         ("secrets.json", 0o600),
         ("audit.jsonl", 0o640),
         ("onepassword.json", 0o600),
+        ("proton.json", 0o600),
     ] {
         let path = dir.join(name);
         assert_eq!(std::fs::read(&path).expect("read").len(), 0, "{name}");

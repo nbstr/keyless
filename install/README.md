@@ -345,8 +345,9 @@ $ sudo keylessd credential --store onepassword --name SERVICE_ACCOUNT
 $ keylessd check --config /usr/local/etc/keyless/keylessd.json
 ```
 
-`--store` picks which of the two credential files the entry goes in. It can be
-left off when only one store's `credentials` names the entry.
+`--store` picks which credential file the entry goes in. It can be left off
+when only one store's `credentials` names the entry, and is refused when more
+than one does.
 
 `check` prints the same two rows it prints for Infisical: `identity` is about
 the file — does it exist, is it `0600`, is it owned by the daemon — and `store
@@ -363,10 +364,188 @@ run will settle.
 
 ### Removing it
 
-`install/uninstall.sh` deletes both credential files, unlike the secrets store
+`install/uninstall.sh` deletes every credential file, unlike the secrets store
 beside them. The store may be your only copy of something; these files never
 are, because the identity lives at the vendor. **Revoke it there as well** — deleting
 the copy is not revoking the credential.
+
+---
+
+## Serving names out of Proton Pass
+
+Optional, and independent of everything above.
+
+### The problem this arrangement solves
+
+Proton keeps **one logged-in identity per session directory**, chosen by
+`PROTON_PASS_SESSION_DIR`. A session inherits whichever identity the person at
+the keyboard logged in — usually the whole account. The daemon gets one of its
+own instead, at `/usr/local/var/lib/keyless/proton-session`, created by the
+installer at `0700` and readable by nobody else.
+
+Two facts about that directory decide whether any of this works, and the second
+one is the reason this adapter took a day to move behind the daemon.
+
+**It must be writable by the daemon.** `pass-cli` rewrites its session store on
+invocations that only read. A read-only directory is not a safer version of
+this arrangement; it is a broken one.
+
+**The daemon must be able to find the local key that directory is encrypted
+with.** By default that key lives in a login keyring, and a keyring belongs to
+the uid that unlocked it — a daemon uid has none. Asked for a key it cannot
+find, beside a session store that exists, `pass-cli` **forces a logout and
+reinitialises the store**:
+
+```text
+Error: Local encryption key not found but local data exists. Forcing logout for security.
+```
+
+That is the mechanism behind the warning elsewhere in this repository that a
+`pass-cli` run with a stripped environment destroys a web-login session. The
+stripping was one way of reaching it, not the cause: it took away what the
+keyring provider needed to answer. A daemon reaches the same place by simply
+not having a keychain.
+
+So the daemon always names a key provider, and `keyring` is not a value
+`keylessd.json` will accept — it refuses to start rather than run that way.
+`fs` keeps the key in the session directory beside the store, at the same
+`0600` under the same uid.
+
+### Mint the agent token
+
+At the vendor, as yourself, scoped to exactly the one vault the daemon may
+serve:
+
+```console
+# No PROTON_PASS_SESSION_DIR here — this runs as the ACCOUNT, in whichever
+# session your own login lives in, and the default one is where it usually is.
+# It is NOT run by the agent it mints, and not by the daemon.
+$ pass-cli agent create keyless-agents --expiration 1y --vault company
+```
+
+One command, with `--vault`, because viewer is what `create` grants. The main
+README's manager recipe creates bare and grants afterwards for the opposite
+reason: `create --vault` FIXES the access set, so an editor cannot be minted
+that way and upgraded. A viewer wants exactly what `create` gives it.
+
+**Viewer, not editor.** With the daemon enabled, `keyless` refuses every write
+for every store, so an editor token here would be a strictly larger prize with
+no ability whatsoever to be used. The vendor enforces the rest in its crypto
+layer rather than by policy: *"Personal access tokens and agent sessions cannot
+perform user key operations."*
+
+**Write down the day it expires.** The next section needs it, and it cannot be
+recovered later — see *What `check` can and cannot tell you* below.
+
+### Log the daemon's own session in
+
+As the daemon, because whoever runs this owns the files it creates, and a
+session store the daemon cannot open fails in a way that reads exactly like a
+wrong token. The token is a value, so it goes in the environment and never in
+an argument:
+
+```console
+$ sudo -u _keyless env \
+    PROTON_PASS_SESSION_DIR=/usr/local/var/lib/keyless/proton-session \
+    PROTON_PASS_KEY_PROVIDER=fs \
+    PROTON_PASS_PERSONAL_ACCESS_TOKEN=<the token `agent create` printed> \
+    pass-cli login
+```
+
+Afterwards that directory holds the session store, the local key and a
+timestamp file, all `0600` under `_keyless`.
+
+### Configure the store
+
+Coordinates only; there is no field in `keylessd.json` a credential fits in:
+
+```json
+"proton": {
+  "enabled": true,
+  "binary": "/absolute/path/to/pass-cli",
+  "session_dir": "/usr/local/var/lib/keyless/proton-session",
+  "key_provider": "fs",
+  "token_expires": "<YYYY-MM-DD>",
+  "credentials_file": "/usr/local/var/lib/keyless/proton.json",
+  "credentials": { "PROTON_PASS_PERSONAL_ACCESS_TOKEN": "AGENT_TOKEN" }
+}
+```
+
+- **`session_dir` is required and never defaulted.** With none, the vendor
+  falls back to a location derived from the caller's home, which for a daemon
+  uid is either nothing or something nobody meant to be a credential store.
+  Every Proton name degrades instead, and startup says so.
+- **`key_provider`** is `fs` or `env`, and defaults to `fs`. `env` takes the
+  key from `PROTON_PASS_ENCRYPTION_KEY`, which then has to be named under
+  `credentials` beside the token. `keyring` is refused at parse time.
+- **`token_expires`** is a date you write down, not one anything can discover.
+- **An absolute `binary`**, for the reason the Infisical section gives.
+- **Two variables only** under `credentials`:
+  `PROTON_PASS_PERSONAL_ACCESS_TOKEN` and `PROTON_PASS_ENCRYPTION_KEY`. This is
+  narrower than the `INFISICAL_*` rule next door, deliberately: a prefix rule
+  would accept `PROTON_PASS_SESSION_DIR` and `PROTON_PASS_KEY_PROVIDER` too,
+  and a credential entry able to set either would silently overrule which
+  identity answers and whether its session survives being read.
+
+Each name is an item in that vault, by vault name, title and field:
+
+```json
+"secrets": {
+  "OPENAI_API_KEY": { "store": "proton", "vault": "company",
+                      "item": "demo api key", "field": "password" }
+}
+```
+
+**None of the three is defaulted, and that is a security property rather than
+an inconvenience.** A name that appears nowhere in this file has no address, so
+there is no query to make: no `pass-cli` process runs, no vault is listed, and
+no audit entry is written at Proton for a name nobody declared. Guessing any
+one of the three would cost a real read against a real vault.
+
+### Put the token in the daemon's own file too
+
+The session above holds a login; this is what re-establishes it if the vendor
+ever drops that session, which it does without warning. Prompts, echoes
+nothing, takes no value on the command line:
+
+```console
+$ sudo keylessd credential --store proton --name AGENT_TOKEN
+$ sudo keylessd check --config /usr/local/etc/keyless/keylessd.json
+```
+
+### What `check` can and cannot tell you
+
+Five states, and telling them apart is the whole point:
+
+| Row | State |
+|---|---|
+| `identity PROBLEM … does not exist` | no token has been written |
+| `identity PROBLEM … is mode …` / `… owned by uid …` | the file is there and shut to the wrong people |
+| `token PROBLEM … is not an agent token` | what is in it is not shaped like `pst_<token>::<key>` |
+| `token PROBLEM … EXPIRED on …` / `… expires on …, in N day(s)` | the date you wrote down |
+| `store proton PROBLEM … refused this daemon's agent token` | the vendor will not accept it |
+
+The last two are why `token_expires` is a config field. **The vendor's refusal
+is one sentence for three different causes** — *"This personal access token is
+invalid, expired or has been deleted"* — so nothing can ask it whether a token
+is about to expire, and by the time it answers at all, every Proton name has
+already stopped resolving. A date written down is the only thing that can turn
+that into a scheduled task.
+
+With no date declared, that row reads `unproven` and says so. A check nobody
+could make must not read as one that passed.
+
+### Removing it
+
+`install/uninstall.sh` deletes `proton.json` **and** the session directory,
+together. A key left beside a deleted store is useless, and a store left beside
+a deleted key is a directory `pass-cli` will force a logout over the next time
+anything points at it.
+
+**Revoke the token at the vendor as well.** It is the one most likely to be
+forgotten, because it is the only one that would have died on its own: an
+unrevoked agent token is a working credential with a date on it rather than a
+permanent one. That is a smaller window, not a closed one.
 
 ---
 
@@ -377,11 +556,12 @@ changes that hash, so an upgrade that replaces the binary without updating the
 config produces a daemon that refuses its own client.
 
 Re-running the installer is the ordinary way to upgrade, and it is safe to run
-as many times as you like. It never writes over `secrets.json`, `audit.jsonl` or
-`infisical.json` — an existing file keeps its contents and has only its mode and
-owner re-asserted — and it never rewrites `keylessd.json`, because the template
-it renders has no `infisical` block and no `secrets` block and would delete
-yours. What it does instead is print the new hash and stop, leaving one thing
+as many times as you like. It never writes over `secrets.json`, `audit.jsonl` or any
+of the vendor credential files — an existing file keeps its contents and has
+only its mode and owner re-asserted, and the Proton session directory is left
+with its contents intact and only its mode and owner re-asserted too — and it
+never rewrites `keylessd.json`, because the template it renders has no vendor
+blocks and no `secrets` block and would delete yours. What it does instead is print the new hash and stop, leaving one thing
 for you:
 
 ```console
