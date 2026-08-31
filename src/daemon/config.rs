@@ -48,7 +48,9 @@ use crate::store::keychain::KeychainStore;
 use crate::store::onepassword::{
     OnePasswordStore, Routing as OnePasswordRouting, SERVICE_ACCOUNT_TOKEN, ServiceAccount,
 };
-use crate::store::proton::{KeyProvider, Routing as ProtonRouting};
+use crate::store::proton::{
+    KeyProvider, ProtonStore, Reason as ProtonReason, Routing as ProtonRouting,
+};
 use crate::store::{Registry, Store};
 
 /// The daemon's whole configuration.
@@ -912,6 +914,36 @@ impl DaemonConfig {
                 .with_vendor_credentials(self.service_account()),
             ));
         }
+        if self.stores.proton.enabled {
+            let settings = &self.stores.proton;
+            stores.push(Box::new(
+                ProtonStore::new(
+                    settings.binary.to_path_buf(),
+                    settings.probe_binary.to_path_buf(),
+                    self.proton_routing(),
+                    // Not `Reason::for_run(argv)`. The reason is written into
+                    // Proton's own remote audit trail, permanently, and a
+                    // daemon's `argv` arrives from a client — `crate::audit`
+                    // records it as a CLAIM, never a fact. A registry is built
+                    // once at startup anyway, so there is no per-request reason
+                    // to be had here even if one were wanted.
+                    ProtonReason::for_verb(crate::DAEMON_NAME),
+                )
+                .in_session_dir(
+                    settings
+                        .session_dir
+                        .as_deref()
+                        .map(|path| path.to_path_buf()),
+                )
+                // Always named here, never left to the vendor's default. See
+                // `KeyProvider`: the default is a keyring, a daemon uid has
+                // none, and `pass-cli` answers that by reinitialising the
+                // session store it was asked to read.
+                .with_key_provider(Some(settings.key_provider))
+                .with_timeout(settings.timeout_ms)
+                .with_listing_ttl(settings.listing_ttl_ms),
+            ));
+        }
         Registry::new(stores)
             .with_routes(self.routes())
             .with_policy(self.stores.policy)
@@ -938,8 +970,24 @@ impl DaemonConfig {
             && !self.stores.keychain.enabled
             && !self.stores.infisical.enabled
             && !self.stores.onepassword.enabled
+            && !self.stores.proton.enabled
         {
             warnings.push("no store is enabled, so no name can resolve".to_owned());
+        }
+        if self.stores.proton.enabled && self.stores.proton.session_dir.is_none() {
+            // The operator-facing form of the rule in `ProtonStore::session_dir`,
+            // said while the config is being written rather than as every
+            // Proton name degrading with a sentence about a key nobody was
+            // told belongs here. There is no default to fall back to and there
+            // must not be: the vendor's own fallback is derived from the
+            // caller's home, and a daemon's uid either has none or has one
+            // nobody meant to be a credential store.
+            warnings.push(
+                "the Proton store is enabled and `stores.proton.session_dir` names no \
+                 directory, so no name can resolve against it: a daemon has no ambient \
+                 session to inherit and inheriting one would read an identity nobody chose"
+                    .to_owned(),
+            );
         }
         if self.stores.onepassword.enabled && self.stores.onepassword.vault.is_none() {
             // The operator-facing form of the rule in `onepassword_routing`:

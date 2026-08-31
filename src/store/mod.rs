@@ -592,10 +592,13 @@ pub fn build(config: &Config, invocation: &Invocation) -> Built {
         if !explicit.is_empty() {
             // The halves are not the same story, and saying they are would be
             // a wrong fact in the one place a user reads on every command.
-            // `keylessd` carries the Infisical and 1Password adapters: those
-            // names are moved, not lost, and the sentence has to say where to.
-            // It carries no Proton adapter: those names have nowhere to go
-            // yet, and that is a different instruction.
+            // `keylessd` carries all three adapters, so every one of these
+            // names is moved rather than lost — but they are moved to three
+            // different places and the remedies do not collapse into one: an
+            // Infisical name needs an "env" the daemon has no other way to
+            // learn, a 1Password name needs the vault and a service account
+            // scoped to it, and a Proton name needs a session directory the
+            // daemon owns, because there is no ambient login for it to inherit.
             let mut remedies: Vec<String> = Vec::new();
             if config.stores.infisical.enabled {
                 remedies.push(if explicit.len() == 1 {
@@ -623,9 +626,17 @@ pub fn build(config: &Config, invocation: &Invocation) -> Built {
             }
             if config.stores.proton.enabled {
                 remedies.push(if explicit.len() == 1 {
-                    "`keylessd` does not carry that adapter yet".to_owned()
+                    "declare them under `secrets` in `keylessd.json` with their \"vault\", \
+                     \"item\" and \"field\", enable `stores.proton` there with a \
+                     `session_dir` the daemon owns, and log that session in with a \
+                     viewer-role agent token"
+                        .to_owned()
                 } else {
-                    "`keylessd` does not carry the Proton adapter yet".to_owned()
+                    "declare the Proton ones under `secrets` in `keylessd.json` with their \
+                     \"vault\", \"item\" and \"field\", enable `stores.proton` there with a \
+                     `session_dir` the daemon owns, and log that session in with a \
+                     viewer-role agent token"
+                        .to_owned()
                 });
             }
             warnings.push(format!(
@@ -1061,10 +1072,11 @@ mod tests {
     #[test]
     fn the_suppression_warning_says_where_a_suppressed_backends_names_can_go() {
         // A suppression is only actionable if the sentence says what to do
-        // next, and the two backends now have DIFFERENT next steps: `keylessd`
-        // carries the Infisical adapter, so those names move into its config;
-        // it carries no Proton adapter, so those names have nowhere to go yet.
-        // One sentence covering both would have to be wrong about one of them.
+        // next, and the three backends have DIFFERENT next steps: an Infisical
+        // name needs an "env" beside it, a 1Password name needs the vault and a
+        // service account scoped to it, and a Proton name needs a session
+        // directory the daemon owns. One sentence covering all three would have
+        // to be wrong about two of them.
         let infisical_only = registered(&config_from(
             r#"{"stores":{"infisical":{"enabled":true},"daemon":{"enabled":true}}}"#,
         ))
@@ -1085,8 +1097,17 @@ mod tests {
         .1
         .join(" ");
         assert!(
-            proton_only.contains("does not carry that adapter yet"),
-            "a Proton name has nowhere to go and the warning must say so: {proton_only}"
+            proton_only.contains("keylessd.json"),
+            "a Proton name has somewhere to go and the warning must name it: {proton_only}"
+        );
+        assert!(
+            proton_only.contains("session_dir"),
+            "a daemon has no ambient Proton login, so the sentence must say where its \
+             own one lives: {proton_only}"
+        );
+        assert!(
+            !proton_only.contains("does not carry"),
+            "the adapter exists, so this must not say it does not: {proton_only}"
         );
 
         // A 1Password name moves too, and the sentence has to say the two
@@ -1122,10 +1143,8 @@ mod tests {
         assert!(all.contains("keylessd.json"), "{all}");
         assert!(all.contains("the Infisical ones"), "{all}");
         assert!(all.contains("the 1Password ones"), "{all}");
-        assert!(
-            all.contains("does not carry the Proton adapter yet"),
-            "{all}"
-        );
+        assert!(all.contains("the Proton ones"), "{all}");
+        assert!(!all.contains("does not carry"), "{all}");
     }
 
     #[test]

@@ -1423,6 +1423,9 @@ pub struct ProtonStore {
     /// Value of `PROTON_PASS_SESSION_DIR` for every child. See
     /// [`ProtonStore::session_dir`].
     session_dir: Option<PathBuf>,
+    /// Where the local key encrypting that session lives, or `None` to leave
+    /// the choice to the vendor. See [`ProtonStore::key_provider`].
+    key_provider: Option<KeyProvider>,
     timeout: Duration,
     reason: Reason,
     /// name -> where its value lives.
@@ -1516,6 +1519,7 @@ impl ProtonStore {
             binary,
             probe_binary,
             session_dir: None,
+            key_provider: None,
             timeout: crate::config::bounded_timeout(crate::config::DEFAULT_TIMEOUT_MS),
             reason,
             routing,
@@ -1528,6 +1532,27 @@ impl ProtonStore {
     #[must_use]
     pub fn in_session_dir(mut self, session_dir: Option<PathBuf>) -> Self {
         self.session_dir = session_dir;
+        self
+    }
+
+    /// Where the local key encrypting that session is kept.
+    ///
+    /// # Why a session sets none and a daemon must
+    ///
+    /// `None` leaves [`KEY_PROVIDER_VAR`] off the child entirely, so the vendor
+    /// uses whatever the caller's own environment says — which for a person at
+    /// a terminal is the keyring their `pass-cli login` already put the key in.
+    /// Setting one there would be this adapter deciding, on a user's behalf,
+    /// where a key it did not create should be looked for, and getting it wrong
+    /// costs that user their login. So the session side stays out of it.
+    ///
+    /// A daemon has no such inheritance and no such default worth keeping: its
+    /// uid's keyring is empty, and [`KeyProvider`] documents what `pass-cli`
+    /// does about an empty one. So the daemon always names a provider, and it
+    /// is a config field there rather than a constant here.
+    #[must_use]
+    pub fn with_key_provider(mut self, key_provider: Option<KeyProvider>) -> Self {
+        self.key_provider = key_provider;
         self
     }
 
@@ -1595,6 +1620,35 @@ impl ProtonStore {
         Ok(dir)
     }
 
+    /// Put the three things every child of this adapter needs on one command.
+    ///
+    /// Written once and called from all four builders, because the set is not
+    /// obviously complete and a builder that quietly lacked one of them would
+    /// fail in a way nobody reads as a missing variable:
+    ///
+    /// - **The session directory** decides which logged-in identity answers. A
+    ///   verb that inherited the ambient one would enumerate a different set of
+    ///   vaults than the verb beside it, which reads as a missing item.
+    /// - **The key provider** decides whether that identity survives being
+    ///   read. A verb that left it unset under a uid with no keyring would
+    ///   reinitialise the session store — see [`KeyProvider`] — so the next
+    ///   verb, correctly written, would find nothing. One missing call here is
+    ///   enough to make this adapter destroy its own login.
+    /// - **The reason** is required by the vendor and is what the remote audit
+    ///   entry is filed under.
+    ///
+    /// Deliberately NOT `env_clear` followed by a rebuild: `pass-cli` may
+    /// rewrite its session store on any invocation and must never be handed an
+    /// environment somebody stripped. See [`remove_ambient_references`], which
+    /// removes exactly what is known to cause a problem and leaves the rest.
+    fn scope(&self, command: &mut Command, session_dir: &Path, reason: String) {
+        command.env(SESSION_DIR_VAR, session_dir);
+        if let Some(provider) = self.key_provider {
+            command.env(KEY_PROVIDER_VAR, provider.as_str());
+        }
+        command.env(REASON_VAR, reason);
+    }
+
     /// Build one `pass-cli run --env-file … -- printenv KEYLESS_PROBE` invocation.
     ///
     /// `ambient` is the environment the child would otherwise inherit whole.
@@ -1627,8 +1681,7 @@ impl ProtonStore {
         remove_ambient_references(&mut command, ambient);
         // Passed rather than inherited: the ambient session is a different
         // identity with a different set of vaults. See `session_dir`.
-        command.env(SESSION_DIR_VAR, session_dir);
-        command.env(REASON_VAR, self.reason.for_name(name));
+        self.scope(&mut command, session_dir, self.reason.for_name(name));
         command.arg("--");
         command.arg(&self.probe_binary);
         command.arg(PROBE_VAR);
@@ -1672,8 +1725,7 @@ impl ProtonStore {
         command.arg("--output");
         command.arg("json");
         remove_ambient_references(&mut command, ambient);
-        command.env(SESSION_DIR_VAR, session_dir);
-        command.env(REASON_VAR, self.reason.for_name(name));
+        self.scope(&mut command, session_dir, self.reason.for_name(name));
         command
     }
 
@@ -1837,8 +1889,11 @@ impl ProtonStore {
         command.arg("--output");
         command.arg("json");
         remove_ambient_references(&mut command, ambient);
-        command.env(SESSION_DIR_VAR, session_dir);
-        command.env(REASON_VAR, self.reason.for_action("listing", "vaults"));
+        self.scope(
+            &mut command,
+            session_dir,
+            self.reason.for_action("listing", "vaults"),
+        );
         command
     }
 
@@ -1874,9 +1929,9 @@ impl ProtonStore {
         command.arg("--output");
         command.arg("json");
         remove_ambient_references(&mut command, ambient);
-        command.env(SESSION_DIR_VAR, session_dir);
-        command.env(
-            REASON_VAR,
+        self.scope(
+            &mut command,
+            session_dir,
             self.reason
                 .for_action("inspecting the fields of", &item.title),
         );
