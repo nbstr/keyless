@@ -42,6 +42,7 @@
 //! bad afternoon; a security daemon continuing past a broken invariant is worse.
 
 pub mod config;
+pub mod credential;
 pub mod resolver;
 
 use std::io::{self, Write};

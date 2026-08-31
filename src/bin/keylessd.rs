@@ -1,6 +1,6 @@
 //! `keylessd` — the daemon binary.
 //!
-//! Four verbs, and none of them prints a value. That is the same structural
+//! Five verbs, and none of them prints a value. That is the same structural
 //! property the session binary has, and it holds for the same reason: a verb
 //! that writes plaintext to stdout would be the shortest path, and the shortest
 //! path is the one that gets used.
@@ -9,11 +9,20 @@
 //! - `pin` — print the code hash of a client, for the allowlist.
 //! - `check` — parse the config and say what it would do.
 //! - `verify` — recompute the audit chain.
+//! - `credential` — put the daemon's own vendor login into its `0600` file.
 //!
-//! `pin` and `check` are the install-time verbs. They exist so an operator
-//! never has to hand-compute a hash or guess whether a config is doing what
-//! they meant, both of which are how an allowlist ends up authorising nothing
-//! and being widened in frustration.
+//! `credential` is the one that READS a value, and it reads it from stdin with
+//! the terminal's echo off. There is no `--value` flag and no positional value,
+//! for the reason `keyless put` has none: an argument is readable from the
+//! process table for as long as the process lives, and a value typed into a
+//! command is a value in a shell history. Offering the flag guarantees it gets
+//! used, so it does not exist.
+//!
+//! `pin`, `check` and `credential` are the install-time verbs. They exist so
+//! an operator never has to hand-compute a hash, guess whether a config is doing
+//! what they meant, or reach for a shell to get a credential into a file — the
+//! first two are how an allowlist ends up authorising nothing and being widened
+//! in frustration, and the third is how a credential ends up in a history file.
 //!
 //! # macOS only, and it SAYS so rather than being missing
 //!
@@ -41,7 +50,9 @@ mod daemon {
 
     use keyless::attest::is_interpreter;
     use keyless::audit::AuditLog;
+    use keyless::cmd::write::read_value;
     use keyless::daemon::config::{DaemonConfig, refuse_interpreter_pin};
+    use keyless::daemon::credential;
     use keyless::daemon::{Daemon, Running};
     use keyless::ipc::ffi::live_code_hash;
     use keyless::ipc::peer::code_hash_of_file;
@@ -81,6 +92,8 @@ mod daemon {
         Check(ConfigArg),
         /// Recompute the audit chain.
         Verify(VerifyArgs),
+        /// Put one value into the daemon's own credential file. Prints nothing.
+        Credential(CredentialArgs),
     }
 
     #[derive(Args)]
@@ -99,6 +112,17 @@ mod daemon {
         /// what the daemon will actually compare against.
         #[arg(long, value_name = "PID")]
         pid: Option<i32>,
+    }
+
+    #[derive(Args)]
+    struct CredentialArgs {
+        /// The entry name, as `stores.infisical.credentials` in the config
+        /// spells it. The VALUE is read from stdin and never from here.
+        #[arg(long, value_name = "ENTRY")]
+        name: String,
+        /// Config file, used to find the credential file and the daemon's uid.
+        #[arg(long, value_name = "PATH", default_value = DEFAULT_CONFIG)]
+        config: PathBuf,
     }
 
     #[derive(Args)]
@@ -124,6 +148,7 @@ mod daemon {
             Verb::Pin(args) => pin(&args),
             Verb::Check(args) => check(&args.config),
             Verb::Verify(args) => verify(&args),
+            Verb::Credential(args) => credential(&args),
         }
     }
 
@@ -274,6 +299,13 @@ mod daemon {
             }
         }
 
+        // Before the stores, because a store row that says PROBLEM because the
+        // daemon cannot read its own login is a symptom, and this is the cause.
+        // The two questions are different: this one asks whether the credential
+        // is where it must be and shut to everyone else; the `infisical` row
+        // below asks whether Infisical accepts it.
+        let _ = credential::report(&config, &mut out);
+
         for store in config.registry().stores() {
             match store.health() {
                 Ok(()) => {
@@ -314,6 +346,103 @@ mod daemon {
         } else {
             ExitCode::FAILURE
         }
+    }
+
+    /// Put one value into the daemon's own credential file.
+    ///
+    /// The value arrives on stdin. When stdin is a terminal it is prompted for
+    /// with echo off; when it is a pipe it is read whole. Nothing is printed but
+    /// the entry name and the file it landed in, and there is no flag that could
+    /// carry the value — so it is in no shell history, no process table and no
+    /// transcript.
+    fn credential(args: &CredentialArgs) -> ExitCode {
+        use std::io::IsTerminal;
+
+        let config = match DaemonConfig::load(&args.config) {
+            Ok(config) => config,
+            Err(error) => return fail(&error.to_string()),
+        };
+        let path = config.stores.infisical.credentials_file.to_path_buf();
+
+        // The one arrangement that makes writing this credential worse than not
+        // writing it: everything in the file the `file` store serves is a name
+        // an attested client can ask for, so a machine identity kept there is
+        // handed to any session that guesses its label.
+        if config.stores.file.enabled && path == config.stores.file.path.to_path_buf() {
+            return fail(&format!(
+                "{} is the file the `file` store serves, so anything written there is a name \
+                 any attested client can ask for over the socket. Point \
+                 `stores.infisical.credentials_file` at a file of its own first",
+                path.display()
+            ));
+        }
+
+        let interactive = io::stdin().is_terminal();
+        // Echo is switched off around the read and restored afterwards. If it
+        // cannot be switched off, the prompt is NOT offered: a prompt that
+        // echoes would print the credential, which is worse than refusing.
+        let quiet = if interactive {
+            match keyless::tty::without_echo() {
+                Ok(guard) => Some(guard),
+                Err(error) => {
+                    return fail(&format!(
+                        "cannot switch terminal echo off ({error}), so the value would be \
+                         printed as you typed it. Pipe it in instead: `printf '%s' \"$value\" \
+                         | keylessd credential --name {}`",
+                        args.name
+                    ));
+                }
+            }
+        } else {
+            None
+        };
+
+        if interactive {
+            let _ = write!(
+                io::stderr(),
+                "keylessd: value for {} (not echoed): ",
+                args.name
+            );
+            let _ = io::stderr().flush();
+        }
+        let value = read_value(&mut io::stdin(), interactive);
+        drop(quiet);
+        if interactive {
+            // Echo was off, so the user's Enter produced no newline on screen.
+            let _ = writeln!(io::stderr());
+        }
+
+        let value = match value {
+            Ok(value) => value,
+            Err(error) => return fail(&error.to_string()),
+        };
+
+        if let Err(error) = credential::store_entry(&path, &args.name, &value) {
+            return fail(&error.to_string());
+        }
+
+        // The whole output, and there is nothing in it that could carry a value.
+        let _ = writeln!(io::stdout(), "stored\t{}\t{}", args.name, path.display());
+
+        // Said afterwards rather than refused beforehand: the file has to be
+        // writable before a config can point at it, so writing an entry nothing
+        // reads yet is a legitimate order to do this in.
+        if !config
+            .stores
+            .infisical
+            .credentials
+            .values()
+            .any(|entry| entry == &args.name)
+        {
+            let _ = writeln!(
+                io::stderr(),
+                "keylessd: nothing in `stores.infisical.credentials` names `{}`, so no lookup \
+                 will read it yet",
+                args.name
+            );
+        }
+
+        ExitCode::SUCCESS
     }
 
     fn verify(args: &VerifyArgs) -> ExitCode {

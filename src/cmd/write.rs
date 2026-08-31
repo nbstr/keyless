@@ -174,7 +174,16 @@ fn store(
 /// pipe contributes everything, because `printf '%s' "$v" | keyless put` and a
 /// heredoc are both legitimate and a multi-line credential (a PEM key, say) is
 /// real. In both cases exactly one trailing newline is removed.
-fn read_value(input: &mut dyn Read, interactive: bool) -> Result<Secret, ManageError> {
+///
+/// Public because `keylessd credential` reads its value under exactly these
+/// rules. A second reader beside this one would drift, and the two verbs would
+/// then disagree about what a trailing newline means in a credential.
+///
+/// # Errors
+///
+/// [`ManageError::Value`] when the read failed, when more than
+/// [`MAX_INPUT_BYTES`] arrived, or when nothing arrived at all.
+pub fn read_value(input: &mut dyn Read, interactive: bool) -> Result<Secret, ManageError> {
     let value = |detail: &str| ManageError::Value {
         store: "stdin".to_owned(),
         detail: detail.to_owned(),
