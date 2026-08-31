@@ -54,6 +54,7 @@ use zeroize::Zeroize;
 
 use crate::secret::Secret;
 use crate::store::file::Contents;
+use crate::store::proton;
 
 /// The only mode this file may have.
 ///
@@ -280,7 +281,186 @@ pub fn report(config: &super::config::DaemonConfig, out: &mut dyn io::Write) -> 
             login.vendor, login.store
         )?;
     }
+    sound &= proton_token(config, out)?;
     Ok(sound)
+}
+
+/// How many days before an agent token stops working that `check` starts
+/// saying so.
+///
+/// Wide on purpose. This is not a deadline, it is the window in which somebody
+/// can mint a replacement without an outage in it — and the only reader is a
+/// person who happens to run `check`, who may not run it again for weeks.
+const EXPIRY_WARNING_DAYS: i64 = 30;
+
+/// The two `token` rows `keylessd check` prints about a Proton agent token.
+///
+/// Nothing at all unless the Proton store is enabled and names a credential,
+/// for the reason [`report`] gives about rows nobody needs.
+///
+/// # Why these are rows of their own and not part of `identity`
+///
+/// `identity` answers "is the file there, is it shut, is it the daemon's" —
+/// three facts about a FILE that are identical for every vendor. These two are
+/// about what is IN it, and they are the two states that pass every file check
+/// and still cannot log anything in:
+///
+/// - **Malformed.** A value that is not shaped like a token — a token's name,
+///   an agent id, a line copied around one. See [`proton::classify_token`].
+/// - **Expiring, or expired.** The state Infisical never had. A machine
+///   identity renews itself; an agent token simply stops, at an hour nobody
+///   chose, with nobody at the daemon to read the failure. And it cannot be
+///   discovered by asking: the vendor's refusal is one sentence covering an
+///   expired token, a revoked one and a mistyped one alike, so the date has to
+///   have been written down beforehand or it is not knowable at all.
+///
+/// The fifth state — **refused by the vendor** — is deliberately NOT here. It
+/// is the `store proton` row's, because it is the only one of the five that
+/// takes a round trip to establish, and a file-shaped row claiming it would be
+/// claiming something it never asked.
+///
+/// # Errors
+///
+/// Whatever `out` returns.
+fn proton_token(config: &super::config::DaemonConfig, out: &mut dyn io::Write) -> io::Result<bool> {
+    let settings = &config.stores.proton;
+    if !settings.enabled || settings.credentials.is_empty() {
+        return Ok(true);
+    }
+
+    let mut sound = true;
+
+    match token_shape(settings.credentials_file.as_path(), &settings.credentials) {
+        Ok(detail) => writeln!(out, "token    ok {detail}")?,
+        Err(detail) => {
+            writeln!(out, "token    PROBLEM {detail}")?;
+            sound = false;
+        }
+    }
+
+    match settings.token_expires.as_deref() {
+        // Reported, not judged. A date nobody wrote down is a check that could
+        // not be made, and a check that could not be made must not read as one
+        // that passed — the same rule the owner row above follows.
+        None => writeln!(
+            out,
+            "token    unproven `stores.proton.token_expires` names no date, so nothing here \
+             knows when this token stops. The vendor cannot be asked: its refusal reads the \
+             same for an expired token, a revoked one and a wrong one, so the first symptom \
+             would be every Proton name degrading at an hour nobody chose"
+        )?,
+        Some(date) => match crate::time::days_until_utc(date) {
+            Err(detail) => {
+                writeln!(
+                    out,
+                    "token    PROBLEM `stores.proton.token_expires` cannot be read: {detail}"
+                )?;
+                sound = false;
+            }
+            Ok(days) if days < 0 => {
+                writeln!(
+                    out,
+                    "token    PROBLEM the agent token EXPIRED on {date}, {} day(s) ago. Every \
+                     Proton name is degrading now. Mint a fresh token, log the session in \
+                     with it, and write it with `{} credential --store {}`",
+                    -days,
+                    crate::DAEMON_NAME,
+                    proton::STORE_ID
+                )?;
+                sound = false;
+            }
+            Ok(days) if days <= EXPIRY_WARNING_DAYS => {
+                writeln!(
+                    out,
+                    "token    PROBLEM the agent token expires on {date}, in {days} day(s). \
+                     Nothing renews it and nothing will be awake when it stops — replace it \
+                     while somebody is reading this"
+                )?;
+                sound = false;
+            }
+            Ok(days) => writeln!(out, "token    ok expires {date}, in {days} day(s)")?,
+        },
+    }
+
+    Ok(sound)
+}
+
+/// Whether what is in the credential file is shaped like an agent token.
+///
+/// Reads the value and reports only structure — see
+/// [`proton::classify_token`], which is where the rules and the vendor's own
+/// wording live. Nothing here ever renders any part of it.
+///
+/// # Errors
+///
+/// The sentence naming the fault, or the reason the check could not be made.
+/// A permission error is not a fault: it is the `0600` boundary working, and
+/// it is what an operator running this unprivileged will get.
+fn token_shape(path: &Path, declared: &BTreeMap<String, String>) -> Result<String, String> {
+    let Some(entry) = declared.get(proton::TOKEN_VAR) else {
+        return Err(format!(
+            "`stores.proton.credentials` names no `{}`, so the daemon has no token to \
+             re-establish its session with",
+            proton::TOKEN_VAR
+        ));
+    };
+
+    let mut bytes = match fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
+            return Ok(format!(
+                "shape unread — this process cannot open {}, which is what {MODE:04o} under \
+                 another uid means; run `sudo {} check` to have it checked",
+                path.display(),
+                crate::DAEMON_NAME
+            ));
+        }
+        // Everything else about this file is the `identity` row's to report,
+        // and it has already said it. A second sentence about the same fault
+        // teaches a reader that two red rows can mean one problem.
+        Err(_) => {
+            return Ok(format!(
+                "shape unread — see the `identity` row for {}",
+                path.display()
+            ));
+        }
+    };
+    let contents = crate::store::file::classify(&bytes);
+    bytes.zeroize();
+
+    let Contents::Entries(mut entries) = contents else {
+        return Ok(format!(
+            "shape unread — see the `identity` row for {}",
+            path.display()
+        ));
+    };
+    let held = entries.get(entry).cloned();
+    for value in entries.values_mut() {
+        value.zeroize();
+    }
+
+    let Some(mut value) = held else {
+        return Err(format!(
+            "`{}` is declared to live in `{entry}` of {}, which holds no such entry",
+            proton::TOKEN_VAR,
+            path.display()
+        ));
+    };
+    let verdict = proton::classify_token(&value);
+    value.zeroize();
+
+    match verdict {
+        Ok(()) => Ok(format!(
+            "`{entry}` is shaped like an agent token. Whether Proton Pass accepts it is the \
+             `store {}` row below",
+            proton::STORE_ID
+        )),
+        Err(detail) => Err(format!(
+            "`{entry}` in {} is not an agent token: {detail}. Nothing about the value is \
+             printed here",
+            path.display()
+        )),
+    }
 }
 
 /// One vendor's login on the daemon's side of the boundary: the file it lives
@@ -300,9 +480,10 @@ struct VendorLogin {
     in_use: bool,
 }
 
-fn vendor_logins(config: &super::config::DaemonConfig) -> [VendorLogin; 2] {
+fn vendor_logins(config: &super::config::DaemonConfig) -> [VendorLogin; 3] {
     let infisical = &config.stores.infisical;
     let onepassword = &config.stores.onepassword;
+    let proton = &config.stores.proton;
     [
         VendorLogin {
             vendor: "Infisical",
@@ -315,6 +496,12 @@ fn vendor_logins(config: &super::config::DaemonConfig) -> [VendorLogin; 2] {
             store: "onepassword",
             path: onepassword.credentials_file.to_path_buf(),
             in_use: onepassword.enabled && !onepassword.credentials.is_empty(),
+        },
+        VendorLogin {
+            vendor: "Proton Pass",
+            store: proton::STORE_ID,
+            path: proton.credentials_file.to_path_buf(),
+            in_use: proton.enabled && !proton.credentials.is_empty(),
         },
     ]
 }
@@ -517,6 +704,131 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).expect("scratch");
         dir
+    }
+
+    /// A decoy shaped the way a real agent token is: `pst_<token>::<key>`,
+    /// with a base64url key. Invented, and long enough that a grep for it in
+    /// any output would mean a real leak.
+    pub(super) const TOKEN_DECOY: &str = "pst_decoy0Pat0never0real0Aa1::ZGVjb3kta2V5LTA5MDk=";
+
+    /// The daemon's Proton block, with `token_expires` and the credential file
+    /// under the caller's control.
+    fn proton_config(dir: &Path, expires: &str) -> super::super::config::DaemonConfig {
+        serde_json::from_str(&format!(
+            r#"{{"audit":"{dir}/audit.jsonl",
+                 "stores":{{"proton":{{"enabled":true,
+                                       "session_dir":"{dir}/session",
+                                       "credentials_file":"{dir}/proton.json",
+                                       "credentials":{{"PROTON_PASS_PERSONAL_ACCESS_TOKEN":"TOKEN"}}
+                                       {expires}}}}}}}"#,
+            dir = dir.display(),
+        ))
+        .expect("a valid daemon config")
+    }
+
+    /// The rows `report` renders for one config, and its verdict.
+    fn rows(config: &super::super::config::DaemonConfig) -> (String, bool) {
+        let mut out: Vec<u8> = Vec::new();
+        let sound = report(config, &mut out).expect("a Vec");
+        (String::from_utf8(out).expect("ASCII rows"), sound)
+    }
+
+    /// The `token` rows only, so an assertion cannot be satisfied by the
+    /// `identity` row above them.
+    fn token_rows(rendered: &str) -> Vec<&str> {
+        rendered
+            .lines()
+            .filter(|line| line.split_whitespace().next() == Some("token"))
+            .collect()
+    }
+
+    /// The state word of a row: the second whitespace-separated column, read
+    /// WHOLE. `contains("ok")` is satisfied by the sentences beside `PROBLEM`.
+    fn state(row: &str) -> Option<&str> {
+        row.split_whitespace().nth(1)
+    }
+
+    fn write_token_file(dir: &Path, entries: &[(&str, &str)]) {
+        let path = dir.join("proton.json");
+        let body: BTreeMap<&str, &str> = entries.iter().copied().collect();
+        fs::write(&path, serde_json::to_vec(&body).expect("json")).expect("write");
+        fs::set_permissions(&path, fs::Permissions::from_mode(MODE)).expect("chmod");
+    }
+
+    #[test]
+    fn the_four_file_side_states_of_a_proton_token_are_told_apart() {
+        // Four states that a row built from mode and owner alone renders
+        // identically, and whose remedies point at four different places. The
+        // fifth — refused by the vendor — is deliberately the `store proton`
+        // row's, because it is the only one that takes a round trip to
+        // establish. `store::proton::refused_the_token` covers that one.
+        let dir = scratch("proton-states");
+
+        // 1. ABSENT. No file at all, which is what a fresh install has before
+        //    anybody writes a token.
+        let (absent, sound) = rows(&proton_config(&dir, ""));
+        assert!(!sound, "{absent}");
+        assert!(absent.contains("does not exist"), "{absent}");
+
+        // 2. MALFORMED. Present, 0600, one entry, and what is in it is not a
+        //    token — a token's NAME, which is the most plausible paste of all.
+        //    Every file check passes.
+        write_token_file(&dir, &[("TOKEN", "keyless-daemon")]);
+        let (malformed, sound) = rows(&proton_config(&dir, ""));
+        assert!(!sound, "{malformed}");
+        let row = token_rows(&malformed);
+        assert_eq!(state(row[0]), Some("PROBLEM"), "{malformed}");
+        assert!(row[0].contains("pst_"), "{malformed}");
+        assert!(
+            !malformed.contains("keyless-daemon"),
+            "the value was printed: {malformed}"
+        );
+
+        // 3. WELL FORMED, expiry UNDECLARED. The shape row goes green and the
+        //    expiry row says the question could not be asked — never that it
+        //    passed.
+        write_token_file(&dir, &[("TOKEN", TOKEN_DECOY)]);
+        let (undeclared, _) = rows(&proton_config(&dir, ""));
+        let row = token_rows(&undeclared);
+        assert_eq!(state(row[0]), Some("ok"), "{undeclared}");
+        assert_eq!(state(row[1]), Some("unproven"), "{undeclared}");
+        assert!(
+            !undeclared.contains(TOKEN_DECOY),
+            "the token was printed: {undeclared}"
+        );
+
+        // 4a. EXPIRED, and 4b. EXPIRING. Two verdicts, not one, because one is
+        //     an outage happening now and the other is a task with time in it.
+        let (expired, sound) = rows(&proton_config(&dir, r#","token_expires":"2020-01-01""#));
+        assert!(!sound, "{expired}");
+        let row = token_rows(&expired);
+        assert_eq!(state(row[1]), Some("PROBLEM"), "{expired}");
+        assert!(row[1].contains("EXPIRED"), "{expired}");
+
+        let (far, sound) = rows(&proton_config(&dir, r#","token_expires":"2099-01-01""#));
+        let row = token_rows(&far);
+        assert_eq!(state(row[1]), Some("ok"), "{far}");
+        assert!(sound, "a sound Proton token was reported unsound: {far}");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_daemon_with_no_proton_store_gets_no_token_rows_at_all() {
+        // The negative control for every case above, and a rule in its own
+        // right: a report that said something about a Proton token on every
+        // install without one teaches an operator to read past the row on the
+        // one install where it matters.
+        let dir = scratch("proton-absent");
+        let config: super::super::config::DaemonConfig = serde_json::from_str(&format!(
+            r#"{{"audit":"{dir}/audit.jsonl","stores":{{"file":{{"enabled":true}}}}}}"#,
+            dir = dir.display()
+        ))
+        .expect("valid");
+        let (rendered, sound) = rows(&config);
+        assert!(token_rows(&rendered).is_empty(), "{rendered}");
+        assert!(sound, "{rendered}");
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -35,6 +35,66 @@ pub fn rfc3339_utc(millis: u128) -> String {
     format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}.{millis_part:03}Z")
 }
 
+/// Whole days from today (UTC) until `date`, written `YYYY-MM-DD`.
+///
+/// Negative when the date has passed, `0` on the day itself.
+///
+/// # Why this lives beside `rfc3339_utc` and not next to its caller
+///
+/// It is the inverse of [`civil_from_days`], and the two have to agree about
+/// leap years or a credential reported as having a week left is a credential
+/// that expired yesterday. A second civil-date implementation written where it
+/// happened to be needed is exactly the drift this module was created to avoid.
+///
+/// # Errors
+///
+/// A sentence naming what is wrong with the spelling. Deliberately not a
+/// silent `None`: the caller is a health check, and a date it could not read
+/// must read as a fault rather than as "nothing to report".
+pub fn days_until_utc(date: &str) -> Result<i64, String> {
+    let malformed =
+        || format!("`{date}` is not a date; write it as YYYY-MM-DD, the day the token stops");
+
+    let parts: Vec<&str> = date.trim().split('-').collect();
+    let [year, month, day] = parts.as_slice() else {
+        return Err(malformed());
+    };
+    if year.len() != 4 || month.len() != 2 || day.len() != 2 {
+        return Err(malformed());
+    }
+    let year: i64 = year.parse().map_err(|_| malformed())?;
+    let month: u32 = month.parse().map_err(|_| malformed())?;
+    let day: u32 = day.parse().map_err(|_| malformed())?;
+    if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+        return Err(malformed());
+    }
+
+    let target = days_from_civil(year, month, day);
+    // Round-tripped rather than trusted: `2026-02-31` parses as three numbers
+    // in range and is not a day. Hinnant's arithmetic maps it onto 2 March
+    // without complaining, so the only way to reject it is to convert back.
+    if civil_from_days(target) != (year, month, day) {
+        return Err(format!("`{date}` is not a day that exists"));
+    }
+
+    let today = (now_unix_millis() / 1000) as i64 / 86_400;
+    Ok(target - today)
+}
+
+/// A proleptic Gregorian date to days since the Unix epoch.
+///
+/// Howard Hinnant's `days_from_civil`, the exact inverse of
+/// [`civil_from_days`] below.
+fn days_from_civil(year: i64, month: u32, day: u32) -> i64 {
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400; // [0, 399]
+    let mp = i64::from(if month > 2 { month - 3 } else { month + 9 }); // March-based
+    let doy = (153 * mp + 2) / 5 + i64::from(day) - 1; // [0, 365]
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy; // [0, 146096]
+    era * 146_097 + doe - 719_468
+}
+
 /// Days since the Unix epoch to a proleptic Gregorian date.
 ///
 /// Howard Hinnant's `civil_from_days`, which shifts the epoch to 0000-03-01 so
@@ -55,7 +115,55 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
 
 #[cfg(test)]
 mod tests {
-    use super::rfc3339_utc;
+    use super::{days_from_civil, days_until_utc, rfc3339_utc};
+
+    #[test]
+    fn the_two_civil_date_conversions_are_inverses() {
+        // The property that makes `days_until_utc` trustworthy. Without it a
+        // credential reported as having a week left could be one that expired
+        // yesterday, and nothing would say so.
+        for (y, m, d) in [
+            (1970, 1, 1),
+            (2000, 2, 29),
+            (2024, 2, 29),
+            (2026, 1, 1),
+            (2100, 3, 1),
+            (2400, 12, 31),
+        ] {
+            assert_eq!(
+                super::civil_from_days(days_from_civil(y, m, d)),
+                (y, m, d),
+                "{y:04}-{m:02}-{d:02}"
+            );
+        }
+        // Written out rather than derived, so both directions are pinned to a
+        // value neither function produced.
+        assert_eq!(days_from_civil(1970, 1, 1), 0);
+        assert_eq!(days_from_civil(2026, 1, 1), 20_454);
+    }
+
+    #[test]
+    fn a_date_that_is_not_a_day_is_refused_rather_than_rounded() {
+        // Hinnant's arithmetic maps 31 February onto 2 March without
+        // complaining, so three numbers in range is not enough. Read as a
+        // date, a token declared to expire on a day that does not exist would
+        // report a comfortable margin.
+        for bad in [
+            "2026-02-31",
+            "2026-13-01",
+            "26-01-01",
+            "2026-1-1",
+            "",
+            "soon",
+        ] {
+            assert!(days_until_utc(bad).is_err(), "`{bad}` was accepted");
+        }
+        // The control: a real day is read, and the count moves with the date
+        // rather than being any number at all.
+        let near = days_until_utc("2026-01-01").expect("a real day");
+        let far = days_until_utc("2027-01-01").expect("a real day");
+        assert_eq!(far - near, 365);
+    }
 
     #[test]
     fn the_epoch_renders_exactly() {

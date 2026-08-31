@@ -867,6 +867,120 @@ pub fn login_into(session_dir: &Path) -> String {
     scoped_command(session_dir, "login")
 }
 
+/// Whether the vendor's refusal is about the personal access token itself.
+///
+/// # Why this reads the vendor's words rather than asking it something
+///
+/// There is no verb that answers "is my token still good?" separately from
+/// using it, and the vendor's own message is one sentence for three causes —
+/// `This personal access token is invalid, expired or has been deleted`, read
+/// out of the 2.3.2 binary. So the most this can establish is WHICH SIDE the
+/// fault is on: the token, or the session directory. That is the distinction
+/// that decides where somebody goes to fix it, and it is the one the generic
+/// message loses.
+///
+/// Matched on the vendor's own noun rather than on a whole sentence, so a
+/// reworded release still lands in the right branch. Failing to match costs the
+/// generic message, which is the message that was already there — a miss is a
+/// worse sentence, never a wrong verdict.
+fn refused_the_token(vendor_said: &str) -> bool {
+    let lowered = vendor_said.to_ascii_lowercase();
+    lowered.contains("personal access token") || lowered.contains("agent token")
+}
+
+/// The separator between the two halves of a personal access token.
+///
+/// The token is `pst_<token>::<key>` — the encryption key rides INSIDE the
+/// token, which is why one string is the whole login and why there is no
+/// second file beside it.
+const TOKEN_SEPARATOR: &str = "::";
+
+/// The prefix every personal access token carries.
+const TOKEN_PREFIX: &str = "pst_";
+
+/// Whether a value is shaped like a personal access token, without saying what
+/// it is.
+///
+/// # Why a shape check exists at all
+///
+/// The daemon's credential file has four states worth telling apart, and three
+/// of them are about the FILE — absent, shut to the wrong people, unparseable.
+/// A file that is present, `0600`, the daemon's, and holds one entry passes
+/// every one of those and still cannot log anything in, if what somebody put in
+/// it was the token's NAME, or an agent id, or the whole line the vendor
+/// printed. Every one of those is a plausible paste.
+///
+/// Left unchecked, that arrives as the vendor's own refusal, which is one
+/// sentence for three causes — `This personal access token is invalid, expired
+/// or has been deleted`, read out of the 2.3.2 binary — so the reader is sent
+/// to the vendor's dashboard to look for a token that was never wrong.
+///
+/// # What it may say
+///
+/// Structure, never content. The two refusals below are the vendor's own,
+/// quoted because they are the reason these are the rules: `Invalid personal
+/// access token token format. Expected format: pst_<token>::<key>` and `Failed
+/// to decode personal access token key. Must be base64-urlsafe encoded`.
+///
+/// A pass is not a claim that the vendor will accept it — only that what is in
+/// the file is the kind of thing a login is made of. Whether the account
+/// accepts it is the `store proton` row's question.
+///
+/// # Errors
+///
+/// A sentence naming the structural fault. No part of the value appears in it.
+pub fn classify_token(value: &str) -> Result<(), String> {
+    if value.trim().is_empty() {
+        return Err("the entry is empty".to_owned());
+    }
+    if value.trim() != value {
+        // A paste that picked up a newline authenticates as a different string
+        // and fails as though it were the wrong token.
+        return Err(
+            "the entry has whitespace around it, which the vendor reads as part of \
+                    the token"
+                .to_owned(),
+        );
+    }
+    if !value.starts_with(TOKEN_PREFIX) {
+        return Err(format!(
+            "the entry does not begin with `{TOKEN_PREFIX}`, so it is not a personal access \
+             token. The vendor's format is `{TOKEN_PREFIX}<token>{TOKEN_SEPARATOR}<key>` — \
+             this looks like a token's NAME, an agent id, or a line copied around one"
+        ));
+    }
+    let Some((token, key)) = value.split_once(TOKEN_SEPARATOR) else {
+        return Err(format!(
+            "the entry carries no `{TOKEN_SEPARATOR}`, so it is only the first half of a \
+             token. The encryption key travels after it, and without that half nothing can \
+             be decrypted"
+        ));
+    };
+    if token.len() <= TOKEN_PREFIX.len() {
+        return Err(format!(
+            "the entry is `{TOKEN_PREFIX}{TOKEN_SEPARATOR}…` with nothing between them"
+        ));
+    }
+    if key.is_empty() {
+        return Err(format!(
+            "the entry ends at `{TOKEN_SEPARATOR}` with no encryption key after it"
+        ));
+    }
+    if !key.bytes().all(is_base64url) {
+        return Err(
+            "the half after the separator is not base64-urlsafe, so the vendor cannot decode \
+             the encryption key"
+                .to_owned(),
+        );
+    }
+    Ok(())
+}
+
+/// Whether a byte may appear in a base64url encoding, padding included.
+const fn is_base64url(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'=')
+}
+
 /// The daemon's own Proton login, read out of a file only the daemon can open.
 ///
 /// # Why the daemon needs one at all, when a session does not
@@ -2341,6 +2455,23 @@ impl Store for ProtonStore {
             return Err(self.unavailable(interrupted_write_detail(session_dir, &write, &vendor)));
         }
 
+        // The one refusal that must not be reported as "the session is
+        // broken": the vendor REFUSED THE TOKEN. The remedy is at the vendor
+        // and not on this filesystem, and a reader told to re-mint a session
+        // will re-mint it with the same rejected token and watch it fail again.
+        if refused_the_token(&vendor) {
+            return Err(self.unavailable(format!(
+                "Proton refused this daemon's agent token. This is a LOGIN failure and not a \
+                 missing secret, and the vendor cannot say which of three causes it is — its \
+                 words cover an expired token, a revoked one and a mistyped one alike. Check \
+                 `stores.proton.token_expires` first, then whether the token still exists at \
+                 the vendor; mint a fresh one, log the session at {} in with it, and write it \
+                 with `{} credential --store {STORE_ID}`. The vendor said: {vendor}",
+                session_dir.display(),
+                crate::DAEMON_NAME,
+            )));
+        }
+
         Err(self.unavailable(format!(
             "the session at {} cannot be used: {vendor}; re-mint it with `{}` \
              (or re-issue the agent token) and check `stores.proton.session_dir`",
@@ -2551,6 +2682,73 @@ mod tests {
         "NOT_PROTON":   { "store": "keychain" },
         "HALF_WRITTEN": { "vault": "company" }
     }"#;
+
+    #[test]
+    fn a_refused_token_is_told_apart_from_a_broken_session() {
+        // The fifth state a `check` must distinguish, and the only one that
+        // takes a round trip to establish. Its remedy is at the vendor;
+        // everything else on this path is fixed on the filesystem, and a
+        // reader told to re-mint a session will re-mint it with the same
+        // rejected token and watch it fail again.
+        //
+        // The vendor's own wording, read out of the 2.3.2 binary. It is ONE
+        // sentence for three causes — expired, revoked, mistyped — which is
+        // exactly why the branch cannot claim more than which side the fault
+        // is on.
+        for said in [
+            "Invalid or expired personal access token",
+            "This personal access token is invalid, expired or has been deleted.",
+            "Error creating personal access token session",
+        ] {
+            assert!(super::refused_the_token(said), "not matched: {said}");
+        }
+
+        // The control, and it is the whole point of the branch: these are
+        // faults on THIS filesystem, and reading them as a token problem would
+        // send somebody to the vendor's dashboard for a token that is fine.
+        for said in [
+            "No active session",
+            "This operation requires an authenticated client",
+            "Error decrypting local session",
+            "Could not find vault",
+        ] {
+            assert!(!super::refused_the_token(said), "wrongly matched: {said}");
+        }
+    }
+
+    #[test]
+    fn a_token_that_is_not_one_is_named_by_its_shape_and_never_by_its_content() {
+        // Every string below is a plausible paste into the credential file,
+        // and every one of them passes the mode check, the owner check and the
+        // parse check. What tells them apart is the shape, and the message may
+        // describe the shape without ever rendering the value.
+        let cases: [(&str, &str); 6] = [
+            ("", "empty"),
+            ("keyless-daemon", "pst_"),
+            ("pst_decoy0Aa1", "::"),
+            ("pst_decoy0Aa1::", "no encryption key"),
+            ("pst_::ZGVjb3k=", "with nothing between"),
+            ("pst_decoy0Aa1::not base64!", "base64-urlsafe"),
+        ];
+        for (value, expected) in cases {
+            let said = super::classify_token(value)
+                .expect_err(&format!("`{value}` must not pass as a token"));
+            assert!(said.contains(expected), "for `{value}`: {said}");
+            assert!(
+                !said.contains(value) || value.is_empty(),
+                "the value reached the message: {said}"
+            );
+        }
+
+        // The control. Without it, every case above is satisfied by a function
+        // that refuses everything.
+        super::classify_token("pst_decoy0Pat0never0real0Aa1::ZGVjb3kta2V5LTA5MDk=")
+            .expect("a well-formed token must pass");
+
+        // And whitespace, which is the paste that looks right in an editor and
+        // authenticates as a different string.
+        assert!(super::classify_token("pst_decoy0Aa1::ZGVjb3k=\n").is_err());
+    }
 
     #[test]
     fn a_daemon_projects_a_name_onto_the_address_a_session_projects_it_onto() {
