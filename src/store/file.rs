@@ -28,6 +28,17 @@
 //! the daemon report a backend error, which degrades every session and is very
 //! loud. The alternative is a daemon that keeps serving from a world-readable
 //! file and reports success.
+//!
+//! # And so is knowing whether there is anything in it
+//!
+//! A store file that has been emptied passes every permission check there is.
+//! `install -m 0600 /dev/null <path>` is what empties one — it reads as "create
+//! the file" and is a copy — and what it leaves behind is `0600`, owned by the
+//! daemon, and worth nothing. So [`FileStore::health`] classifies the contents
+//! as well, and an empty file is a fault rather than a store that happens to
+//! have no names in it. That is the same refusal the audit log makes when rows
+//! go missing from the end of it: losing data is bad, and losing it and then
+//! reporting sound is what makes it impossible to notice.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -41,6 +52,64 @@ use crate::store::Store;
 
 /// Bits that must be clear on the file's mode: group and other, all of them.
 const FORBIDDEN_MODE_BITS: u32 = 0o077;
+
+/// What a store file's bytes are, before any name is looked for in them.
+///
+/// # Why this is one function and not two
+///
+/// Two programs read this shape of file: this store, and
+/// [`crate::daemon::credential`], which writes the daemon's own vendor login
+/// into one. They disagreed about the same bytes. The writer treated an
+/// all-whitespace file as a store with nothing in it — which is what the
+/// installer leaves behind, so it had to — and this store called those same
+/// bytes malformed. So *"you have not put anything in it yet"* was reported to
+/// the operator as *"your credential file is corrupt"*, and the two states have
+/// completely different remedies.
+///
+/// Deciding it once means the verdict on a given file cannot depend on which
+/// program opened it. What the two still do differ on is what an EMPTY store
+/// means for their verb, and that difference is now explicit: writing into one
+/// is ordinary, reading a name out of one cannot succeed.
+///
+/// # The values are live
+///
+/// [`Contents::Entries`] holds plaintext. Every caller here scrubs it before it
+/// drops; that obligation travels with this type and is not enforced by it,
+/// because a `Drop` impl would stop the one caller that must move an entry out.
+pub enum Contents {
+    /// Nothing but whitespace, including nothing at all.
+    ///
+    /// A file, not a fault — but a store with no names in it, and a name asked
+    /// of it cannot be answered.
+    Empty,
+    /// A JSON object of names to values.
+    Entries(BTreeMap<String, String>),
+    /// Not that, at this position.
+    ///
+    /// The position and never the bytes: serde's own message quotes the input
+    /// around the failure, and the input is a file of plaintext secrets.
+    Malformed {
+        /// One-based line the parse gave up on.
+        line: usize,
+        /// One-based column the parse gave up on.
+        column: usize,
+    },
+}
+
+/// Read one store file's bytes as one of the three things they can be.
+#[must_use]
+pub fn classify(bytes: &[u8]) -> Contents {
+    if bytes.iter().all(u8::is_ascii_whitespace) {
+        return Contents::Empty;
+    }
+    match serde_json::from_slice::<BTreeMap<String, String>>(bytes) {
+        Ok(entries) => Contents::Entries(entries),
+        Err(error) => Contents::Malformed {
+            line: error.line(),
+            column: error.column(),
+        },
+    }
+}
 
 /// A JSON object of `{"NAME": "value"}` at a path only its owner can read.
 pub struct FileStore {
@@ -74,6 +143,36 @@ impl FileStore {
         }
     }
 
+    /// The file, read and classified. Its bytes are scrubbed on the way out.
+    fn contents(&self) -> Result<Contents, StoreError> {
+        let mut raw = fs::read(&self.path)
+            .map_err(|source| self.unavailable(format!("cannot read: {source}")))?;
+        let contents = classify(&raw);
+        raw.zeroize();
+        Ok(contents)
+    }
+
+    /// Why an empty store file is a fault and not a state to pass over.
+    ///
+    /// Both readings are named because nothing on disk distinguishes them, and
+    /// the operator is the only one who knows which it is. Saying only the
+    /// first would make a wipe read as a fresh install.
+    fn empty_detail(&self) -> String {
+        format!(
+            "{} holds no names at all — it is empty. Either nothing has been put in it yet, \
+             or it was truncated or rewritten and what was in it is gone",
+            self.path.display()
+        )
+    }
+
+    /// Why a store file that is not a JSON object cannot be served from.
+    fn malformed_detail(&self) -> String {
+        format!(
+            "{} is not a JSON object of names to values",
+            self.path.display()
+        )
+    }
+
     /// Refuse a file any other user can read.
     fn check_permissions(&self) -> Result<(), StoreError> {
         #[cfg(unix)]
@@ -102,20 +201,15 @@ impl Store for FileStore {
     fn resolve(&self, name: &str) -> Result<Option<Secret>, StoreError> {
         self.check_permissions()?;
 
-        let mut raw = fs::read(&self.path)
-            .map_err(|source| self.unavailable(format!("cannot read: {source}")))?;
-        let parsed = serde_json::from_slice::<BTreeMap<String, String>>(&raw);
-        raw.zeroize();
-
-        // The parse error is reported without its position, because serde's
-        // message quotes the input around the failure and the input is a file
-        // of plaintext secrets.
-        let mut entries = parsed.map_err(|_| {
-            self.backend(format!(
-                "{} is not a JSON object of names to values",
-                self.path.display()
-            ))
-        })?;
+        let mut entries = match self.contents()? {
+            Contents::Entries(entries) => entries,
+            Contents::Empty => return Err(self.backend(self.empty_detail())),
+            // The position is dropped here rather than reported. It is safe to
+            // print — see [`Contents::Malformed`] — and this message is the one
+            // a session sees when a lookup degrades, where a line number is
+            // noise; `keylessd check` is where it is worth having.
+            Contents::Malformed { .. } => return Err(self.backend(self.malformed_detail())),
+        };
 
         let found = entries.remove(name);
         // Every other value was allocated by the parse and is about to be
@@ -134,8 +228,33 @@ impl Store for FileStore {
         }
     }
 
+    /// Whether this store could answer anything at all.
+    ///
+    /// The mode, and then the contents. A store file that is empty passes every
+    /// permission check there is and can serve no name, and that is exactly
+    /// what a `install -m 0600 /dev/null` over a full store leaves behind — so
+    /// a health check that stopped at the mode reported a store that had just
+    /// been wiped as sound. It is the same fault the audit log already refuses
+    /// to be quiet about when rows go missing from the end of it.
+    ///
+    /// The values are read and scrubbed without being returned, counted or
+    /// named anywhere. What comes back out of here is one of three verdicts
+    /// about the file, never anything that was in it.
     fn health(&self) -> Result<(), StoreError> {
-        self.check_permissions()
+        self.check_permissions()?;
+        match self.contents()? {
+            Contents::Entries(mut entries) => {
+                for value in entries.values_mut() {
+                    value.zeroize();
+                }
+                Ok(())
+            }
+            Contents::Empty => Err(self.backend(self.empty_detail())),
+            Contents::Malformed { line, column } => Err(self.backend(format!(
+                "{} (line {line}, column {column})",
+                self.malformed_detail()
+            ))),
+        }
     }
 }
 
@@ -220,6 +339,62 @@ mod tests {
         assert!(
             !rendered.contains("8823"),
             "the store's contents reached an error message: {rendered}"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn an_empty_file_is_empty_rather_than_malformed_and_is_never_healthy() {
+        // Two readers used to give these bytes opposite verdicts. The daemon's
+        // credential writer called an all-whitespace file a store with nothing
+        // in it — it had to, because that is what the installer leaves — and
+        // this store called it malformed, so "you have not put anything in yet"
+        // reached the operator as "your file is corrupt".
+        //
+        // The health check is the half that matters after a truncation:
+        // `install -m 0600 /dev/null` over a full store leaves a file that
+        // passes every permission check there is and can serve nothing.
+        for body in ["", "  \n\t\n"] {
+            let path = write_store("empty-file", body, 0o600);
+            let store = FileStore::new(path.clone());
+
+            let resolving = store
+                .resolve("DECOY")
+                .expect_err("a store with nothing in it cannot answer a name")
+                .to_string();
+            assert!(resolving.contains("holds no names"), "{resolving}");
+            assert!(
+                !resolving.contains("not a JSON object"),
+                "an empty store was reported as a broken one: {resolving}"
+            );
+
+            let health = store
+                .health()
+                .expect_err("an empty store is not a healthy one")
+                .to_string();
+            assert!(health.contains("holds no names"), "{health}");
+            // Both readings, because nothing on disk tells them apart and only
+            // the operator knows which happened.
+            assert!(health.contains("truncated"), "{health}");
+
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
+    #[test]
+    fn a_malformed_file_is_unhealthy_and_says_where_without_saying_what() {
+        let path = write_store(
+            "malformed-health",
+            r#"{"DECOY":"decoy-must-not-be-quoted-4471" oops}"#,
+            0o600,
+        );
+        let store = FileStore::new(path.clone());
+        let health = store.health().expect_err("malformed").to_string();
+        assert!(health.contains("not a JSON object"), "{health}");
+        assert!(health.contains("line 1"), "{health}");
+        assert!(
+            !health.contains("4471"),
+            "the store's contents reached a health message: {health}"
         );
         let _ = std::fs::remove_file(path);
     }

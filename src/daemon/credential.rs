@@ -17,6 +17,12 @@
 //! because "the file is there" is the reassuring half of a sentence whose other
 //! half is the one that matters.
 //!
+//! It reads what is IN the file too, and that is not a third boundary check —
+//! it is the difference between a row about the file and a row about the login.
+//! An empty file and a file holding a machine identity have the same mode and
+//! the same owner, so a report built from those two alone says the same thing
+//! about both, and the empty one is what every install starts with.
+//!
 //! # Why ownership is compared against the audit log
 //!
 //! Nothing in `keylessd.json` says which uid the daemon runs as — the launchd
@@ -47,6 +53,7 @@ use std::path::{Path, PathBuf};
 use zeroize::Zeroize;
 
 use crate::secret::Secret;
+use crate::store::file::Contents;
 
 /// The only mode this file may have.
 ///
@@ -95,8 +102,28 @@ pub fn daemon_uid(audit: &Path) -> Option<u32> {
 ///
 /// `Ok` carries the detail of a sound file; `Err` carries the one fault found,
 /// named specifically enough to fix. The faults are reported one at a time and
-/// in this order — missing, then exposed, then misowned — because each later
-/// one is only meaningful once the earlier one holds.
+/// in this order — missing, then exposed, then misowned, then what is in it —
+/// because each later one is only meaningful once the earlier one holds.
+///
+/// # Why the contents are read and not just the mode
+///
+/// The mode and the owner are the boundary, and they are the same on a file
+/// holding a machine identity as on the empty one the installer leaves. A row
+/// built from those two alone therefore said `ok` over a credential file with
+/// nothing in it — which is the state every install starts in, and the state a
+/// re-run used to put a working install back into. "The file is there, shut,
+/// and the daemon's" is the reassuring half of a sentence whose other half is
+/// whether there is a login in it.
+///
+/// # When the contents cannot be read
+///
+/// This runs as whoever typed `keylessd check`, and the file is `0600` under
+/// the daemon's uid inside a `0700` directory — so an operator running it
+/// unprivileged cannot open it, and cannot `stat` it either. That is the
+/// boundary working, not a fault, and it is why the checks in the README are
+/// written with `sudo`. Read as anybody else, the row reports what it could
+/// establish and says the contents went unread, rather than counting zero
+/// entries in a file it never opened.
 ///
 /// # Errors
 ///
@@ -131,25 +158,89 @@ pub fn inspect(path: &Path, daemon: Option<u32>) -> Result<String, String> {
     }
 
     let owner = meta.uid();
-    match daemon {
-        Some(expected) if owner != expected => Err(format!(
+    if let Some(expected) = daemon
+        && owner != expected
+    {
+        return Err(format!(
             "{} is mode {MODE:04o} and owned by uid {owner}, but the daemon runs as uid \
              {expected} — so the daemon cannot read its own login and every Infisical \
              lookup will degrade. Run: chown {expected} {}",
             path.display(),
             path.display()
-        )),
+        ));
+    }
+
+    let held = entries_in(path)?;
+
+    match daemon {
         Some(expected) => Ok(format!(
-            "mode {MODE:04o}, owner uid {expected} — {}",
+            "{held}, mode {MODE:04o}, owner uid {expected} — {}",
             path.display()
         )),
         // Reported, not judged. See the module header.
         None => Ok(format!(
-            "mode {MODE:04o}, owner uid {owner}, unverified — there is no audit log yet to \
-             read the daemon's own uid from, so nothing here has checked that {owner} is it \
-             — {}",
+            "{held}, mode {MODE:04o}, owner uid {owner}, unverified — there is no audit log \
+             yet to read the daemon's own uid from, so nothing here has checked that {owner} \
+             is it — {}",
             path.display()
         )),
+    }
+}
+
+/// How many entries the credential file holds, in words, or why it holds none
+/// that can be used.
+///
+/// # Errors
+///
+/// The empty file and the unparseable one, told apart. They are the two states
+/// that used to render identically — as `ok` — and they have opposite remedies:
+/// one wants the value put in, the other wants the file taken away first,
+/// because [`store_entry`] refuses to rewrite a file it cannot parse rather
+/// than lose what somebody put in it by hand.
+fn entries_in(path: &Path) -> Result<String, String> {
+    let mut bytes = match fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
+            // The boundary, working. Said plainly rather than counted as zero.
+            return Ok(format!(
+                "contents unread — this process cannot open it, which is what {MODE:04o} \
+                 under another uid means; run `sudo {} check` to have the entries counted",
+                crate::DAEMON_NAME
+            ));
+        }
+        Err(error) => return Err(format!("{} cannot be read: {error}", path.display())),
+    };
+    let contents = crate::store::file::classify(&bytes);
+    bytes.zeroize();
+
+    match contents {
+        Contents::Empty => Err(format!(
+            "{} is mode {MODE:04o} and the daemon's, and it is EMPTY — no login has been put \
+             in it, so every Infisical lookup will degrade. That is the state a fresh \
+             install leaves; fill it with `{} credential --name <entry>`, which takes no \
+             value on a command line",
+            path.display(),
+            crate::DAEMON_NAME
+        )),
+        Contents::Malformed { line, column } => Err(format!(
+            "{} is mode {MODE:04o} and the daemon's, and it is not a JSON object of name to \
+             value (line {line}, column {column}) — so nothing can be read out of it and \
+             every Infisical lookup will degrade. `{} credential` will not rewrite it, \
+             because that would lose whatever is in it; move it aside and write the entries \
+             again",
+            path.display(),
+            crate::DAEMON_NAME
+        )),
+        Contents::Entries(mut entries) => {
+            let held = entries.len();
+            for value in entries.values_mut() {
+                value.zeroize();
+            }
+            Ok(match held {
+                1 => "1 entry".to_owned(),
+                other => format!("{other} entries"),
+            })
+        }
     }
 }
 
@@ -170,7 +261,7 @@ pub fn inspect(path: &Path, daemon: Option<u32>) -> Result<String, String> {
 /// Whatever `out` returns.
 pub fn report(config: &super::config::DaemonConfig, out: &mut dyn io::Write) -> io::Result<bool> {
     if !config.stores.infisical.enabled || config.stores.infisical.credentials.is_empty() {
-        return Ok(true);
+        return orphaned(config, out);
     }
     let path = config.stores.infisical.credentials_file.to_path_buf();
     let sound = match inspect(&path, daemon_uid(config.audit.as_path())) {
@@ -188,6 +279,42 @@ pub fn report(config: &super::config::DaemonConfig, out: &mut dyn io::Write) -> 
         "         whether Infisical accepts it is the `store infisical` row below"
     )?;
     Ok(sound)
+}
+
+/// A vendor login on disk that this config gives nothing to do.
+///
+/// The one thing `check` can see of a config that lost its `infisical` block.
+/// Nothing in the daemon remembers what the config used to say, so a store
+/// deleted from it leaves no trace at all — no identity row, no `store
+/// infisical` row, no warning — and the report is fully green while every
+/// Infisical name has stopped resolving. What does survive is the credential
+/// FILE, because it lives outside the config, and a file with a login in it
+/// that no store is configured to use is either that accident or an install
+/// somebody reconfigured and never cleaned up.
+///
+/// Both are worth a red row. The second is what `install/uninstall.sh` argues
+/// at length is a landmine: a long-lived credential left on a machine with
+/// nothing to use it, still valid at the vendor, that nobody is thinking about.
+///
+/// Silence for a file that is absent, empty, or unreadable from here — an
+/// install that never used Infisical must not be nagged, and a guess made
+/// through a permission error would be exactly that.
+fn orphaned(config: &super::config::DaemonConfig, out: &mut dyn io::Write) -> io::Result<bool> {
+    let path = config.stores.infisical.credentials_file.to_path_buf();
+    let holds_something = fs::metadata(&path).is_ok_and(|meta| meta.len() > 0);
+    if !holds_something {
+        return Ok(true);
+    }
+    writeln!(
+        out,
+        "identity PROBLEM {} holds a vendor login and nothing in this config uses it: the \
+         Infisical store is not enabled here, or names no credential. Either the `infisical` \
+         block was lost out of this config — in which case every name it served has stopped \
+         resolving, silently — or the login is left over, in which case delete it and REVOKE \
+         the identity at the vendor",
+        path.display()
+    )?;
+    Ok(false)
 }
 
 /// Put one value into the credential file, leaving its owner and mode alone.
@@ -254,24 +381,22 @@ fn read_existing(
         Err(error) => return Err(io_error(path, format!("cannot be read: {error}"))),
     };
 
-    if bytes.iter().all(u8::is_ascii_whitespace) {
-        bytes.zeroize();
-        return Ok((BTreeMap::new(), owner));
-    }
-
-    let parsed = serde_json::from_slice::<BTreeMap<String, String>>(&bytes);
+    // Classified by the same function the `file` store reads with, so the two
+    // cannot disagree about what a given file IS. What they still decide
+    // separately is what an empty one means for their verb: writing into one is
+    // ordinary, and reading a name out of one cannot succeed.
+    let contents = crate::store::file::classify(&bytes);
     bytes.zeroize();
-    match parsed {
-        Ok(entries) => Ok((entries, owner)),
+    match contents {
+        Contents::Empty => Ok((BTreeMap::new(), owner)),
+        Contents::Entries(entries) => Ok((entries, owner)),
         // The contents are never quoted back: a parse error in a credential file
         // would otherwise print the credentials it failed to parse.
-        Err(error) => Err(io_error(
+        Contents::Malformed { line, column } => Err(io_error(
             path,
             format!(
                 "is not a JSON object of name to value, so rewriting it would lose what is \
-                 in it (line {}, column {})",
-                error.line(),
-                error.column()
+                 in it (line {line}, column {column})"
             ),
         )),
     }
@@ -471,6 +596,59 @@ mod tests {
     }
 
     #[test]
+    fn the_file_the_installer_leaves_does_not_report_the_identity_as_sound() {
+        // The measured defect. An empty file, a file of whitespace and a file
+        // of broken JSON have the same mode and the same owner as a file
+        // holding a machine identity, and a row built from those two said `ok`
+        // over all four. The empty one is what every install starts with and
+        // what a re-run used to put a working install back into.
+        let dir = scratch("contents");
+        let path = dir.join("infisical.json");
+        fs::write(&path, b"").expect("create");
+        fs::set_permissions(&path, fs::Permissions::from_mode(MODE)).expect("chmod");
+        let owner = fs::metadata(&path).expect("stat").uid();
+
+        let empty = inspect(&path, Some(owner)).expect_err("an empty credential file");
+        assert!(empty.contains("EMPTY"), "{empty}");
+        assert!(empty.contains("credential --name"), "{empty}");
+
+        // Whitespace is the same state, not a third one. The two readers used
+        // to disagree about exactly these bytes.
+        fs::write(&path, b"  \n\t\n").expect("create");
+        let blank = inspect(&path, Some(owner)).expect_err("whitespace is not a login");
+        assert!(blank.contains("EMPTY"), "{blank}");
+
+        // Malformed is a different state with a different remedy, and it must
+        // not read as the empty one.
+        fs::write(&path, format!("{{\"BROKEN\": \"{DECOY}\"")).expect("create");
+        let broken = inspect(&path, Some(owner)).expect_err("a truncated object");
+        assert!(broken.contains("not a JSON object"), "{broken}");
+        assert!(
+            !broken.contains("EMPTY"),
+            "a malformed file was reported as an empty one: {broken}"
+        );
+        assert!(!broken.contains(DECOY), "{broken}");
+
+        // The remedy the malformed message prescribes: move it aside, because
+        // the writer will not rewrite a file it cannot parse.
+        store_entry(&path, "CLIENT_ID", &Secret::new("decoy-id-0177".to_owned()))
+            .expect_err("the writer refuses to overwrite what it cannot read");
+        fs::remove_file(&path).expect("aside");
+
+        // And a file with a login in it says how much is in it, so a rewrite
+        // that dropped one half of a two-part identity is visible in the row
+        // rather than only at the next lookup.
+        store_entry(&path, "CLIENT_ID", &Secret::new("decoy-id-0177".to_owned())).expect("first");
+        let one = inspect(&path, Some(owner)).expect("a sound file");
+        assert!(one.contains("1 entry"), "{one}");
+        store_entry(&path, "CLIENT_SECRET", &Secret::new(DECOY.to_owned())).expect("second");
+        let two = inspect(&path, Some(owner)).expect("a sound file");
+        assert!(two.contains("2 entries"), "{two}");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn no_message_this_module_writes_can_carry_a_value() {
         // The blanket rule the rest of the crate holds to. Every sentence above
         // is built from a path, a mode and a uid, and this is what keeps it that
@@ -480,11 +658,20 @@ mod tests {
         store_entry(&path, "MACHINE_IDENTITY", &Secret::new(DECOY.to_owned())).expect("stored");
 
         let owner = fs::metadata(&path).expect("stat").uid();
+
+        // The contents are read now, so every sentence built from them is on
+        // this list too — including the one about a file that cannot be parsed,
+        // which is the sentence a parser would otherwise want to quote.
+        let broken = dir.join("broken.json");
+        fs::write(&broken, format!("{{\"BROKEN\": \"{DECOY}\"")).expect("create");
+        fs::set_permissions(&broken, fs::Permissions::from_mode(MODE)).expect("chmod");
+
         let said = [
             inspect(&path, Some(owner)).unwrap_or_else(|e| e),
             inspect(&path, Some(owner + 1)).unwrap_or_else(|e| e),
             inspect(&path, None).unwrap_or_else(|e| e),
             inspect(&dir.join("absent.json"), Some(owner)).unwrap_or_else(|e| e),
+            inspect(&broken, Some(owner)).unwrap_or_else(|e| e),
             store_entry(&dir, "X", &Secret::new(DECOY.to_owned()))
                 .map(|()| String::new())
                 .unwrap_or_else(|e| e.to_string()),
@@ -517,19 +704,76 @@ mod report_tests {
         // The negative control for the whole row. A report that printed
         // "identity absent" on every install without Infisical would train a
         // reader to skip the line on the one install where it matters.
-        let (rows, sound) = rendered(&config_from(
-            r#"{"stores":{"file":{"enabled":true,"path":"/tmp/keyless-test/secrets.json"}}}"#,
-        ));
+        //
+        // The credential file is named explicitly and does not exist. Left at
+        // its default this test would read whatever is under /usr/local on the
+        // machine running it, and would start failing the day somebody
+        // installed the daemon — which is a test reporting on a filesystem
+        // rather than on a config.
+        let dir = super::tests::scratch("no-login");
+        let absent = dir.join("infisical.json");
+        let (rows, sound) = rendered(&config_from(&format!(
+            r#"{{"stores":{{"file":{{"enabled":true,"path":"{dir}/secrets.json"}},
+                            "infisical":{{"credentials_file":"{absent}"}}}}}}"#,
+            dir = dir.display(),
+            absent = absent.display(),
+        )));
         assert!(rows.is_empty(), "{rows}");
         assert!(sound);
 
         // And with Infisical on but no credential declared: still nothing, for
         // the same reason — a session-style install inherits its own login.
-        let (rows, _) = rendered(&config_from(
-            r#"{"stores":{"infisical":{"enabled":true}},
-                "secrets":{"X":{"env":"fixture-env"}}}"#,
-        ));
+        let (rows, _) = rendered(&config_from(&format!(
+            r#"{{"stores":{{"infisical":{{"enabled":true,
+                                          "credentials_file":"{absent}"}}}},
+                 "secrets":{{"X":{{"env":"fixture-env"}}}}}}"#,
+            absent = absent.display(),
+        )));
         assert!(rows.is_empty(), "{rows}");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_login_on_disk_that_no_store_uses_is_a_row_rather_than_silence() {
+        // What a config that lost its `infisical` block looks like from here.
+        // Nothing else in the report can see that loss: no identity row, no
+        // store row, no warning, and every name it served has quietly stopped
+        // resolving. The credential file outlives the config and is the one
+        // witness left.
+        let dir = super::tests::scratch("orphan");
+        let path = dir.join("infisical.json");
+        store_entry(&path, "MACHINE_IDENTITY", &Secret::new(DECOY.to_owned())).expect("stored");
+
+        let config = config_from(&format!(
+            r#"{{"stores":{{"infisical":{{"credentials_file":"{path}"}}}}}}"#,
+            path = path.display(),
+        ));
+        let (rows, sound) = rendered(&config);
+        assert!(!sound, "{rows}");
+        assert_eq!(
+            rows.lines()
+                .next()
+                .expect("a row")
+                .split_whitespace()
+                .nth(1),
+            Some("PROBLEM"),
+            "{rows}"
+        );
+        assert!(rows.contains("REVOKE"), "{rows}");
+        assert!(
+            !rows.contains(DECOY),
+            "the row carried the credential: {rows}"
+        );
+
+        // And an empty file left by an install that never used Infisical is
+        // silence, or every such machine gets nagged forever.
+        fs::write(&path, b"").expect("empty");
+        let (rows, sound) = rendered(&config);
+        assert!(rows.is_empty(), "{rows}");
+        assert!(sound);
+
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

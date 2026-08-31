@@ -399,10 +399,12 @@ cat <<'NEXT'
 # 4. Log out and back in, or your shell will not yet be in the keyless group
 #    and every request will be refused at the socket.
 #
-# 5. Check it:
+# 5. Check it. `check` under sudo, because the store and the daemon's own
+#    credential file live in a 0700 directory owned by the daemon: read as
+#    you, it cannot open either of them and can only report that:
 #
 #      keyless doctor
-#      keylessd check --config /usr/local/etc/keyless/keylessd.json
+#      sudo keylessd check --config /usr/local/etc/keyless/keylessd.json
 #      keylessd verify --config /usr/local/etc/keyless/keylessd.json
 #
 # ---------------------------------------------------------------------------
@@ -454,10 +456,12 @@ cat <<'NEXT'
 #      sudo keylessd credential --name MACHINE_IDENTITY_CLIENT_ID
 #      sudo keylessd credential --name MACHINE_IDENTITY_CLIENT_SECRET
 #
-# c. Check it. `identity` reports the file's mode and owner, and the
-#    `store infisical` row is the login actually being accepted by your tenant:
+# c. Check it. `identity` reports the file's mode, its owner and how many
+#    entries are in it, and the `store infisical` row is the login actually
+#    being accepted by your tenant. Under sudo: read as you, the file cannot be
+#    opened at all, and the row says so rather than counting nothing:
 #
-#      keylessd check --config /usr/local/etc/keyless/keylessd.json
+#      sudo keylessd check --config /usr/local/etc/keyless/keylessd.json
 #
 # WHY A CLIENT SECRET AND NOT A TOKEN. An access token is smaller and expires;
 # a daemon has nobody to prompt when it does, and what you would see is every
@@ -465,7 +469,8 @@ cat <<'NEXT'
 # on disk the daemon mints its own token per lookup and never asks you again.
 # The credential file's 0600 mode and its owner ARE the boundary that makes
 # that safe, which is why `keylessd check` verifies both rather than merely
-# checking the file is there.
+# checking the file is there — and reads what is in it, because an empty file
+# has exactly that mode and that owner and holds no login at all.
 #
 NEXT
 

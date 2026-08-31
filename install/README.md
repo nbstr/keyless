@@ -125,9 +125,14 @@ looks exactly like a broken daemon.
 
 ```console
 $ keyless doctor
-$ keylessd check  --config /usr/local/etc/keyless/keylessd.json
+$ sudo keylessd check  --config /usr/local/etc/keyless/keylessd.json
 $ keylessd verify --config /usr/local/etc/keyless/keylessd.json
 ```
+
+`check` runs under `sudo` and the other two do not. The store and the daemon's
+credential file sit in a `0700` directory owned by the daemon, which is the
+whole point of them; read as you, `check` cannot open either one and reports
+that it could not rather than reporting nothing wrong.
 
 `keyless doctor` also reports the case worth catching: a socket that is
 listening while your config does not mention it. That means the daemon is
@@ -166,7 +171,8 @@ trip and never expires.
 
 The price is a long-lived credential on a disk, and the whole of what bounds it
 is one file's mode and one file's owner. Which is why `keylessd check` verifies
-both rather than checking that the file exists.
+both rather than checking that the file exists — and reads what is in it, since
+an empty file has exactly that mode and that owner and holds no login at all.
 
 ### Setting it up
 
@@ -213,12 +219,14 @@ history and in no process table:
 ```console
 $ sudo keylessd credential --name MACHINE_IDENTITY_CLIENT_ID
 $ sudo keylessd credential --name MACHINE_IDENTITY_CLIENT_SECRET
-$ keylessd check --config /usr/local/etc/keyless/keylessd.json
+$ sudo keylessd check --config /usr/local/etc/keyless/keylessd.json
 ```
 
 `check` prints two separate rows about this, and they answer different
 questions. `identity` is about the file: does it exist, is it `0600`, is it
-owned by the uid the daemon runs as. `store infisical` is about the tenant:
+owned by the uid the daemon runs as, and is there a login in it — an empty file
+and a file holding an identity are the same file by mode and owner, and the
+empty one is what a fresh install leaves. `store infisical` is about the tenant:
 does Infisical accept the login. A credential that is refused says so and never
 reports a name as missing — those two are the outcomes that must never be
 confused, because one means "fix your login" and the other means "look in
