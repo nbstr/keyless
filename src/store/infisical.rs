@@ -510,6 +510,12 @@ pub const NAMES_VERB: &str = "__names";
 /// [`InfisicalStore::resolve`], which compares what it reads back against what
 /// it forwarded, and reports the collision rather than returning either guess.
 ///
+/// That comparison covers a second set of names this list does not contain: the
+/// variables the adapter INJECTS rather than forwards. A daemon's minted
+/// [`ACCESS_TOKEN`] is set on the child alone and is in no environment this
+/// process could read, so a check that only consulted `std::env` was blind to
+/// exactly the variable this file writes itself.
+///
 /// - `HOME` — where the CLI keeps its login, its instance domain and its cache.
 ///   Without it the lookup is unauthenticated.
 /// - `PATH` — the binary defaults to the bare name `infisical`, so the spawn
@@ -615,12 +621,17 @@ fn forwarded_value(key: &str) -> Option<std::ffi::OsString> {
     }
 }
 
-/// Why a forwarded name's value cannot be attributed, and how to make it one.
+/// Why a handed-in name's value cannot be attributed, and how to make it one.
 ///
 /// Written by this crate rather than taken from a backend's stderr, like the
 /// empty-value sentence beside it. It carries no value: the whole subject is
 /// that the two candidate values are byte-identical, so naming either would
 /// name both.
+///
+/// "Hand" covers both ways a variable gets into the child: forwarded out of
+/// this process, and MINTED for it — the access token the daemon exchanges its
+/// identity for is handed over by this process just as `PATH` is, and it is the
+/// one this file writes itself.
 fn shadowed_detail(key: &str) -> String {
     format!(
         "`{key}` is one of the variables this process must hand the Infisical CLI for it to \
@@ -1355,16 +1366,22 @@ impl Store for InfisicalStore {
 
     fn resolve(&self, name: &str) -> Result<Option<Secret>, StoreError> {
         let at = self.coordinates(name)?;
-        // Read BEFORE the spawn, from the same source the spawn forwards from,
-        // so the comparison below is against the exact bytes that went in
-        // rather than against a second reading of a variable that could have
-        // changed in between.
+        // Both halves of what the child will carry under `at.key`, read BEFORE
+        // the spawn and from the same values the spawn hands over — so the
+        // comparison below is against the exact bytes that went in rather than
+        // against a second reading of something that could have changed in
+        // between.
+        //
+        // The second half is the one that was missing. `forwarded_value` reads
+        // THIS process's environment, and the daemon's minted `INFISICAL_TOKEN`
+        // is never in it: it is set on the child alone. So a declared secret
+        // whose key is `INFISICAL_TOKEN` came back as the daemon's own access
+        // token, with no collision reported — the blind spot the shadow check
+        // exists to close, in the one variable this adapter itself injects.
         let forwarded = forwarded_value(&at.key);
-        let mut captured = capture(
-            self.probe_command(&at, &self.vendor_environment()?),
-            self.timeout,
-        )
-        .map_err(|error| self.unreachable(&error))?;
+        let vendor = self.vendor_environment()?;
+        let mut captured = capture(self.probe_command(&at, &vendor), self.timeout)
+            .map_err(|error| self.unreachable(&error))?;
 
         if !captured.status.success() {
             // stdout is empty on every failure path the CLI has, so reading it
@@ -1400,12 +1417,17 @@ impl Store for InfisicalStore {
             )));
         }
 
-        // The one name the clearing cannot make exact: a key the vendor itself
-        // needs. Returning this would hand the caller's own `PATH` back as a
-        // credential, stamped `INJECTED`.
-        if let Some(shadow) = &forwarded
-            && bytes == std::os::unix::ffi::OsStrExt::as_bytes(shadow.as_os_str())
-        {
+        // The names the clearing cannot make exact: a key the vendor itself
+        // needs. Returning one of these would hand the caller's own `PATH` back
+        // as a credential, stamped `INJECTED` — or, in the case the second arm
+        // covers, hand back the daemon's own access token as the value of a
+        // secret it went to Infisical to fetch.
+        let shadowed = forwarded.as_ref().is_some_and(|value| {
+            bytes == std::os::unix::ffi::OsStrExt::as_bytes(value.as_os_str())
+        }) || vendor
+            .iter()
+            .any(|(variable, secret)| variable == &at.key && bytes == secret.expose().as_bytes());
+        if shadowed {
             return Err(self.backend(shadowed_detail(&at.key)));
         }
 
@@ -2098,6 +2120,38 @@ mod tests {
         )))
     }
 
+    /// A stand-in `infisical` that mints on `login` and, on `run`, executes
+    /// whatever follows the `--`.
+    ///
+    /// That is what makes a shadow observable: the trailing command is
+    /// `printenv <key>`, so the child answers out of the environment it was
+    /// handed, exactly as the real vendor's `run` would.
+    ///
+    /// It also exports one key of its own, `KEYLESS_FIXTURE_KEY`, which stands
+    /// for an ordinary secret the store holds: a name nothing here forwards and
+    /// nothing here injects. That is the control every shadow assertion needs —
+    /// without a key this fixture can actually answer, "the shadow was refused"
+    /// is satisfied by a fixture that answers nothing.
+    fn passthrough_vendor(dir: &std::path::Path, minted: &str) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let binary = dir.join("infisical");
+        std::fs::write(
+            &binary,
+            format!(
+                "#!/bin/sh\n\
+                 if [ \"$1\" = login ]; then printf '{minted}\\n'; exit 0; fi\n\
+                 while [ \"$1\" != \"--\" ]; do shift; done\n\
+                 shift\n\
+                 KEYLESS_FIXTURE_KEY=decoy-store-value-0703\n\
+                 export KEYLESS_FIXTURE_KEY\n\
+                 exec \"$@\"\n"
+            ),
+        )
+        .expect("stub");
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        binary
+    }
+
     fn temporary(tag: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!(
             "keyless-infisical-{tag}-{}-{:?}",
@@ -2169,5 +2223,73 @@ mod tests {
         }
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_secret_named_for_the_minted_token_is_a_collision_and_not_a_value() {
+        // The shadow check read this process's environment, and the minted
+        // access token is set on the CHILD alone — so a declared secret whose
+        // key is `INFISICAL_TOKEN` came back as the daemon's own token, with no
+        // collision reported. That is the one variable this file writes itself,
+        // and it was the one the check could not see.
+        let dir = temporary("shadowed-token");
+        let vendor = passthrough_vendor(&dir, "decoy-minted-token-0703");
+        let store = store_from(&format!(
+            r#"{{"stores":{{"infisical":{{"enabled":true,"binary":"{vendor}"}}}},
+                 "secrets":{{"{key}":{{"env":"fixture-env"}}}}}}"#,
+            vendor = vendor.display(),
+            key = super::ACCESS_TOKEN,
+        ))
+        .with_vendor_credentials(Some(super::VendorCredentials::new(
+            Box::new(crate::store::file::FileStore::new(write_identity_file(
+                &dir,
+            ))),
+            BTreeMap::from([
+                (super::IDENTITY_CLIENT_ID.to_owned(), "CLIENT_ID".to_owned()),
+                (
+                    super::IDENTITY_CLIENT_SECRET.to_owned(),
+                    "CLIENT_SECRET".to_owned(),
+                ),
+            ]),
+        )));
+
+        let said = store
+            .resolve(super::ACCESS_TOKEN)
+            .expect_err("the daemon's own token is not this secret's value")
+            .to_string();
+        assert!(said.contains("byte-for-byte"), "{said}");
+        assert!(
+            !said.contains("decoy-minted-token-0703"),
+            "the collision message carried the token: {said}"
+        );
+
+        // The control: the same stand-in vendor, and the one key it exports as
+        // an ordinary stored secret — forwarded by nothing, injected by
+        // nothing. Without it, "the shadow was refused" is satisfied by an
+        // adapter that refuses everything this fixture asks for.
+        let ordinary = store_from(&format!(
+            r#"{{"stores":{{"infisical":{{"enabled":true,"binary":"{vendor}"}}}},
+                 "secrets":{{"KEYLESS_FIXTURE_KEY":{{"env":"fixture-env"}}}}}}"#,
+            vendor = vendor.display(),
+        ));
+        assert!(
+            ordinary.resolve("KEYLESS_FIXTURE_KEY").is_ok(),
+            "the fixture cannot answer at all, so the refusal above proves nothing"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The two-part identity, in a `0600` file the `file` store will read.
+    fn write_identity_file(dir: &std::path::Path) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join("infisical.json");
+        std::fs::write(
+            &path,
+            r#"{"CLIENT_ID":"decoy-client-id-0703","CLIENT_SECRET":"decoy-client-secret-0703"}"#,
+        )
+        .expect("credentials");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).expect("chmod");
+        path
     }
 }
