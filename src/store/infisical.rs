@@ -1281,8 +1281,18 @@ impl InfisicalStore {
             .into_iter()
             .map(|(name, _)| name.to_string_lossy().into_owned())
             .collect();
+        // `vendor_environment`, never `vendor_credentials`. The difference is
+        // the promise [`VendorCredentials`] makes: a machine identity is minted
+        // into a short-lived token first, and only the token reaches the child,
+        // so the long-lived credential is handed to exactly one process — the
+        // login. This path forwarded the identity itself, which was a promise
+        // the code contradicted and, separately, a spawn that could not have
+        // worked: `infisical run` ignores both halves of an identity.
+        //
+        // It costs a second spawn when an identity is configured, the same way
+        // a lookup does: one to mint, one to list.
         let captured = capture(
-            self.names_command(at, probe, &self.vendor_credentials()?),
+            self.names_command(at, probe, &self.vendor_environment()?),
             self.timeout,
         )
         .map_err(|error| self.unreachable(&error))?;
@@ -2026,5 +2036,138 @@ mod tests {
         // An absence that names the verb that DOES answer, rather than one that
         // leaves the reader looking for a flag.
         assert!(said.contains("items infisical"), "{said}");
+    }
+
+    // -----------------------------------------------------------------------
+    // What reaches the vendor's own child, when the daemon supplies its login.
+    // -----------------------------------------------------------------------
+
+    /// A stand-in `infisical` that mints on `login` and dumps its environment
+    /// on anything else.
+    ///
+    /// It exits 1 after the dump, because what is under test is what the child
+    /// was HANDED and not what came back — and a stub that succeeded would have
+    /// to imitate a listing as well.
+    fn recording_vendor(dir: &std::path::Path, minted: &str) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let dump = dir.join("child-environment");
+        let binary = dir.join("infisical");
+        std::fs::write(
+            &binary,
+            format!(
+                "#!/bin/sh\n\
+                 if [ \"$1\" = login ]; then printf '{minted}\\n'; exit 0; fi\n\
+                 env > '{dump}'\n\
+                 exit 1\n",
+                dump = dump.display(),
+            ),
+        )
+        .expect("stub");
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        binary
+    }
+
+    /// A store whose vendor is [`recording_vendor`] and whose login is a
+    /// two-part machine identity read out of a `0600` file beside it.
+    fn identity_store(dir: &std::path::Path) -> InfisicalStore {
+        use std::os::unix::fs::PermissionsExt;
+        let credentials = dir.join("infisical.json");
+        std::fs::write(
+            &credentials,
+            r#"{"CLIENT_ID":"decoy-client-id-0511","CLIENT_SECRET":"decoy-client-secret-0511"}"#,
+        )
+        .expect("credentials");
+        std::fs::set_permissions(&credentials, std::fs::Permissions::from_mode(0o600))
+            .expect("chmod");
+
+        let names = BTreeMap::from([
+            (super::IDENTITY_CLIENT_ID.to_owned(), "CLIENT_ID".to_owned()),
+            (
+                super::IDENTITY_CLIENT_SECRET.to_owned(),
+                "CLIENT_SECRET".to_owned(),
+            ),
+        ]);
+        store_from(&format!(
+            r#"{{"stores":{{"infisical":{{"enabled":true,"binary":"{vendor}"}}}},
+                 "secrets":{{"DECOY":{{"env":"fixture-env"}}}}}}"#,
+            vendor = recording_vendor(dir, "decoy-minted-token-0511").display(),
+        ))
+        .with_vendor_credentials(Some(super::VendorCredentials::new(
+            Box::new(crate::store::file::FileStore::new(credentials)),
+            names,
+        )))
+    }
+
+    fn temporary(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "keyless-infisical-{tag}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch");
+        dir
+    }
+
+    #[test]
+    fn a_listing_hands_the_child_a_minted_token_and_never_the_identity_itself() {
+        // `VendorCredentials` promises the long-lived credential reaches
+        // exactly one process — the login — and no other. The listing path
+        // forwarded the identity straight to `infisical run` instead, which
+        // contradicted that promise and could not have worked either: `run`
+        // authenticates with `INFISICAL_TOKEN` and ignores both halves of an
+        // identity, so the child would have been unauthenticated with the
+        // credential in its environment for nothing.
+        let dir = temporary("listing-identity");
+        let store = identity_store(&dir);
+        let at = Location {
+            env: "fixture-env".to_owned(),
+            path: "/".to_owned(),
+        };
+
+        let _ = store.names_at(&at, std::path::Path::new("/usr/bin/true"));
+
+        let handed = std::fs::read_to_string(dir.join("child-environment"))
+            .expect("the stand-in vendor recorded the child's environment");
+        assert!(
+            handed.contains("INFISICAL_TOKEN=decoy-minted-token-0511"),
+            "the listing child was not given the minted token"
+        );
+        for half in [super::IDENTITY_CLIENT_ID, super::IDENTITY_CLIENT_SECRET] {
+            assert!(
+                !handed.contains(half),
+                "the listing child was handed `{half}`, which is the long-lived \
+                 credential the mint exists to keep out of it"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_lookup_hands_the_child_a_minted_token_and_never_the_identity_itself() {
+        // The control for the test above: the lookup path was already correct,
+        // so an assertion that passes for both is asserting on the mint rather
+        // than on one call site. If this one ever reds, the fault is in
+        // `vendor_environment` and not in either caller.
+        let dir = temporary("lookup-identity");
+        let store = identity_store(&dir);
+
+        let _ = store.resolve("DECOY");
+
+        let handed = std::fs::read_to_string(dir.join("child-environment"))
+            .expect("the stand-in vendor recorded the child's environment");
+        assert!(
+            handed.contains("INFISICAL_TOKEN=decoy-minted-token-0511"),
+            "the lookup child was not given the minted token"
+        );
+        for half in [super::IDENTITY_CLIENT_ID, super::IDENTITY_CLIENT_SECRET] {
+            assert!(
+                !handed.contains(half),
+                "the lookup child was handed `{half}`"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
