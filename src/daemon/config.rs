@@ -49,7 +49,8 @@ use crate::store::onepassword::{
     OnePasswordStore, Routing as OnePasswordRouting, SERVICE_ACCOUNT_TOKEN, ServiceAccount,
 };
 use crate::store::proton::{
-    KeyProvider, ProtonStore, Reason as ProtonReason, Routing as ProtonRouting,
+    AgentToken, ENCRYPTION_KEY_VAR as PROTON_ENCRYPTION_KEY, KeyProvider, ProtonStore,
+    Reason as ProtonReason, Routing as ProtonRouting, TOKEN_VAR as PROTON_TOKEN,
 };
 use crate::store::{Registry, Store};
 
@@ -807,6 +808,24 @@ impl DaemonConfig {
         ProtonRouting::from_secrets(&self.secrets)
     }
 
+    /// The daemon's Proton login, read out of its own file.
+    ///
+    /// The same arrangement as [`DaemonConfig::vendor_credentials`], for the
+    /// same reasons — and one more that is specific to this vendor: the token
+    /// is what lets a dropped session put itself back, so a daemon without one
+    /// works right up until anything disturbs its session directory and then
+    /// stops, with nobody there to log it back in.
+    fn agent_token(&self) -> Option<AgentToken> {
+        let settings = &self.stores.proton;
+        if settings.credentials.is_empty() {
+            return None;
+        }
+        Some(AgentToken::new(
+            Box::new(FileStore::new(settings.credentials_file.to_path_buf())),
+            settings.credentials.clone(),
+        ))
+    }
+
     /// The daemon's 1Password login, read out of its own file.
     ///
     /// The same arrangement as [`DaemonConfig::vendor_credentials`], for the
@@ -941,7 +960,8 @@ impl DaemonConfig {
                 // session store it was asked to read.
                 .with_key_provider(Some(settings.key_provider))
                 .with_timeout(settings.timeout_ms)
-                .with_listing_ttl(settings.listing_ttl_ms),
+                .with_listing_ttl(settings.listing_ttl_ms)
+                .with_agent_token(self.agent_token()),
             ));
         }
         Registry::new(stores)
@@ -988,6 +1008,68 @@ impl DaemonConfig {
                  session to inherit and inheriting one would read an identity nobody chose"
                     .to_owned(),
             );
+        }
+        if self.stores.proton.enabled && self.stores.proton.credentials.is_empty() {
+            warnings.push(format!(
+                "the Proton store is enabled and names no credential, so the daemon's \
+                 `pass-cli` cannot re-establish its session if the vendor ever drops it, \
+                 and every Proton name degrades from that moment with nobody watching. \
+                 Name `{PROTON_TOKEN}` under `stores.proton.credentials` and write it with \
+                 `{} credential --store proton`",
+                crate::DAEMON_NAME
+            ));
+        }
+        if self.stores.proton.enabled
+            && self.stores.proton.key_provider == KeyProvider::Env
+            && !self
+                .stores
+                .proton
+                .credentials
+                .contains_key(PROTON_ENCRYPTION_KEY)
+        {
+            // The one arrangement that is a misconfiguration rather than a
+            // risk: `env` says the local key arrives in a variable, and no
+            // credential names that variable, so it arrives in nothing.
+            warnings.push(format!(
+                "`stores.proton.key_provider` is `env`, which takes the local encryption key \
+                 from `{PROTON_ENCRYPTION_KEY}`, and no credential names it — so `pass-cli` \
+                 will find no local key beside an existing session and reinitialise it. \
+                 Name it under `stores.proton.credentials`, or use `fs`"
+            ));
+        }
+        let refused = AgentToken::refused(&self.stores.proton.credentials);
+        if !refused.is_empty() {
+            warnings.push(format!(
+                "these Proton credential variables are refused, and every Proton lookup \
+                 will degrade while they are named: {}. Only `{PROTON_TOKEN}` and \
+                 `{PROTON_ENCRYPTION_KEY}` may be written this way — every other \
+                 `PROTON_PASS_*` variable is one this adapter sets itself, and one named \
+                 here would overrule which identity answers or where its key is looked for",
+                refused.join(", ")
+            ));
+        }
+        if !self.stores.proton.credentials.is_empty()
+            && self.stores.file.enabled
+            && self.stores.proton.credentials_file.to_path_buf()
+                == self.stores.file.path.to_path_buf()
+        {
+            warnings.push(format!(
+                "the Proton credential file is the same file the `file` store serves, so \
+                 {} {} a name any attested client can ask for; put the credential in a file \
+                 of its own and name it in `stores.proton.credentials_file`",
+                self.stores
+                    .proton
+                    .credentials
+                    .values()
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                if self.stores.proton.credentials.len() == 1 {
+                    "is"
+                } else {
+                    "are"
+                }
+            ));
         }
         if self.stores.onepassword.enabled && self.stores.onepassword.vault.is_none() {
             // The operator-facing form of the rule in `onepassword_routing`:

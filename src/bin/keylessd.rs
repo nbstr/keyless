@@ -121,9 +121,9 @@ mod daemon {
         /// spells it. The VALUE is read from stdin and never from here.
         #[arg(long, value_name = "ENTRY")]
         name: String,
-        /// Which store's credential file to write: `infisical` or
-        /// `onepassword`. Defaults to whichever store's `credentials` names
-        /// the entry, and to `infisical` when none does.
+        /// Which store's credential file to write: `infisical`,
+        /// `onepassword` or `proton`. Defaults to whichever store's
+        /// `credentials` names the entry, and to `infisical` when none does.
         #[arg(long, value_name = "STORE")]
         store: Option<String>,
         /// Config file, used to find the credential file and the daemon's uid.
@@ -319,46 +319,63 @@ mod daemon {
             Err(error) => return fail(&error.to_string()),
         };
 
-        // Two vendors, two files. Which one is decided by `--store`, else by
-        // which store's `credentials` map names the entry — and when neither
+        // One file per vendor. Which one is decided by `--store`, else by
+        // which store's `credentials` map names the entry — and when none
         // does, by the historical default, so a recipe written before the
-        // second file existed keeps working and the note below still fires.
+        // other files existed keeps working and the note below still fires.
         let names_it = |credentials: &std::collections::BTreeMap<String, String>| {
             credentials.values().any(|entry| entry == &args.name)
         };
         let store = match args.store.as_deref() {
-            Some(store @ ("infisical" | "onepassword")) => store,
+            Some(store @ ("infisical" | "onepassword" | "proton")) => store,
             Some(other) => {
                 return fail(&format!(
                     "`--store {other}` names no store with a credential file of its own; this \
-                     build has: infisical, onepassword"
+                     build has: infisical, onepassword, proton"
                 ));
             }
-            None => match (
-                names_it(&config.stores.infisical.credentials),
-                names_it(&config.stores.onepassword.credentials),
-            ) {
-                (false, true) => "onepassword",
-                (true, true) => {
-                    return fail(&format!(
-                        "both `stores.infisical.credentials` and `stores.onepassword.credentials` \
-                         name `{}`; pass --store to say which file it goes in",
-                        args.name
-                    ));
+            None => {
+                // Which file, when nothing said. Decided by which store's own
+                // `credentials` map names the entry, so a recipe that predates
+                // a second file keeps working — and refused outright when more
+                // than one claims it, because writing a vault-unlocking token
+                // into the wrong vendor's file is not a mistake that announces
+                // itself.
+                let claimed: Vec<&str> = [
+                    ("infisical", &config.stores.infisical.credentials),
+                    ("onepassword", &config.stores.onepassword.credentials),
+                    ("proton", &config.stores.proton.credentials),
+                ]
+                .into_iter()
+                .filter_map(|(id, credentials)| names_it(credentials).then_some(id))
+                .collect();
+                match claimed.as_slice() {
+                    [one] => one,
+                    [] => "infisical",
+                    several => {
+                        return fail(&format!(
+                            "`{}` is named by more than one store's `credentials` ({}); pass \
+                             --store to say which file it goes in",
+                            args.name,
+                            several.join(", ")
+                        ));
+                    }
                 }
-                _ => "infisical",
-            },
+            }
         };
-        let (path, declared) = if store == "onepassword" {
-            (
+        let (path, declared) = match store {
+            "onepassword" => (
                 config.stores.onepassword.credentials_file.to_path_buf(),
                 &config.stores.onepassword.credentials,
-            )
-        } else {
-            (
+            ),
+            "proton" => (
+                config.stores.proton.credentials_file.to_path_buf(),
+                &config.stores.proton.credentials,
+            ),
+            _ => (
                 config.stores.infisical.credentials_file.to_path_buf(),
                 &config.stores.infisical.credentials,
-            )
+            ),
         };
 
         // The one arrangement that makes writing this credential worse than not

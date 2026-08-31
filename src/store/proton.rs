@@ -171,6 +171,9 @@ use crate::store::Store;
 use crate::store::discover::{Discover, FieldKind, FieldSummary, ItemSummary};
 use crate::store::exec::{self, CaptureError, capture, strip_one_newline, summarise};
 
+/// This adapter's id, as a config route and an error message spell it.
+pub const STORE_ID: &str = "proton";
+
 /// The environment variable a read's justification travels in.
 pub(crate) const REASON_VAR: &str = "PROTON_PASS_AGENT_REASON";
 
@@ -864,6 +867,145 @@ pub fn login_into(session_dir: &Path) -> String {
     scoped_command(session_dir, "login")
 }
 
+/// The daemon's own Proton login, read out of a file only the daemon can open.
+///
+/// # Why the daemon needs one at all, when a session does not
+///
+/// A session spawns `pass-cli` and inherits whatever login the caller already
+/// established — a session store the caller owns, encrypted with a key in the
+/// caller's keyring. A daemon inherits neither half. It is given a session
+/// directory of its own, and it must be able to put that session back when the
+/// vendor drops it: measured behaviour recorded in [`remove_ambient_references`]
+/// is that a personal-access-token session **re-establishes itself** on the next
+/// command, because the token lives outside the session database. Without the
+/// token in the environment there is nothing to re-establish it from, and the
+/// first time anything disturbs that directory every Proton name stops
+/// resolving until somebody notices and logs it back in by hand.
+///
+/// Under [`KeyProvider::Env`] it carries the local encryption key too, which is
+/// the other half of the session and is a secret in exactly the same sense.
+///
+/// # Where it comes from, and everywhere it must not be
+///
+/// **Not the launchd plist**, whose `EnvironmentVariables` are readable by
+/// every user on the machine. **Not `keylessd.json`**, which names coordinates
+/// and has no field a value fits in. **Not the file the `file` store serves**,
+/// because everything in that file is a name an attested client can ask for
+/// over the socket — a vault-unlocking token kept there is handed to any
+/// session that guesses its label, which is the hole this project exists to
+/// close, reopened by its own installer.
+///
+/// So it comes from a [`Store`] the daemon reads under its own uid: a
+/// mode-`0600` file [`crate::store::file::FileStore`] refuses to read if
+/// anybody else could. The config names the variable and the entry; the value
+/// never appears in anything an operator opens.
+///
+/// # One token, and it is a viewer
+///
+/// [`crate::config::ProtonConfig`] carries a second, editor-role identity for
+/// the write verbs. The daemon deliberately has no counterpart: with
+/// `daemon.enabled`, [`crate::store::manage`] refuses every write for every
+/// store, so an editor token here would be a strictly larger prize with no
+/// ability whatsoever to be used.
+///
+/// The vendor enforces the rest in its crypto layer rather than by policy —
+/// `Personal access tokens and agent sessions cannot perform user key
+/// operations`, read out of the 2.3.2 binary — so a viewer-role token scoped to
+/// one vault is narrower than anything a login could be talked into.
+///
+/// # Read per lookup, not held
+///
+/// Resolved when a lookup is about to spawn the vendor, and dropped with the
+/// [`Secret`]s that carry it. A rotated token therefore takes effect without
+/// restarting the daemon, and nothing keeps a plaintext copy between calls. The
+/// same residency as the forwarded variables beside it: one copy lives as long
+/// as the [`Command`] holding it.
+pub struct AgentToken {
+    source: Box<dyn Store>,
+    names: BTreeMap<String, String>,
+}
+
+impl AgentToken {
+    /// Read the values for `names` — vendor variable to entry name — out of
+    /// `source`.
+    #[must_use]
+    pub fn new(source: Box<dyn Store>, names: BTreeMap<String, String>) -> Self {
+        AgentToken { source, names }
+    }
+
+    /// The named variables this adapter will not set, in the order it reads them.
+    ///
+    /// An **allowlist of exactly two**, and deliberately narrower than the
+    /// `INFISICAL_*` prefix rule the sibling adapter uses. A prefix rule works
+    /// there because every `INFISICAL_*` variable is a credential. It does not
+    /// work here: the two variables that decide whether this adapter is safe
+    /// are both `PROTON_PASS_*`. [`SESSION_DIR_VAR`] chooses which identity
+    /// answers — the difference between reading one vault and reading a whole
+    /// account — and [`KEY_PROVIDER_VAR`] chooses whether the session store
+    /// survives being read. A credential entry able to set either would
+    /// silently overrule the two settings this store's own config exists to
+    /// state.
+    ///
+    /// An associated function on the map rather than a method, so a config can
+    /// be checked before a store is built from it.
+    #[must_use]
+    pub fn refused(names: &BTreeMap<String, String>) -> Vec<String> {
+        names
+            .keys()
+            .filter(|variable| {
+                variable.as_str() != TOKEN_VAR && variable.as_str() != ENCRYPTION_KEY_VAR
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// Every named value, or the sentence saying which one could not be read.
+    fn resolve(&self) -> Result<Vec<(String, Secret)>, StoreError> {
+        if let Some(variable) = Self::refused(&self.names).first() {
+            return Err(StoreError::Misconfigured {
+                store: STORE_ID.to_owned(),
+                detail: format!(
+                    "`{variable}` is named as a Proton credential and is neither \
+                     `{TOKEN_VAR}` nor `{ENCRYPTION_KEY_VAR}`. Only those two may be set \
+                     this way: every other `PROTON_PASS_*` variable is one this adapter \
+                     sets itself, and one named here would choose which identity answers \
+                     or where its encryption key is looked for"
+                ),
+            });
+        }
+
+        let mut resolved = Vec::with_capacity(self.names.len());
+        for (variable, name) in &self.names {
+            match self.source.resolve(name) {
+                Ok(Some(secret)) => resolved.push((variable.clone(), secret)),
+                // Named and missing is a misconfiguration, not an absence: the
+                // operator wrote down where the token lives and it is not
+                // there, so every Proton name degrades and the message says
+                // which entry to write rather than which vault to search.
+                Ok(None) => {
+                    return Err(StoreError::Misconfigured {
+                        store: STORE_ID.to_owned(),
+                        detail: format!(
+                            "the Proton credential `{variable}` is declared to live in \
+                             `{name}` of the `{}` store, which holds no such entry",
+                            self.source.id()
+                        ),
+                    });
+                }
+                Err(error) => {
+                    return Err(StoreError::Misconfigured {
+                        store: STORE_ID.to_owned(),
+                        detail: format!(
+                            "the Proton credential `{variable}` could not be read: {error}"
+                        ),
+                    });
+                }
+            }
+        }
+        Ok(resolved)
+    }
+}
+
 /// What to tell an operator whose session directory holds an unfinished write.
 ///
 /// Two states, because they call for opposite actions: a write that stopped
@@ -1426,6 +1568,9 @@ pub struct ProtonStore {
     /// Where the local key encrypting that session lives, or `None` to leave
     /// the choice to the vendor. See [`ProtonStore::key_provider`].
     key_provider: Option<KeyProvider>,
+    /// The daemon's own login, or `None` on a session, which inherits one.
+    /// See [`AgentToken`].
+    credentials: Option<AgentToken>,
     timeout: Duration,
     reason: Reason,
     /// name -> where its value lives.
@@ -1520,6 +1665,7 @@ impl ProtonStore {
             probe_binary,
             session_dir: None,
             key_provider: None,
+            credentials: None,
             timeout: crate::config::bounded_timeout(crate::config::DEFAULT_TIMEOUT_MS),
             reason,
             routing,
@@ -1532,6 +1678,16 @@ impl ProtonStore {
     #[must_use]
     pub fn in_session_dir(mut self, session_dir: Option<PathBuf>) -> Self {
         self.session_dir = session_dir;
+        self
+    }
+
+    /// The login this daemon presents, read out of its own file at lookup time.
+    ///
+    /// `None` on a session, which inherits one by spawning the vendor. See
+    /// [`AgentToken`] for why a daemon cannot.
+    #[must_use]
+    pub fn with_agent_token(mut self, credentials: Option<AgentToken>) -> Self {
+        self.credentials = credentials;
         self
     }
 
@@ -1641,12 +1797,35 @@ impl ProtonStore {
     /// rewrite its session store on any invocation and must never be handed an
     /// environment somebody stripped. See [`remove_ambient_references`], which
     /// removes exactly what is known to cause a problem and leaves the rest.
-    fn scope(&self, command: &mut Command, session_dir: &Path, reason: String) {
+    fn scope(
+        &self,
+        command: &mut Command,
+        session_dir: &Path,
+        login: &[(String, Secret)],
+        reason: String,
+    ) {
         command.env(SESSION_DIR_VAR, session_dir);
         if let Some(provider) = self.key_provider {
             command.env(KEY_PROVIDER_VAR, provider.as_str());
         }
+        for (variable, secret) in login {
+            command.env(variable, secret.expose());
+        }
         command.env(REASON_VAR, reason);
+    }
+
+    /// The daemon's login, resolved for one lookup, or nothing on a session.
+    ///
+    /// # Errors
+    ///
+    /// Whatever [`AgentToken::resolve`] could not read. Never an absence: a
+    /// lookup that could not read its own login has not established that a
+    /// name is missing.
+    fn vendor_login(&self) -> Result<Vec<(String, Secret)>, StoreError> {
+        match &self.credentials {
+            Some(credentials) => credentials.resolve(),
+            None => Ok(Vec::new()),
+        }
     }
 
     /// Build one `pass-cli run --env-file … -- printenv KEYLESS_PROBE` invocation.
@@ -1662,6 +1841,7 @@ impl ProtonStore {
         session_dir: &Path,
         env_file: &Path,
         name: &str,
+        login: &[(String, Secret)],
         ambient: I,
     ) -> Command
     where
@@ -1681,7 +1861,7 @@ impl ProtonStore {
         remove_ambient_references(&mut command, ambient);
         // Passed rather than inherited: the ambient session is a different
         // identity with a different set of vaults. See `session_dir`.
-        self.scope(&mut command, session_dir, self.reason.for_name(name));
+        self.scope(&mut command, session_dir, login, self.reason.for_name(name));
         command.arg("--");
         command.arg(&self.probe_binary);
         command.arg(PROBE_VAR);
@@ -1709,7 +1889,14 @@ impl ProtonStore {
     /// No value can come back from this verb: it prints ids, titles, states and
     /// timestamps. `--show-secrets` is what would print content, it is refused
     /// for agent sessions, and it is not passed here.
-    fn list_command<I>(&self, session_dir: &Path, vault: &str, name: &str, ambient: I) -> Command
+    fn list_command<I>(
+        &self,
+        session_dir: &Path,
+        vault: &str,
+        name: &str,
+        login: &[(String, Secret)],
+        ambient: I,
+    ) -> Command
     where
         I: IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
     {
@@ -1725,7 +1912,7 @@ impl ProtonStore {
         command.arg("--output");
         command.arg("json");
         remove_ambient_references(&mut command, ambient);
-        self.scope(&mut command, session_dir, self.reason.for_name(name));
+        self.scope(&mut command, session_dir, login, self.reason.for_name(name));
         command
     }
 
@@ -1806,7 +1993,13 @@ impl ProtonStore {
         name: &str,
     ) -> Result<Vec<ItemRecord>, StoreError> {
         let captured = capture(
-            self.list_command(session_dir, vault, name, std::env::vars_os()),
+            self.list_command(
+                session_dir,
+                vault,
+                name,
+                &self.vendor_login()?,
+                std::env::vars_os(),
+            ),
             self.timeout,
         )
         .map_err(|error| self.unreachable(&error))?;
@@ -1879,7 +2072,12 @@ impl ProtonStore {
     /// Same shape as the other two: the session directory decides which identity
     /// answers, the reason is recorded, and an ambient `pass://` is removed. The
     /// verb prints vault names, ids and counts — no item content of any kind.
-    fn vault_list_command<I>(&self, session_dir: &Path, ambient: I) -> Command
+    fn vault_list_command<I>(
+        &self,
+        session_dir: &Path,
+        login: &[(String, Secret)],
+        ambient: I,
+    ) -> Command
     where
         I: IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
     {
@@ -1892,6 +2090,7 @@ impl ProtonStore {
         self.scope(
             &mut command,
             session_dir,
+            login,
             self.reason.for_action("listing", "vaults"),
         );
         command
@@ -1917,7 +2116,13 @@ impl ProtonStore {
     /// base64url, so about one in 64 begins with `-`, and passed as a separate
     /// argument the vendor's parser reads it as a short-flag cluster and refuses
     /// the whole command. See [`flag_value`].
-    fn view_command<I>(&self, session_dir: &Path, item: &ItemRecord, ambient: I) -> Command
+    fn view_command<I>(
+        &self,
+        session_dir: &Path,
+        item: &ItemRecord,
+        login: &[(String, Secret)],
+        ambient: I,
+    ) -> Command
     where
         I: IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
     {
@@ -1932,6 +2137,7 @@ impl ProtonStore {
         self.scope(
             &mut command,
             session_dir,
+            login,
             self.reason
                 .for_action("inspecting the fields of", &item.title),
         );
@@ -1941,7 +2147,7 @@ impl ProtonStore {
     /// Every vault this identity can see.
     fn vaults(&self, session_dir: &Path) -> Result<Vec<String>, StoreError> {
         let captured = capture(
-            self.vault_list_command(session_dir, std::env::vars_os()),
+            self.vault_list_command(session_dir, &self.vendor_login()?, std::env::vars_os()),
             self.timeout,
         )
         .map_err(|error| self.unreachable(&error))?;
@@ -1979,7 +2185,7 @@ impl ProtonStore {
 
 impl Store for ProtonStore {
     fn id(&self) -> &str {
-        "proton"
+        STORE_ID
     }
 
     fn resolve(&self, name: &str) -> Result<Option<Secret>, StoreError> {
@@ -2021,7 +2227,13 @@ impl Store for ProtonStore {
         })?;
 
         let mut captured = capture(
-            self.probe_command(session_dir, &env_file.path, name, std::env::vars_os()),
+            self.probe_command(
+                session_dir,
+                &env_file.path,
+                name,
+                &self.vendor_login()?,
+                std::env::vars_os(),
+            ),
             self.timeout,
         )
         .map_err(|error| self.unreachable(&error))?;
@@ -2106,7 +2318,7 @@ impl Store for ProtonStore {
         }
 
         let captured = capture(
-            self.vault_list_command(session_dir, std::env::vars_os()),
+            self.vault_list_command(session_dir, &self.vendor_login()?, std::env::vars_os()),
             self.timeout,
         )
         .map_err(|error| self.unreachable(&error))?;
@@ -2223,7 +2435,12 @@ impl Discover for ProtonStore {
         };
 
         let captured = capture(
-            self.view_command(session_dir, record, std::env::vars_os()),
+            self.view_command(
+                session_dir,
+                record,
+                &self.vendor_login()?,
+                std::env::vars_os(),
+            ),
             self.timeout,
         )
         .map_err(|error| self.unreachable(&error))?;
@@ -2455,6 +2672,7 @@ mod tests {
             Path::new(SCOPED),
             Path::new("/tmp/probe.env"),
             name,
+            &[],
             ambient(),
         )
     }
@@ -2789,7 +3007,7 @@ mod tests {
     // -----------------------------------------------------------------------
 
     fn list_argv(store: &ProtonStore, vault: &str) -> Vec<String> {
-        let command = store.list_command(Path::new(SCOPED), vault, "X", ambient());
+        let command = store.list_command(Path::new(SCOPED), vault, "X", &[], ambient());
         std::iter::once(command.get_program())
             .chain(command.get_args())
             .map(OsStr::to_string_lossy)
@@ -2836,7 +3054,7 @@ mod tests {
         // value read — the same failure the session pin exists to prevent, one
         // step earlier.
         let store = store_from("{}");
-        let command = store.list_command(Path::new(SCOPED), "personal", "DECOY", ambient());
+        let command = store.list_command(Path::new(SCOPED), "personal", "DECOY", &[], ambient());
         let env: Vec<(String, Option<String>)> = command
             .get_envs()
             .map(|(key, value)| {
@@ -2869,7 +3087,7 @@ mod tests {
         // because it exercised the function rather than the command builder.
         let store = store_from("{}");
         let removed: Vec<String> = store
-            .list_command(Path::new(SCOPED), "personal", "X", ambient())
+            .list_command(Path::new(SCOPED), "personal", "X", &[], ambient())
             .get_envs()
             .filter(|(_, value)| value.is_none())
             .map(|(key, _)| key.to_string_lossy().into_owned())
@@ -3142,7 +3360,7 @@ mod tests {
             title: "demo api key".to_owned(),
             item_type: "custom".to_owned(),
         };
-        let command = store.view_command(Path::new(SCOPED), &record, ambient());
+        let command = store.view_command(Path::new(SCOPED), &record, &[], ambient());
         let argv: Vec<String> = std::iter::once(command.get_program())
             .chain(command.get_args())
             .map(OsStr::to_string_lossy)
@@ -3242,7 +3460,7 @@ mod tests {
             title: "demo.service".to_owned(),
             item_type: "custom".to_owned(),
         };
-        let command = store.view_command(Path::new(SCOPED), &record, ambient());
+        let command = store.view_command(Path::new(SCOPED), &record, &[], ambient());
         let view: Vec<String> = std::iter::once(command.get_program())
             .chain(command.get_args())
             .map(OsStr::to_string_lossy)
