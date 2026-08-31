@@ -12,12 +12,11 @@
 //!
 //! Both halves of that are quiet in the same direction:
 //!
-//! - **Run as a client**, the refusal reads
-//!   `` `keyless` is not a pinned client ``, which names the program the
-//!   operator thinks they installed. It reads as a broken pin. It sends
-//!   somebody to re-pin a binary that was already pinned correctly, and the
-//!   re-pin does not help because the file being run is not the file being
-//!   pinned.
+//! - **Run as a client**, the refusal says the image is not a pinned client.
+//!   It names the peer's PATH, so the file being refused is at least
+//!   identifiable — but only to somebody already connecting, and only after
+//!   the run has degraded. Nothing tells the operator that the file the
+//!   installer pinned is sitting a directory further along, unreached.
 //! - **Run as anything else**, an old copy simply lacks whatever landed since
 //!   it was built. Measured: `keylessd credential --name …` answered
 //!   `unrecognized subcommand 'credential'` from a copy ten days old, while the

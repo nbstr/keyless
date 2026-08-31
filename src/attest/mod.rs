@@ -225,7 +225,15 @@ impl Policy {
         if !self.images.contains(&peer.code_hash) {
             return Some(Denial::UnknownImage {
                 code_hash: peer.code_hash_hex(),
-                image: peer.image_name().to_owned(),
+                // The PATH, not the file name. A second copy of this program
+                // earlier on the caller's PATH is refused exactly here, and a
+                // message naming only `keyless` describes the program the
+                // operator believes they installed — so it reads as a broken
+                // pin and sends somebody to re-pin a file that was already
+                // pinned correctly. The path is the peer's own, already known
+                // to the peer, and the audit row carries `kind()` rather than
+                // this sentence, so naming it discloses nothing.
+                image: peer.image.display().to_string(),
             });
         }
         None
@@ -250,7 +258,7 @@ pub enum Denial {
     UnknownImage {
         /// The peer's code hash, in hex.
         code_hash: String,
-        /// The peer's image file name.
+        /// The path of the peer's loaded image.
         image: String,
     },
 }
@@ -289,7 +297,9 @@ impl fmt::Display for Denial {
             ),
             Denial::UnknownImage { code_hash, image } => write!(
                 f,
-                "`{image}` is not a pinned client (code hash {code_hash})"
+                "{image} is not a pinned client (code hash {code_hash}); if that is not \
+                 the path this daemon's client was installed at, a second copy of it is \
+                 what your shell reaches"
             ),
         }
     }
@@ -338,7 +348,63 @@ impl Attestation {
 
 #[cfg(test)]
 mod tests {
-    use super::is_interpreter;
+    use super::{Denial, Policy, is_interpreter};
+    use crate::ipc::peer::{CDHASH_LEN, PeerIdentity};
+
+    /// A peer this daemon could be asked about, at a path of its own.
+    ///
+    /// Built by hand rather than off a socket. [`PeerIdentity`]'s fields are
+    /// public precisely because it is a set of facts and not a decision — the
+    /// decision is [`Attestation`], which no test can construct.
+    fn peer_at(image: &str, code_hash: [u8; CDHASH_LEN]) -> PeerIdentity {
+        PeerIdentity {
+            uid: 501,
+            gid: 20,
+            groups: Vec::new(),
+            pid: 4242,
+            generation: 1,
+            unique_id: 7,
+            code_hash,
+            image: std::path::PathBuf::from(image),
+        }
+    }
+
+    #[test]
+    fn refusing_an_unpinned_client_names_the_path_and_not_only_the_program() {
+        // The measured failure: a second copy of this program earlier on PATH
+        // is refused exactly here. A message reading "`keyless` is not a pinned
+        // client" names the program the operator believes they installed, so it
+        // reads as a broken pin — and re-pinning does not help, because the
+        // file being run is not the file being pinned. The path is the one fact
+        // that separates those two readings.
+        let policy = Policy::new().allow_uid(501).allow_image([1u8; CDHASH_LEN]);
+        let elsewhere = "/somewhere/else/bin/keyless";
+
+        let denial = policy
+            .judge(&peer_at(elsewhere, [2u8; CDHASH_LEN]))
+            .expect("an unpinned image is refused");
+
+        assert!(matches!(denial, Denial::UnknownImage { .. }), "{denial:?}");
+        assert!(
+            denial.to_string().contains(elsewhere),
+            "the refusal did not say which file was refused: {denial}"
+        );
+        // The reason word is what an operator greps the audit log for, and it
+        // must not move because the sentence beside it did.
+        assert_eq!(denial.kind(), "unknown-image");
+    }
+
+    #[test]
+    fn a_pinned_client_at_any_path_is_not_refused() {
+        // The control. Without it, an assertion that an unpinned image is
+        // refused is satisfied by a policy that refuses everything.
+        let policy = Policy::new().allow_uid(501).allow_image([1u8; CDHASH_LEN]);
+        assert!(
+            policy
+                .judge(&peer_at("/somewhere/else/bin/keyless", [1u8; CDHASH_LEN]))
+                .is_none()
+        );
+    }
 
     #[test]
     fn interpreters_are_recognised_including_versioned_names() {
