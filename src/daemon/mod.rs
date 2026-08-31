@@ -41,6 +41,7 @@
 //! their commands run with unmodified environments. Degrading the fleet is a
 //! bad afternoon; a security daemon continuing past a broken invariant is worse.
 
+pub mod check;
 pub mod config;
 pub mod credential;
 pub mod resolver;

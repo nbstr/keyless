@@ -51,6 +51,7 @@ mod daemon {
     use keyless::attest::is_interpreter;
     use keyless::audit::AuditLog;
     use keyless::cmd::write::read_value;
+    use keyless::daemon::check::report as check_report;
     use keyless::daemon::config::{DaemonConfig, refuse_interpreter_pin};
     use keyless::daemon::credential;
     use keyless::daemon::{Daemon, Running};
@@ -274,77 +275,13 @@ mod daemon {
             Err(error) => return fail(&error.to_string()),
         };
 
-        let mut out = io::stdout();
-        let _ = writeln!(out, "config   {}", config_path.display());
-        let _ = writeln!(out, "socket   {}", config.socket.display());
-        let _ = writeln!(out, "audit    {}", config.audit.display());
-        let _ = writeln!(
-            out,
-            "cache    {}s in memory, never on disk",
-            config.cache_ttl_seconds
-        );
-
-        match config.policy() {
-            Ok(policy) => {
-                let _ = writeln!(
-                    out,
-                    "policy   {} uid(s), {} pinned image(s), interpreted callers refused",
-                    config.peer.allow_uids.len(),
-                    policy.image_count()
-                );
-            }
-            Err(error) => {
-                let _ = writeln!(out, "policy   PROBLEM {error}");
-                return ExitCode::FAILURE;
-            }
-        }
-
-        // Before the stores, because a store row that says PROBLEM because the
-        // daemon cannot read its own login is a symptom, and this is the cause.
-        // The two questions are different: this one asks whether the credential
-        // is where it must be and shut to everyone else; the `infisical` row
-        // below asks whether Infisical accepts it.
-        let _ = credential::report(&config, &mut out);
-
-        for store in config.registry().stores() {
-            match store.health() {
-                Ok(()) => {
-                    let _ = writeln!(out, "store    {} ok", store.id());
-                }
-                Err(error) => {
-                    let _ = writeln!(out, "store    {} PROBLEM {error}", store.id());
-                }
-            }
-        }
-
-        // A healthy store is not a store that will be asked. With two enabled,
-        // which one answers a name is decided here and nowhere else, so the
-        // decision is printed beside them rather than left to be inferred from
-        // a run that degrades later.
-        let _ = writeln!(
-            out,
-            "routing  {} policy, default {}, {} name(s) pinned",
-            match config.stores.policy {
-                keyless::config::Policy::Explicit => "explicit",
-                keyless::config::Policy::Ordered => "ordered",
-            },
-            config.stores.default_store.as_deref().unwrap_or("unset"),
-            config
-                .secrets
-                .values()
-                .filter(|route| route.store.is_some())
-                .count()
-        );
-
-        let warnings = config.warnings();
-        for warning in &warnings {
-            let _ = writeln!(out, "warning  {warning}");
-        }
-
-        if warnings.is_empty() {
-            ExitCode::SUCCESS
-        } else {
-            ExitCode::FAILURE
+        // The whole report, and its verdict, are `daemon::check`'s. What is
+        // left here is the exit code, which is the one thing a library cannot
+        // decide for a binary.
+        match check_report(&config, config_path, &mut io::stdout()) {
+            Ok(true) => ExitCode::SUCCESS,
+            Ok(false) => ExitCode::FAILURE,
+            Err(error) => fail(&format!("the report could not be written: {error}")),
         }
     }
 
