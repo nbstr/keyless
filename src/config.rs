@@ -710,7 +710,9 @@ pub(crate) fn default_infisical_path() -> String {
     "/".to_owned()
 }
 
-fn default_proton_binary() -> ConfigPath {
+/// The vendor's own binary name. `pub(crate)` so the daemon's config defaults
+/// to the same spelling rather than a second literal that can drift.
+pub(crate) fn default_proton_binary() -> ConfigPath {
     ConfigPath::from("pass-cli")
 }
 

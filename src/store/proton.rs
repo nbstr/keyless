@@ -177,6 +177,110 @@ pub(crate) const REASON_VAR: &str = "PROTON_PASS_AGENT_REASON";
 /// The environment variable that chooses which logged-in identity answers.
 pub(crate) const SESSION_DIR_VAR: &str = "PROTON_PASS_SESSION_DIR";
 
+/// The environment variable that chooses where the local encryption key lives.
+///
+/// See [`KeyProvider`], which is the whole story.
+pub const KEY_PROVIDER_VAR: &str = "PROTON_PASS_KEY_PROVIDER";
+
+/// The environment variable [`KeyProvider::Env`] reads that key out of.
+pub const ENCRYPTION_KEY_VAR: &str = "PROTON_PASS_ENCRYPTION_KEY";
+
+/// Where `pass-cli` keeps the key its local session store is encrypted with.
+///
+/// # This is the field that decides whether a login survives
+///
+/// `pass-cli` encrypts its session database with a **local key**, and where
+/// that key is kept is chosen by [`KEY_PROVIDER_VAR`]. Read out of the 2.3.2
+/// binary, it accepts exactly three words: `fs`, `keyring` and `env`, and it
+/// says so — `Invalid PROTON_PASS_KEY_PROVIDER value: '<what you wrote>'. Valid
+/// values are 'fs', 'keyring', or 'env'`.
+///
+/// Two of those three are representable here. `keyring` is not, and that is
+/// this type's entire reason to exist.
+///
+/// **The default is `keyring`, and a keyring belongs to the uid that unlocked
+/// it.** So a process with no login keychain — a daemon's uid, a build agent,
+/// anything started without a user session — asks the keyring for the local
+/// key and is told there is none. The binary's own words for what happens
+/// next: `Local encryption key not found but local data exists. Forcing logout
+/// for security.` It then reinitialises the session store at that path.
+///
+/// That is the mechanism behind this adapter's oldest and worst hazard, the
+/// one [`remove_ambient_references`] documents: a `pass-cli` invoked with a
+/// stripped environment **destroys a web-login session**, unrecoverably. The
+/// stripping was never the cause; it was one way of reaching the cause, by
+/// taking away what the keyring provider needed to answer. A daemon reaches
+/// the same cause by simply not having a login keychain in the first place.
+///
+/// Naming a provider that keeps the key somewhere a daemon can reach is
+/// therefore not a convenience — it is the difference between an adapter that
+/// works behind a uid boundary and one that empties a session store every time
+/// it runs. So the field is not optional, its default is the safe value, and
+/// the unsafe value cannot be written into a config at all: a `keyring` there
+/// is a parse error, which on a daemon means it refuses to start, which is
+/// visible. See [`crate::daemon::config`] on why that is the right direction
+/// for a daemon to fail in.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum KeyProvider {
+    /// The key is a file inside the session directory. Whoever owns that
+    /// directory can read it, and nobody else, which is the same boundary the
+    /// session store itself has.
+    #[default]
+    Fs,
+    /// The key arrives in [`ENCRYPTION_KEY_VAR`], base64url-encoded. Nothing
+    /// is written beside the session store, at the cost of the daemon having
+    /// to hold one more value in its own credential file.
+    Env,
+}
+
+impl KeyProvider {
+    /// The word the vendor accepts.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            KeyProvider::Fs => "fs",
+            KeyProvider::Env => "env",
+        }
+    }
+}
+
+impl fmt::Display for KeyProvider {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl serde::Serialize for KeyProvider {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for KeyProvider {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let word = String::deserialize(deserializer)?;
+        match word.as_str() {
+            "fs" => Ok(KeyProvider::Fs),
+            "env" => Ok(KeyProvider::Env),
+            // Refused by name, with the reason, rather than by serde's
+            // "unknown variant" — an operator reading that would reasonably
+            // conclude this build is out of date, and set out to find one that
+            // accepts the vendor's own documented value.
+            "keyring" => Err(serde::de::Error::custom(format!(
+                "`{KEY_PROVIDER_VAR}` may not be `keyring` here. A keyring belongs to the \
+                 uid that unlocked it, so a daemon's uid finds no local key in one — and \
+                 `pass-cli` answers a missing local key beside an existing session store by \
+                 FORCING A LOGOUT and reinitialising the store. Use `fs`, which keeps the \
+                 key in the session directory, or `env`, which takes it from \
+                 `{ENCRYPTION_KEY_VAR}`"
+            ))),
+            other => Err(serde::de::Error::custom(format!(
+                "`{other}` is not a key provider; this build accepts `fs` and `env`"
+            ))),
+        }
+    }
+}
+
 /// The vendor's cap on that justification.
 const REASON_MAX: usize = 300;
 

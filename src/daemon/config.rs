@@ -48,6 +48,7 @@ use crate::store::keychain::KeychainStore;
 use crate::store::onepassword::{
     OnePasswordStore, Routing as OnePasswordRouting, SERVICE_ACCOUNT_TOKEN, ServiceAccount,
 };
+use crate::store::proton::{KeyProvider, Routing as ProtonRouting};
 use crate::store::{Registry, Store};
 
 /// The daemon's whole configuration.
@@ -143,6 +144,10 @@ pub struct DaemonStores {
     /// service account pinned to one vault.
     #[serde(default)]
     pub onepassword: DaemonOnePasswordConfig,
+    /// Proton Pass, reached through `pass-cli` under the daemon's own uid, as
+    /// a viewer-role agent token in a session directory the daemon owns.
+    #[serde(default)]
+    pub proton: DaemonProtonConfig,
     /// How a name that pins no store chooses one. See [`crate::config::Policy`].
     ///
     /// The strict one by default, on the daemon exactly as on a session: the
@@ -399,6 +404,141 @@ impl Default for DaemonOnePasswordConfig {
     }
 }
 
+/// Settings for the Proton Pass backend, on the daemon's side of the boundary.
+///
+/// # Why this one needs settings a session's does not
+///
+/// A session's `pass-cli` is pointed at a session directory and inherits
+/// everything else: a login keychain holding the local key, a home directory,
+/// an ambient environment. A daemon's uid has none of those, and each absence
+/// is a field here.
+///
+/// - [`DaemonProtonConfig::key_provider`] replaces the login keychain, and is
+///   the one that decides whether the session store survives being read at
+///   all. See [`KeyProvider`].
+/// - [`DaemonProtonConfig::credentials`] replaces the login, naming the agent
+///   token — and, under [`KeyProvider::Env`], the local key beside it.
+/// - [`DaemonProtonConfig::session_dir`] is the same field a session has and
+///   means more here: the directory, the store inside it and (under
+///   [`KeyProvider::Fs`]) the key inside it must all be the daemon's, because
+///   `pass-cli` writes to that directory on invocations that only read.
+///
+/// # A viewer token, and exactly one of them
+///
+/// [`crate::config::ProtonConfig`] carries a second identity — an editor-role
+/// `manager` session the write verbs use. There is deliberately no counterpart
+/// here. With `daemon.enabled`, [`crate::store::manage`] returns
+/// `DaemonHoldsIt` and refuses every write for every store, so an editor token
+/// in the daemon's file would be a strictly larger prize with no ability
+/// whatsoever to be used. The manager stays on the session side, where the
+/// verbs that need it live.
+///
+/// Spelled as the session config spells it, so a setting moved across the
+/// boundary keeps its name.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct DaemonProtonConfig {
+    /// Off unless asked for.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Path to, or name of, the `pass-cli` binary. Worth an absolute path
+    /// here, for the reason [`DaemonInfisicalConfig::binary`] gives.
+    #[serde(default = "default_proton_binary")]
+    pub binary: ConfigPath,
+    /// The session directory holding the daemon's own logged-in identity.
+    ///
+    /// No default, and an absent one degrades every Proton name rather than
+    /// falling back to a shared per-user location — see
+    /// [`crate::store::proton::ProtonStore::session_dir`] for why inheriting is
+    /// the worst of the three available answers. It matters more here than on
+    /// a session: the location `pass-cli` falls back to is derived from the
+    /// caller's home, and a daemon's uid either has none or has one nobody
+    /// intended to be a credential store.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_dir: Option<ConfigPath>,
+    /// Where the key encrypting that session directory is kept.
+    ///
+    /// **Not the vendor's default**, which is the login keychain, which a
+    /// daemon's uid does not have. See [`KeyProvider`] for what `pass-cli` does
+    /// when it cannot find the local key, and why `keyring` is not a value this
+    /// field can hold.
+    #[serde(default)]
+    pub key_provider: KeyProvider,
+    /// How long one lookup may take before it degrades the run.
+    #[serde(default = "default_timeout_ms")]
+    pub timeout_ms: u64,
+    /// How long one vault listing may be reused. See
+    /// [`crate::config::ProtonConfig::listing_ttl_ms`].
+    #[serde(default = "default_listing_ttl_ms")]
+    pub listing_ttl_ms: u64,
+    /// The helper that reads one variable out of the child environment.
+    #[serde(default = "default_probe_binary")]
+    pub probe_binary: ConfigPath,
+    /// The daemon's own login: which `PROTON_PASS_*` variable holds it, and
+    /// which entry of [`DaemonProtonConfig::credentials_file`] its value is in.
+    ///
+    /// **Names, never values**, exactly as for the other two vendors. The
+    /// ordinary entry is `{"PROTON_PASS_PERSONAL_ACCESS_TOKEN": "<entry>"}`; a
+    /// daemon running [`KeyProvider::Env`] names `PROTON_PASS_ENCRYPTION_KEY`
+    /// beside it.
+    ///
+    /// Only those two variables are accepted — a narrower rule than the
+    /// `INFISICAL_*` prefix next door, and deliberately so. Every other
+    /// `PROTON_PASS_*` variable this adapter cares about is one it SETS
+    /// itself: `PROTON_PASS_SESSION_DIR` chooses which identity answers and
+    /// `PROTON_PASS_KEY_PROVIDER` chooses whether the session store survives,
+    /// so a prefix rule would let a credential entry quietly overrule both.
+    /// [`crate::store::proton::AgentToken::refused`] is what says so, and
+    /// [`DaemonConfig::warnings`] says it out loud.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub credentials: BTreeMap<String, String>,
+    /// The mode-`0600` file those values live in. A file of its own by
+    /// default, beside the secrets file rather than inside it, for the reason
+    /// [`DaemonInfisicalConfig::credentials_file`] gives.
+    #[serde(default = "default_proton_credentials_file")]
+    pub credentials_file: ConfigPath,
+    /// The day the agent token stops working, as `YYYY-MM-DD`.
+    ///
+    /// # Why an operator writes this down instead of the daemon asking
+    ///
+    /// A Proton agent token expires — the vendor's own default is months, not
+    /// years — and this is the one setting whose failure arrives on a schedule
+    /// nobody chose with nobody awake to read it. Infisical never needed the
+    /// field because a machine identity there renews itself; there is no
+    /// counterpart here.
+    ///
+    /// It cannot be discovered at lookup time. Read out of the 2.3.2 binary,
+    /// the vendor's answer to a token it will not accept is one sentence for
+    /// three different causes: `This personal access token is invalid, expired
+    /// or has been deleted.` So a daemon that waited to be told would learn
+    /// nothing it could act on, and would learn it at the moment every Proton
+    /// name had already stopped resolving.
+    ///
+    /// Written down, `keylessd check` can say `expires in <n> days` while
+    /// there is still time to do something, and `EXPIRED` afterwards — which
+    /// is the difference between a scheduled task and an outage. Absent, the
+    /// row says the date was never declared and stops there: a check nobody
+    /// could make must not read as one that passed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_expires: Option<String>,
+}
+
+impl Default for DaemonProtonConfig {
+    fn default() -> Self {
+        DaemonProtonConfig {
+            enabled: false,
+            binary: default_proton_binary(),
+            session_dir: None,
+            key_provider: KeyProvider::default(),
+            timeout_ms: default_timeout_ms(),
+            listing_ttl_ms: default_listing_ttl_ms(),
+            probe_binary: default_probe_binary(),
+            credentials: BTreeMap::new(),
+            credentials_file: default_proton_credentials_file(),
+            token_expires: None,
+        }
+    }
+}
+
 fn default_socket() -> ConfigPath {
     ConfigPath::from(crate::ipc::default_socket_path())
 }
@@ -434,6 +574,18 @@ fn default_onepassword_credentials_file() -> ConfigPath {
         PathBuf::from("/usr/local/var/lib")
             .join(crate::NAME)
             .join("onepassword.json"),
+    )
+}
+
+/// Where the daemon's Proton agent token lives, by default.
+///
+/// Its own file, a sibling of the other two, for the reason
+/// [`default_onepassword_credentials_file`] gives.
+fn default_proton_credentials_file() -> ConfigPath {
+    ConfigPath::from(
+        PathBuf::from("/usr/local/var/lib")
+            .join(crate::NAME)
+            .join("proton.json"),
     )
 }
 
@@ -474,6 +626,10 @@ fn default_infisical_path() -> String {
 
 fn default_onepassword_binary() -> ConfigPath {
     crate::config::default_onepassword_binary()
+}
+
+fn default_proton_binary() -> ConfigPath {
+    crate::config::default_proton_binary()
 }
 
 fn default_listing_ttl_ms() -> u64 {
@@ -621,6 +777,32 @@ impl DaemonConfig {
             self.stores.onepassword.vault.clone(),
             self.stores.onepassword.field.clone(),
         )
+    }
+
+    /// Where each name lives inside Proton Pass.
+    ///
+    /// The same projection a session builds, from the same fields of the same
+    /// [`SecretRoute`] type, through the same constructor — see
+    /// [`crate::store::proton::Routing`] for why one walk rather than two.
+    ///
+    /// # There is no coordinate here a daemon has to supply
+    ///
+    /// This is the reason the Proton adapter needed no new gate to be hosted
+    /// behind the socket, and the reason it differs from the Infisical one next
+    /// door. An Infisical name is `<key>` at `<path>` of `<environment>`, and
+    /// two of those three have defaults, so an undeclared name is still a
+    /// well-formed query the vendor will answer. A Proton name is a vault, an
+    /// item and a field, **none** of which is inferable: guessing any of them
+    /// would send a read, and a permanent off-machine audit entry, to an item
+    /// nobody asked for. So `Address::from_route` yields nothing for a name
+    /// that declares nothing, `resolve` turns that into an error, and no
+    /// process is created.
+    ///
+    /// `tests/daemon_proton.rs` asserts that as the ABSENCE of a vendor
+    /// invocation rather than as a returned status.
+    #[must_use]
+    pub fn proton_routing(&self) -> ProtonRouting {
+        ProtonRouting::from_secrets(&self.secrets)
     }
 
     /// The daemon's 1Password login, read out of its own file.
@@ -1498,5 +1680,73 @@ mod tests {
     #[test]
     fn a_missing_daemon_config_is_an_error_rather_than_defaults() {
         assert!(DaemonConfig::load(Path::new("/nonexistent/keylessd.json")).is_err());
+    }
+
+    #[test]
+    fn the_key_provider_that_forces_a_logout_cannot_be_written_into_a_config() {
+        // `keyring` is the vendor's default and the one value a daemon must
+        // never use: its uid has no login keychain, `pass-cli` answers a
+        // missing local key beside an existing session store by reinitialising
+        // that store, and a session store that is reinitialised on every
+        // lookup is a store that never works and quietly destroys what it
+        // replaces. So it is a parse error rather than a warning, which on a
+        // daemon means the process refuses to start.
+        let refused = serde_json::from_str::<DaemonConfig>(
+            r#"{"stores":{"proton":{"enabled":true,"key_provider":"keyring"}}}"#,
+        )
+        .expect_err("`keyring` must not parse");
+        let said = refused.to_string();
+        assert!(
+            said.contains("FORCING A LOGOUT"),
+            "the refusal does not say what `keyring` does here: {said}"
+        );
+
+        // The control: both accepted values parse, so the assertion above is
+        // about this one word and not about the field being unreadable.
+        for word in ["fs", "env"] {
+            let config = parse(&format!(
+                r#"{{"stores":{{"proton":{{"enabled":true,"key_provider":"{word}"}}}}}}"#
+            ));
+            assert_eq!(config.stores.proton.key_provider.as_str(), word);
+        }
+
+        // And the default is the safe one, so a config that says nothing is
+        // not silently the vendor's default.
+        assert_eq!(parse("{}").stores.proton.key_provider.as_str(), "fs");
+    }
+
+    #[test]
+    fn a_proton_name_is_routed_only_where_the_daemons_own_config_declares_it() {
+        // A daemon-hosted Proton lookup reaches exactly the vault, item and
+        // field an operator wrote in a file the calling user cannot write.
+        // Nothing is defaulted, so a name that appears nowhere has no address
+        // at all — which is what makes an invented name cost no vendor process.
+        let config = parse(
+            r#"{"stores":{"proton":{"enabled":true}},
+                "secrets":{"DECLARED":{"store":"proton","vault":"company",
+                                       "item":"decoy","field":"password"},
+                           "ELSEWHERE":{"store":"keychain"}}}"#,
+        );
+        let routing = config.proton_routing();
+
+        // Counted, not tested for emptiness: `ELSEWHERE` says nothing about
+        // Proton and must not be projected, and a `> 0` check cannot see that.
+        assert_eq!(routing.declared(), 1);
+    }
+
+    #[test]
+    fn the_daemon_has_no_second_proton_identity_for_writes() {
+        // The session config carries a `manager` block — an editor-role token
+        // the write verbs use. There is deliberately no counterpart here:
+        // `store::manage` refuses every write under a daemon, so an editor
+        // token in the daemon's file would be a larger prize with no way to be
+        // used. A key added later would be dropped by serde in silence, so the
+        // check is that the parsed config cannot express one.
+        let config = parse(
+            r#"{"stores":{"proton":{"enabled":true,
+                                    "manager":{"session_dir":"/nonexistent/manager"}}}}"#,
+        );
+        let rendered = serde_json::to_string(&config).expect("serialize");
+        assert!(!rendered.contains("manager"), "{rendered}");
     }
 }
