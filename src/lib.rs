@@ -80,6 +80,13 @@ pub mod tty;
 /// nothing else.
 pub const NAME: &str = "keyless";
 
+/// The daemon binary's name, as it is spelled in a remedy somebody will type.
+///
+/// A constant rather than a literal per message, because half the sentences
+/// that name it are written in `src/store/`, where the daemon binary is not a
+/// dependency and a typo would be caught by nothing.
+pub const DAEMON_NAME: &str = "keylessd";
+
 /// The outcome of a `run`, from the caller's point of view.
 ///
 /// Deliberately two-valued. A third state ("partially injected") would mean the

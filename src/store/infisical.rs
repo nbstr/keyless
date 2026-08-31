@@ -540,6 +540,49 @@ pub const FORWARDED_EXACT: [&str; 9] = [
 /// listing that worked only on a laptop.
 pub const FORWARDED_PREFIX: &str = "INFISICAL_";
 
+/// The only variable `infisical run` authenticates with.
+///
+/// Measured against 0.43.124, and it is the fact the whole daemon-side login
+/// turns on: **`run` reads this and nothing else.** Handed
+/// [`IDENTITY_CLIENT_ID`] and [`IDENTITY_CLIENT_SECRET`] instead, with no
+/// terminal and no keyring, it ignores both, opens a browser login it cannot
+/// complete, and exits 1 saying `Failed to automatically trigger login flow`.
+/// A machine identity therefore has to be exchanged for one of these before a
+/// lookup can happen at all — see [`InfisicalStore::mint_access_token`].
+pub const ACCESS_TOKEN: &str = "INFISICAL_TOKEN";
+
+/// The client id half of a universal-auth machine identity.
+pub const IDENTITY_CLIENT_ID: &str = "INFISICAL_UNIVERSAL_AUTH_CLIENT_ID";
+
+/// The client secret half of a universal-auth machine identity.
+pub const IDENTITY_CLIENT_SECRET: &str = "INFISICAL_UNIVERSAL_AUTH_CLIENT_SECRET";
+
+/// The vendor field that carries an HTTP status back out of a failed call.
+///
+/// Measured against 0.43.124 on both verbs: a refused login prints
+/// `[status-code=401]` and a refused fetch prints `[status-code=401]` or
+/// `[status-code=403]` inside its own one-line diagnosis. That field is what
+/// tells an authentication failure apart from every other reason a lookup can
+/// fail, which is the distinction [`unauthenticated`] exists to draw and the
+/// one this adapter must never report as an absence.
+const STATUS_CODE_FIELD: &str = "status-code=";
+
+/// Whether a vendor failure was Infisical refusing the login that was presented.
+///
+/// Reads the vendor's own structured field rather than its prose, because the
+/// prose differs per verb — `unable to authenticate with universal auth` on a
+/// login, `failed to fetch secrets for path` on a fetch — while the status is
+/// the same shape in both. A release that stops printing it stops matching, and
+/// the failure is then reported with the vendor's new wording instead: less
+/// specific, never wrong.
+#[must_use]
+fn unauthenticated(stderr: &[u8]) -> bool {
+    let text = String::from_utf8_lossy(stderr);
+    ["401", "403"]
+        .iter()
+        .any(|code| text.contains(&format!("{STATUS_CODE_FIELD}{code}")))
+}
+
 /// Whether a variable of this process is handed to the vendor CLI.
 #[must_use]
 fn is_forwarded(name: &str) -> bool {
@@ -695,6 +738,28 @@ struct Coordinates {
 /// anybody else could. The config names the variable and the entry; the value
 /// never appears in anything an operator opens.
 ///
+/// # An identity, not a token, and the reason is that nobody is watching
+///
+/// Two things fit in this file, and they are not equally good.
+///
+/// An **access token** ([`ACCESS_TOKEN`]) is what the vendor's `run` verb wants,
+/// and it is the smaller blast radius: it expires on its own. That is also what
+/// rules it out as the only option. It expires at a time nobody chose, there is
+/// no operator at the daemon to notice, and what a session sees at that moment
+/// is its command running with an unmodified environment. A store that stops
+/// working on a schedule it will not announce is a store nobody can rely on.
+///
+/// A **universal-auth machine identity** ([`IDENTITY_CLIENT_ID`] and
+/// [`IDENTITY_CLIENT_SECRET`]) is a long-lived credential on disk, and it
+/// renews itself: [`InfisicalStore::mint_access_token`] exchanges it for a fresh
+/// token per lookup, so there is no expiry to survive. It is revocable at the
+/// vendor, scoped to the environments the operator granted it, and it is the
+/// arrangement this adapter prefers — [`crate::daemon::config::DaemonConfig`]
+/// says so out loud at startup when only a token is named.
+///
+/// Both are declared the same way and both work; the difference is who has to
+/// be awake when the credential ages out.
+///
 /// # Read per lookup, not held
 ///
 /// The values are resolved when a lookup is about to spawn the vendor, and
@@ -703,6 +768,11 @@ struct Coordinates {
 /// copy between calls. One copy does outlive the `Secret`: the one
 /// [`std::process::Command`] holds for the spawn, which is the same residency
 /// the forwarded variables beside it already have.
+///
+/// A minted token is held for exactly as long — the lookup that minted it — and
+/// is never written anywhere. That is why there is no token cache here: caching
+/// one would keep a plaintext credential resident between calls, which is the
+/// property this paragraph exists to keep.
 pub struct VendorCredentials {
     source: Box<dyn Store>,
     names: BTreeMap<String, String>,
@@ -735,6 +805,36 @@ impl VendorCredentials {
             .collect()
     }
 
+    /// Whether these names are a universal-auth machine identity.
+    ///
+    /// True only when BOTH halves are named. One half alone is not a weaker
+    /// identity, it is an unusable one, and [`Self::half_an_identity`] is what
+    /// says so rather than letting the pair be silently ignored.
+    ///
+    /// An associated function on the map, so a config can be classified before
+    /// a store is built from it.
+    #[must_use]
+    pub fn is_an_identity(names: &BTreeMap<String, String>) -> bool {
+        names.contains_key(IDENTITY_CLIENT_ID) && names.contains_key(IDENTITY_CLIENT_SECRET)
+    }
+
+    /// The half of a machine identity that was named without its other half.
+    ///
+    /// `None` when both are named or neither is. A pair with one half missing
+    /// would otherwise be forwarded to a `run` that ignores it, and the operator
+    /// would read the browser-login failure that follows as a network fault.
+    #[must_use]
+    pub fn half_an_identity(names: &BTreeMap<String, String>) -> Option<&'static str> {
+        match (
+            names.contains_key(IDENTITY_CLIENT_ID),
+            names.contains_key(IDENTITY_CLIENT_SECRET),
+        ) {
+            (true, false) => Some(IDENTITY_CLIENT_SECRET),
+            (false, true) => Some(IDENTITY_CLIENT_ID),
+            _ => None,
+        }
+    }
+
     /// Every named value, or the sentence saying which one could not be read.
     fn resolve(&self) -> Result<Vec<(String, Secret)>, StoreError> {
         if let Some(variable) = Self::refused(&self.names).first() {
@@ -745,6 +845,17 @@ impl VendorCredentials {
                      `{FORWARDED_PREFIX}*` variable. Only the vendor's own credential \
                      variables may be set this way; anything else would choose which \
                      binary runs or which login it finds"
+                ),
+            });
+        }
+
+        if let Some(missing) = Self::half_an_identity(&self.names) {
+            return Err(StoreError::Misconfigured {
+                store: STORE_ID.to_owned(),
+                detail: format!(
+                    "a universal-auth machine identity is half declared: `{missing}` is \
+                     named by nothing, and `infisical run` authenticates with neither half \
+                     on its own. Name both, or name `{ACCESS_TOKEN}` instead"
                 ),
             });
         }
@@ -788,6 +899,7 @@ pub struct InfisicalStore {
     routing: Routing,
     project_id: Option<String>,
     config_dir: Option<PathBuf>,
+    domain: Option<String>,
     timeout: Duration,
     credentials: Option<VendorCredentials>,
 }
@@ -827,9 +939,29 @@ impl InfisicalStore {
             routing,
             project_id: None,
             config_dir: None,
+            domain: None,
             timeout: crate::config::bounded_timeout(crate::config::DEFAULT_TIMEOUT_MS),
             credentials: None,
         }
+    }
+
+    /// Point the vendor at one Infisical instance.
+    ///
+    /// `None` leaves the CLI on its own default, which is the US cloud. That
+    /// default is not a safe silence: an identity minted in another region
+    /// authenticates against nothing there, and the operator reads a refusal
+    /// about their credentials rather than about their region.
+    ///
+    /// Passed on the command line rather than left to `INFISICAL_DOMAIN`,
+    /// because the environment handed to the vendor is cleared and a daemon
+    /// under launchd carries no such variable to forward. It is a coordinate,
+    /// not a credential — the same kind of thing as
+    /// [`in_project`](Self::in_project) — so it belongs in a config an operator
+    /// can read.
+    #[must_use]
+    pub fn at_domain(mut self, domain: Option<String>) -> Self {
+        self.domain = domain;
+        self
     }
 
     /// Supply the vendor's own login, for a process that carries none.
@@ -848,6 +980,141 @@ impl InfisicalStore {
         match &self.credentials {
             Some(credentials) => credentials.resolve(),
             None => Ok(Vec::new()),
+        }
+    }
+
+    /// What the vendor's `run` child is given in order to be authenticated.
+    ///
+    /// One of two things, and the difference is measured rather than chosen:
+    ///
+    /// - A configured **access token** is handed straight through, because
+    ///   [`ACCESS_TOKEN`] is the variable `run` reads.
+    /// - A configured **machine identity** is exchanged for one first, because
+    ///   `run` ignores [`IDENTITY_CLIENT_ID`] and [`IDENTITY_CLIENT_SECRET`]
+    ///   entirely. The identity itself is then NOT forwarded: only the minted
+    ///   token goes to the child, so the long-lived credential reaches exactly
+    ///   one process — the login — and no other.
+    ///
+    /// # Errors
+    ///
+    /// Whatever [`VendorCredentials::resolve`] could not read, or the sentence
+    /// naming a login Infisical refused. Never an absence: a lookup that could
+    /// not authenticate has not established that a name is missing.
+    fn vendor_environment(&self) -> Result<Vec<(String, Secret)>, StoreError> {
+        let resolved = self.vendor_credentials()?;
+        let declares_an_identity = self
+            .credentials
+            .as_ref()
+            .is_some_and(|credentials| VendorCredentials::is_an_identity(&credentials.names));
+        if !declares_an_identity {
+            return Ok(resolved);
+        }
+        let token = self.mint_access_token(&resolved)?;
+        Ok(vec![(ACCESS_TOKEN.to_owned(), token)])
+    }
+
+    /// Build the one `infisical login` invocation this adapter makes.
+    ///
+    /// `--plain` so stdout is the token and nothing else, `--silent` so the tip
+    /// lines that would otherwise share that stream are suppressed, and the
+    /// identity arrives in the child's ENVIRONMENT — never in argv, which is
+    /// readable from the process table for as long as the process lives.
+    ///
+    /// Measured against 0.43.124 with an unwritable `HOME` and no keyring
+    /// reachable: this exits 0, writes the access token and one newline to
+    /// stdout, writes nothing to stderr, and stores nothing anywhere. That is
+    /// what makes it usable by a daemon uid, which has neither.
+    fn login_command(&self, credentials: &[(String, Secret)]) -> Command {
+        let mut command = Command::new(&self.binary);
+        command.env_clear();
+        command.envs(forwarded_vars());
+        for (variable, secret) in credentials {
+            command.env(variable, secret.expose());
+        }
+        command.arg("login");
+        command.arg("--method=universal-auth");
+        command.arg("--plain");
+        command.arg("--silent");
+        command.arg("--log-destination=stderr");
+        command.arg(TELEMETRY_OFF);
+        if let Some(domain) = &self.domain {
+            command.arg(format!("--domain={domain}"));
+        }
+        command
+    }
+
+    /// Exchange a machine identity for an access token.
+    ///
+    /// # Errors
+    ///
+    /// A sentence that says the login was refused and names the entries to
+    /// rewrite. It is deliberately not the vendor's line alone: the vendor says
+    /// "check your credentials or verify you're using the correct domain", which
+    /// is true and does not tell the reader that the credentials in question are
+    /// the daemon's own and live in a file only it can read.
+    fn mint_access_token(&self, credentials: &[(String, Secret)]) -> Result<Secret, StoreError> {
+        let mut captured = capture(self.login_command(credentials), self.timeout)
+            .map_err(|error| self.unreachable(&error))?;
+
+        if !captured.status.success() {
+            return Err(self.backend(format!(
+                "the Infisical machine identity did not authenticate, so no name can be \
+                 resolved — this is a login failure and not a missing secret. Rewrite \
+                 `{IDENTITY_CLIENT_ID}` and `{IDENTITY_CLIENT_SECRET}` with `{} credential`, \
+                 or check that `domain` names the region the identity was created in. \
+                 The vendor said: {}",
+                crate::DAEMON_NAME,
+                first_line(&captured.stderr)
+            )));
+        }
+
+        let mut bytes = std::mem::take(&mut captured.stdout);
+        strip_one_newline(&mut bytes);
+
+        // A token is one opaque word. Anything else means the vendor put
+        // something on the stream this code reads as a credential, and setting
+        // it as `INFISICAL_TOKEN` would authenticate with a banner. Refusing is
+        // the only outcome that cannot be mistaken for a working login.
+        if bytes.is_empty() || bytes.iter().any(|byte| byte.is_ascii_whitespace()) {
+            return Err(self.backend(format!(
+                "`infisical login` succeeded and did not print a single-word access token, \
+                 so there is nothing to authenticate `{ACCESS_TOKEN}` with. This adapter \
+                 will not guess which part of that output was the token"
+            )));
+        }
+
+        Secret::from_bytes(bytes)
+            .ok_or_else(|| self.backend("the minted access token is not valid UTF-8".to_owned()))
+    }
+
+    /// What a lookup says when Infisical refused the login it presented.
+    ///
+    /// Its own sentence, because the alternative is the vendor's — and the
+    /// vendor's reads the same whether the identity was revoked, the region is
+    /// wrong or the token simply aged out. What must never happen is the third
+    /// reading: an authentication failure reported as an absence, which is
+    /// indistinguishable from a name that is genuinely not in the vault.
+    fn refused_login_detail(&self, vendor_said: &str) -> String {
+        let renews_itself = self
+            .credentials
+            .as_ref()
+            .is_some_and(|credentials| VendorCredentials::is_an_identity(&credentials.names));
+        if renews_itself {
+            format!(
+                "Infisical refused this daemon's login. The machine identity authenticated \
+                 and is not allowed to read this environment and path, so grant it that \
+                 scope at the vendor — the name may well be there. The vendor said: \
+                 {vendor_said}"
+            )
+        } else {
+            format!(
+                "Infisical refused this daemon's login: the access token in `{ACCESS_TOKEN}` \
+                 has expired or been revoked. This is not a missing secret. Write a fresh \
+                 one with `{} credential`, or store a universal-auth machine identity \
+                 instead — the daemon renews one of those itself and never expires. \
+                 The vendor said: {vendor_said}",
+                crate::DAEMON_NAME
+            )
         }
     }
 
@@ -928,6 +1195,9 @@ impl InfisicalStore {
         command.arg("--log-level=error");
         command.arg("--log-destination=stderr");
         command.arg(TELEMETRY_OFF);
+        if let Some(domain) = &self.domain {
+            command.arg(format!("--domain={domain}"));
+        }
         if let Some(project) = &self.project_id {
             command.arg(format!("--projectId={project}"));
         }
@@ -979,6 +1249,9 @@ impl InfisicalStore {
         command.arg("--log-destination=stderr");
         command.arg("--expand=false");
         command.arg(TELEMETRY_OFF);
+        if let Some(domain) = &self.domain {
+            command.arg(format!("--domain={domain}"));
+        }
         if let Some(project) = &self.project_id {
             command.arg(format!("--projectId={project}"));
         }
@@ -1078,7 +1351,7 @@ impl Store for InfisicalStore {
         // changed in between.
         let forwarded = forwarded_value(&at.key);
         let mut captured = capture(
-            self.probe_command(&at, &self.vendor_credentials()?),
+            self.probe_command(&at, &self.vendor_environment()?),
             self.timeout,
         )
         .map_err(|error| self.unreachable(&error))?;
@@ -1092,6 +1365,12 @@ impl Store for InfisicalStore {
                 // The probe ran and reported the variable unset. That is an
                 // answer — "this store does not have it" — not a failure.
                 return Ok(None);
+            }
+            // Checked BEFORE the generic path, because a refused login and a
+            // missing name are the two outcomes an operator most needs told
+            // apart and the vendor's own wording does not tell them apart.
+            if unauthenticated(&captured.stderr) {
+                return Err(self.backend(self.refused_login_detail(&detail)));
             }
             return Err(self.backend(detail));
         }
@@ -1147,13 +1426,15 @@ impl Store for InfisicalStore {
             ));
         };
         let captured = capture(
-            self.probe_command(&at, &self.vendor_credentials()?),
+            self.probe_command(&at, &self.vendor_environment()?),
             self.timeout,
         )
         .map_err(|error| self.unreachable(&error))?;
 
         if captured.status.success() {
             Ok(())
+        } else if unauthenticated(&captured.stderr) {
+            Err(self.unavailable(self.refused_login_detail(&first_line(&captured.stderr))))
         } else {
             Err(self.unavailable(first_line(&captured.stderr)))
         }

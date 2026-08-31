@@ -40,7 +40,10 @@ use crate::error::ConfigError;
 use crate::ipc::peer::decode_hex;
 use crate::paths::ConfigPath;
 use crate::store::file::FileStore;
-use crate::store::infisical::{InfisicalStore, Routing, VendorCredentials};
+use crate::store::infisical::{
+    ACCESS_TOKEN, IDENTITY_CLIENT_ID, IDENTITY_CLIENT_SECRET, InfisicalStore, Routing,
+    VendorCredentials,
+};
 use crate::store::keychain::KeychainStore;
 use crate::store::{Registry, Store};
 
@@ -241,6 +244,19 @@ pub struct DaemonInfisicalConfig {
     /// Directory holding `.infisical.json`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub config_dir: Option<ConfigPath>,
+    /// Which Infisical instance to reach, when it is not the vendor's default.
+    ///
+    /// **The vendor's default is the US cloud, and a wrong region is quiet.**
+    /// An identity minted in another region has no account there, so the
+    /// refusal an operator reads is about their credentials rather than about
+    /// their region — and `config_dir` cannot settle it either: measured
+    /// against 0.43.124, a `.infisical.json` beside a machine identity is not
+    /// consulted for the project at all.
+    ///
+    /// A URL, not a secret. See
+    /// [`crate::store::infisical::InfisicalStore::at_domain`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub domain: Option<String>,
     /// How long one lookup may take before it degrades the run.
     #[serde(default = "default_timeout_ms")]
     pub timeout_ms: u64,
@@ -280,6 +296,7 @@ impl Default for DaemonInfisicalConfig {
             path: default_infisical_path(),
             project_id: None,
             config_dir: None,
+            domain: None,
             timeout_ms: default_timeout_ms(),
             probe_binary: default_probe_binary(),
             credentials: BTreeMap::new(),
@@ -543,6 +560,7 @@ impl DaemonConfig {
                         .as_deref()
                         .map(|path| path.to_path_buf()),
                 )
+                .at_domain(settings.domain.clone())
                 .with_vendor_credentials(self.vendor_credentials()),
             ));
         }
@@ -594,6 +612,32 @@ impl DaemonConfig {
                  `INFISICAL_*`, and every Infisical lookup will degrade while they are \
                  named: {}",
                 refused.join(", ")
+            ));
+        }
+
+        if let Some(missing) =
+            VendorCredentials::half_an_identity(&self.stores.infisical.credentials)
+        {
+            warnings.push(format!(
+                "a universal-auth machine identity is half declared: `{missing}` is named by \
+                 nothing. `infisical run` authenticates with neither half on its own, so \
+                 every Infisical lookup will degrade; name both, or name \
+                 `{ACCESS_TOKEN}` instead"
+            ));
+        }
+
+        // Not a misconfiguration — a token works — but it is the one setting
+        // whose failure arrives on a schedule nobody chose and with nobody
+        // awake to read it. Said at startup, which is the last moment an
+        // operator is standing here.
+        if self.stores.infisical.credentials.contains_key(ACCESS_TOKEN)
+            && !VendorCredentials::is_an_identity(&self.stores.infisical.credentials)
+        {
+            warnings.push(format!(
+                "the Infisical login is an access token, which expires. When it does, every \
+                 Infisical name degrades at whatever hour that happens and nothing here is \
+                 watching. Name `{IDENTITY_CLIENT_ID}` and `{IDENTITY_CLIENT_SECRET}` \
+                 instead and the daemon mints its own token per lookup"
             ));
         }
 
@@ -1026,13 +1070,19 @@ mod tests {
         // The negative control: a file of its own — the default arrangement —
         // says nothing. Without it the warning could be firing on every config
         // that names a credential at all.
+        //
+        // A machine identity rather than the access token above, because a
+        // token draws a warning of its own about expiring and this control has
+        // to be able to assert SILENCE.
         let separate = parse(
             r#"{"peer":{"allow_uids":[501],
                 "allow_images":["00112233445566778899aabbccddeeff00112233"]},
                 "stores":{"file":{"enabled":true,"path":"/tmp/keyless-test/secrets.json"},
                           "infisical":{"enabled":true,"default":"file",
                                        "credentials_file":"/tmp/keyless-test/infisical.json",
-                                       "credentials":{"INFISICAL_TOKEN":"MACHINE_IDENTITY"}},
+                                       "credentials":{
+                            "INFISICAL_UNIVERSAL_AUTH_CLIENT_ID":"MACHINE_IDENTITY_CLIENT_ID",
+                            "INFISICAL_UNIVERSAL_AUTH_CLIENT_SECRET":"MACHINE_IDENTITY_SECRET"}},
                           "default":"file"},
                 "secrets":{"DATABASE_URL":{"env":"staging","store":"infisical"}}}"#,
         )

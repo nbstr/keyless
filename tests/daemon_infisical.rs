@@ -454,3 +454,359 @@ fn the_client_cannot_name_an_environment_because_the_wire_has_no_field_for_one()
     drop(running);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// ---------------------------------------------------------------------------
+// The login the vendor's `run` verb actually accepts.
+//
+// Measured against `infisical` 0.43.124: `run` authenticates with
+// `INFISICAL_TOKEN` and with nothing else. Handed a universal-auth client id
+// and client secret in its environment, with no terminal and no keyring, it
+// ignores both and tries to open a browser login — so a daemon that stored a
+// client secret and stopped there would have stored a credential no lookup can
+// use. What works with neither a home directory nor a keyring is
+// `infisical login --method=universal-auth --plain --silent`, which prints an
+// access token and stores nothing; the adapter runs it per lookup and hands the
+// token on.
+//
+// Every case below therefore asserts on TWO spawns, and the interesting half is
+// what the second one did NOT receive.
+// ---------------------------------------------------------------------------
+
+/// The credential-file entries holding a machine identity.
+const CLIENT_ID_ENTRY: &str = "FIXTURE_CLIENT_ID";
+const CLIENT_SECRET_ENTRY: &str = "FIXTURE_CLIENT_SECRET";
+
+/// The stand-in identity. Distinct decoys, so "which value is this?" is always
+/// answerable, and long enough that a grep for one means a real leak.
+const CLIENT_ID_DECOY: &str = "decoy-Cid6-universal-auth-client-id-0505";
+const CLIENT_SECRET_DECOY: &str = "decoy-Cse7-universal-auth-client-secret-0606";
+
+/// What the stand-in vendor's login hands back.
+const MINTED_TOKEN: &str = "decoy-Tok8-minted-access-token-0707";
+
+/// Where the stand-in vendor records the argv of its `login` invocation.
+fn login_argv(dir: &Path) -> std::path::PathBuf {
+    dir.join("infisical-login.argv")
+}
+
+/// Where it records the identity that reached the login child.
+fn login_identity(dir: &Path) -> std::path::PathBuf {
+    dir.join("login-client-secret")
+}
+
+/// Where it records the client secret that reached the `run` child.
+///
+/// The assertion this file cares about most: after minting, the long-lived
+/// credential must reach the login and nothing else.
+fn run_client_secret(dir: &Path) -> std::path::PathBuf {
+    dir.join("run-client-secret")
+}
+
+/// A stand-in vendor with two verbs, each recording what it was handed.
+///
+/// `${VAR-ABSENT}` rather than `${VAR:-ABSENT}`, so a variable that arrived
+/// EMPTY is told apart from one that never arrived at all.
+fn stub_infisical_with_login(dir: &Path, login: &str, run: &str) -> std::path::PathBuf {
+    let body = format!(
+        "#!/bin/sh\n\
+         if [ \"$1\" = login ]; then\n\
+         \x20 printf '%s\\n' \"$@\" > '{login_argv}'\n\
+         \x20 printf '%s' \"${{INFISICAL_UNIVERSAL_AUTH_CLIENT_SECRET-ABSENT}}\" > '{identity}'\n\
+         {login}\n\
+         fi\n\
+         printf '%s\\n' \"$@\" > '{argv}'\n\
+         printf '%s' \"${{INFISICAL_TOKEN-ABSENT}}\" > '{token}'\n\
+         printf '%s' \"${{INFISICAL_UNIVERSAL_AUTH_CLIENT_SECRET-ABSENT}}\" > '{secret}'\n\
+         while [ \"$1\" != \"--\" ] && [ $# -gt 0 ]; do shift; done\n\
+         shift\n\
+         {run}\n",
+        login_argv = login_argv(dir).display(),
+        identity = login_identity(dir).display(),
+        argv = vendor_argv(dir).display(),
+        token = vendor_token(dir).display(),
+        secret = run_client_secret(dir).display(),
+    );
+    install_executable(&dir.join("infisical-with-login"), &body)
+}
+
+/// The login half that mints a token, as the real one does.
+const LOGIN_MINTS: &str = "  printf '%s\\n' 'decoy-Tok8-minted-access-token-0707'\n  exit 0";
+
+/// The login half Infisical refuses.
+const LOGIN_REFUSED: &str = "  echo 'error: CallUniversalAuthLogin unsuccessful response \
+                             [status-code=401] [message=\"Unauthorized.\"]' >&2\n  exit 1";
+
+/// The `run` half that injects, as `stub_infisical` does.
+const RUN_INJECTS: &str =
+    "exec /usr/bin/env \"$2=decoy-Inf7-company-vault-value-0101\" \"$1\" \"$2\"";
+
+/// The `run` half Infisical refuses because the login it was given is dead.
+const RUN_REFUSED: &str = "echo 'error: failed to fetch secrets for path \"/\": \
+                           CallGetRawSecretsV3 Unsuccessful response [status-code=401] \
+                           [message=\"Unauthorized. Access token expired.\"]' >&2\nexit 1";
+
+/// The `run` half where the probe ran and the variable was unset. The control
+/// that separates "Infisical said no" from "the name is not there".
+const RUN_UNSET: &str = "\"$1\" \"$2\"\n\
+                         status=$?\n\
+                         if [ $status -ne 0 ]; then\n\
+                         \x20 echo \"failed to wait for command termination: exit status \
+                         $status\" >&2\n\
+                         fi\n\
+                         exit $status";
+
+/// A daemon carrying a universal-auth machine identity in its own `0600` file.
+fn daemon_config_with_identity(dir: &Path, vendor: &Path) -> DaemonConfig {
+    let credentials = dir.join("infisical-credentials.json");
+    write_secrets(
+        &credentials,
+        &[
+            (CLIENT_ID_ENTRY, CLIENT_ID_DECOY),
+            (CLIENT_SECRET_ENTRY, CLIENT_SECRET_DECOY),
+        ],
+    );
+    serde_json::from_str(&format!(
+        r#"{{"socket":"{socket}","audit":"{audit}",
+             "cache_ttl_seconds":0,"idle_timeout_seconds":5,
+             "stores":{{"infisical":{{"enabled":true,"binary":"{vendor}",
+                                      "timeout_ms":60000,
+                                      "credentials_file":"{credentials}",
+                                      "credentials":{{
+                          "INFISICAL_UNIVERSAL_AUTH_CLIENT_ID":"{CLIENT_ID_ENTRY}",
+                          "INFISICAL_UNIVERSAL_AUTH_CLIENT_SECRET":"{CLIENT_SECRET_ENTRY}"}}}}}},
+             "secrets":{{"{DECLARED}":{{"store":"infisical","env":"{SLUG}"}}}}}}"#,
+        socket = short_socket_path(dir).display(),
+        audit = dir.join("audit.jsonl").display(),
+        vendor = vendor.display(),
+        credentials = credentials.display(),
+    ))
+    .expect("valid daemon config")
+}
+
+#[test]
+fn a_machine_identity_is_exchanged_for_a_token_and_only_the_token_reaches_the_lookup() {
+    let dir = scratch("daemon-infisical-mint");
+    let vendor = stub_infisical_with_login(&dir, LOGIN_MINTS, RUN_INJECTS);
+    let config = daemon_config_with_identity(&dir, &vendor);
+    let running = start_daemon(&config, policy_allowing_self());
+
+    let client = client_config(running.socket(), 5_000);
+    let registry = store::build(&client, &Invocation::default()).registry;
+
+    match registry.resolve(DECLARED) {
+        Resolution::Found { secret, .. } => assert_eq!(secret.expose(), INFISICAL_DECOY),
+        other => panic!(
+            "the lookup must work, or nothing below is tested: {}",
+            other.reason()
+        ),
+    }
+
+    // The login happened, with the identity in its ENVIRONMENT.
+    let login = support::recorded_lines(&login_argv(&dir));
+    assert!(
+        login.iter().any(|arg| arg == "--method=universal-auth"),
+        "the adapter did not run the vendor's universal-auth login: {login:?}"
+    );
+    assert!(
+        login.iter().any(|arg| arg == "--plain"),
+        "without --plain the vendor's stdout is not a bare token: {login:?}"
+    );
+    assert_eq!(
+        support::recorded(&login_identity(&dir)),
+        CLIENT_SECRET_DECOY,
+        "the client secret did not reach the login"
+    );
+    assert!(
+        !login.iter().any(|arg| arg.contains(CLIENT_SECRET_DECOY)),
+        "the client secret was put on the vendor's command line: {login:?}"
+    );
+
+    // And the lookup got the MINTED token — not the identity.
+    assert_eq!(
+        support::recorded(&vendor_token(&dir)),
+        MINTED_TOKEN,
+        "the minted access token did not reach the lookup"
+    );
+    assert_eq!(
+        support::recorded(&run_client_secret(&dir)),
+        "ABSENT",
+        "the long-lived client secret reached the lookup child as well as the login"
+    );
+
+    let spawned = support::recorded_lines(&vendor_argv(&dir));
+    assert!(
+        !spawned.iter().any(|arg| arg.contains(CLIENT_SECRET_DECOY)),
+        "the client secret reached the lookup's command line: {spawned:?}"
+    );
+    let audit = std::fs::read_to_string(dir.join("audit.jsonl")).expect("the daemon wrote a row");
+    assert!(
+        !audit.contains(CLIENT_SECRET_DECOY),
+        "the identity was audited"
+    );
+    assert!(
+        !audit.contains(MINTED_TOKEN),
+        "the minted token was audited"
+    );
+
+    drop(running);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_refused_login_says_so_and_never_reads_as_a_missing_name() {
+    // The confusion this whole file exists to prevent, in its sharpest form: a
+    // credential that no longer works must not look like a secret that was
+    // never there. One spawns nothing further and names the credential; the
+    // other is an answer about the vault.
+    let dir = scratch("daemon-infisical-login-refused");
+    let vendor = stub_infisical_with_login(&dir, LOGIN_REFUSED, RUN_INJECTS);
+    let config = daemon_config_with_identity(&dir, &vendor);
+    let running = start_daemon(&config, policy_allowing_self());
+
+    let client = client_config(running.socket(), 5_000);
+    let registry = store::build(&client, &Invocation::default()).registry;
+
+    assert!(
+        !vendor_argv(&dir).exists(),
+        "the scratch directory is dirty"
+    );
+    let outcome = registry.resolve(DECLARED);
+    let reason = outcome.reason();
+
+    // The login was tried and the LOOKUP was not: a daemon that could not
+    // authenticate has made no statement about what is in the vault.
+    assert!(
+        login_argv(&dir).exists(),
+        "the login was never attempted: {reason}"
+    );
+    assert!(
+        !vendor_argv(&dir).exists(),
+        "an unauthenticated lookup was attempted anyway: {:?}",
+        support::recorded_lines(&vendor_argv(&dir))
+    );
+
+    assert!(reason.contains("did not authenticate"), "{reason}");
+    assert!(reason.contains("not a missing secret"), "{reason}");
+    assert!(reason.contains("credential"), "{reason}");
+    assert!(
+        !reason.contains(CLIENT_SECRET_DECOY),
+        "the refusal carried the credential it could not use: {reason}"
+    );
+
+    // The negative control, in the same test: the same daemon, the same stand-in
+    // vendor, a login that works and a probe that reports the variable unset.
+    // THAT is what an absence reads like, and the two sentences must not be the
+    // same sentence.
+    let ok_dir = scratch("daemon-infisical-login-refused-control");
+    let ok_vendor = stub_infisical_with_login(&ok_dir, LOGIN_MINTS, RUN_UNSET);
+    let ok_config = daemon_config_with_identity(&ok_dir, &ok_vendor);
+    let ok_running = start_daemon(&ok_config, policy_allowing_self());
+    let ok_client = client_config(ok_running.socket(), 5_000);
+    let ok_registry = store::build(&ok_client, &Invocation::default()).registry;
+    // Both sides asserted against LITERALS rather than against each other: an
+    // `assert_ne!` between two strings the same code renders holds whatever
+    // that code says, including when it says the same thing twice.
+    let absent = ok_registry.resolve(DECLARED).reason();
+    assert_eq!(absent, "not found in any store", "{absent}");
+    assert!(
+        !absent.contains("did not authenticate"),
+        "an absence was reported as a login failure: {absent}"
+    );
+
+    drop(ok_running);
+    let _ = std::fs::remove_dir_all(&ok_dir);
+    drop(running);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn an_access_token_that_infisical_refuses_is_reported_as_an_expiry_with_its_remedy() {
+    // The other arrangement: a bare `INFISICAL_TOKEN` in the credential file,
+    // which is what a human's own login flow produces and what expires. The
+    // vendor's own line says "Unauthorized" and stops; the daemon has to say
+    // which credential that is and what replaces it.
+    let dir = scratch("daemon-infisical-token-expired");
+    let vendor = stub_infisical_with_login(&dir, LOGIN_MINTS, RUN_REFUSED);
+    let config = daemon_config_with_credential(&dir, &vendor);
+    let running = start_daemon(&config, policy_allowing_self());
+
+    let client = client_config(running.socket(), 5_000);
+    let registry = store::build(&client, &Invocation::default()).registry;
+    let reason = registry.resolve(DECLARED).reason();
+
+    // No login was minted: a token was configured, so there was nothing to
+    // exchange. This is the path where an expiry is possible at all.
+    assert!(
+        !login_argv(&dir).exists(),
+        "a configured access token was exchanged for another one"
+    );
+    assert!(reason.contains("expired or been revoked"), "{reason}");
+    assert!(reason.contains("not a missing secret"), "{reason}");
+    assert!(
+        reason.contains("machine identity"),
+        "the remedy that ends the expiry is not offered: {reason}"
+    );
+    assert!(
+        !reason.contains(IDENTITY_DECOY),
+        "the refusal carried the token it could not use: {reason}"
+    );
+
+    drop(running);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn half_a_machine_identity_is_refused_at_startup_and_reaches_no_vendor_process() {
+    // One half of the pair is not a weaker identity, it is an unusable one:
+    // `infisical run` authenticates with neither half on its own, so a config
+    // that names only the client id would spawn a vendor that opens a browser
+    // login it cannot complete and reports something about a login flow.
+    let dir = scratch("daemon-infisical-half-identity");
+    let vendor = stub_infisical_with_login(&dir, LOGIN_MINTS, RUN_INJECTS);
+    let credentials = dir.join("infisical-credentials.json");
+    write_secrets(&credentials, &[(CLIENT_ID_ENTRY, CLIENT_ID_DECOY)]);
+    let config: DaemonConfig = serde_json::from_str(&format!(
+        r#"{{"socket":"{socket}","audit":"{audit}",
+             "cache_ttl_seconds":0,"idle_timeout_seconds":5,
+             "stores":{{"infisical":{{"enabled":true,"binary":"{vendor}",
+                                      "timeout_ms":60000,
+                                      "credentials_file":"{credentials}",
+                                      "credentials":{{
+                          "INFISICAL_UNIVERSAL_AUTH_CLIENT_ID":"{CLIENT_ID_ENTRY}"}}}}}},
+             "secrets":{{"{DECLARED}":{{"store":"infisical","env":"{SLUG}"}}}}}}"#,
+        socket = short_socket_path(&dir).display(),
+        audit = dir.join("audit.jsonl").display(),
+        vendor = vendor.display(),
+        credentials = credentials.display(),
+    ))
+    .expect("valid daemon config");
+
+    let said = config.warnings().join(" ");
+    assert!(said.contains("half declared"), "{said}");
+    assert!(
+        said.contains("INFISICAL_UNIVERSAL_AUTH_CLIENT_SECRET"),
+        "the warning does not name the half that is missing: {said}"
+    );
+
+    let running = start_daemon(&config, policy_allowing_self());
+    let client = client_config(running.socket(), 5_000);
+    let registry = store::build(&client, &Invocation::default()).registry;
+
+    assert!(
+        !vendor_argv(&dir).exists(),
+        "the scratch directory is dirty"
+    );
+    let reason = registry.resolve(DECLARED).reason();
+    assert!(
+        !login_argv(&dir).exists() && !vendor_argv(&dir).exists(),
+        "half an identity still reached a vendor process: {reason}"
+    );
+    assert!(reason.contains("half declared"), "{reason}");
+    assert!(
+        !reason.contains(CLIENT_ID_DECOY),
+        "the refusal carried a value: {reason}"
+    );
+
+    drop(running);
+    let _ = std::fs::remove_dir_all(&dir);
+}
