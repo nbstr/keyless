@@ -1246,6 +1246,72 @@ fn is_scalar(value: &serde_json::Value) -> bool {
     )
 }
 
+/// Where every declared name lives inside Proton Pass.
+///
+/// # Why the projection is a type and not a map built at each call site
+///
+/// Two hosts build this adapter now — a session, from
+/// [`crate::config::Config`], and a daemon, from its own `secrets` block — and
+/// the one property that must hold in both is the one this file's whole safety
+/// argument rests on: **a name that appears in no config has no address, and a
+/// lookup with no address is a lookup that never spawns anything.** Two walks
+/// of two maps would be free to disagree about which entries are addresses, and
+/// the disagreement would be invisible: the daemon would simply resolve a name
+/// the session refuses, or refuse one the session resolves.
+///
+/// So both hosts project through [`Routing::from_secrets`], and the session's
+/// [`Routing::from_config`] is a thin wrapper over it rather than a second
+/// implementation. What a daemon has that a session does not is a config file
+/// the calling user cannot write — which is what turns "declared" into a
+/// boundary rather than a convention.
+pub struct Routing {
+    /// name -> where its value lives. An entry that says nothing about Proton
+    /// is absent, exactly as it is absent from a session's own projection.
+    addresses: BTreeMap<String, Address>,
+}
+
+impl Routing {
+    /// The projection a session builds, from its own parsed config.
+    #[must_use]
+    pub fn from_config(config: &Config) -> Self {
+        Self::from_secrets(&config.secrets)
+    }
+
+    /// The projection either host builds, from a `secrets` map.
+    #[must_use]
+    pub fn from_secrets(secrets: &BTreeMap<String, SecretRoute>) -> Self {
+        Routing {
+            addresses: secrets
+                .iter()
+                .filter_map(|(name, route)| {
+                    Address::from_route(route).map(|address| (name.clone(), address))
+                })
+                .collect(),
+        }
+    }
+
+    /// How many names carry a Proton address of any kind, usable or not.
+    ///
+    /// Counted rather than tested for emptiness so an operator-facing warning
+    /// can say how many names it is talking about. An [`Address::Unusable`]
+    /// counts: it is a name somebody meant to declare, and reporting "no name
+    /// declares an address" over a config full of typos would send the reader
+    /// to the wrong file.
+    #[must_use]
+    pub fn declared(&self) -> usize {
+        self.addresses.len()
+    }
+
+    /// Where one name lives, or `None` when nothing declares it.
+    ///
+    /// `None` is the property `tests/daemon_proton.rs` asserts as the absence
+    /// of a vendor process: see [`ProtonStore::resolve`], which turns it into
+    /// an error before a temporary file is written or a child is created.
+    fn route(&self, name: &str) -> Option<&Address> {
+        self.addresses.get(name)
+    }
+}
+
 /// Reads one Proton Pass item at a time through `pass-cli run`.
 pub struct ProtonStore {
     binary: PathBuf,
@@ -1256,7 +1322,7 @@ pub struct ProtonStore {
     timeout: Duration,
     reason: Reason,
     /// name -> where its value lives.
-    addresses: BTreeMap<String, Address>,
+    routing: Routing,
     /// How long a listing may be reused. See [`ProtonStore::cached_items`].
     listing_ttl: Duration,
     /// vault name -> that vault's items, until they expire.
@@ -1312,27 +1378,70 @@ impl ProtonStore {
     #[must_use]
     pub fn from_config(config: &Config, reason: Reason) -> Self {
         let settings = &config.stores.proton;
-        let addresses = config
-            .secrets
-            .iter()
-            .filter_map(|(name, route)| {
-                Address::from_route(route).map(|address| (name.clone(), address))
-            })
-            .collect();
-
-        ProtonStore {
-            binary: settings.binary.to_path_buf(),
-            probe_binary: settings.probe_binary.to_path_buf(),
-            session_dir: settings
+        Self::new(
+            settings.binary.to_path_buf(),
+            settings.probe_binary.to_path_buf(),
+            Routing::from_config(config),
+            reason,
+        )
+        .in_session_dir(
+            settings
                 .session_dir
                 .as_deref()
                 .map(|path| path.to_path_buf()),
-            timeout: crate::config::bounded_timeout(settings.timeout_ms),
+        )
+        .with_timeout(settings.timeout_ms)
+        .with_listing_ttl(settings.listing_ttl_ms)
+    }
+
+    /// Construct from the parts, with no session config anywhere behind it.
+    ///
+    /// The constructor a daemon uses. It takes a [`Routing`] rather than a
+    /// `Config` for the reason [`Routing`] exists: the daemon's `secrets` block
+    /// is not a [`crate::config::Config`] and must not have to become one for
+    /// this adapter to be hosted behind the socket.
+    ///
+    /// The session directory is deliberately **not** a parameter here and is
+    /// set by [`ProtonStore::in_session_dir`] instead, so that a store built
+    /// and never pointed at one degrades every lookup rather than inheriting
+    /// the ambient session. See [`ProtonStore::session_dir`] for why that is
+    /// the only acceptable default.
+    #[must_use]
+    pub fn new(binary: PathBuf, probe_binary: PathBuf, routing: Routing, reason: Reason) -> Self {
+        ProtonStore {
+            binary,
+            probe_binary,
+            session_dir: None,
+            timeout: crate::config::bounded_timeout(crate::config::DEFAULT_TIMEOUT_MS),
             reason,
-            addresses,
-            listing_ttl: bounded_listing_ttl(settings.listing_ttl_ms),
+            routing,
+            listing_ttl: bounded_listing_ttl(crate::config::default_listing_ttl_ms()),
             listings: Mutex::new(BTreeMap::new()),
         }
+    }
+
+    /// Which logged-in identity answers every child this store spawns.
+    #[must_use]
+    pub fn in_session_dir(mut self, session_dir: Option<PathBuf>) -> Self {
+        self.session_dir = session_dir;
+        self
+    }
+
+    /// Bound one lookup, in milliseconds. Clamped by
+    /// [`crate::config::bounded_timeout`], so a config cannot switch the
+    /// deadline off by naming a large enough number.
+    #[must_use]
+    pub fn with_timeout(mut self, timeout_ms: u64) -> Self {
+        self.timeout = crate::config::bounded_timeout(timeout_ms);
+        self
+    }
+
+    /// How long one vault listing may be reused, in milliseconds. Clamped by
+    /// [`bounded_listing_ttl`], for the reason that function documents.
+    #[must_use]
+    pub fn with_listing_ttl(mut self, listing_ttl_ms: u64) -> Self {
+        self.listing_ttl = bounded_listing_ttl(listing_ttl_ms);
+        self
     }
 
     /// The configured session directory, or the reason there will be no lookup.
@@ -1721,7 +1830,7 @@ impl Store for ProtonStore {
         // the operator should see first.
         let session_dir = self.session_dir()?;
 
-        let Some(address) = self.addresses.get(name) else {
+        let Some(address) = self.routing.route(name) else {
             // Deliberately an error rather than `Ok(None)`. "I was asked for a
             // name I have no address for" is a config mistake with a specific
             // fix, and reporting it as a plain absence would leave the user
@@ -2050,6 +2159,117 @@ mod tests {
     fn store_from(json: &str) -> ProtonStore {
         let config: Config = serde_json::from_str(json).expect("valid config");
         ProtonStore::from_config(&config, Reason::default())
+    }
+
+    /// The `secrets` block both hosts project, written once.
+    ///
+    /// Four entries on purpose: the reference form, the name form, an entry
+    /// that says nothing about Proton at all, and a half-written one. The last
+    /// two are the ones the two projections could disagree about — whether an
+    /// entry is absent or merely unusable decides which sentence a lookup
+    /// reports, and a daemon that disagreed with a session about that would
+    /// tell an operator to fix the wrong file.
+    const SHARED_SECRETS: &str = r#"{
+        "BY_REFERENCE": { "reference": "pass://share/item/password" },
+        "BY_NAME":      { "vault": "company", "item": "decoy", "field": "password" },
+        "NOT_PROTON":   { "store": "keychain" },
+        "HALF_WRITTEN": { "vault": "company" }
+    }"#;
+
+    #[test]
+    fn a_daemon_projects_a_name_onto_the_address_a_session_projects_it_onto() {
+        // The two hosts of this adapter read two different config types. What
+        // must not differ is which name has an address and which address it is:
+        // a daemon that resolved a name the session refuses, or refused one it
+        // resolves, would be a second answer to a question with one answer.
+        //
+        // Each side is compared against a WRITTEN-OUT address rather than
+        // against the other. Comparing the two projections to each other is
+        // satisfied by any change that moves both — including deleting the
+        // rule that decides what an address is.
+        let config: Config = serde_json::from_str(&format!(
+            r#"{{"stores":{{"proton":{{"session_dir":"{SCOPED}"}}}},"secrets":{SHARED_SECRETS}}}"#
+        ))
+        .expect("valid config");
+        let secrets: std::collections::BTreeMap<String, crate::config::SecretRoute> =
+            serde_json::from_str(SHARED_SECRETS).expect("valid secrets");
+
+        let session = super::Routing::from_config(&config);
+        let daemon = super::Routing::from_secrets(&secrets);
+
+        let expected: [(&str, Option<Address>); 4] = [
+            (
+                "BY_REFERENCE",
+                Some(Address::Reference("pass://share/item/password".to_owned())),
+            ),
+            (
+                "BY_NAME",
+                Some(Address::Named(ItemAddress {
+                    vault: "company".to_owned(),
+                    item: "decoy".to_owned(),
+                    field: "password".to_owned(),
+                })),
+            ),
+            // An entry that says nothing about Proton is ABSENT, not unusable:
+            // the two have different remedies and a lookup reports different
+            // sentences for them.
+            ("NOT_PROTON", None),
+            ("A_NAME_NOBODY_EVER_DECLARED", None),
+        ];
+
+        for (name, want) in &expected {
+            assert_eq!(session.route(name), want.as_ref(), "session, `{name}`");
+            assert_eq!(daemon.route(name), want.as_ref(), "daemon, `{name}`");
+        }
+
+        // The half-written one carries a sentence rather than a coordinate, so
+        // the variant is what is pinned — on each side separately.
+        assert!(matches!(
+            session.route("HALF_WRITTEN"),
+            Some(Address::Unusable(_))
+        ));
+        assert!(matches!(
+            daemon.route("HALF_WRITTEN"),
+            Some(Address::Unusable(_))
+        ));
+        assert_eq!(session.declared(), 3);
+        assert_eq!(daemon.declared(), 3);
+    }
+
+    #[test]
+    fn a_store_built_from_parts_carries_no_session_directory_until_it_is_given_one() {
+        // `new` is the daemon's constructor, and the one default it must not
+        // have is a session directory: inheriting the ambient one resolves
+        // every name against an identity nobody chose, which is the failure
+        // mode that looks exactly like success. See `session_dir`.
+        let secrets: std::collections::BTreeMap<String, crate::config::SecretRoute> =
+            serde_json::from_str(SHARED_SECRETS).expect("valid secrets");
+        let store = ProtonStore::new(
+            std::path::PathBuf::from("/nonexistent/pass-cli"),
+            std::path::PathBuf::from("/usr/bin/printenv"),
+            super::Routing::from_secrets(&secrets),
+            Reason::default(),
+        );
+
+        let error = store
+            .resolve("BY_NAME")
+            .expect_err("a store with no session directory must degrade");
+        assert!(
+            error.to_string().contains("session_dir"),
+            "the fault named is not the missing session directory: {error}"
+        );
+
+        // And once it is given one, the same store reaches the address rather
+        // than the precondition above — the control that keeps the assertion
+        // from passing for any reason at all.
+        let pointed = store.in_session_dir(Some(std::path::PathBuf::from(SCOPED)));
+        let error = pointed
+            .resolve("A_NAME_NOBODY_EVER_DECLARED")
+            .expect_err("an undeclared name must not resolve");
+        assert!(
+            error.to_string().contains("no Proton address declared"),
+            "{error}"
+        );
     }
 
     /// An ambient environment written out by hand.
