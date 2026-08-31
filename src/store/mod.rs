@@ -51,6 +51,7 @@ pub mod file;
 pub mod infisical;
 pub mod keychain;
 pub mod manage;
+pub mod onepassword;
 pub mod proton;
 pub mod proton_manager;
 
@@ -366,6 +367,7 @@ pub fn enabled_stores(config: &Config) -> Vec<&'static str> {
     [
         ("keychain", config.stores.keychain.enabled),
         (infisical::STORE_ID, config.stores.infisical.enabled),
+        (onepassword::STORE_ID, config.stores.onepassword.enabled),
         ("proton", config.stores.proton.enabled),
     ]
     .into_iter()
@@ -498,7 +500,8 @@ pub struct Built {
 /// # The rule enforced here rather than documented
 ///
 /// **When the daemon is enabled, every local backend is suppressed — keychain,
-/// Infisical and Proton alike — whatever their own `enabled` flags say.**
+/// Infisical, 1Password and Proton alike — whatever their own `enabled` flags
+/// say.**
 ///
 /// The point of the daemon is that killing it must get you *fewer* secrets,
 /// never more. Leave any local backend registered beside it, and the moment the
@@ -508,11 +511,12 @@ pub struct Built {
 /// itself automatically whenever the thing closing it goes away, and anyone able
 /// to stop a process could choose it.
 ///
-/// All three are the same class of thing, which is why the rule is not specific
+/// All four are the same class of thing, which is why the rule is not specific
 /// to the keychain: each resolves through a credential the calling user already
-/// holds. Infisical inherits the CLI's login, Proton inherits `pass-cli`'s. A
-/// session that can run `keyless` can run either CLI directly, so registering
-/// them under the daemon would leave it guarding one door of three.
+/// holds. Infisical inherits the CLI's login, 1Password inherits `op`'s, Proton
+/// inherits `pass-cli`'s. A session that can run `keyless` can run any of those
+/// CLIs directly, so registering them under the daemon would leave it guarding
+/// one door of four.
 ///
 /// ## Per-name pins are dropped too, and that is the safer direction
 ///
@@ -553,12 +557,13 @@ pub fn build(config: &Config, invocation: &Invocation) -> Built {
         )));
 
         // Which suppressions the user will actually miss, and which are
-        // routine, is a question the config can answer — but only for two of
-        // the three.
+        // routine, is a question the config can answer — but only for three of
+        // the four.
         //
-        // `infisical` and `proton` default to disabled, so finding one enabled
-        // means somebody typed it, and suppressing it takes away names they are
-        // resolving today. That earns a warning on every run.
+        // `infisical`, `onepassword` and `proton` default to disabled, so
+        // finding one enabled means somebody typed it, and suppressing it takes
+        // away names they are resolving today. That earns a warning on every
+        // run.
         //
         // `keychain` defaults to ENABLED, so its flag says nothing about
         // intent: a config that has never mentioned a keychain reports one.
@@ -567,6 +572,7 @@ pub fn build(config: &Config, invocation: &Invocation) -> Built {
         // to `doctor`, which is where somebody has come to ask.
         let explicit: Vec<&str> = [
             ("infisical", config.stores.infisical.enabled),
+            (onepassword::STORE_ID, config.stores.onepassword.enabled),
             ("proton", config.stores.proton.enabled),
         ]
         .into_iter()
@@ -576,6 +582,7 @@ pub fn build(config: &Config, invocation: &Invocation) -> Built {
         let suppressed: Vec<&str> = [
             ("keychain", config.stores.keychain.enabled),
             ("infisical", config.stores.infisical.enabled),
+            (onepassword::STORE_ID, config.stores.onepassword.enabled),
             ("proton", config.stores.proton.enabled),
         ]
         .into_iter()
@@ -583,32 +590,51 @@ pub fn build(config: &Config, invocation: &Invocation) -> Built {
         .collect();
 
         if !explicit.is_empty() {
-            // The two halves are no longer the same story, and saying they are
-            // would be a wrong fact in the one place a user reads on every
-            // command. `keylessd` carries the Infisical adapter: those names are
-            // moved, not lost, and the sentence has to say where to. It carries
-            // no Proton adapter: those names have nowhere to go yet, and that is
-            // a different instruction.
-            let remedy = match (
-                config.stores.infisical.enabled,
-                config.stores.proton.enabled,
-            ) {
-                (true, false) => {
+            // The halves are not the same story, and saying they are would be
+            // a wrong fact in the one place a user reads on every command.
+            // `keylessd` carries the Infisical and 1Password adapters: those
+            // names are moved, not lost, and the sentence has to say where to.
+            // It carries no Proton adapter: those names have nowhere to go
+            // yet, and that is a different instruction.
+            let mut remedies: Vec<String> = Vec::new();
+            if config.stores.infisical.enabled {
+                remedies.push(if explicit.len() == 1 {
                     "declare them under `secrets` in `keylessd.json`, with an \"env\", and \
                      enable `stores.infisical` there"
-                }
-                (false, true) => "`keylessd` does not carry that adapter yet",
-                _ => {
+                        .to_owned()
+                } else {
                     "declare the Infisical ones under `secrets` in `keylessd.json`, with an \
-                     \"env\"; `keylessd` does not carry the Proton adapter yet"
-                }
-            };
+                     \"env\", and enable `stores.infisical` there"
+                        .to_owned()
+                });
+            }
+            if config.stores.onepassword.enabled {
+                remedies.push(if explicit.len() == 1 {
+                    "declare them under `secrets` in `keylessd.json`, enable \
+                     `stores.onepassword` there with the same \"vault\", and give the daemon \
+                     a service account scoped to that vault"
+                        .to_owned()
+                } else {
+                    "declare the 1Password ones under `secrets` in `keylessd.json`, enable \
+                     `stores.onepassword` there with the same \"vault\", and give the daemon \
+                     a service account scoped to that vault"
+                        .to_owned()
+                });
+            }
+            if config.stores.proton.enabled {
+                remedies.push(if explicit.len() == 1 {
+                    "`keylessd` does not carry that adapter yet".to_owned()
+                } else {
+                    "`keylessd` does not carry the Proton adapter yet".to_owned()
+                });
+            }
             warnings.push(format!(
                 "the daemon is enabled, so {} {} not used locally: a local fallback would hand \
                  out more secrets when the daemon stops, not fewer. Names that live there must \
-                 be served by the daemon's own config — {remedy}",
+                 be served by the daemon's own config — {}",
                 explicit.join(" and "),
                 if explicit.len() == 1 { "is" } else { "are" },
+                remedies.join("; ")
             ));
         }
 
@@ -668,6 +694,9 @@ pub fn build(config: &Config, invocation: &Invocation) -> Built {
                 config,
                 invocation.infisical_env.as_deref(),
             )));
+        }
+        if config.stores.onepassword.enabled {
+            stores.push(Box::new(onepassword::OnePasswordStore::from_config(config)));
         }
         if config.stores.proton.enabled {
             stores.push(Box::new(proton::ProtonStore::from_config(
@@ -1015,12 +1044,13 @@ mod tests {
         let (ids, warnings) = registered(&config_from(
             r#"{"stores":{"keychain":{"enabled":true},
                           "infisical":{"enabled":true},
+                          "onepassword":{"enabled":true},
                           "proton":{"enabled":true},
                           "daemon":{"enabled":true}}}"#,
         ));
         assert_eq!(ids, ["daemon"]);
         let said = warnings.join(" ");
-        for backend in ["keychain", "infisical", "proton"] {
+        for backend in ["keychain", "infisical", "onepassword", "proton"] {
             assert!(
                 said.contains(backend),
                 "dropping {backend} must be said out loud: {said}"
@@ -1059,18 +1089,42 @@ mod tests {
             "a Proton name has nowhere to go and the warning must say so: {proton_only}"
         );
 
-        // Both at once: each half keeps its own instruction rather than one
-        // being flattened into the other's.
-        let both = registered(&config_from(
-            r#"{"stores":{"infisical":{"enabled":true},"proton":{"enabled":true},
-                          "daemon":{"enabled":true}}}"#,
+        // A 1Password name moves too, and the sentence has to say the two
+        // things a daemon needs that a session did not: the same vault, and a
+        // login of its own.
+        let onepassword_only = registered(&config_from(
+            r#"{"stores":{"onepassword":{"enabled":true},"daemon":{"enabled":true}}}"#,
         ))
         .1
         .join(" ");
-        assert!(both.contains("keylessd.json"), "{both}");
         assert!(
-            both.contains("does not carry the Proton adapter yet"),
-            "{both}"
+            onepassword_only.contains("keylessd.json"),
+            "{onepassword_only}"
+        );
+        assert!(
+            onepassword_only.contains("service account"),
+            "{onepassword_only}"
+        );
+        assert!(onepassword_only.contains("\"vault\""), "{onepassword_only}");
+        assert!(
+            !onepassword_only.contains("does not carry"),
+            "{onepassword_only}"
+        );
+
+        // All at once: each keeps its own instruction rather than one being
+        // flattened into another's.
+        let all = registered(&config_from(
+            r#"{"stores":{"infisical":{"enabled":true},"onepassword":{"enabled":true},
+                          "proton":{"enabled":true},"daemon":{"enabled":true}}}"#,
+        ))
+        .1
+        .join(" ");
+        assert!(all.contains("keylessd.json"), "{all}");
+        assert!(all.contains("the Infisical ones"), "{all}");
+        assert!(all.contains("the 1Password ones"), "{all}");
+        assert!(
+            all.contains("does not carry the Proton adapter yet"),
+            "{all}"
         );
     }
 
@@ -1081,9 +1135,10 @@ mod tests {
         let (ids, warnings) = registered(&config_from(
             r#"{"stores":{"keychain":{"enabled":true},
                           "infisical":{"enabled":true},
+                          "onepassword":{"enabled":true},
                           "proton":{"enabled":true}}}"#,
         ));
-        assert_eq!(ids, ["keychain", "infisical", "proton"]);
+        assert_eq!(ids, ["keychain", "infisical", "onepassword", "proton"]);
         assert!(warnings.is_empty(), "{warnings:?}");
     }
 

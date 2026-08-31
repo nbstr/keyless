@@ -54,7 +54,9 @@ use keyless::cmd::init::{EXIT_NEEDS_AN_ANSWER, Finding, InitRequest, detect, ini
 use keyless::cmd::status::{Mark, Style};
 use keyless::config::Config;
 use keyless::paths::Paths;
-use support::{Backend, Stub, scratch, stub_infisical, stub_pass_cli_discovery, stub_security};
+use support::{
+    Backend, Stub, scratch, stub_infisical, stub_op, stub_pass_cli_discovery, stub_security,
+};
 
 const BIN: &str = env!("CARGO_BIN_EXE_keyless");
 
@@ -97,13 +99,20 @@ impl Machine {
         self.root.join(name)
     }
 
-    /// Write a config whose three backends are backed as asked.
+    /// Write a config whose four backends are backed as asked.
     ///
     /// The coordinates are always present — a `project_id`, a declared name with
-    /// an `env`, a session directory. Detection reads them through the real
-    /// config, so a fixture that left them out would make Infisical and Proton
-    /// unprovable for a reason that has nothing to do with the case at hand.
-    fn write_config(&self, keychain: Backing, infisical: Backing, proton: Backing) {
+    /// an `env`, a session directory, a pinned vault. Detection reads them
+    /// through the real config, so a fixture that left them out would make the
+    /// vault backends unprovable for a reason that has nothing to do with the
+    /// case at hand.
+    fn write_config(
+        &self,
+        keychain: Backing,
+        infisical: Backing,
+        onepassword: Backing,
+        proton: Backing,
+    ) {
         let keychain = match keychain {
             Backing::Answers => stub_security(&self.root, &Stub::NotFound),
             Backing::Missing => self.absent("no-security-here"),
@@ -111,6 +120,10 @@ impl Machine {
         let infisical = match infisical {
             Backing::Answers => stub_infisical(&self.root, &Backend::Injects("probe")),
             Backing::Missing => self.absent("no-infisical-here"),
+        };
+        let onepassword = match onepassword {
+            Backing::Answers => stub_op(&self.root, &Backend::Injects("probe")),
+            Backing::Missing => self.absent("no-op-here"),
         };
         let proton = match proton {
             Backing::Answers => stub_pass_cli_discovery(&self.root, ONE_VAULT, "{}", "{}"),
@@ -123,11 +136,13 @@ impl Machine {
             r#"{{"stores": {{
                  "keychain": {{"binary": "{keychain}"}},
                  "infisical": {{"binary": "{infisical}", "project_id": "proj-init"}},
+                 "onepassword": {{"binary": "{onepassword}", "vault": "company"}},
                  "proton": {{"binary": "{proton}", "session_dir": "{session}"}}
                }},
                "secrets": {{"DECOY": {{"store": "infisical", "env": "staging"}}}}}}"#,
             keychain = keychain.display(),
             infisical = infisical.display(),
+            onepassword = onepassword.display(),
             proton = proton.display(),
             session = session.display(),
         );
@@ -252,7 +267,12 @@ fn every_proven_row_says_which_read_path_answered() {
     // the whole report cannot tell those apart, so this asserts the detail per
     // row, verbatim.
     let machine = Machine::fresh("proven-details");
-    machine.write_config(Backing::Answers, Backing::Answers, Backing::Answers);
+    machine.write_config(
+        Backing::Answers,
+        Backing::Answers,
+        Backing::Answers,
+        Backing::Answers,
+    );
 
     let findings = detect(&machine.config());
     let detail = |store: &str| {
@@ -262,7 +282,7 @@ fn every_proven_row_says_which_read_path_answered() {
             .unwrap_or_else(|| panic!("no `{store}` row"))
     };
 
-    for store in ["keychain", "infisical", "proton"] {
+    for store in ["keychain", "infisical", "onepassword", "proton"] {
         assert_eq!(
             detail(store).mark,
             Mark::Proven,
@@ -284,6 +304,10 @@ fn every_proven_row_says_which_read_path_answered() {
         detail("infisical").detail,
         "the CLI fetched a non-credential key"
     );
+    assert_eq!(
+        detail("onepassword").detail,
+        "the login can see the pinned vault"
+    );
     assert_eq!(detail("proton").detail, "the session listed its vaults");
 }
 
@@ -294,7 +318,12 @@ fn every_row_that_is_not_proven_names_the_one_step_that_moves_it() {
     // `keychain` arm is deleted sends a macOS user to `pass-cli`. Both looked
     // identical to the suite.
     let machine = Machine::fresh("next-steps-per-store");
-    machine.write_config(Backing::Missing, Backing::Missing, Backing::Missing);
+    machine.write_config(
+        Backing::Missing,
+        Backing::Missing,
+        Backing::Missing,
+        Backing::Missing,
+    );
 
     let findings = detect(&machine.config());
     let step = |store: &str| {
@@ -314,6 +343,11 @@ fn every_row_that_is_not_proven_names_the_one_step_that_moves_it() {
     assert_eq!(
         step("infisical"),
         "`infisical login`, then add \"project_id\" under `stores.infisical` and an \"env\" on each name"
+    );
+    assert_eq!(
+        step("onepassword"),
+        "`op signin`, then set `stores.onepassword.vault` to the ONE vault this machine may \
+         read, and `stores.onepassword.account` if you have more than one account"
     );
     assert_eq!(
         step("proton"),
@@ -342,7 +376,12 @@ fn the_question_offers_exactly_the_backends_that_proved() {
     // proved, offering the ones that FAILED, and taking an answer other than
     // the one typed.
     let machine = Machine::fresh("question-offers");
-    machine.write_config(Backing::Answers, Backing::Missing, Backing::Answers);
+    machine.write_config(
+        Backing::Answers,
+        Backing::Missing,
+        Backing::Missing,
+        Backing::Answers,
+    );
     let paths = machine.paths();
 
     let (code, out, err) = drive(&request(&paths, true), "proton\n");
@@ -378,7 +417,12 @@ fn an_empty_answer_takes_the_first_offer_rather_than_asking_again() {
     // exercise by pressing return. Without this, an implementation that treated
     // an empty line as an unknown answer — or as end of input — passes.
     let machine = Machine::fresh("question-empty");
-    machine.write_config(Backing::Answers, Backing::Missing, Backing::Answers);
+    machine.write_config(
+        Backing::Answers,
+        Backing::Missing,
+        Backing::Missing,
+        Backing::Answers,
+    );
     let paths = machine.paths();
 
     let (code, _out, err) = drive(&request(&paths, true), "\n");
@@ -397,7 +441,12 @@ fn an_answer_that_names_no_offer_writes_nothing() {
     // config on disk is the fixture's, so "nothing was written" is checked
     // against the bytes rather than against the absence of a file.
     let machine = Machine::fresh("question-wrong");
-    machine.write_config(Backing::Answers, Backing::Missing, Backing::Answers);
+    machine.write_config(
+        Backing::Answers,
+        Backing::Missing,
+        Backing::Missing,
+        Backing::Answers,
+    );
     let paths = machine.paths();
 
     let (code, _out, err) = drive(&request(&paths, true), "keychian\n");
@@ -420,7 +469,12 @@ fn a_pipeline_with_a_choice_to_make_names_the_flags_and_stops() {
     // list and the backend `--yes` would take all have to be in the message,
     // because that message is the entire remedy.
     let machine = Machine::fresh("question-piped");
-    machine.write_config(Backing::Answers, Backing::Missing, Backing::Answers);
+    machine.write_config(
+        Backing::Answers,
+        Backing::Missing,
+        Backing::Missing,
+        Backing::Answers,
+    );
     let paths = machine.paths();
 
     let (code, _out, err) = drive(&request(&paths, false), "");
@@ -447,7 +501,12 @@ fn yes_takes_the_first_offer_and_asks_nothing() {
     // The control for the case above. Without it, both pass on an `init` that
     // refuses to decide anything at all.
     let machine = Machine::fresh("question-yes");
-    machine.write_config(Backing::Answers, Backing::Missing, Backing::Answers);
+    machine.write_config(
+        Backing::Answers,
+        Backing::Missing,
+        Backing::Missing,
+        Backing::Answers,
+    );
     let paths = machine.paths();
     let mut asked = request(&paths, false);
     asked.assume_yes = true;
@@ -472,7 +531,12 @@ fn nothing_usable_is_a_refusal_and_not_a_config() {
     // default to write, so the verb stops. `is_usable` replaced by a constant
     // `true` makes this case write a config against a store that cannot answer.
     let machine = Machine::fresh("question-none");
-    machine.write_config(Backing::Missing, Backing::Missing, Backing::Missing);
+    machine.write_config(
+        Backing::Missing,
+        Backing::Missing,
+        Backing::Missing,
+        Backing::Missing,
+    );
     let paths = machine.paths();
 
     let (code, out, _err) = drive(&request(&paths, true), "keychain\n");
@@ -495,7 +559,12 @@ fn store_names_a_backend_this_build_has_or_it_names_none() {
     // inverted the lookup returns the FIRST backend whose name differs, so a
     // typo silently writes `keychain` and reports success.
     let machine = Machine::fresh("store-unknown");
-    machine.write_config(Backing::Answers, Backing::Missing, Backing::Answers);
+    machine.write_config(
+        Backing::Answers,
+        Backing::Missing,
+        Backing::Missing,
+        Backing::Answers,
+    );
     let paths = machine.paths();
     let mut asked = request(&paths, false);
     asked.only = Some("keyvault");
@@ -505,7 +574,8 @@ fn store_names_a_backend_this_build_has_or_it_names_none() {
     assert_eq!(code, EXIT_NEEDS_AN_ANSWER, "{err}");
     assert!(
         flat(&err).contains(
-            "`--store keyvault` names no backend. This build has: keychain, infisical, proton"
+            "`--store keyvault` names no backend. This build has: keychain, infisical, \
+             onepassword, proton"
         ),
         "the refusal did not list the backends this build has:\n{err}"
     );
@@ -521,7 +591,12 @@ fn store_writes_a_backend_that_has_not_proved_yet() {
     // have. Refusing would send them to a text editor. The row above still says
     // it has not proved, which is what keeps this from being a false green.
     let machine = Machine::fresh("store-unproven");
-    machine.write_config(Backing::Missing, Backing::Missing, Backing::Missing);
+    machine.write_config(
+        Backing::Missing,
+        Backing::Missing,
+        Backing::Missing,
+        Backing::Missing,
+    );
     let paths = machine.paths();
     let mut asked = request(&paths, false);
     asked.only = Some("proton");
@@ -544,7 +619,12 @@ fn store_writes_a_backend_that_has_not_proved_yet() {
 /// Write a config with `store` as the default and hand back the report.
 fn next_section_for(tag: &str, store: &str) -> String {
     let machine = Machine::fresh(tag);
-    machine.write_config(Backing::Answers, Backing::Answers, Backing::Answers);
+    machine.write_config(
+        Backing::Answers,
+        Backing::Answers,
+        Backing::Missing,
+        Backing::Answers,
+    );
     let paths = machine.paths();
     let mut asked = request(&paths, false);
     asked.only = Some(store);
@@ -636,7 +716,12 @@ fn the_closing_note_names_only_the_backends_still_waiting_on_a_login() {
     // `infisical` may be named — and the singular verb is part of the claim,
     // because the plural branch is a different arm.
     let machine = Machine::fresh("waiting-one");
-    machine.write_config(Backing::Answers, Backing::Missing, Backing::Answers);
+    machine.write_config(
+        Backing::Answers,
+        Backing::Missing,
+        Backing::Answers,
+        Backing::Answers,
+    );
     let paths = machine.paths();
     let mut asked = request(&paths, false);
     asked.assume_yes = true;
@@ -660,15 +745,24 @@ fn the_closing_note_names_only_the_backends_still_waiting_on_a_login() {
         !flattened.contains("`proton` is still waiting"),
         "a backend that proved was reported as still waiting:\n{out}"
     );
+    assert!(
+        !flattened.contains("`onepassword` is still waiting"),
+        "a backend that proved was reported as still waiting:\n{out}"
+    );
 }
 
 #[test]
 fn the_closing_note_joins_several_backends_rather_than_naming_one() {
     // The other arm of the same match. With every backend unreachable and one
-    // named explicitly, all three are waiting — and the sentence has to read as
+    // named explicitly, all four are waiting — and the sentence has to read as
     // a list rather than as a singular.
     let machine = Machine::fresh("waiting-several");
-    machine.write_config(Backing::Missing, Backing::Missing, Backing::Missing);
+    machine.write_config(
+        Backing::Missing,
+        Backing::Missing,
+        Backing::Missing,
+        Backing::Missing,
+    );
     let paths = machine.paths();
     let mut asked = request(&paths, false);
     asked.only = Some("keychain");
@@ -678,8 +772,8 @@ fn the_closing_note_joins_several_backends_rather_than_naming_one() {
 
     assert!(
         flat(&out).contains(
-            "`keychain` and `infisical` and `proton` are still waiting on a login only you can \
-             perform."
+            "`keychain` and `infisical` and `onepassword` and `proton` are still waiting on a \
+             login only you can perform."
         ),
         "the closing note did not list every backend still waiting:\n{out}"
     );
@@ -691,7 +785,12 @@ fn a_report_with_nothing_waiting_says_nothing_about_waiting() {
     // prints the note unconditionally — which would tell somebody whose whole
     // machine works that it does not.
     let machine = Machine::fresh("waiting-none");
-    machine.write_config(Backing::Answers, Backing::Answers, Backing::Answers);
+    machine.write_config(
+        Backing::Answers,
+        Backing::Answers,
+        Backing::Answers,
+        Backing::Answers,
+    );
     let paths = machine.paths();
     let mut asked = request(&paths, false);
     asked.assume_yes = true;

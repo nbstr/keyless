@@ -107,8 +107,8 @@ security: SecKeychainSearchCopyNext: The specified item could not be found.
 { "stores": { "daemon": { "enabled": true } } }
 ```
 
-Enabling the daemon **disables every local backend** — keychain, Infisical and
-Proton Pass alike — whatever each one's own `enabled` flag says. That is
+Enabling the daemon **disables every local backend** — keychain, Infisical,
+1Password and Proton Pass alike — whatever each one's own `enabled` flag says. That is
 enforced in `store::build`, not documented as a convention, because a local
 fallback would re-open the hole the moment the daemon stopped — and anyone who
 can stop a process could choose that. Killing `keylessd` must get you fewer
@@ -232,11 +232,104 @@ reports a name as missing — those two are the outcomes that must never be
 confused, because one means "fix your login" and the other means "look in
 another vault".
 
+## Serving names out of one 1Password vault
+
+Optional. Skip it if you do not use 1Password; nothing above depends on it and
+the installer does not enable it.
+
+This is the arrangement that turns the store's vault pin from an allowlist into
+a boundary. On a session, `op` inherits a login that sees every vault the
+person can see, and `stores.onepassword.vault` only stops `keyless` from
+reading the others. Behind the daemon, `op` is handed a **service account** —
+an identity the vendor mints with access to named vaults and refuses
+everything else — and the token lives in a file only the daemon's uid can
+read. Sessions ask over the socket by name and never see it.
+
+### Mint the service account
+
+At the vendor, as yourself, with read access to exactly the one vault the
+daemon may serve:
+
+```console
+$ op service-account create keyless-agents --vault company:read_items
+```
+
+That prints the token once. It goes into the daemon's file in the next step and
+nowhere else; a service account cannot be granted your Personal or Private
+vault, which is the vendor's own rule and the right one.
+
+### Configure the store
+
+Add it to `/usr/local/etc/keyless/keylessd.json`. Coordinates only; there is no
+field in this file a credential fits in:
+
+```json
+"onepassword": {
+  "enabled": true,
+  "binary": "/absolute/path/to/op",
+  "vault": "company",
+  "field": "password",
+  "config_dir": "/usr/local/var/lib/keyless/op",
+  "credentials_file": "/usr/local/var/lib/keyless/onepassword.json",
+  "credentials": { "OP_SERVICE_ACCOUNT_TOKEN": "SERVICE_ACCOUNT" }
+}
+```
+
+- **`vault` is required and never defaulted.** It is the same rule a session
+  has, for the same reason: which vault a name resolves against must be
+  written down, never inferred from what the login happens to see — and it
+  should be the vault the service account was minted for, or every lookup is
+  refused by the vendor.
+- **`field`** is the field a name reads when its own entry names none. Set it
+  when every item in the vault has the same shape; leave it out otherwise and
+  put `field` on each name.
+- **`config_dir`** names a directory the daemon's uid can write. `op` keeps an
+  account list and a cache socket under the calling user's config directory,
+  and a daemon's home may not be one it can write to. Create it owned by the
+  daemon.
+- **An absolute `binary`**, for the reason the Infisical section gives.
+- **`OP_*` only** under `credentials`. Anything else is refused by every
+  lookup and named by `keylessd check`.
+
+Each name is an item in that vault, by title, and the item's id when two share
+one:
+
+```json
+"secrets": {
+  "STRIPE_KEY": { "store": "onepassword", "item": "demo api key", "field": "credential" }
+}
+```
+
+### Put the token in the daemon's own file
+
+Prompts, echoes nothing, takes no value on the command line:
+
+```console
+$ sudo keylessd credential --store onepassword --name SERVICE_ACCOUNT
+$ keylessd check --config /usr/local/etc/keyless/keylessd.json
+```
+
+`--store` picks which of the two credential files the entry goes in. It can be
+left off when only one store's `credentials` names the entry.
+
+`check` prints the same two rows it prints for Infisical: `identity` is about
+the file — does it exist, is it `0600`, is it owned by the daemon — and `store
+onepassword` is the vendor accepting the token **for that vault**. A refused
+token says so and never reports a name as missing.
+
+### What has not been measured
+
+The adapter's authenticated path is built from the vendor's documentation and
+has not been run against a signed-in account; the README's *Not built yet*
+carries the detail. Whether a service account under launchd needs the
+`config_dir` above, or works without it, is one of the things that first live
+run will settle.
+
 ### Removing it
 
-`install/uninstall.sh` deletes the credential file, unlike the secrets store
-beside it. The store may be your only copy of something; this file never is,
-because the identity lives at the vendor. **Revoke it there as well** — deleting
+`install/uninstall.sh` deletes both credential files, unlike the secrets store
+beside them. The store may be your only copy of something; these files never
+are, because the identity lives at the vendor. **Revoke it there as well** — deleting
 the copy is not revoking the credential.
 
 ---

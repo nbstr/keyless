@@ -40,10 +40,11 @@ use keyless::store::proton::Reason;
 use keyless::store::{self, Invocation, Registry};
 
 use support::{
-    Backend, CONCEALED, INFISICAL_DECOY, Listing, NEIGHBOUR_KEY, PROTON_DECOY, SCOPED_SESSION_DIR,
-    install_executable, listing_count, recorded, recorded_lines, run_with, scratch, stub_infisical,
-    stub_pass_cli, stub_pass_cli_discovery, stub_pass_cli_listing, witness, witness_env, witnessed,
-    witnessed_env,
+    Backend, CONCEALED, INFISICAL_DECOY, Listing, NEIGHBOUR_KEY, ONEPASSWORD_DECOY,
+    OnePasswordListing, PROTON_DECOY, SCOPED_SESSION_DIR, install_executable, listing_count,
+    op_listing_count, recorded, recorded_lines, run_with, scratch, stub_infisical, stub_op,
+    stub_op_listing, stub_pass_cli, stub_pass_cli_discovery, stub_pass_cli_listing, witness,
+    witness_env, witnessed, witnessed_env,
 };
 
 /// Whether `argv` carries `flag`, in either of the two spellings clap accepts.
@@ -2049,4 +2050,474 @@ fn a_leftover_older_than_the_session_file_is_a_scar_and_not_a_cause() {
         "{report}"
     );
     assert_eq!(code, 1, "{report}");
+}
+
+// ---------------------------------------------------------------------------
+// Property: 1Password cannot stop the command, and reads exactly one vault.
+//
+// The stub encodes the vendor's DOCUMENTED shapes and two MEASURED refusals;
+// see `src/store/onepassword.rs` for which is which. What these cases prove is
+// what `keyless` does with each answer, from the vendor's side of the
+// interface: the argv it was spawned with, the environment it was handed, and
+// the reference it was asked to resolve.
+// ---------------------------------------------------------------------------
+
+/// A config with only 1Password enabled, pinned to one vault, with a store-wide
+/// field, pointed at a stub. `timeout_ms` is the same ceiling every other
+/// builder in this file names, for the reason `proton_config` gives.
+fn onepassword_config(binary: &Path, secrets: &str) -> String {
+    format!(
+        r#"{{"stores":{{"keychain":{{"enabled":false}},
+             "onepassword":{{"enabled":true,"binary":"{}","vault":"company","field":"password",
+                             "timeout_ms":60000}}}},
+            "secrets":{secrets}}}"#,
+        binary.display()
+    )
+}
+
+/// The one name most 1Password fixtures declare: the stub's live item, by title.
+const ONEPASSWORD_DECOY_BY_TITLE: &str = r#"{"DECOY":{"item":"DECOY"}}"#;
+
+/// The verb the LAST `op` invocation ran, read off what the stub recorded.
+///
+/// `op.argv` is overwritten by every invocation, so after a lookup it holds the
+/// `run`; after a lookup that stopped at the listing it holds the `item list`.
+fn last_op_verb(dir: &Path) -> String {
+    recorded_lines(&dir.join("op.argv"))
+        .first()
+        .cloned()
+        .unwrap_or_default()
+}
+
+#[test]
+fn an_absent_op_binary_still_spawns_the_child() {
+    let dir = scratch("onepassword-absent");
+    let marker = dir.join("witness");
+    let registry = registry_from(
+        &onepassword_config(&dir.join("there-is-no-op-here"), ONEPASSWORD_DECOY_BY_TITLE),
+        &Reason::default(),
+    );
+
+    let (outcome, notes) = run_with(&registry, &["DECOY"], &witness(&marker, "DECOY", 42), &[]);
+
+    assert_eq!(
+        witnessed(&marker),
+        "<unset>",
+        "the environment was modified"
+    );
+    assert_eq!(outcome.exit_code, 42);
+    assert_eq!(outcome.state, State::Degraded);
+    assert!(notes.contains("DEGRADED"), "{notes}");
+    assert!(notes.contains("DECOY"), "the banner must name the secret");
+}
+
+#[test]
+fn an_op_that_never_answers_still_spawns_the_child() {
+    let dir = scratch("onepassword-hangs");
+    let marker = dir.join("witness");
+    let stub = stub_op(&dir, &Backend::Hangs);
+    // The listing answers and the RUN hangs, so the deadline being tested is
+    // the lookup's. Its own config: here the deadline is the SUBJECT.
+    let registry = registry_from(
+        &format!(
+            r#"{{"stores":{{"keychain":{{"enabled":false}},
+                 "onepassword":{{"enabled":true,"binary":"{}","vault":"company",
+                                 "field":"password","timeout_ms":300}}}},
+                "secrets":{ONEPASSWORD_DECOY_BY_TITLE}}}"#,
+            stub.display()
+        ),
+        &Reason::default(),
+    );
+
+    let started = Instant::now();
+    let (outcome, notes) = run_with(&registry, &["DECOY"], &witness(&marker, "DECOY", 17), &[]);
+    let elapsed = started.elapsed();
+
+    assert!(elapsed < Duration::from_secs(10), "waited {elapsed:?}");
+    assert_eq!(witnessed(&marker), "<unset>");
+    assert_eq!(outcome.exit_code, 17);
+    assert_eq!(outcome.state, State::Degraded);
+    assert!(notes.contains("no answer within 300 ms"), "{notes}");
+}
+
+#[test]
+fn an_op_that_is_not_signed_in_degrades_and_names_the_login_rather_than_the_name() {
+    // The measured refusal. It must reach the caller as a LOGIN problem with
+    // the vendor's own bootstrap named, never as a name that is absent — those
+    // send a reader to two different places.
+    let dir = scratch("onepassword-not-signed-in");
+    let marker = dir.join("witness");
+    let stub = stub_op_listing(
+        &dir,
+        &Backend::Injects(ONEPASSWORD_DECOY),
+        &OnePasswordListing::NotSignedIn,
+        "{}",
+    );
+    let registry = registry_from(
+        &onepassword_config(&stub, ONEPASSWORD_DECOY_BY_TITLE),
+        &Reason::default(),
+    );
+
+    let (outcome, notes) = run_with(&registry, &["DECOY"], &witness(&marker, "DECOY", 9), &[]);
+
+    assert_eq!(witnessed(&marker), "<unset>");
+    assert_eq!(outcome.exit_code, 9);
+    assert_eq!(outcome.state, State::Degraded);
+    assert!(notes.contains("op signin"), "{notes}");
+    assert!(notes.contains("not a missing name"), "{notes}");
+    assert!(
+        notes.contains("not signed in"),
+        "the vendor's own words must reach the caller: {notes}"
+    );
+    // The log prefix the vendor wraps its errors in is not part of the diagnosis.
+    assert!(!notes.contains("[ERROR]"), "{notes}");
+    // And the refusal stopped at the listing: no `run` was attempted.
+    assert_eq!(last_op_verb(&dir), "item");
+}
+
+#[test]
+fn a_onepassword_value_reaches_the_child_and_nothing_else() {
+    let dir = scratch("onepassword-happy");
+    let marker = dir.join("witness");
+    let stub = stub_op(&dir, &Backend::Injects(ONEPASSWORD_DECOY));
+    let registry = registry_from(
+        &onepassword_config(&stub, ONEPASSWORD_DECOY_BY_TITLE),
+        &Reason::default(),
+    );
+
+    let (outcome, notes) = run_with(
+        &registry,
+        &["DECOY"],
+        &witness_env(&marker, &["DECOY", "KEYLESS_PROBE"]),
+        &[],
+    );
+
+    assert_eq!(outcome.state, State::Injected, "{notes}");
+    assert_eq!(notes, "", "a successful run says nothing at all");
+    let seen = witnessed_env(&marker);
+    assert_eq!(seen["DECOY"], ONEPASSWORD_DECOY, "the child must see it");
+    // The probe variable is the adapter's, for one process that lives for one
+    // lookup. The user's command must never inherit it.
+    assert_eq!(
+        seen["KEYLESS_PROBE"], "<unset>",
+        "the probe leaked into the child"
+    );
+
+    // What the vendor was asked to resolve: the PINNED vault, the item's id
+    // out of the listing, and the store-wide field — as a reference in the
+    // environment, never in argv.
+    assert_eq!(
+        recorded(&dir.join("op.probe")),
+        "op://company/It3mL1v3/password"
+    );
+    let argv = recorded_lines(&dir.join("op.argv"));
+    assert!(!argv.iter().any(|arg| arg.contains("op://")), "{argv:?}");
+}
+
+#[test]
+fn the_onepassword_invocation_uses_run_and_no_verb_that_prints_a_value() {
+    // Asserted on what the stub RECORDED, not on the adapter's own list. `read`,
+    // `item get` and `inject` print plaintext and the hook pack refuses them;
+    // if one appears here, this adapter has become the way around that.
+    let dir = scratch("onepassword-argv");
+    let marker = dir.join("witness");
+    let stub = stub_op(&dir, &Backend::Injects(ONEPASSWORD_DECOY));
+    let registry = registry_from(
+        &onepassword_config(&stub, ONEPASSWORD_DECOY_BY_TITLE),
+        &Reason::default(),
+    );
+    let (outcome, _) = run_with(&registry, &["DECOY"], &witness(&marker, "DECOY", 0), &[]);
+    assert_eq!(outcome.state, State::Injected);
+
+    let run = recorded_lines(&dir.join("op.argv"));
+    assert_eq!(run.first().map(String::as_str), Some("run"), "{run:?}");
+    assert!(run.iter().any(|arg| arg == "--no-masking"), "{run:?}");
+    let separator = run.iter().position(|arg| arg == "--").expect("a separator");
+    assert_eq!(
+        run[separator + 1..],
+        ["/usr/bin/printenv", "KEYLESS_PROBE"],
+        "{run:?}"
+    );
+
+    let list = recorded_lines(&dir.join("op.list.argv"));
+    assert_eq!(&list[..2], ["item", "list"], "{list:?}");
+    assert!(mentions(&list, "--vault"), "{list:?}");
+    assert!(list.iter().any(|arg| arg == "--vault=company"), "{list:?}");
+    assert!(
+        list.iter().any(|arg| arg == "--include-archive"),
+        "{list:?}"
+    );
+
+    for argv in [&run, &list] {
+        for forbidden in ["read", "get", "inject", "--reveal"] {
+            assert!(
+                !argv.iter().any(|arg| arg == forbidden),
+                "`{forbidden}` appeared in {argv:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn the_vendor_is_handed_a_cleared_environment_and_the_probe() {
+    // The clearing is what makes `printenv` exact: nothing this process
+    // carries can come back as a value, and no ambient `op://` can cost a read
+    // nobody asked for. Read off the environment the stub actually received.
+    let dir = scratch("onepassword-env");
+    let marker = dir.join("witness");
+    let stub = stub_op(&dir, &Backend::Injects(ONEPASSWORD_DECOY));
+    let registry = registry_from(
+        &onepassword_config(&stub, ONEPASSWORD_DECOY_BY_TITLE),
+        &Reason::default(),
+    );
+    let (outcome, _) = run_with(&registry, &["DECOY"], &witness(&marker, "DECOY", 0), &[]);
+    assert_eq!(outcome.state, State::Injected);
+
+    let handed = recorded(&dir.join("op.env"));
+    let names: Vec<&str> = handed.lines().collect();
+    assert!(names.contains(&"KEYLESS_PROBE"), "{names:?}");
+    assert!(names.contains(&"PATH"), "{names:?}");
+    // The adapter's forwarded set, plus what `/bin/sh` adds to its own
+    // environment on the way to `env`. Anything else is a variable this
+    // process carried that reached the vendor.
+    let forwarded = [
+        "HOME",
+        "PATH",
+        "TMPDIR",
+        "SSL_CERT_FILE",
+        "SSL_CERT_DIR",
+        "HTTPS_PROXY",
+        "HTTP_PROXY",
+        "NO_PROXY",
+        "no_proxy",
+        "XDG_CONFIG_HOME",
+        "KEYLESS_PROBE",
+    ];
+    let shell_adds = ["PWD", "OLDPWD", "SHLVL", "_"];
+    for name in &names {
+        assert!(
+            forwarded.contains(name) || shell_adds.contains(name) || name.starts_with("OP_"),
+            "`{name}` was handed to the vendor: {names:?}"
+        );
+    }
+}
+
+#[test]
+fn a_title_absent_from_the_vault_is_an_absence_and_never_reaches_run() {
+    // The listing says the item is not there, so there is nothing to resolve
+    // and the vendor is not asked to try. `NotFound` rather than a vendor
+    // error, so `doctor` sends the reader to the vault and not to the login.
+    let dir = scratch("onepassword-absent-title");
+    let marker = dir.join("witness");
+    let stub = stub_op(&dir, &Backend::Injects(ONEPASSWORD_DECOY));
+    // `decoy` is not `DECOY`: the match is exact, so the listing's one item
+    // does not answer for it.
+    let registry = registry_from(
+        &onepassword_config(&stub, r#"{"MISSING":{"item":"decoy"}}"#),
+        &Reason::default(),
+    );
+
+    let (outcome, notes) = run_with(
+        &registry,
+        &["MISSING"],
+        &witness(&marker, "MISSING", 0),
+        &[],
+    );
+
+    assert_eq!(outcome.state, State::Degraded);
+    assert_eq!(witnessed(&marker), "<unset>");
+    assert!(notes.contains("not found in any store"), "{notes}");
+    assert_eq!(
+        last_op_verb(&dir),
+        "item",
+        "a run was attempted for an absent title"
+    );
+}
+
+#[test]
+fn an_archived_item_never_resolves_and_the_command_still_runs() {
+    // The vendor resolves a reference to an archived item (documented), so
+    // the listing is the only thing between a put-away credential and the
+    // child. The state word is the vendor's own.
+    let dir = scratch("onepassword-archived");
+    let marker = dir.join("witness");
+    let stub = stub_op_listing(
+        &dir,
+        &Backend::Injects(ONEPASSWORD_DECOY),
+        &OnePasswordListing::Json(
+            r#"[{"id":"It3mDead","title":"DECOY","category":"PASSWORD","state":"ARCHIVED"}]"#,
+        ),
+        "{}",
+    );
+    let registry = registry_from(
+        &onepassword_config(&stub, ONEPASSWORD_DECOY_BY_TITLE),
+        &Reason::default(),
+    );
+
+    let (outcome, notes) = run_with(&registry, &["DECOY"], &witness(&marker, "DECOY", 3), &[]);
+
+    assert_eq!(outcome.state, State::Degraded);
+    assert_eq!(outcome.exit_code, 3);
+    assert_eq!(witnessed(&marker), "<unset>");
+    assert!(notes.contains("archived"), "{notes}");
+    assert_eq!(last_op_verb(&dir), "item", "an archived item reached `run`");
+}
+
+#[test]
+fn two_live_items_with_one_title_degrade_and_name_the_ids() {
+    let dir = scratch("onepassword-ambiguous-title");
+    let marker = dir.join("witness");
+    let stub = stub_op_listing(
+        &dir,
+        &Backend::Injects(ONEPASSWORD_DECOY),
+        &OnePasswordListing::Json(
+            r#"[{"id":"It3mOne","title":"DECOY","category":"PASSWORD"},
+                {"id":"It3mTwo","title":"DECOY","category":"LOGIN"}]"#,
+        ),
+        "{}",
+    );
+    let registry = registry_from(
+        &onepassword_config(&stub, ONEPASSWORD_DECOY_BY_TITLE),
+        &Reason::default(),
+    );
+
+    let (outcome, notes) = run_with(&registry, &["DECOY"], &witness(&marker, "DECOY", 0), &[]);
+
+    assert_eq!(outcome.state, State::Degraded);
+    assert!(
+        notes.contains("It3mOne") && notes.contains("It3mTwo"),
+        "{notes}"
+    );
+    assert!(notes.contains("\"item\""), "the fix must be named: {notes}");
+    assert_eq!(last_op_verb(&dir), "item");
+
+    // The escape hatch: the id in `item` picks one, and resolves.
+    let marker = dir.join("witness-by-id");
+    let registry = registry_from(
+        &onepassword_config(&stub, r#"{"DECOY":{"item":"It3mTwo"}}"#),
+        &Reason::default(),
+    );
+    let (outcome, _) = run_with(&registry, &["DECOY"], &witness(&marker, "DECOY", 0), &[]);
+    assert_eq!(outcome.state, State::Injected);
+    assert_eq!(
+        recorded(&dir.join("op.probe")),
+        "op://company/It3mTwo/password"
+    );
+}
+
+#[test]
+fn a_name_pinned_to_another_vault_never_spawns_op() {
+    // The scoping rule at the one place a config entry could reach around
+    // it. No listing, no run, no file written by the stub.
+    let dir = scratch("onepassword-other-vault");
+    let marker = dir.join("witness");
+    let stub = stub_op(&dir, &Backend::Injects(ONEPASSWORD_DECOY));
+    let registry = registry_from(
+        &onepassword_config(&stub, r#"{"DECOY":{"vault":"personal","item":"DECOY"}}"#),
+        &Reason::default(),
+    );
+
+    let (outcome, notes) = run_with(&registry, &["DECOY"], &witness(&marker, "DECOY", 0), &[]);
+
+    assert_eq!(outcome.state, State::Degraded);
+    assert_eq!(witnessed(&marker), "<unset>");
+    assert!(notes.contains("pinned to `company`"), "{notes}");
+    assert!(notes.contains("personal"), "{notes}");
+    assert!(
+        !dir.join("op.argv").exists(),
+        "a vendor process was spawned for a name pinned to another vault"
+    );
+}
+
+#[test]
+fn a_reference_handed_back_unresolved_is_refused_rather_than_injected() {
+    // Measured: `op run` with nothing to resolve runs its child untouched. A
+    // vendor that did that to the probe would hand `printenv` the literal
+    // reference, and without the guard that string would be injected as the
+    // credential.
+    let dir = scratch("onepassword-unresolved");
+    let marker = dir.join("witness");
+    let stub = stub_op(&dir, &Backend::Unset);
+    let registry = registry_from(
+        &onepassword_config(&stub, ONEPASSWORD_DECOY_BY_TITLE),
+        &Reason::default(),
+    );
+
+    let (outcome, notes) = run_with(&registry, &["DECOY"], &witness(&marker, "DECOY", 0), &[]);
+
+    assert_eq!(outcome.state, State::Degraded);
+    assert_eq!(
+        witnessed(&marker),
+        "<unset>",
+        "the reference was injected as a value"
+    );
+    assert!(notes.contains("resolving the reference"), "{notes}");
+}
+
+#[test]
+fn a_concealed_onepassword_value_is_refused_rather_than_injected() {
+    let dir = scratch("onepassword-concealed");
+    let marker = dir.join("witness");
+    let stub = stub_op(&dir, &Backend::Concealed);
+    let registry = registry_from(
+        &onepassword_config(&stub, ONEPASSWORD_DECOY_BY_TITLE),
+        &Reason::default(),
+    );
+
+    let (outcome, notes) = run_with(&registry, &["DECOY"], &witness(&marker, "DECOY", 0), &[]);
+
+    assert_eq!(outcome.state, State::Degraded);
+    assert_eq!(
+        witnessed(&marker),
+        "<unset>",
+        "the mask token was injected as a value"
+    );
+    assert!(notes.contains("concealed"), "{notes}");
+}
+
+#[test]
+fn several_onepassword_names_cost_exactly_one_listing() {
+    // A run resolves its names concurrently, and the listing is what turns a
+    // title into an id — so without the memoisation, N names would be N
+    // listings racing each other. Counted from the stub's side.
+    let dir = scratch("onepassword-one-listing");
+    let marker = dir.join("witness");
+    let stub = stub_op_listing(
+        &dir,
+        &Backend::Injects(ONEPASSWORD_DECOY),
+        &OnePasswordListing::Json(
+            r#"[{"id":"It3mOne","title":"DECOY","category":"PASSWORD"},
+                {"id":"It3mTwo","title":"Router","category":"LOGIN"},
+                {"id":"It3mL1v3","title":"decoy alpha","category":"API_CREDENTIAL"}]"#,
+        ),
+        "{}",
+    );
+    let registry = registry_from(
+        &onepassword_config(
+            &stub,
+            r#"{"A":{"item":"DECOY"},"B":{"item":"Router"},"C":{"item":"decoy alpha"}}"#,
+        ),
+        &Reason::default(),
+    );
+
+    let (outcome, notes) = run_with(
+        &registry,
+        &["A", "B", "C"],
+        &witness_env(&marker, &["A", "B", "C"]),
+        &[],
+    );
+
+    assert_eq!(outcome.state, State::Injected, "{notes}");
+    let seen = witnessed_env(&marker);
+    for name in ["A", "B", "C"] {
+        assert_eq!(
+            seen[name], ONEPASSWORD_DECOY,
+            "{name} did not reach the child"
+        );
+    }
+    assert_eq!(
+        op_listing_count(&dir),
+        1,
+        "three names must cost one listing"
+    );
 }

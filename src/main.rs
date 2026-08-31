@@ -189,6 +189,8 @@ struct ItemsArgs {
     /// Proton: a vault name; without it, every vault the identity can see.
     /// Infisical: `<env>` or `<env>:<path>` — the coordinate `keyless ls`
     /// prints. Without it, every coordinate the config declares, and no others.
+    /// 1Password: only the vault the store is pinned to; naming another is
+    /// refused rather than listed.
     #[arg(long, visible_alias = "env", value_name = "VAULT")]
     vault: Option<String>,
 }

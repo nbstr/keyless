@@ -552,9 +552,9 @@ fn choose(
 ///
 /// The order is "how much does this need from the user", cheapest first. The
 /// keychain is on the machine already and needs no login; Infisical needs a
-/// login and a project; Proton needs a login and a session directory that has no
-/// safe default.
-const KNOWN: [&str; 3] = ["keychain", "infisical", "proton"];
+/// login and a project; 1Password needs a login and the name of one vault;
+/// Proton needs a login and a session directory that has no safe default.
+const KNOWN: [&str; 4] = ["keychain", "infisical", "onepassword", "proton"];
 
 /// Probe each backend on its own, against the config that will actually be used.
 ///
@@ -649,6 +649,7 @@ fn sole_store(base: &Config, id: &str) -> Config {
     config.stores.daemon.enabled = false;
     config.stores.keychain.enabled = id == "keychain";
     config.stores.infisical.enabled = id == "infisical";
+    config.stores.onepassword.enabled = id == "onepassword";
     config.stores.proton.enabled = id == "proton";
     config
 }
@@ -657,6 +658,7 @@ fn proven_detail(id: &str) -> String {
     match id {
         "keychain" => "the login keychain answered a search".to_owned(),
         "infisical" => "the CLI fetched a non-credential key".to_owned(),
+        "onepassword" => "the login can see the pinned vault".to_owned(),
         _ => "the session listed its vaults".to_owned(),
     }
 }
@@ -669,6 +671,12 @@ fn setup_step(id: &str) -> String {
             .to_owned(),
         "infisical" => "`infisical login`, then add \"project_id\" under \
                         `stores.infisical` and an \"env\" on each name"
+            .to_owned(),
+        // The vault is the coordinate nobody can guess for you, and the
+        // account is the one that bites on a machine with two of them.
+        "onepassword" => "`op signin`, then set `stores.onepassword.vault` to the ONE vault \
+                          this machine may read, and `stores.onepassword.account` if you \
+                          have more than one account"
             .to_owned(),
         // The variable is the whole of the instruction. "Log in into a session
         // directory" is followable only by somebody who already knows the
@@ -733,6 +741,8 @@ fn next_steps(
             "lists the keys at one environment: names and coordinates, never a value",
         )?;
     } else {
+        // Proton and 1Password are both vault backends: items have titles and
+        // several fields, and both verbs answer.
         command(
             out,
             style,
@@ -843,6 +853,7 @@ mod tests {
             serde_json::from_str(&render("keychain")).expect("valid");
         assert!(config.stores.keychain.enabled);
         assert!(!config.stores.infisical.enabled);
+        assert!(!config.stores.onepassword.enabled);
         assert!(!config.stores.proton.enabled);
     }
 
@@ -1073,14 +1084,26 @@ mod tests {
         // The standing invariant, asserted against this verb's own output. The
         // config format has no field a value fits in, and this test exists so
         // that adding one is visibly a breaking change here.
+        //
+        // Matched as a JSON KEY rather than as a bare substring, because a
+        // store section is not a value field: `"onepassword": {` names a
+        // backend, and a substring check on `password` refused it. The key
+        // form still catches the thing this exists for — a `"password":` or
+        // `"value":` that a value could sit behind.
         for chosen in KNOWN {
             let body = render(chosen);
-            for forbidden in ["value", "secret\":", "password", "token"] {
+            for forbidden in ["\"value\":", "\"secret\":", "\"password\":", "\"token\":"] {
                 assert!(
                     !body.contains(forbidden),
                     "`init` wrote a `{forbidden}` field:\n{body}"
                 );
             }
         }
+        // The control: the key form is still a check. A body that DID carry a
+        // value field is refused by it.
+        assert!(
+            r#"{"secrets":{"A":{"password":"x"}}}"#.contains("\"password\":"),
+            "the key-form check stopped matching a value field"
+        );
     }
 }

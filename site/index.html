@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>keyless — run the command, never read the secret</title>
-<meta name="description" content="Your vault can print a value. keyless cannot, so nothing in your transcript ever holds one. A secrets broker for AI coding agents, reading from Proton Pass and Infisical.">
+<meta name="description" content="Your vault can print a value. keyless cannot, so nothing in your transcript ever holds one. A secrets broker for AI coding agents, reading from Proton Pass, 1Password and Infisical.">
 <link rel="canonical" href="https://keyless.hackistan.org/">
 <!-- Inline favicon. The page ships as ONE file with no external requests, so the
      icon is a data URI rather than a /favicon.ico the host would have to serve.
@@ -18,10 +18,10 @@
 <meta property="og:site_name" content="keyless">
 <meta property="og:url" content="https://keyless.hackistan.org/">
 <meta property="og:title" content="keyless — run the command, never read the secret">
-<meta property="og:description" content="Your vault can print a value. keyless cannot, so nothing in your transcript ever holds one. A secrets broker for AI coding agents, reading from Proton Pass and Infisical.">
+<meta property="og:description" content="Your vault can print a value. keyless cannot, so nothing in your transcript ever holds one. A secrets broker for AI coding agents, reading from Proton Pass, 1Password and Infisical.">
 <meta name="twitter:card" content="summary">
 <meta name="twitter:title" content="keyless — run the command, never read the secret">
-<meta name="twitter:description" content="Your vault can print a value. keyless cannot, so nothing in your transcript ever holds one. A secrets broker for AI coding agents, reading from Proton Pass and Infisical.">
+<meta name="twitter:description" content="Your vault can print a value. keyless cannot, so nothing in your transcript ever holds one. A secrets broker for AI coding agents, reading from Proton Pass, 1Password and Infisical.">
 <style>
 /* ------------------------------------------------------------------ reset */
 *,*::before,*::after{box-sizing:border-box}
@@ -562,7 +562,7 @@ html{scroll-behavior:smooth}
       <div class="pipe">
         <div class="stage is-store">
           <span class="st-l">your store</span>
-          <span class="st-v">Proton Pass<br>Infisical</span>
+          <span class="st-v">Proton Pass<br>1Password<br>Infisical</span>
         </div>
         <div class="wire w1"><span class="dot"></span></div>
         <div class="stage is-broker">
@@ -589,7 +589,7 @@ html{scroll-behavior:smooth}
 
   <div class="col">
     <p class="caveat cascade d6">
-      It reads from the vault you already run &mdash; <b>Proton Pass</b> or <b>Infisical</b>.
+      It reads from the vault you already run &mdash; <b>Proton Pass</b>, <b>1Password</b> or <b>Infisical</b>.
       &nbsp;&middot;&nbsp; <b>keyless get</b> is not a typo you can make; it does not exist.
       &nbsp;&middot;&nbsp; Two states, no third — <b>INJECTED</b> or <b>DEGRADED</b>.
       &nbsp;&middot;&nbsp; MIT &middot; Rust &middot; macOS &middot; five direct dependencies.
@@ -830,6 +830,18 @@ html{scroll-behavior:smooth}
           <p>Resolved through the Infisical CLI's own injection path, per project and per environment.
             Your access rules stay exactly where they are.</p>
         </div>
+        <div class="src">
+          <svg class="mark" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round" aria-hidden="true">
+            <circle cx="12" cy="12" r="9.2"/>
+            <path d="M12 7.6v8.8M9.4 10.2h5.2v3.4H9.4z"/>
+          </svg>
+          <div>
+            <div class="src-k">keyless reads from this</div>
+            <h4 class="gap-s">1Password</h4>
+          </div>
+          <p>Resolved through <code>op run</code>, in the one vault you name and no other.
+            Behind the daemon, a service account scoped to that vault is the boundary.</p>
+        </div>
       </div>
     </div>
 
@@ -841,11 +853,12 @@ html{scroll-behavior:smooth}
             is that keyless never builds a command containing one.</p>
           <ul class="rows gap-m">
             <li><span class="k">view &middot; show &middot; get</span><span class="lbl">Proton Pass — printing an entry</span></li>
+            <li><span class="k">read &middot; item get &middot; inject</span><span class="lbl">1Password — printing a value</span></li>
             <li><span class="k">export &middot; read &middot; reveal</span><span class="lbl">Infisical — printing a value</span></li>
           </ul>
           <p class="micro gap-l">
             <b>a test asserts none of these words ever appears</b> in the command keyless builds &mdash;
-            for either store, in both directions
+            for every store, in both directions
           </p>
         </div>
         <div class="pad">

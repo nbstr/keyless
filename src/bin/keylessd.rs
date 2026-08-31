@@ -117,10 +117,15 @@ mod daemon {
 
     #[derive(Args)]
     struct CredentialArgs {
-        /// The entry name, as `stores.infisical.credentials` in the config
+        /// The entry name, as `stores.<store>.credentials` in the config
         /// spells it. The VALUE is read from stdin and never from here.
         #[arg(long, value_name = "ENTRY")]
         name: String,
+        /// Which store's credential file to write: `infisical` or
+        /// `onepassword`. Defaults to whichever store's `credentials` names
+        /// the entry, and to `infisical` when none does.
+        #[arg(long, value_name = "STORE")]
+        store: Option<String>,
         /// Config file, used to find the credential file and the daemon's uid.
         #[arg(long, value_name = "PATH", default_value = DEFAULT_CONFIG)]
         config: PathBuf,
@@ -299,7 +304,48 @@ mod daemon {
             Ok(config) => config,
             Err(error) => return fail(&error.to_string()),
         };
-        let path = config.stores.infisical.credentials_file.to_path_buf();
+
+        // Two vendors, two files. Which one is decided by `--store`, else by
+        // which store's `credentials` map names the entry — and when neither
+        // does, by the historical default, so a recipe written before the
+        // second file existed keeps working and the note below still fires.
+        let names_it = |credentials: &std::collections::BTreeMap<String, String>| {
+            credentials.values().any(|entry| entry == &args.name)
+        };
+        let store = match args.store.as_deref() {
+            Some(store @ ("infisical" | "onepassword")) => store,
+            Some(other) => {
+                return fail(&format!(
+                    "`--store {other}` names no store with a credential file of its own; this \
+                     build has: infisical, onepassword"
+                ));
+            }
+            None => match (
+                names_it(&config.stores.infisical.credentials),
+                names_it(&config.stores.onepassword.credentials),
+            ) {
+                (false, true) => "onepassword",
+                (true, true) => {
+                    return fail(&format!(
+                        "both `stores.infisical.credentials` and `stores.onepassword.credentials` \
+                         name `{}`; pass --store to say which file it goes in",
+                        args.name
+                    ));
+                }
+                _ => "infisical",
+            },
+        };
+        let (path, declared) = if store == "onepassword" {
+            (
+                config.stores.onepassword.credentials_file.to_path_buf(),
+                &config.stores.onepassword.credentials,
+            )
+        } else {
+            (
+                config.stores.infisical.credentials_file.to_path_buf(),
+                &config.stores.infisical.credentials,
+            )
+        };
 
         // The one arrangement that makes writing this credential worse than not
         // writing it: everything in the file the `file` store serves is a name
@@ -309,7 +355,7 @@ mod daemon {
             return fail(&format!(
                 "{} is the file the `file` store serves, so anything written there is a name \
                  any attested client can ask for over the socket. Point \
-                 `stores.infisical.credentials_file` at a file of its own first",
+                 `stores.{store}.credentials_file` at a file of its own first",
                 path.display()
             ));
         }
@@ -364,16 +410,10 @@ mod daemon {
         // Said afterwards rather than refused beforehand: the file has to be
         // writable before a config can point at it, so writing an entry nothing
         // reads yet is a legitimate order to do this in.
-        if !config
-            .stores
-            .infisical
-            .credentials
-            .values()
-            .any(|entry| entry == &args.name)
-        {
+        if !names_it(declared) {
             let _ = writeln!(
                 io::stderr(),
-                "keylessd: nothing in `stores.infisical.credentials` names `{}`, so no lookup \
+                "keylessd: nothing in `stores.{store}.credentials` names `{}`, so no lookup \
                  will read it yet",
                 args.name
             );

@@ -244,6 +244,17 @@ const INFISICAL_HAS_NO_WRITER: &str = "this build writes through no Infisical ve
      from the process table for as long as the process lives — and the CLI offers no way to pass \
      one on stdin. Set it in the Infisical UI";
 
+/// Why 1Password has no manager identity here yet.
+///
+/// Unlike Infisical this is a gap rather than a refusal: measured against `op`
+/// 2.39.0, `op item create -` reads a JSON item template from stdin, which is
+/// exactly the shape a writer needs. It is listed under *Not built yet* in the
+/// README; until then the sentence names the vendor's own stdin form so nobody
+/// reaches for the assignment form, which puts the value in argv.
+const ONEPASSWORD_HAS_NO_WRITER: &str = "this build writes through no 1Password verb yet. Create the item in the 1Password app, \
+     or with `op item create --vault <VAULT> -` fed a JSON template on stdin — never with an \
+     assignment argument such as `password=<value>`, which is readable from the process table";
+
 /// The [`Manage`] implementation for a store id, or the reason there is none.
 ///
 /// # Errors
@@ -278,6 +289,10 @@ pub fn manager(
         "infisical" => Err(ManageError::NoIdentity {
             store: store.to_owned(),
             detail: INFISICAL_HAS_NO_WRITER.to_owned(),
+        }),
+        "onepassword" => Err(ManageError::NoIdentity {
+            store: store.to_owned(),
+            detail: ONEPASSWORD_HAS_NO_WRITER.to_owned(),
         }),
         other => Err(ManageError::NoIdentity {
             store: other.to_owned(),
@@ -397,6 +412,17 @@ mod tests {
             .map(|_| String::new())
             .unwrap_or_else(|error| error.to_string());
         assert!(error.contains("command-line argument"), "{error}");
+    }
+
+    #[test]
+    fn onepassword_says_it_has_no_writer_yet_and_names_the_stdin_form() {
+        // A gap rather than a refusal, and the sentence must send nobody to
+        // the assignment form — `password=<value>` is the CLI-flag shape.
+        let error = manager(&config_from("{}"), "onepassword", &Reason::default())
+            .map(|_| String::new())
+            .unwrap_or_else(|error| error.to_string());
+        assert!(error.contains("stdin"), "{error}");
+        assert!(error.contains("process table"), "{error}");
     }
 
     #[test]

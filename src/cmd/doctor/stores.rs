@@ -17,9 +17,10 @@ use crate::store::{Registry, Store};
 /// came to check. `"keychain": {"enabled": false}` in a config used to produce
 /// no line at all, which reads identically to a build that has no keychain
 /// support.
-const KNOWN_STORES: [&str; 4] = [
+const KNOWN_STORES: [&str; 5] = [
     "keychain",
     crate::store::infisical::STORE_ID,
+    crate::store::onepassword::STORE_ID,
     "proton",
     crate::store::daemon::DAEMON_STORE_ID,
 ];
@@ -83,9 +84,10 @@ pub(super) fn store_rows(config: &Config, registry: &Registry) -> Vec<StoreRow> 
 /// from the backend that answered — so it names the coordinates handed to the
 /// store, never coordinates the report established.
 ///
-/// For three of the four backends those are the same sentence: the keychain
-/// service, the Proton session directory and the daemon socket are each passed
-/// to the backend verbatim, so config is what the lookup used.
+/// For four of the five backends those are the same sentence: the keychain
+/// service, the 1Password vault, the Proton session directory and the daemon
+/// socket are each passed to the backend verbatim, so config is what the
+/// lookup used.
 ///
 /// Infisical is the one where that gap is load-bearing rather than pedantic.
 /// The adapter hands the vendor CLI this process's `HOME` and every
@@ -114,6 +116,19 @@ fn points_at(config: &Config, id: &str) -> String {
             Some(dir) => format!("session {}", dir.as_path().display()),
             None => "session directory unset".to_owned(),
         },
+        // The vault is the coordinate the health check named, verbatim, and
+        // the one this store is confined to. The account is stated when the
+        // config states it; otherwise the CLI chose, and the row says so.
+        "onepassword" => {
+            let vault = match &config.stores.onepassword.vault {
+                Some(vault) => format!("vault \"{vault}\""),
+                None => "vault unset".to_owned(),
+            };
+            match &config.stores.onepassword.account {
+                Some(account) => format!("{vault}, account {account}"),
+                None => format!("{vault}, account chosen by the CLI"),
+            }
+        }
         "daemon" => config.stores.daemon.socket_path().display().to_string(),
         // A backend this build does not have settings for. It answered, which
         // is the whole claim the row makes; inventing coordinates for it would
@@ -201,6 +216,12 @@ fn remedy(config: &Config, id: &str, error: &StoreError) -> String {
         "daemon" => "start `keylessd`, or set `stores.daemon.enabled` to false so \
                      this machine reads its own stores"
             .to_owned(),
+        // `op signin` is the vendor's own bootstrap and is idempotent; the
+        // account is the half that goes wrong on a machine with two of them.
+        "onepassword" => "`op signin`, then check `stores.onepassword.vault` names a vault \
+                          that login can see, and `stores.onepassword.account` when this \
+                          machine has more than one account"
+            .to_owned(),
         other => format!("check the settings for `stores.{other}`"),
     }
 }
@@ -246,6 +267,7 @@ fn dormant_row(config: &Config, id: &str) -> StoreRow {
     let enabled = match id {
         "keychain" => config.stores.keychain.enabled,
         "infisical" => config.stores.infisical.enabled,
+        "onepassword" => config.stores.onepassword.enabled,
         "proton" => config.stores.proton.enabled,
         // Not a backend this build has a flag for, and not in the registry
         // either. There is nothing here to have switched off.
@@ -488,12 +510,13 @@ mod tests {
         let enabled = dormant_rows(
             r#"{"stores":{"keychain":{"enabled":true},
                           "infisical":{"enabled":true},
+                          "onepassword":{"enabled":true},
                           "proton":{"enabled":true},
                           "daemon":{"enabled":false,
                                     "socket":"/nonexistent/keyless-doctor/daemon.sock"}},
                 "secrets":{}}"#,
         );
-        for id in ["keychain", "infisical", "proton"] {
+        for id in ["keychain", "infisical", "onepassword", "proton"] {
             assert_eq!(
                 detail_of(&enabled, id),
                 "enabled here, but this registry did not construct it",
@@ -555,6 +578,31 @@ mod tests {
             flat(&text).contains("enabled here, but this registry did not construct it"),
             "{text}"
         );
+    }
+
+    #[test]
+    fn a_proven_onepassword_row_names_the_vault_it_is_confined_to() {
+        // The vault is the whole point of this backend, so a green row that
+        // did not name it would certify the wrong thing: "1Password answered"
+        // is true of every vault the login can see, and this store reads one.
+        let load = loaded(
+            r#"{"stores":{"onepassword":{"enabled":true,"vault":"company","account":"demo"}},
+                "secrets":{}}"#,
+        );
+        let detail = points_at(&load.config, "onepassword");
+        assert!(detail.contains("vault \"company\""), "{detail}");
+        assert!(detail.contains("account demo"), "{detail}");
+
+        // With no account named, the row must not invent one: the CLI chose,
+        // and which one it chose is a fact this report never read.
+        let load = loaded(r#"{"stores":{"onepassword":{"enabled":true,"vault":"company"}}}"#);
+        let detail = points_at(&load.config, "onepassword");
+        assert!(detail.contains("chosen by the CLI"), "{detail}");
+
+        let action = remedy(&load.config, "onepassword", &unavailable("onepassword"));
+        assert!(action.contains("op signin"), "{action}");
+        assert!(action.contains("stores.onepassword.vault"), "{action}");
+        assert!(action.contains("stores.onepassword.account"), "{action}");
     }
 
     #[test]

@@ -18,13 +18,16 @@
 //!     "keychain": { "service": "keyless" },
 //!     "infisical": { "enabled": true },
 //!     "proton": { "enabled": true },
+//!     "onepassword": { "enabled": true, "vault": "company", "field": "password" },
 //!     "default": "keychain"
 //!   },
 //!   "secrets": {
 //!     "DATABASE_URL": { "store": "infisical", "env": "staging", "path": "/backend" },
 //!     "GITHUB_TOKEN": { "account": "demo-token", "service": "demo" },
 //!     "HOME_WIFI": { "store": "proton", "vault": "Personal", "item": "Router",
-//!                    "field": "password" }
+//!                    "field": "password" },
+//!     "STRIPE_KEY": { "store": "onepassword", "item": "demo api key",
+//!                     "field": "credential" }
 //!   }
 //! }
 //! ```
@@ -64,6 +67,9 @@ pub struct Stores {
     /// Proton Pass, via `pass-cli run`.
     #[serde(default)]
     pub proton: ProtonConfig,
+    /// 1Password, via `op run`, pinned to ONE vault.
+    #[serde(default)]
+    pub onepassword: OnePasswordConfig,
     /// How an unpinned name chooses a backend. See [`Policy`].
     #[serde(default)]
     pub policy: Policy,
@@ -78,7 +84,7 @@ pub struct Stores {
     /// `keylessd`, across the uid boundary.
     ///
     /// When this is enabled, **every local backend above is suppressed** —
-    /// keychain, Infisical and Proton alike — whatever their own `enabled`
+    /// keychain, Infisical, 1Password and Proton alike — whatever their own `enabled`
     /// flags say, and per-name `store` pins are dropped. See
     /// [`crate::store::build`] for why that is a rule rather than a default.
     #[serde(default)]
@@ -431,6 +437,102 @@ impl Default for ProtonManagerConfig {
     }
 }
 
+/// 1Password settings.
+///
+/// As with the other two vault backends, the login is the CLI's: `op` finds it
+/// through the desktop app's integration, through an `OP_SESSION_*` variable a
+/// plain `op signin` exported, or through an `OP_SERVICE_ACCOUNT_TOKEN` in its
+/// environment. `keyless` reads none of those and has no field for one.
+///
+/// What there IS a field for is **which vault**, and it is the whole point of
+/// this backend. See [`OnePasswordConfig::vault`].
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct OnePasswordConfig {
+    /// Path to, or name of, the `op` binary.
+    #[serde(default = "default_onepassword_binary")]
+    pub binary: ConfigPath,
+    /// **The one vault this store reads, and it has no default.**
+    ///
+    /// Every lookup this backend makes is `op://<this vault>/<item>/<field>`,
+    /// and a name whose own `vault` says anything else is refused before
+    /// anything is spawned — so the set of vaults `keyless` can reach through
+    /// this store is exactly one, written down here, whatever the login behind
+    /// it can see.
+    ///
+    /// Absent, every lookup degrades and says so. Defaulting it — to the
+    /// account's first vault, say, or to "whichever vault holds the title" —
+    /// would make the vault a name resolves against invisible at the point of
+    /// use, which is the hazard [`InfisicalConfig::env`] documents at length.
+    ///
+    /// **Locally this is an allowlist, not a boundary.** A session that can run
+    /// `keyless` can run `op read` against any vault its login sees; see
+    /// [`crate::store::onepassword`] for the identity that turns the allowlist
+    /// into a boundary, and [`crate::daemon::config`] for where it lives.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vault: Option<String>,
+    /// Which 1Password account answers, as `--account`.
+    ///
+    /// The CLI accepts a sign-in address, an account id or a user id here.
+    /// Absent, the CLI picks the account most recently signed in to — and on a
+    /// machine with two accounts and no sign-in it refuses every call with
+    /// `multiple accounts found`, measured against `op` 2.39.0. Name it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account: Option<String>,
+    /// The field a name reads when its own entry declares none.
+    ///
+    /// Not defaulted by `keyless`. A 1Password item has several fields and
+    /// which one is the credential depends on the category — `password` on a
+    /// Login or Password item, `credential` on an API Credential — so a guess
+    /// would resolve a name to the wrong field of the right item, which is a
+    /// value that looks real and is not. Set it here when every item in the
+    /// vault has the same shape; otherwise put `field` on each name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub field: Option<String>,
+    /// The CLI's own configuration directory, as `--config`.
+    ///
+    /// Where `op` keeps its account list and its cache socket. A session never
+    /// needs this — the CLI defaults to the calling user's own — and it exists
+    /// for a process whose home directory is not one the CLI can write to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config_dir: Option<ConfigPath>,
+    /// How long one lookup may take before it degrades the run.
+    #[serde(default = "default_timeout_ms")]
+    pub timeout_ms: u64,
+    /// How long one vault listing may be reused before it is fetched again, in
+    /// milliseconds.
+    ///
+    /// The same bound, for the same reason, as
+    /// [`ProtonConfig::listing_ttl_ms`]: the listing is what tells this adapter
+    /// an item exists, is not archived and has exactly one owner of its title,
+    /// and a listing kept past the moment somebody archived an item resolves
+    /// that item as if it were live. Clamped to
+    /// [`crate::store::proton::MAX_LISTING_TTL_MS`].
+    #[serde(default = "default_listing_ttl_ms")]
+    pub listing_ttl_ms: u64,
+    /// The helper that reads one variable out of the child environment.
+    #[serde(default = "default_probe_binary")]
+    pub probe_binary: ConfigPath,
+    /// Set false to take the backend out of the search order.
+    #[serde(default)]
+    pub enabled: bool,
+}
+
+impl Default for OnePasswordConfig {
+    fn default() -> Self {
+        OnePasswordConfig {
+            binary: default_onepassword_binary(),
+            vault: None,
+            account: None,
+            field: None,
+            config_dir: None,
+            timeout_ms: default_timeout_ms(),
+            listing_ttl_ms: default_listing_ttl_ms(),
+            probe_binary: default_probe_binary(),
+            enabled: false,
+        }
+    }
+}
+
 /// Where one name lives, when the defaults are not right.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct SecretRoute {
@@ -478,17 +580,37 @@ pub struct SecretRoute {
     ///
     /// Names are what a person types and what stays true; the ids underneath
     /// them are minted per session. See [`crate::store::proton`].
+    ///
+    /// For 1Password the vault is pinned once, in
+    /// [`OnePasswordConfig::vault`], and this field may only agree with it: a
+    /// name that says otherwise is refused, because the whole point of that
+    /// store is that no config entry can widen the set of vaults it reads.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vault: Option<String>,
     /// Proton Pass item TITLE, matched exactly within [`SecretRoute::vault`].
+    ///
+    /// For 1Password, the item's title or its id within the pinned vault.
+    /// Defaults to the name itself there and nowhere else: the vault is already
+    /// fixed by the store, so the title is the only coordinate left to guess
+    /// and guessing it costs a listing, never a read of the wrong item.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub item: Option<String>,
     /// Which field of that item holds the value, e.g. `password`.
     ///
-    /// Never defaulted. Guessing a field would send a read — and a permanent,
-    /// off-machine audit entry — to something nobody asked for.
+    /// Never defaulted by `keyless`. Guessing a field would send a read — and a
+    /// permanent, off-machine audit entry — to something nobody asked for. For
+    /// 1Password an operator may name a store-wide one in
+    /// [`OnePasswordConfig::field`]; that is a statement, not a guess.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub field: Option<String>,
+    /// The 1Password SECTION the field sits in, when it is not top-level.
+    ///
+    /// A custom field somebody added to an item lives in a section, and the
+    /// vendor addresses it as `op://vault/item/section/field`. Named separately
+    /// rather than smuggled into `field` with a `/`, so a field whose label
+    /// happens to contain one cannot silently become a different address.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub section: Option<String>,
     /// Proton Pass reference, `pass://SHARE_ID/ITEM_ID/FIELD`.
     ///
     /// The id form. It still works and it still pins exactly one item, which is
@@ -592,6 +714,12 @@ fn default_proton_binary() -> ConfigPath {
     ConfigPath::from("pass-cli")
 }
 
+/// The vendor's own binary name. `pub(crate)` so the daemon's config defaults
+/// to the same spelling rather than a second literal that can drift.
+pub(crate) fn default_onepassword_binary() -> ConfigPath {
+    ConfigPath::from("op")
+}
+
 /// Ten seconds per lookup.
 ///
 /// Long enough that a cold CLI start, a TLS handshake and a token refresh all
@@ -618,7 +746,10 @@ pub const DEFAULT_TIMEOUT_MS: u64 = 10_000;
 /// Sixty seconds is also what [`crate::daemon`] gives its own resolved-value
 /// cache, so the two staleness windows a name can sit behind are one number
 /// rather than two that drift apart.
-fn default_listing_ttl_ms() -> u64 {
+///
+/// `pub(crate)` because the 1Password adapter is hosted by the daemon too, and
+/// its config there must default the same window a session does.
+pub(crate) fn default_listing_ttl_ms() -> u64 {
     60_000
 }
 
@@ -879,6 +1010,42 @@ mod tests {
         );
         // The vendor's own default, and the only coordinate still defaulted.
         assert_eq!(parsed.stores.infisical.path, "/");
+    }
+
+    #[test]
+    fn the_onepassword_store_is_off_and_names_no_vault_until_asked() {
+        // Off by default, like the other two vault backends: a keychain-only
+        // setup must not start paying a process spawn per lookup. And no
+        // vault, because a defaulted vault is a vault a name resolves against
+        // invisibly — the same hazard as a defaulted Infisical environment.
+        let config = Config::default();
+        assert!(!config.stores.onepassword.enabled);
+        assert!(config.stores.onepassword.vault.is_none());
+        assert!(config.stores.onepassword.field.is_none());
+        assert_eq!(config.stores.onepassword.binary.as_path(), Path::new("op"));
+
+        let parsed: Config = serde_json::from_str(
+            r#"{"stores":{"onepassword":{"enabled":true,"vault":"company",
+                                         "account":"demo","field":"password"}}}"#,
+        )
+        .expect("valid config");
+        assert!(parsed.stores.onepassword.enabled);
+        assert_eq!(parsed.stores.onepassword.vault.as_deref(), Some("company"));
+        assert_eq!(parsed.stores.onepassword.account.as_deref(), Some("demo"));
+        assert_eq!(parsed.stores.onepassword.field.as_deref(), Some("password"));
+    }
+
+    #[test]
+    fn a_name_can_say_which_section_its_field_sits_in() {
+        let parsed: Config = serde_json::from_str(
+            r#"{"secrets":{"A":{"item":"demo api key","section":"other","field":"api key"}}}"#,
+        )
+        .expect("valid config");
+        let route = parsed.route("A");
+        assert_eq!(route.section.as_deref(), Some("other"));
+        // A section is a coordinate, and a coordinate says nothing about which
+        // variable a program reads.
+        assert!(route.aliases("A").is_empty());
     }
 
     #[test]

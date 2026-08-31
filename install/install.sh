@@ -271,11 +271,12 @@ note "The audit log. 0640: you read it, you cannot write it. That asymmetry
 # is what the hash chain needs in order to mean anything."
 place_state_file 0640 "$LOG_DIR/audit.jsonl"
 
-note "The daemon's own vendor login. 0600, its own file, and EMPTY on a first
-# install: this script never asks you for a credential and never holds one. See
-# the Infisical step at the end for how the value gets in without passing
-# through a command line."
+note "The daemon's own vendor logins. 0600, one file per vendor, and EMPTY on a
+# first install: this script never asks you for a credential and never holds
+# one. See the Infisical and 1Password steps at the end for how a value gets in
+# without passing through a command line."
 place_state_file 0600 "$LIB_DIR/infisical.json"
+place_state_file 0600 "$LIB_DIR/onepassword.json"
 
 # --- the policy ------------------------------------------------------------
 
@@ -471,6 +472,54 @@ cat <<'NEXT'
 # that safe, which is why `keylessd check` verifies both rather than merely
 # checking the file is there — and reads what is in it, because an empty file
 # has exactly that mode and that owner and holds no login at all.
+#
+# ---------------------------------------------------------------------------
+# OPTIONAL: serve names out of ONE 1Password vault as well
+# ---------------------------------------------------------------------------
+#
+# Skip all of this if you do not use 1Password. Nothing above depends on it.
+#
+# This is the arrangement that makes "one vault and no other" a boundary rather
+# than a config line. Create a SERVICE ACCOUNT at the vendor with read access to
+# exactly the vault the daemon may read — `op service-account create <name>
+# --vault <VAULT>:read_items` prints the token once, and the vendor refuses that
+# token every other vault. The token then lives in the daemon's own 0600 file,
+# and the socket carries names and values but never the token.
+#
+# a. Add the store to /usr/local/etc/keyless/keylessd.json. Coordinates only;
+#    there is no field in this file a credential fits in:
+#
+#      "onepassword": {
+#        "enabled": true,
+#        "binary": "/absolute/path/to/op",
+#        "vault": "<the one vault>",
+#        "field": "password",
+#        "config_dir": "/usr/local/var/lib/keyless/op",
+#        "credentials_file": "/usr/local/var/lib/keyless/onepassword.json",
+#        "credentials": { "OP_SERVICE_ACCOUNT_TOKEN": "SERVICE_ACCOUNT" }
+#      }
+#
+#    "vault" is required and is never defaulted: it is the whole point.
+#    "field" is the field a name reads when its own entry names none — set it
+#    when every item in the vault has the same shape, leave it out otherwise.
+#    "config_dir" names a directory the daemon's uid can write, because the
+#    vendor keeps an account list and a cache socket there and a daemon's home
+#    may not be writable; create it owned by the daemon.
+#
+#    Each name is an item in that vault, by title:
+#
+#      "secrets": { "STRIPE_KEY": { "store": "onepassword", "item": "<title>",
+#                                   "field": "credential" } }
+#
+# b. Put the token in the daemon's own file. Prompts, echoes nothing, takes no
+#    value on the command line:
+#
+#      sudo keylessd credential --store onepassword --name SERVICE_ACCOUNT
+#
+# c. Check it. `identity` reports the file's mode and owner, and the
+#    `store onepassword` row is the vendor accepting the token for THAT vault:
+#
+#      keylessd check --config /usr/local/etc/keyless/keylessd.json
 #
 NEXT
 
