@@ -237,7 +237,24 @@ the copy is not revoking the credential.
 
 The allowlist holds the **code hash** of the `keyless` binary. Rebuilding it
 changes that hash, so an upgrade that replaces the binary without updating the
-config produces a daemon that refuses its own client:
+config produces a daemon that refuses its own client.
+
+Re-running the installer is the ordinary way to upgrade, and it is safe to run
+as many times as you like. It never writes over `secrets.json`, `audit.jsonl` or
+`infisical.json` — an existing file keeps its contents and has only its mode and
+owner re-asserted — and it never rewrites `keylessd.json`, because the template
+it renders has no `infisical` block and no `secrets` block and would delete
+yours. What it does instead is print the new hash and stop, leaving one thing
+for you:
+
+```console
+$ sudo ./install/install.sh --commit
+# it prints: ACTION REQUIRED ... <hash>
+# put that hash in peer.allow_images, then:
+$ sudo launchctl kickstart -k system/sh.keyless.keylessd
+```
+
+By hand, if you would rather not run the script at all:
 
 ```console
 $ sudo cp target/release/keyless /usr/local/bin/keyless

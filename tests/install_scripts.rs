@@ -16,14 +16,23 @@
 //! on a machine that no longer has a daemon to use it, and nothing anywhere
 //! says so. That is the case this file exists for.
 //!
-//! # Why the scripts are not executed
+//! # Why most of this reads text, and one part does not
 //!
-//! They create users, load launchd jobs and write under `/usr/local`. There is
-//! no scratch prefix that makes those reversible, and a test suite that runs
-//! them is a test suite that changes the machine it is checked on. So what is
-//! asserted is the TEXT of the command each script will run, which is exactly
-//! what the dry run prints and exactly what `--commit` executes — the two are
-//! the same list by construction of `step`.
+//! The scripts create users, load launchd jobs and write under `/usr/local`.
+//! There is no scratch prefix that makes those reversible, and a test suite
+//! that runs them is a test suite that changes the machine it is checked on. So
+//! for those, what is asserted is the TEXT of the command each script will run,
+//! which is exactly what the dry run prints and exactly what `--commit`
+//! executes — the two are the same list by construction of `step`.
+//!
+//! Text is not enough for one question, and it is the question that decides
+//! whether an operator loses data. `install -m 0600 /dev/null <dest>` reads as
+//! "create the file" and is a copy, which over an existing file truncates it;
+//! `printf ... > <dest>` reads as "write the config" and over an existing
+//! config deletes the blocks somebody hand-added. Both are indistinguishable
+//! from their safe forms by reading. Those two blocks are therefore LIFTED OUT
+//! OF THE SCRIPT VERBATIM and executed against a scratch directory, with `step`
+//! and `chown` stubbed and nothing else changed — see [`block`].
 
 // `DaemonConfig` is macOS-only, like the daemon it configures. Off macOS this
 // file compiles to nothing and reports no tests — absent rather than ignored,
@@ -72,11 +81,11 @@ fn the_installer_creates_the_file_the_daemon_will_open_and_shuts_it_to_everyone_
 
     // The whole command, not the path alone: `0600` and the daemon's ownership
     // are the boundary this credential has, and a line that created the right
-    // path at the wrong mode would satisfy a path-only assertion.
-    let expected = format!(
-        r#"step install -m 0600 -o "$DAEMON_USER" -g "$ACCESS_GROUP" /dev/null "$LIB_DIR/{}""#,
-        file_name(&path)
-    );
+    // path at the wrong mode would satisfy a path-only assertion. The mode
+    // travels with the call rather than with the `install` line, because the
+    // call is what a reader has to check; that the helper honours it is
+    // asserted by executing the helper, below.
+    let expected = format!(r#"place_state_file 0600 "$LIB_DIR/{}""#, file_name(&path));
     assert!(
         script.contains(&expected),
         "install/install.sh does not create the daemon's credential file at {path} \
@@ -184,6 +193,223 @@ fn neither_script_can_carry_a_credential_of_its_own() {
             );
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// The half that cannot be read off the text: what the commands actually DO
+// ---------------------------------------------------------------------------
+//
+// `install -m 0600 /dev/null <dest>` reads as "create the file". It is a COPY,
+// and a copy over an existing file truncates it — silently, exit 0. No
+// assertion over the script's text can tell those two apart, because the text
+// is identical either way. So the two pieces of the installer that decide
+// whether an operator's data survives a second run are LIFTED OUT AND RUN, in
+// a scratch directory, with `step` and `chown` stubbed and nothing else
+// changed. What executes is the script's own bytes.
+//
+// This is not the whole commit path and cannot be: the rest of it creates a
+// user, edits a group and loads a launchd job, none of which has a scratch
+// form. What is covered is exactly the part that can destroy something.
+
+/// One block of the installer, lifted out verbatim so it can be executed.
+///
+/// `opens` is matched against the whole line, and everything up to and
+/// including the first line equal to `closes` comes with it. Both markers are
+/// at column zero in the script, which is what makes the match unambiguous
+/// while the block's own nested `fi`s and `}`s are indented.
+fn block(script: &str, opens: &str, closes: &str) -> String {
+    let mut lines = script.lines().skip_while(|line| *line != opens).peekable();
+    assert!(
+        lines.peek().is_some(),
+        "install/install.sh no longer has a line reading `{opens}`, so the test below is \
+         executing nothing. Re-point it rather than deleting it."
+    );
+    let mut out = String::new();
+    for line in lines {
+        out.push_str(line);
+        out.push('\n');
+        if line == closes {
+            return out;
+        }
+    }
+    panic!("the block opened by `{opens}` is never closed by a line reading `{closes}`");
+}
+
+fn scratch(tag: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!(
+        "keyless-install-{tag}-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("scratch");
+    dir
+}
+
+/// Run a shell program and return its stdout, insisting it exited 0.
+fn bash(program: &str) -> String {
+    let out = std::process::Command::new("bash")
+        .arg("-c")
+        .arg(program)
+        .output()
+        .expect("bash");
+    assert!(
+        out.status.success(),
+        "the lifted block failed: {}\n--- program ---\n{program}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+fn mode_of(path: &std::path::Path) -> u32 {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path).expect("stat").permissions().mode() & 0o7777
+}
+
+/// The preamble every lifted block needs: `step` runs the command it is given,
+/// which is what `--commit` does, and the daemon's account is this one so the
+/// ownership calls are real rather than skipped.
+fn preamble(dir: &std::path::Path) -> String {
+    format!(
+        "set -euo pipefail\n\
+         DAEMON_USER=\"$(id -un)\"\n\
+         ACCESS_GROUP=\"$(id -gn)\"\n\
+         COMMIT=1\n\
+         CONF_DIR={dir:?}\n\
+         step() {{ \"$@\"; }}\n\
+         chown() {{ command chown \"$@\" || true; }}\n"
+    )
+}
+
+#[test]
+fn a_second_install_does_not_empty_the_files_the_first_one_left_behind() {
+    // The measured defect: 23 bytes in, 0 bytes out, exit 0, nothing printed.
+    // Every path here holds something that has no other copy — the migrated
+    // store, the append-only record, and a credential whose only other home is
+    // the vendor.
+    let dir = scratch("survive");
+    let helper = block(&installer(), "place_state_file() {", "}");
+
+    let placed = [
+        (
+            "secrets.json",
+            0o600,
+            r#"{"DECOY":"decoy-survives-a-rerun-0031"}"#,
+        ),
+        ("audit.jsonl", 0o640, "{\"row\":1}\n{\"row\":2}\n"),
+        (
+            "infisical.json",
+            0o600,
+            r#"{"MACHINE_IDENTITY":"decoy-identity-0031"}"#,
+        ),
+    ];
+    for (name, _, body) in placed {
+        std::fs::write(dir.join(name), body).expect("seed");
+    }
+    // Widened on purpose. A re-run must repair the boundary while leaving the
+    // contents alone; those are two different operations and only one of them
+    // is destructive.
+    std::fs::set_permissions(
+        dir.join("secrets.json"),
+        <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o644),
+    )
+    .expect("widen");
+
+    bash(&format!(
+        "{}{helper}\n\
+         place_state_file 0600 {dir:?}/secrets.json\n\
+         place_state_file 0640 {dir:?}/audit.jsonl\n\
+         place_state_file 0600 {dir:?}/infisical.json\n",
+        preamble(&dir)
+    ));
+
+    for (name, mode, body) in placed {
+        let path = dir.join(name);
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read"),
+            body,
+            "the installer emptied {name} on a second run"
+        );
+        assert_eq!(
+            mode_of(&path),
+            mode,
+            "{name} is not shut back to {mode:04o}"
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_first_install_still_creates_each_file_empty_and_shut() {
+    // The other half, and the reason the fix is not simply "never touch it":
+    // on a machine with nothing there, these files still have to appear, at the
+    // mode that is the whole boundary.
+    let dir = scratch("create");
+    let helper = block(&installer(), "place_state_file() {", "}");
+
+    bash(&format!(
+        "{}{helper}\n\
+         place_state_file 0600 {dir:?}/secrets.json\n\
+         place_state_file 0640 {dir:?}/audit.jsonl\n",
+        preamble(&dir)
+    ));
+
+    for (name, mode) in [("secrets.json", 0o600), ("audit.jsonl", 0o640)] {
+        let path = dir.join(name);
+        assert_eq!(std::fs::read(&path).expect("read").len(), 0, "{name}");
+        assert_eq!(mode_of(&path), mode, "{name}");
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn an_existing_config_is_left_alone_and_the_new_pin_is_printed_instead() {
+    // The template this script renders has no `infisical` block and no
+    // `secrets` block, and the script's own closing instructions are what tell
+    // an operator to add them. Writing the template over a config that has them
+    // deletes the Infisical store entirely, and the daemon that comes back up
+    // reports no fault at all.
+    let dir = scratch("config");
+    let conf = dir.join("keylessd.json");
+    let kept = r#"{"stores":{"infisical":{"enabled":true}},"peer":{"allow_images":["aa11"]}}"#;
+    std::fs::write(&conf, kept).expect("seed");
+
+    let region = block(&installer(), r#"CONF_FILE="$CONF_DIR/keylessd.json""#, "fi");
+    let program = format!(
+        "{}CLIENT_HASH=bb22\nCONFIG_JSON='{{\"template\":true}}'\n{region}",
+        preamble(&dir)
+    );
+    let said = bash(&program);
+
+    assert_eq!(
+        std::fs::read_to_string(&conf).expect("read"),
+        kept,
+        "the installer overwrote a config it did not write"
+    );
+    assert!(
+        said.contains("ACTION REQUIRED") && said.contains("bb22"),
+        "a config that does not pin the client just installed was left stale in \
+         silence: {said}"
+    );
+
+    // And when the existing config already pins that client there is nothing to
+    // do, which must not read the same as the case above.
+    std::fs::write(&conf, r#"{"peer":{"allow_images":["bb22"]}}"#).expect("seed");
+    let said = bash(&program);
+    assert!(!said.contains("ACTION REQUIRED"), "{said}");
+
+    // With nothing there, the template is still written. Without this the
+    // assertions above are satisfied by a script that writes no config ever.
+    std::fs::remove_file(&conf).expect("remove");
+    bash(&program);
+    assert_eq!(
+        std::fs::read_to_string(&conf).expect("read").trim(),
+        r#"{"template":true}"#
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// The last component of a path, for building the uninstaller's own spelling.

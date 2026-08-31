@@ -238,18 +238,44 @@ step install -d -m 0755 -o "$DAEMON_USER" -g "$ACCESS_GROUP" "$RUN_DIR"
 step install -d -m 0755 -o "$DAEMON_USER" -g "$ACCESS_GROUP" "$LOG_DIR"
 step install -d -m 0700 -o "$DAEMON_USER" -g "$ACCESS_GROUP" "$LIB_DIR"
 
+# --- state files, placed without ever destroying what is already there -----
+#
+# `install -m 0600 /dev/null <dest>` is NOT "create if missing". It is a COPY,
+# and a copy over an existing file TRUNCATES it: a store full of migrated
+# credentials becomes a zero-byte file, exit 0, nothing printed. This script
+# offers a dry run precisely so it gets read and then re-run, and the paths
+# below hold the only copy of things nobody can get back — so the destructive
+# form is not a hazard this script may carry.
+#
+# What re-running still does is re-assert the two facts that ARE the boundary:
+# the mode and the owner. `chmod` and `chown` change neither the contents nor
+# the inode, so an editor that widened the store or a `cp` that left it owned
+# by whoever typed sudo is repaired by the same command that is safe to run on
+# a file with everything in it.
+place_state_file() {
+  local mode="$1" dest="$2"
+  if [[ -e "$dest" ]]; then
+    printf '# %s already exists. Its contents are left alone; only its mode and owner are re-asserted.\n' "$dest"
+    step chmod "$mode" "$dest"
+    step chown "$DAEMON_USER:$ACCESS_GROUP" "$dest"
+  else
+    step install -m "$mode" -o "$DAEMON_USER" -g "$ACCESS_GROUP" /dev/null "$dest"
+  fi
+}
+
 note "The store. 0600 under the daemon's uid: unreadable by you, by every
 # session you start, and by every subagent any of them spawns."
-step install -m 0600 -o "$DAEMON_USER" -g "$ACCESS_GROUP" /dev/null "$LIB_DIR/secrets.json"
+place_state_file 0600 "$LIB_DIR/secrets.json"
 
 note "The audit log. 0640: you read it, you cannot write it. That asymmetry
 # is what the hash chain needs in order to mean anything."
-step install -m 0640 -o "$DAEMON_USER" -g "$ACCESS_GROUP" /dev/null "$LOG_DIR/audit.jsonl"
+place_state_file 0640 "$LOG_DIR/audit.jsonl"
 
-note "The daemon's own vendor login. 0600, its own file, and EMPTY: this script
-# never asks you for a credential and never holds one. See the Infisical step at
-# the end for how the value gets in without passing through a command line."
-step install -m 0600 -o "$DAEMON_USER" -g "$ACCESS_GROUP" /dev/null "$LIB_DIR/infisical.json"
+note "The daemon's own vendor login. 0600, its own file, and EMPTY on a first
+# install: this script never asks you for a credential and never holds one. See
+# the Infisical step at the end for how the value gets in without passing
+# through a command line."
+place_state_file 0600 "$LIB_DIR/infisical.json"
 
 # --- the policy ------------------------------------------------------------
 
@@ -282,12 +308,55 @@ JSON
 
 note "The daemon's config. World-readable on purpose: it holds a policy, never
 # a credential, and you should be able to read what is authorising what."
+
+# ---------------------------------------------------------------------------
+# AN EXISTING CONFIG IS NEVER REWRITTEN, AND THE REFUSAL IS NOT LAZINESS
+# ---------------------------------------------------------------------------
+#
+# The template above has no "infisical" block and no "secrets" block. Those are
+# hand-added — this script's own closing instructions are what tell an operator
+# to add them — so writing the template over a config that has them deletes
+# exactly the work the script asked for, and the daemon that comes back up
+# serves a strictly smaller set of names while reporting no fault.
+#
+# Three ways out were available. Merging is the one that looks best and is the
+# worst: a merge has to decide, per key, whether a difference is the operator's
+# edit or this script's newer default, and it would have to make that decision
+# in shell, over JSON, on a machine where `jq` may not exist. A merge that gets
+# it wrong is a config that nobody wrote and everybody believes. Writing only
+# when absent is safe and silently strands the ONE field that legitimately
+# changes on a re-run — the pinned image hash, which a rebuilt `keyless`
+# invalidates and which, left stale, makes the daemon refuse its own client.
+#
+# So: refuse, and report the one thing the operator now has to do by hand. The
+# hash is printed here, where somebody is standing, rather than discovered
+# later as every request being denied.
+CONF_FILE="$CONF_DIR/keylessd.json"
 if [[ $COMMIT -eq 1 ]]; then
-  printf '%s\n' "$CONFIG_JSON" > "$CONF_DIR/keylessd.json"
-  chmod 0644 "$CONF_DIR/keylessd.json"
-  chown root:wheel "$CONF_DIR/keylessd.json"
+  if [[ -e "$CONF_FILE" ]]; then
+    printf '# %s already exists and was NOT rewritten. It may carry `infisical`\n' "$CONF_FILE"
+    printf '# and `secrets` blocks this installer has no template for.\n'
+    if grep -qF -- "$CLIENT_HASH" "$CONF_FILE"; then
+      printf '# It already pins the client just installed. Nothing to do.\n'
+    else
+      printf '#\n'
+      printf '# ACTION REQUIRED: it does NOT pin the client just installed, so the daemon\n'
+      printf '# will refuse every request from it. Put this hash in peer.allow_images:\n'
+      printf '#\n'
+      printf '#   %s\n' "$CLIENT_HASH"
+      printf '#\n'
+      printf '# then: sudo launchctl kickstart -k system/sh.keyless.keylessd\n'
+    fi
+  else
+    printf '%s\n' "$CONFIG_JSON" > "$CONF_FILE"
+    chmod 0644 "$CONF_FILE"
+    chown root:wheel "$CONF_FILE"
+  fi
+elif [[ -e "$CONF_FILE" ]]; then
+  printf '  %s already exists; it would NOT be rewritten. The new pin would be\n' "$CONF_FILE"
+  printf '  printed for you to place in peer.allow_images by hand.\n'
 else
-  printf '  write %s:\n' "$CONF_DIR/keylessd.json"
+  printf '  write %s:\n' "$CONF_FILE"
   printf '%s\n' "$CONFIG_JSON" | sed 's/^/    /'
 fi
 
