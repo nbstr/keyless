@@ -145,7 +145,7 @@ const CLASSIFIED: &[(u64, &str)] = &[
     ),
     (
         300,
-        "tests/stores.rs — the deadline IS the subject: two fixtures assert the \
+        "tests/stores.rs — the deadline IS the subject: three fixtures assert the \
          wording of `no answer within 300 ms` against a stub that sleeps.",
     ),
     (
@@ -256,7 +256,7 @@ fn every_fixture_deadline_is_classified() {
 /// spot: it is enabled by DEFAULT, so a fixture that spawns the `security` stub
 /// need write nothing at all, and there is no token here to find. Closing that
 /// needs a different mechanism than a source scan.
-const SPAWNING_STORES: &[&str] = &["infisical", "proton"];
+const SPAWNING_STORES: &[&str] = &["infisical", "onepassword", "proton"];
 
 #[test]
 fn a_fixture_that_spawns_a_vendor_cli_names_its_deadline() {

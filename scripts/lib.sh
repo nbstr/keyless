@@ -130,7 +130,7 @@ target_dir() {
   echo "${CARGO_TARGET_DIR:-target}"
 }
 
-# vendorless_path -- a PATH that cannot reach `infisical` or `pass-cli`.
+# vendorless_path -- a PATH that cannot reach `infisical`, `pass-cli` or `op`.
 #
 # Built once per gate run and cached in GATE_LOG_DIR. See
 # scripts/vendorless_path.py for why this is manufactured rather than observed.

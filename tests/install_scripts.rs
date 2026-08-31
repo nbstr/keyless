@@ -62,69 +62,86 @@ fn read(relative: &str) -> String {
         .unwrap_or_else(|error| panic!("cannot read {}: {error}", path.display()))
 }
 
-/// The path the daemon will actually open, read from the config's own default.
-fn credential_path() -> String {
+/// The paths the daemon will actually open, read from the config's own
+/// defaults — one per vendor it carries a login for.
+///
+/// Both, rather than one: a second vendor's file added to the config and to
+/// neither script is exactly the drift the module header describes, arriving
+/// through a file this test used to know nothing about.
+fn credential_paths() -> Vec<String> {
     let config: DaemonConfig = serde_json::from_str("{}").expect("an empty config is a valid one");
-    config
-        .stores
-        .infisical
-        .credentials_file
-        .to_path_buf()
-        .display()
-        .to_string()
+    vec![
+        config
+            .stores
+            .infisical
+            .credentials_file
+            .to_path_buf()
+            .display()
+            .to_string(),
+        config
+            .stores
+            .onepassword
+            .credentials_file
+            .to_path_buf()
+            .display()
+            .to_string(),
+    ]
 }
 
 #[test]
-fn the_installer_creates_the_file_the_daemon_will_open_and_shuts_it_to_everyone_else() {
-    let path = credential_path();
+fn the_installer_creates_the_files_the_daemon_will_open_and_shuts_them_to_everyone_else() {
     let script = installer();
-
-    // The whole command, not the path alone: `0600` and the daemon's ownership
-    // are the boundary this credential has, and a line that created the right
-    // path at the wrong mode would satisfy a path-only assertion. The mode
-    // travels with the call rather than with the `install` line, because the
-    // call is what a reader has to check; that the helper honours it is
-    // asserted by executing the helper, below.
-    let expected = format!(r#"place_state_file 0600 "$LIB_DIR/{}""#, file_name(&path));
-    assert!(
-        script.contains(&expected),
-        "install/install.sh does not create the daemon's credential file at {path} \
-         with mode 0600 owned by the daemon. Expected this line:\n  {expected}"
-    );
-    // And its own `LIB_DIR` is the directory the config names, or the line
-    // above creates a path that agrees with nothing.
-    assert!(
-        script.contains(&format!(
-            r#"LIB_DIR="{}""#,
-            path.rsplit_once('/').expect("an absolute path").0
-        )),
-        "install/install.sh's LIB_DIR is not the directory {path} is in"
-    );
+    for path in credential_paths() {
+        // The whole command, not the path alone: `0600` and the daemon's
+        // ownership are the boundary this credential has, and a line that
+        // created the right path at the wrong mode would satisfy a path-only
+        // assertion. The mode travels with the call rather than with the
+        // `install` line, because the call is what a reader has to check; that
+        // the helper honours it is asserted by executing the helper, below.
+        let expected = format!(r#"place_state_file 0600 "$LIB_DIR/{}""#, file_name(&path));
+        assert!(
+            script.contains(&expected),
+            "install/install.sh does not create the daemon's credential file at {path} \
+             with mode 0600 owned by the daemon. Expected this line:
+  {expected}"
+        );
+        // And its own `LIB_DIR` is the directory the config names, or the line
+        // above creates a path that agrees with nothing.
+        assert!(
+            script.contains(&format!(
+                r#"LIB_DIR="{}""#,
+                path.rsplit_once('/').expect("an absolute path").0
+            )),
+            "install/install.sh's LIB_DIR is not the directory {path} is in"
+        );
+    }
 }
 
 #[test]
-fn the_uninstaller_removes_it() {
+fn the_uninstaller_removes_them() {
     // The asymmetry with the secrets store beside it is deliberate and is
-    // argued in the script: the store may be somebody's only copy, this file
-    // never is, and a long-lived credential left on a machine with no daemon
+    // argued in the script: the store may be somebody's only copy, these files
+    // never are, and a long-lived credential left on a machine with no daemon
     // to use it is a landmine with no upside.
-    let path = credential_path();
     let script = uninstaller();
-    let expected = format!(r#"step rm -f "$LIB_DIR/{}""#, file_name(&path));
-    assert!(
-        script.contains(&expected),
-        "install/uninstall.sh does not remove the daemon's credential file at {path}. \
-         Expected this line:\n  {expected}"
-    );
-    // And the directory the script's own variable stands for is the one the
-    // config names, or the line above deletes a path that agrees with nothing.
-    assert!(
-        script.contains(&format!(
-            r#"LIB_DIR="{}""#,
-            path.rsplit_once('/').expect("an absolute path").0
-        )),
-        "install/uninstall.sh's LIB_DIR is not the directory {path} is in"
-    );
+    for path in credential_paths() {
+        let expected = format!(r#"step rm -f "$LIB_DIR/{}""#, file_name(&path));
+        assert!(
+            script.contains(&expected),
+            "install/uninstall.sh does not remove the daemon's credential file at {path}. \
+             Expected this line:\n  {expected}"
+        );
+        // And the directory the script's own variable stands for is the one
+        // the config names, or the line above deletes a path that agrees with
+        // nothing.
+        assert!(
+            script.contains(&format!(
+                r#"LIB_DIR="{}""#,
+                path.rsplit_once('/').expect("an absolute path").0
+            )),
+            "install/uninstall.sh's LIB_DIR is not the directory {path} is in"
+        );
+    }
 }
 
 #[test]
@@ -183,6 +200,8 @@ fn neither_script_can_carry_a_credential_of_its_own() {
         for forbidden in [
             "INFISICAL_TOKEN=",
             "INFISICAL_UNIVERSAL_AUTH_CLIENT_SECRET=",
+            "OP_SERVICE_ACCOUNT_TOKEN=",
+            "OP_CONNECT_TOKEN=",
             "--client-secret",
             "--token=",
         ] {
@@ -302,6 +321,11 @@ fn a_second_install_does_not_empty_the_files_the_first_one_left_behind() {
             0o600,
             r#"{"MACHINE_IDENTITY":"decoy-identity-0031"}"#,
         ),
+        (
+            "onepassword.json",
+            0o600,
+            r#"{"SERVICE_ACCOUNT":"decoy-service-account-0031"}"#,
+        ),
     ];
     for (name, _, body) in placed {
         std::fs::write(dir.join(name), body).expect("seed");
@@ -319,7 +343,8 @@ fn a_second_install_does_not_empty_the_files_the_first_one_left_behind() {
         "{}{helper}\n\
          place_state_file 0600 {dir:?}/secrets.json\n\
          place_state_file 0640 {dir:?}/audit.jsonl\n\
-         place_state_file 0600 {dir:?}/infisical.json\n",
+         place_state_file 0600 {dir:?}/infisical.json\n\
+         place_state_file 0600 {dir:?}/onepassword.json\n",
         preamble(&dir)
     ));
 
@@ -351,11 +376,16 @@ fn a_first_install_still_creates_each_file_empty_and_shut() {
     bash(&format!(
         "{}{helper}\n\
          place_state_file 0600 {dir:?}/secrets.json\n\
-         place_state_file 0640 {dir:?}/audit.jsonl\n",
+         place_state_file 0640 {dir:?}/audit.jsonl\n\
+         place_state_file 0600 {dir:?}/onepassword.json\n",
         preamble(&dir)
     ));
 
-    for (name, mode) in [("secrets.json", 0o600), ("audit.jsonl", 0o640)] {
+    for (name, mode) in [
+        ("secrets.json", 0o600),
+        ("audit.jsonl", 0o640),
+        ("onepassword.json", 0o600),
+    ] {
         let path = dir.join(name);
         assert_eq!(std::fs::read(&path).expect("read").len(), 0, "{name}");
         assert_eq!(mode_of(&path), mode, "{name}");

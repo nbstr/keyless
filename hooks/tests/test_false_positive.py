@@ -81,13 +81,24 @@ SAFE = [
     "infisical scan",
     "infisical ssh connect myhost",
     "infisical vault set file",
-    # ── 1Password — documented ──────────────────────────────────────────────
+    # ── 1Password 2.39.0 — measured ─────────────────────────────────────────
     "op item list",
+    "op item list --vault company --format json --include-archive",
     "op vault list",
+    "op vault get company --format json",
     "op user list",
     "op run -- ./deploy.sh",
+    "op run --no-masking -- printenv KEYLESS_PROBE",
     "op signin",
     "op item get --help",
+    # The write forms that keep the value off the command line: a template on
+    # stdin, and no `--reveal`. What the verb prints back has concealed fields
+    # hidden, which is what the flag condition on that row reads.
+    "op item create --vault company -",
+    "op item create --vault company --title demo --category Password -",
+    "op item edit demo --title demo",
+    "op item template get Password",
+    "op whoami",
     # ── Proton Pass CLI 2.2.5 — measured ────────────────────────────────────
     # `pass-cli run` is the store's own sanctioned verb and keyless itself calls
     # it; refusing it would break the tool this pack recommends.

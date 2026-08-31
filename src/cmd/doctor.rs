@@ -33,8 +33,9 @@
 //!
 //! - a **store** is proven when a read path answered — for the keychain, a
 //!   search that reached the item database; for Infisical, a fetch of a
-//!   non-credential key; for Proton, a vault listing as this session. None of
-//!   the three reads a credential of yours.
+//!   non-credential key; for 1Password, the pinned vault's own record; for
+//!   Proton, a vault listing as this session. None of the four reads a
+//!   credential of yours.
 //! - a **name** is proven only under `--probe`, which reads the real credential.
 //!
 //! # Why there is no capability check, and why the report says so out loud

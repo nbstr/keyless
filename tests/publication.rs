@@ -309,6 +309,9 @@ const DECOY_COORDINATES: &[&str] = &[
     "-dashvault",
     "Personal",
     "company",
+    // The vendor's `<vault>:<permission>` syntax for `op service-account
+    // create --vault`, on the decoy vault above.
+    "company:read_items",
     "personal",
     // Item titles.
     "",
@@ -342,8 +345,16 @@ const DECOY_COORDINATES: &[&str] = &[
     "Expiry Date",
     "api key",
     "comment",
+    // 1Password's own built-in field names: `credential` on an API
+    // Credential item, `notesPlain` on every item. Vendor vocabulary, not
+    // anybody's inventory.
+    "credential",
     "expires",
     "first hidden field",
+    "notesPlain",
+    // The vendor's documented query form, quoted in the 1Password adapter's
+    // test that a `?` in a field is refused.
+    "otp?attribute=otp",
     "password",
     "second hidden field",
     "username",

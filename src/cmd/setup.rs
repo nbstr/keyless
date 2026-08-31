@@ -370,7 +370,8 @@ pub fn setup(
         style,
         &format!(
             "A store credential is per-person and this command cannot mint one. \
-             Infisical needs `infisical login` against your own account. Proton needs \
+             Infisical needs `infisical login` against your own account. 1Password needs \
+             `op signin` and the name of the one vault it may read. Proton needs \
              `{}` — a session directory that does not copy between machines or \
              accounts, named by that variable and by nothing else.",
             crate::store::proton::scoped_command_template("login")
@@ -1113,9 +1114,9 @@ pub fn uninstall(
     note(
         out,
         style,
-        "Your store sessions are untouched: an Infisical login and a Proton \
-         session are credentials of yours, and removing a tool is not a reason \
-         to invalidate them.",
+        "Your store sessions are untouched: an Infisical login, a 1Password sign-in \
+         and a Proton session are credentials of yours, and removing a tool is not \
+         a reason to invalidate them.",
     )?;
     note(
         out,

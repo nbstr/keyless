@@ -161,6 +161,7 @@ account that is yours**, and no amount of configuration shortcuts it:
 |---|---|
 | **macOS keychain** | Nothing. It is on by default and needs no config file. |
 | **Infisical** | Log in as you. The CLI resolves its project from the **working directory**, so the same command answers in one directory and fails in another with nothing in the output saying that location was the difference. |
+| **1Password** | Sign in as you, and name the **one vault** this machine may read. With more than one account configured and none signed in, every call fails with `multiple accounts found` until the config names one. |
 | **Proton Pass** | Log in as you. The agent token is minted per account and its session directory does **not** copy between machines or between people. |
 
 So a config file can be shared and a *setup* cannot. Somebody else's working
@@ -301,9 +302,10 @@ keyless 0.1.0   /Users/you/.config/keyless/config.json   1 name(s) declared
 
 STORES
   ✔ keychain   proven     service "keyless"
-  – infisical  off        "enabled": false under `stores.infisical`
-  – proton     off        "enabled": false under `stores.proton`
-  – daemon     off        not enabled in this config
+  – infisical    off        "enabled": false under `stores.infisical`
+  – onepassword  off        "enabled": false under `stores.onepassword`
+  – proton       off        "enabled": false under `stores.proton`
+  – daemon       off        not enabled in this config
 
 NAMES
   ✔ FIRST_SECRET  proven     read back from keychain
@@ -469,23 +471,25 @@ refusing to parse and therefore serving none.
 
 ## Stores
 
-Three, and the first is the only one on by default.
+Four, and the first is the only one on by default.
 
 | Store | `enabled` default | Reached by | Live path verified |
 |---|---|---|---|
 | `keychain` | **on** | `security find-generic-password -w` | yes |
 | `infisical` | off | `infisical run … -- printenv KEY` | yes — CLI 0.43.114, 2026-08-06 |
+| `onepassword` | off | `op run --no-masking -- printenv KEYLESS_PROBE`, in one vault | **no** — the unauthenticated half is measured against CLI 2.39.0, 2026-08-31; the rest is the vendor's documentation. See [the section](#1password--one-vault-named-once) |
 | `proton` | off | `pass-cli run --env-file … -- printenv` | yes — CLI 2.2.5, 2026-08-08 |
 
-The two network-backed ones are off unless asked for: a keychain-only setup must
-not start paying a process spawn and a network round trip per lookup because a
-newer build knows how to talk to a vault.
+The three network-backed ones are off unless asked for: a keychain-only setup
+must not start paying a process spawn and a network round trip per lookup
+because a newer build knows how to talk to a vault.
 
 ```json
 {
   "stores": {
     "keychain": { "service": "keyless" },
     "infisical": { "enabled": true, "path": "/backend" },
+    "onepassword": { "enabled": true, "vault": "company", "field": "password" },
     "proton": { "enabled": true, "session_dir": "/Users/you/.keyless-pass-session" },
     "default": "keychain"
   },
@@ -494,7 +498,9 @@ newer build knows how to talk to a vault.
                       "key": "DB_URL" },
     "GITHUB_TOKEN": { "store": "keychain", "account": "demo-token" },
     "HOME_WIFI":    { "store": "proton", "vault": "Personal", "item": "Router",
-                      "field": "password" }
+                      "field": "password" },
+    "STRIPE_KEY":   { "store": "onepassword", "item": "demo api key",
+                      "field": "credential" }
   }
 }
 ```
@@ -924,6 +930,118 @@ Two details of the contract shape the adapter:
   leak this tool exists to prevent and forward it to a third party under a field
   labelled "reason".
 
+### 1Password — one vault, named once
+
+`op` reads whatever the login behind it can see. This store reads **one
+vault**, written down in the config, and nothing under `secrets` can widen it:
+
+```json
+"onepassword": { "enabled": true, "vault": "company", "field": "password",
+                 "account": "demo" }
+```
+
+- **`vault` is required and never defaulted.** Every lookup this store makes is
+  `op://company/…`; a name whose own entry says `"vault": "personal"` is
+  refused before anything is spawned, and `keyless items onepassword --vault
+  personal` is refused rather than listed. Defaulting it — to the account's
+  first vault, or to whichever one holds the title — would make the vault a
+  name resolves against invisible at the point of use, which is the
+  [Infisical environment hazard](#an-environment-is-required-and-has-no-default)
+  in different clothes.
+- **`field` is the field a name reads when its entry names none.** `keyless`
+  never guesses one: a Login item's credential is `password`, an API
+  Credential's is `credential`, and a wrong field resolves to a value that
+  looks real and is not. Set it when every item in the vault has the same
+  shape, leave it out otherwise and put `field` on each name.
+- **`account` is `--account`**, and it is not optional where more than one
+  account is configured. Measured against `op` 2.39.0: with several configured
+  and none signed in, every authenticated verb fails with `multiple accounts
+  found`.
+
+A name is an item in that vault, by title — or by id, which is the escape hatch
+when two items share a title:
+
+```json
+"STRIPE_KEY":  { "store": "onepassword", "item": "demo api key", "field": "credential" },
+"DB_PASSWORD": { "store": "onepassword" },
+"WIFI_PSK":    { "store": "onepassword", "item": "Router", "section": "other",
+                 "field": "api key" }
+```
+
+The second declares nothing, so it is the item titled `DB_PASSWORD` at the
+store-wide field. A custom field somebody added to an item lives in a section,
+and the third names it: `"section"` is its own key rather than a `/` inside
+`field`, so a label that happens to contain one cannot silently become a
+different address.
+
+The keychain is on by default, so with this store enabled a name that pins
+nothing has two candidates and is reported [ambiguous](#one-name-several-stores)
+rather than guessed. Set `"default": "onepassword"` under `stores`, or switch
+the keychain off, or put `"store": "onepassword"` on each name.
+
+#### The verb, and the listing in front of it
+
+The lookup is the same shape as the other two vault backends — `op run
+--no-masking -- printenv KEYLESS_PROBE`, with the `op://` reference in that one
+variable of a **cleared** environment and never in argv. `op read` and `op item
+get` print plaintext, and the hook pack refuses them; this adapter never spells
+them.
+
+Before the `run`, a listing: `op item list --vault <vault> --format json
+--include-archive`, memoised for one run and for
+`stores.onepassword.listing_ttl_ms` afterwards. It is what turns a title into
+the id the reference is built from, and it is where three rules live:
+
+- **An absent title is an absence.** `doctor` says the item is not in the
+  vault; a name nobody declared costs a listing, never a read.
+- **An archived item never resolves.** The vendor still resolves a reference
+  to one (documented), so the listing is the only thing between a put-away
+  credential and a child's environment. The rule is an allowlist on "no
+  `state` at all", so a state this build has never heard of fails closed.
+  `items` still shows the item, with `ARCHIVED` beside it.
+- **Two live items with one title are refused**, and the message names both
+  ids.
+
+#### An allowlist locally, a boundary behind the daemon
+
+Say this plainly: on the machine you type at, the vault pin is an allowlist.
+A session that can run `keyless` can run `op read` against every vault its
+login sees, and the pin stops `keyless` from doing that, not the session.
+
+The boundary is the identity. A 1Password **service account** is minted with
+access to named vaults and no others, and the vendor refuses it everything
+else:
+
+```console
+$ op service-account create keyless-agents --vault company:read_items
+```
+
+That prints a token once. In a shell it is a credential in an environment
+variable, which is the shape this tool exists to remove — so the place for it
+is behind [`keylessd`](#keylessd--the-uid-boundary), in a mode-`0600` file only
+the daemon's uid can read, read per lookup and written to nothing. The daemon
+carries this adapter with the same `vault` rule; the recipe is in
+[`install/README.md`](install/README.md#serving-names-out-of-one-1password-vault).
+
+#### What was measured, and what was not
+
+No account was signed in when this adapter was measured, so the
+**authenticated** path — a value coming back, the listing's JSON, an archived
+item's `state` — is the vendor's documentation and the stub in `tests/support`
+encodes it. What the real `op` 2.39.0 did without a sign-in:
+
+| Measured | Consequence |
+|---|---|
+| `op run` with **no** reference in its environment runs the child without authenticating | the health check is `op vault get <vault>`, never `run` |
+| more than one account configured, no sign-in: `multiple accounts found. Use the --account flag …`, exit 1 | `account` is a config field |
+| a bogus `OP_SERVICE_ACCOUNT_TOKEN`: `DecodeSACredentials`, exit 9 (`vault get`) / exit 1 (`run`) | read as a refused login, never as a missing name |
+| `op` finds its accounts under `env -i` with only `HOME` and `PATH` | the probe runs in a cleared environment |
+| the masking placeholder is `<concealed by 1Password>` | `--no-masking` on every probe; a concealed value is refused |
+| errors are `[ERROR] <date> <time> <message>` | the prefix is stripped before a message is quoted |
+
+A green `doctor` row for this store says the login can see the pinned vault. It
+does not say a lookup has ever worked on this machine; `doctor --probe` does.
+
 ### Timeouts
 
 A network store must not hang your terminal. Every lookup is bounded — **10
@@ -1084,6 +1202,33 @@ neither is a value this tool parses or stores, it opens nothing in the vendor's
 state directory, it has no config field a token fits in, and it carries no HTTP
 client.
 
+### 1Password lists the one vault it is pinned to
+
+`op item list` prints ids, titles and categories and no field content, so the
+listing is read directly — confined to the pinned vault, with archived items
+shown and marked:
+
+```console
+$ keyless items onepassword
+company	Active	password	DB_PASSWORD
+company	Active	api_credential	demo api key
+company	ARCHIVED	login	Router
+
+$ keyless fields onepassword --item "demo api key"
+username	builtin	STRING	fields[0]
+credential	custom	CONCEALED	fields[1]
+notesPlain	builtin	STRING	fields[2]
+api key	custom	CONCEALED	fields[3] in section "other"
+```
+
+`fields` runs `op item get <id> --vault <vault> --format json`, whose output
+carries every field's **value** beside its label — the same situation as the
+Proton path, handled the same way: the JSON is parsed into a guard type that
+prints `ItemView(<redacted>)`, zeroizes every string in the tree on drop, and
+has one accessor that reads labels, types and section labels and never a value.
+The `path` column names the section, because a field in one is declared with
+`"section"`.
+
 ### Two backends say why they cannot do this
 
 A verb that works in one backend and leaks in another is worse than one that is
@@ -1093,6 +1238,7 @@ where it is safe. So:
 | Backend | `items` | `fields` | Why |
 |---|---|---|---|
 | `proton` | yes | yes | `item list` and `item view`, with the extraction above |
+| `onepassword` | the pinned vault only | yes | `item list` prints no content; `item get` does, and is scrubbed as above. Another vault is refused, not listed |
 | `infisical` | yes | no | the environment `infisical run` builds is the listing; a secret is one value, so there is no field to name |
 | `keychain` | no | no | `security` has no verb listing one service's items without dumping the whole keychain file, and one extra flag on that dump prints values |
 | `daemon` | no | no | a client that could enumerate the store could read what it never named — the hole the uid boundary closes |
@@ -1274,6 +1420,7 @@ is not present, and one false claim teaches you the other one is false too.
 | `keychain` | `add-generic-password -U -w`, value on stdin | `-U` updates in place, so this rotates |
 | `proton` | `item create <type> --from-template -`, template on stdin | **creates only** |
 | `infisical` | no | `infisical secrets set` takes the value as a command-line argument, and the CLI offers no stdin form |
+| `onepassword` | not yet | `op item create -` reads a JSON template on stdin, so a writer is possible and is listed under *Not built yet*; the assignment form `password=<value>` puts the value in argv and is what the refusal steers away from |
 
 Two measured details behind those:
 
@@ -1602,8 +1749,8 @@ one never touches disk and dies with the daemon, so killing `keylessd` strictly
 reduces what is obtainable.
 
 **And there is no local fallback.** Enabling the daemon *disables* every local
-backend — keychain, Infisical and Proton Pass alike — whatever each one's own
-flag says. It is enforced in `store::build`, not documented as a convention,
+backend — keychain, Infisical, 1Password and Proton Pass alike — whatever each
+one's own flag says. It is enforced in `store::build`, not documented as a convention,
 because a fallback would re-open the hole the moment the daemon stopped, and
 anyone able to stop a process could choose that. Killing the daemon must get you
 fewer secrets, never more.
@@ -1912,9 +2059,19 @@ This says nothing about the `infisical` runs you make yourself.
 
 Deliberately out of scope, with the seams left clean:
 
-- **More backends.** `Store` is one trait with one method. Adding 1Password,
-  Bitwarden or Vault means implementing it and registering it in `store::build`;
-  `run` never learns which backend answered, and neither does the daemon.
+- **More backends.** `Store` is one trait with one method. Adding Bitwarden or
+  Vault means implementing it and registering it in `store::build`; `run` never
+  learns which backend answered, and neither does the daemon.
+- **The 1Password live path.** The adapter's authenticated half — a value
+  coming back, the listing's JSON shape, an archived item's `state` — is built
+  from the vendor's documentation and has not been run against a signed-in
+  account. The stub encodes the documented shapes; what needs doing is one
+  session against a disposable vault, recorded the way `proton_live.rs` records
+  Proton, and any disagreement fixed in the stub.
+- **A 1Password writer.** `op item create --vault <V> -` takes a JSON template
+  on stdin, which is the shape `put` and `new` need. Until it exists, `keyless
+  put` against this store refuses and names that form, so nobody reaches for
+  the assignment form that puts the value in argv.
 - **Proton Pass *behind* the daemon.** This is a gap with teeth, so it is stated
   rather than buried. Enabling the daemon suppresses every local backend — that
   is the [rule](#many-sessions-at-once) that keeps a fallback from re-opening the
@@ -2038,12 +2195,21 @@ Who built it stays. What is inside their machine does not: the copyright, the
 author and the reasoning are identity, and a count only they can reproduce is an
 inventory.
 
-No test reads a real credential, and no test reaches a real vault. All three
+No test reads a real credential, and no test reaches a real vault. All four
 backends are exercised against shell stubs — `security find-generic-password` is
 never invoked against a real service name, no keychain prompt is triggered,
-`security add-generic-password` never touches your keychain, and neither
-`infisical` nor `pass-cli` is ever run against an account. Every value in the
-suite is a decoy invented in `tests/support`.
+`security add-generic-password` never touches your keychain, and none of
+`infisical`, `op` or `pass-cli` is ever run against an account. Every value in
+the suite is a decoy invented in `tests/support`.
+
+The 1Password stub is the one whose shapes are **documented rather than
+measured** — the listing's JSON, the `item get` JSON, an archived item's
+`state` — and it says so; the two refusals it reproduces (`account is not
+signed in`, and the `[ERROR] <date> <time>` prefix) are what `op` 2.39.0
+actually printed. It records the argv, the environment NAMES, the reference it
+was asked to resolve and the service-account token it was handed, each to its
+own file, so a test reads what the vendor received rather than what the adapter
+says it sent.
 
 The Infisical stub reproduces behaviour **measured** against CLI 0.43.114: the
 flags it accepts, that its stdout is byte-for-byte the child's, and the exact
@@ -2057,7 +2223,7 @@ shape, whose every value position holds a marker string — which is what makes
 "no value reached the field list" an assertion rather than a restatement of the
 parser.
 
-Both stubs take their fixtures from **files** rather than inlining JSON into the
+The stubs take their fixtures from **files** rather than inlining JSON into the
 shell script. That is not style: the vendor's own wording includes
 `passwords don't match`, and an apostrophe inside a single-quoted shell string is
 a syntax error. Inline one and the stub fails to parse, and the adapter reports

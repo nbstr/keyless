@@ -134,9 +134,10 @@ pub fn inspect(path: &Path, daemon: Option<u32>) -> Result<String, String> {
         Ok(meta) => meta,
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
             return Err(format!(
-                "{} does not exist, so every Infisical lookup will degrade. The installer \
-                 creates it empty and owned by the daemon; `{} credential --name <entry>` \
-                 fills it without the value passing through a command line",
+                "{} does not exist, so every lookup through the store it belongs to will \
+                 degrade. The installer creates it empty and owned by the daemon; \
+                 `{} credential --store <store> --name <entry>` fills it without the value \
+                 passing through a command line",
                 path.display(),
                 crate::DAEMON_NAME
             ));
@@ -163,8 +164,8 @@ pub fn inspect(path: &Path, daemon: Option<u32>) -> Result<String, String> {
     {
         return Err(format!(
             "{} is mode {MODE:04o} and owned by uid {owner}, but the daemon runs as uid \
-             {expected} — so the daemon cannot read its own login and every Infisical \
-             lookup will degrade. Run: chown {expected} {}",
+             {expected} — so the daemon cannot read its own login and every lookup through \
+             that store will degrade. Run: chown {expected} {}",
             path.display(),
             path.display()
         ));
@@ -260,34 +261,71 @@ fn entries_in(path: &Path) -> Result<String, String> {
 ///
 /// Whatever `out` returns.
 pub fn report(config: &super::config::DaemonConfig, out: &mut dyn io::Write) -> io::Result<bool> {
-    if !config.stores.infisical.enabled || config.stores.infisical.credentials.is_empty() {
-        return orphaned(config, out);
+    let mut sound = true;
+    for login in vendor_logins(config) {
+        if !login.in_use {
+            sound &= orphaned(&login, out)?;
+            continue;
+        }
+        match inspect(&login.path, daemon_uid(config.audit.as_path())) {
+            Ok(detail) => writeln!(out, "identity ok {detail}")?,
+            Err(detail) => {
+                writeln!(out, "identity PROBLEM {detail}")?;
+                sound = false;
+            }
+        }
+        writeln!(
+            out,
+            "         whether {} accepts it is the `store {}` row below",
+            login.vendor, login.store
+        )?;
     }
-    let path = config.stores.infisical.credentials_file.to_path_buf();
-    let sound = match inspect(&path, daemon_uid(config.audit.as_path())) {
-        Ok(detail) => {
-            writeln!(out, "identity ok {detail}")?;
-            true
-        }
-        Err(detail) => {
-            writeln!(out, "identity PROBLEM {detail}")?;
-            false
-        }
-    };
-    writeln!(
-        out,
-        "         whether Infisical accepts it is the `store infisical` row below"
-    )?;
     Ok(sound)
+}
+
+/// One vendor's login on the daemon's side of the boundary: the file it lives
+/// in, and whether this config gives it anything to do.
+///
+/// One row per vendor the daemon can carry a login for, so a second vendor's
+/// file cannot go unreported the way a file this report never knew about would.
+struct VendorLogin {
+    /// The vendor, as a report names it.
+    vendor: &'static str,
+    /// The store id, as the `store` row beside it spells it.
+    store: &'static str,
+    /// Where the login lives.
+    path: PathBuf,
+    /// Whether the store is enabled AND names a credential — the two facts
+    /// that together mean a lookup will open the file.
+    in_use: bool,
+}
+
+fn vendor_logins(config: &super::config::DaemonConfig) -> [VendorLogin; 2] {
+    let infisical = &config.stores.infisical;
+    let onepassword = &config.stores.onepassword;
+    [
+        VendorLogin {
+            vendor: "Infisical",
+            store: "infisical",
+            path: infisical.credentials_file.to_path_buf(),
+            in_use: infisical.enabled && !infisical.credentials.is_empty(),
+        },
+        VendorLogin {
+            vendor: "1Password",
+            store: "onepassword",
+            path: onepassword.credentials_file.to_path_buf(),
+            in_use: onepassword.enabled && !onepassword.credentials.is_empty(),
+        },
+    ]
 }
 
 /// A vendor login on disk that this config gives nothing to do.
 ///
-/// The one thing `check` can see of a config that lost its `infisical` block.
+/// The one thing `check` can see of a config that lost a vendor's store block.
 /// Nothing in the daemon remembers what the config used to say, so a store
 /// deleted from it leaves no trace at all — no identity row, no `store
-/// infisical` row, no warning — and the report is fully green while every
-/// Infisical name has stopped resolving. What does survive is the credential
+/// <vendor>` row, no warning — and the report is fully green while every
+/// name that store served has stopped resolving. What does survive is the credential
 /// FILE, because it lives outside the config, and a file with a login in it
 /// that no store is configured to use is either that accident or an install
 /// somebody reconfigured and never cleaned up.
@@ -297,22 +335,24 @@ pub fn report(config: &super::config::DaemonConfig, out: &mut dyn io::Write) -> 
 /// nothing to use it, still valid at the vendor, that nobody is thinking about.
 ///
 /// Silence for a file that is absent, empty, or unreadable from here — an
-/// install that never used Infisical must not be nagged, and a guess made
+/// install that never used the vendor must not be nagged, and a guess made
 /// through a permission error would be exactly that.
-fn orphaned(config: &super::config::DaemonConfig, out: &mut dyn io::Write) -> io::Result<bool> {
-    let path = config.stores.infisical.credentials_file.to_path_buf();
-    let holds_something = fs::metadata(&path).is_ok_and(|meta| meta.len() > 0);
+fn orphaned(login: &VendorLogin, out: &mut dyn io::Write) -> io::Result<bool> {
+    let path = &login.path;
+    let holds_something = fs::metadata(path).is_ok_and(|meta| meta.len() > 0);
     if !holds_something {
         return Ok(true);
     }
     writeln!(
         out,
         "identity PROBLEM {} holds a vendor login and nothing in this config uses it: the \
-         Infisical store is not enabled here, or names no credential. Either the `infisical` \
+         {} store is not enabled here, or names no credential. Either the `{}` \
          block was lost out of this config — in which case every name it served has stopped \
          resolving, silently — or the login is left over, in which case delete it and REVOKE \
          the identity at the vendor",
-        path.display()
+        path.display(),
+        login.vendor,
+        login.store
     )?;
     Ok(false)
 }
@@ -772,6 +812,36 @@ mod report_tests {
         let (rows, sound) = rendered(&config);
         assert!(rows.is_empty(), "{rows}");
         assert!(sound);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_second_vendors_orphaned_login_is_a_row_of_its_own() {
+        // The row is per vendor, or a 1Password token left on disk after its
+        // store block was lost would be exactly the file this report never
+        // knew about. The sentence names the store whose block is missing, so
+        // the reader edits the right one.
+        let dir = super::tests::scratch("orphan-onepassword");
+        let path = dir.join("onepassword.json");
+        store_entry(&path, "SERVICE_ACCOUNT", &Secret::new(DECOY.to_owned())).expect("stored");
+
+        let config = config_from(&format!(
+            r#"{{"stores":{{"onepassword":{{"credentials_file":"{path}"}}}}}}"#,
+            path = path.display(),
+        ));
+        let (rows, sound) = rendered(&config);
+        assert!(!sound, "{rows}");
+        assert!(rows.contains("`onepassword` block"), "{rows}");
+        assert!(rows.contains("1Password store"), "{rows}");
+        assert!(
+            !rows.contains("Infisical"),
+            "the wrong vendor was named: {rows}"
+        );
+        assert!(
+            !rows.contains(DECOY),
+            "the row carried the credential: {rows}"
+        );
 
         let _ = fs::remove_dir_all(&dir);
     }

@@ -412,7 +412,7 @@ fn a_daemon_that_dies_between_two_runs_degrades_the_second() {
 #[test]
 fn killing_the_daemon_never_widens_what_a_session_can_reach() {
     // Invariant 2, stated as a test. The config asks for the daemon AND all
-    // three local backends; none of the three may be registered, because each
+    // four local backends; none of the four may be registered, because each
     // of them resolves through a credential the calling user already holds —
     // so any one left behind is a fallback that opens the instant the daemon
     // stops.
@@ -420,6 +420,7 @@ fn killing_the_daemon_never_widens_what_a_session_can_reach() {
     let config: keyless::config::Config = serde_json::from_str(
         r#"{"stores":{"keychain":{"enabled":true},
                       "infisical":{"enabled":true},
+                      "onepassword":{"enabled":true},
                       "proton":{"enabled":true},
                       "daemon":{"enabled":true,
                       "socket":"/nonexistent/keyless/never.sock","timeout_ms":200}}}"#,
@@ -434,9 +435,9 @@ fn killing_the_daemon_never_widens_what_a_session_can_reach() {
         "a local fallback would re-open the hole whenever the daemon stopped"
     );
 
-    // Both channels: the two backends the user explicitly enabled are a
+    // Both channels: the three backends the user explicitly enabled are a
     // run-time warning, the keychain is a `doctor` note. What matters here is
-    // that none of the three is dropped in silence.
+    // that none of the four is dropped in silence.
     let said = built
         .warnings
         .iter()
@@ -444,7 +445,7 @@ fn killing_the_daemon_never_widens_what_a_session_can_reach() {
         .cloned()
         .collect::<Vec<_>>()
         .join(" ");
-    for backend in ["keychain", "infisical", "proton"] {
+    for backend in ["keychain", "infisical", "onepassword", "proton"] {
         assert!(
             said.contains(backend),
             "dropping {backend} must be said out loud: {said}"

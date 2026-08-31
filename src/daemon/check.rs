@@ -69,8 +69,8 @@ pub fn report(config: &DaemonConfig, config_path: &Path, out: &mut dyn Write) ->
     // Before the stores, because a store row that says PROBLEM because the
     // daemon cannot read its own login is a symptom, and this is the cause. The
     // two questions are different: this one asks whether the credential is
-    // where it must be and shut to everyone else; the `infisical` row below
-    // asks whether Infisical accepts it.
+    // where it must be and shut to everyone else; the vendor's own `store` row
+    // below asks whether the vendor accepts it.
     sound &= credential::report(config, out)?;
 
     for store in config.registry().stores() {

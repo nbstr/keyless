@@ -201,10 +201,25 @@ DEFAULT_VAULT_VERBS = [
     ["infisical", r"^ssh\s+issue-credentials\b", "keyless run -s <NAME> -- <cmd>", None],
     ["infisical", r"^token\s+renew\b", "keyless run -s <NAME> -- <cmd>", None],
     ["infisical", r"^service-token\s+create\b", "keyless run -s <NAME> -- <cmd>", None],
-    # ── 1Password — documented ──────────────────────────────────────────────
+    # ── 1Password 2.39.0 — measured ─────────────────────────────────────────
+    # `read`, `item get` and `document get` print a value; `inject` renders a
+    # template to stdout. `item create` and `item edit` print the item they
+    # wrote, with concealed fields hidden UNLESS `--reveal` is passed — so the
+    # flag is the condition and the verb stays open, because `op item create
+    # --vault <V> -` with a template on stdin is the one write form that keeps
+    # the value off the command line. `service-account create` and `connect
+    # token create` each print a token once, and neither is a bootstrap an
+    # agent needs. `signin` prints a session token when the app integration is
+    # off and is left open as the store's own bootstrap — a named gap, see
+    # `tests/test_false_positive.py`. `item list`, `vault list`, `vault get`
+    # and `run` print no value.
     ["op", r"^(read|inject)\b", "op run -- <cmd>", None],
     ["op", r"^item\s+get\b", "op run -- <cmd>", None],
     ["op", r"^document\s+get\b", "op run -- <cmd>", None],
+    ["op", r"^item\s+(create|edit)\b", "op item create --vault <V> - (template on stdin)",
+     r"(?:^|\s)--reveal(?=\s|$)"],
+    ["op", r"^service-account\s+create\b", "keyless run -s <NAME> -- <cmd>", None],
+    ["op", r"^connect\s+token\s+create\b", "keyless run -s <NAME> -- <cmd>", None],
     # ── Proton Pass CLI 2.2.5 — measured ────────────────────────────────────
     # `item view` prints the item. `item totp` and `totp generate` print a
     # one-time code, which is a credential. `inject` writes the rendered

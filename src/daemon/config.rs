@@ -45,6 +45,9 @@ use crate::store::infisical::{
     VendorCredentials,
 };
 use crate::store::keychain::KeychainStore;
+use crate::store::onepassword::{
+    OnePasswordStore, Routing as OnePasswordRouting, SERVICE_ACCOUNT_TOKEN, ServiceAccount,
+};
 use crate::store::{Registry, Store};
 
 /// The daemon's whole configuration.
@@ -86,8 +89,10 @@ pub struct DaemonConfig {
     ///
     /// `store` decides which of the daemon's backends answers a name; `env`,
     /// `path` and `key` are the Infisical coordinates that backend looks the
-    /// name up at, read by [`DaemonConfig::infisical_routing`]. The remaining
-    /// fields describe adapters the daemon does not carry and are ignored.
+    /// name up at, read by [`DaemonConfig::infisical_routing`]; `item`,
+    /// `section` and `field` are the 1Password ones, read by
+    /// [`DaemonConfig::onepassword_routing`]. The remaining fields describe
+    /// adapters the daemon does not carry and are ignored.
     ///
     /// **`env` here is the ONLY place a daemon-hosted lookup can get an
     /// Infisical environment from.** See [`DaemonConfig::infisical_routing`].
@@ -134,6 +139,10 @@ pub struct DaemonStores {
     /// Infisical, reached through the vendor CLI under the daemon's own uid.
     #[serde(default)]
     pub infisical: DaemonInfisicalConfig,
+    /// 1Password, reached through `op` under the daemon's own uid, as a
+    /// service account pinned to one vault.
+    #[serde(default)]
+    pub onepassword: DaemonOnePasswordConfig,
     /// How a name that pins no store chooses one. See [`crate::config::Policy`].
     ///
     /// The strict one by default, on the daemon exactly as on a session: the
@@ -305,6 +314,91 @@ impl Default for DaemonInfisicalConfig {
     }
 }
 
+/// Settings for the 1Password backend, on the daemon's side of the boundary.
+///
+/// This is where the vault allowlist becomes a boundary. A session's `op`
+/// inherits a login that sees every vault the person can see; the daemon's
+/// `op` is handed a **service account**, which the vendor minted with access to
+/// named vaults and refuses everything else — and that token lives in a file
+/// only the daemon's uid can read. `vault` here is required exactly as it is
+/// in a session, and for the same reason: which vault a name resolves against
+/// must be written down, never inferred from what the login happens to see.
+///
+/// Spelled as the session config spells it, so a setting moved across the
+/// boundary keeps its name.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct DaemonOnePasswordConfig {
+    /// Off unless asked for.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Path to, or name of, the `op` binary. Worth an absolute path here, for
+    /// the reason [`DaemonInfisicalConfig::binary`] gives.
+    #[serde(default = "default_onepassword_binary")]
+    pub binary: ConfigPath,
+    /// The one vault this daemon reads. See
+    /// [`crate::config::OnePasswordConfig::vault`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vault: Option<String>,
+    /// Which account, as `--account`. A service account implies its own and
+    /// usually needs none; a daemon signed in some other way names one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account: Option<String>,
+    /// The field a name reads when its own entry declares none. See
+    /// [`crate::config::OnePasswordConfig::field`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub field: Option<String>,
+    /// The CLI's own configuration directory, as `--config`.
+    ///
+    /// **Worth setting here.** `op` keeps an account list and a cache socket
+    /// under the calling user's config directory, and a daemon uid's home may
+    /// not be one the vendor can write to. This names one it can.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config_dir: Option<ConfigPath>,
+    /// How long one lookup may take before it degrades the run.
+    #[serde(default = "default_timeout_ms")]
+    pub timeout_ms: u64,
+    /// How long one vault listing may be reused. See
+    /// [`crate::config::OnePasswordConfig::listing_ttl_ms`].
+    #[serde(default = "default_listing_ttl_ms")]
+    pub listing_ttl_ms: u64,
+    /// The helper that reads one variable out of the child environment.
+    #[serde(default = "default_probe_binary")]
+    pub probe_binary: ConfigPath,
+    /// The vendor's own login: which `OP_*` variable holds it, and which entry
+    /// of [`DaemonOnePasswordConfig::credentials_file`] its value is in.
+    ///
+    /// **Names, never values**, exactly as for Infisical. The ordinary entry
+    /// is `{"OP_SERVICE_ACCOUNT_TOKEN": "<entry>"}`; a Connect deployment
+    /// names `OP_CONNECT_HOST` and `OP_CONNECT_TOKEN` instead. Only `OP_*` is
+    /// accepted, and anything else is refused by every lookup and said out
+    /// loud by [`DaemonConfig::warnings`].
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub credentials: BTreeMap<String, String>,
+    /// The mode-`0600` file those values live in. A file of its own by
+    /// default, beside the secrets file rather than inside it, for the reason
+    /// [`DaemonInfisicalConfig::credentials_file`] gives.
+    #[serde(default = "default_onepassword_credentials_file")]
+    pub credentials_file: ConfigPath,
+}
+
+impl Default for DaemonOnePasswordConfig {
+    fn default() -> Self {
+        DaemonOnePasswordConfig {
+            enabled: false,
+            binary: default_onepassword_binary(),
+            vault: None,
+            account: None,
+            field: None,
+            config_dir: None,
+            timeout_ms: default_timeout_ms(),
+            listing_ttl_ms: default_listing_ttl_ms(),
+            probe_binary: default_probe_binary(),
+            credentials: BTreeMap::new(),
+            credentials_file: default_onepassword_credentials_file(),
+        }
+    }
+}
+
 fn default_socket() -> ConfigPath {
     ConfigPath::from(crate::ipc::default_socket_path())
 }
@@ -327,6 +421,19 @@ fn default_infisical_credentials_file() -> ConfigPath {
         PathBuf::from("/usr/local/var/lib")
             .join(crate::NAME)
             .join("infisical.json"),
+    )
+}
+
+/// Where the daemon's 1Password service account lives, by default.
+///
+/// Its own file, and a sibling of the Infisical one rather than the same file:
+/// each vendor's credential is written by `keylessd credential --store`, and
+/// one file per store is what lets a rotation of one leave the other alone.
+fn default_onepassword_credentials_file() -> ConfigPath {
+    ConfigPath::from(
+        PathBuf::from("/usr/local/var/lib")
+            .join(crate::NAME)
+            .join("onepassword.json"),
     )
 }
 
@@ -363,6 +470,14 @@ fn default_infisical_binary() -> ConfigPath {
 
 fn default_infisical_path() -> String {
     crate::config::default_infisical_path()
+}
+
+fn default_onepassword_binary() -> ConfigPath {
+    crate::config::default_onepassword_binary()
+}
+
+fn default_listing_ttl_ms() -> u64 {
+    crate::config::default_listing_ttl_ms()
 }
 
 fn default_probe_binary() -> ConfigPath {
@@ -492,6 +607,37 @@ impl DaemonConfig {
             .any(|name| routing.route(name).env.is_some())
     }
 
+    /// Where each name lives inside the daemon's one 1Password vault.
+    ///
+    /// The same projection a session builds, from the same fields of the same
+    /// [`SecretRoute`] type. There is no daemon-side default vault for the
+    /// reason there is none on a session — see
+    /// [`crate::config::OnePasswordConfig::vault`] — and no per-name `vault`
+    /// can widen it, because `read_route` refuses one that disagrees.
+    #[must_use]
+    pub fn onepassword_routing(&self) -> OnePasswordRouting {
+        OnePasswordRouting::new(
+            &self.secrets,
+            self.stores.onepassword.vault.clone(),
+            self.stores.onepassword.field.clone(),
+        )
+    }
+
+    /// The daemon's 1Password login, read out of its own file.
+    ///
+    /// The same arrangement as [`DaemonConfig::vendor_credentials`], for the
+    /// same reasons.
+    fn service_account(&self) -> Option<ServiceAccount> {
+        let settings = &self.stores.onepassword;
+        if settings.credentials.is_empty() {
+            return None;
+        }
+        Some(ServiceAccount::new(
+            Box::new(FileStore::new(settings.credentials_file.to_path_buf())),
+            settings.credentials.clone(),
+        ))
+    }
+
     /// Which name is pinned to which store, by store id.
     ///
     /// Only [`SecretRoute::store`] is read here: the coordinate fields beside
@@ -564,6 +710,26 @@ impl DaemonConfig {
                 .with_vendor_credentials(self.vendor_credentials()),
             ));
         }
+        if self.stores.onepassword.enabled {
+            let settings = &self.stores.onepassword;
+            stores.push(Box::new(
+                OnePasswordStore::new(
+                    settings.binary.to_path_buf(),
+                    settings.probe_binary.to_path_buf(),
+                    self.onepassword_routing(),
+                )
+                .with_timeout(settings.timeout_ms)
+                .with_listing_ttl(settings.listing_ttl_ms)
+                .for_account(settings.account.clone())
+                .in_config_dir(
+                    settings
+                        .config_dir
+                        .as_deref()
+                        .map(|path| path.to_path_buf()),
+                )
+                .with_vendor_credentials(self.service_account()),
+            ));
+        }
         Registry::new(stores)
             .with_routes(self.routes())
             .with_policy(self.stores.policy)
@@ -589,8 +755,63 @@ impl DaemonConfig {
         if !self.stores.file.enabled
             && !self.stores.keychain.enabled
             && !self.stores.infisical.enabled
+            && !self.stores.onepassword.enabled
         {
             warnings.push("no store is enabled, so no name can resolve".to_owned());
+        }
+        if self.stores.onepassword.enabled && self.stores.onepassword.vault.is_none() {
+            // The operator-facing form of the rule in `onepassword_routing`:
+            // said at startup, rather than as every 1Password name degrading
+            // with a sentence about a config key nobody was told belongs here.
+            warnings.push(
+                "the 1Password store is enabled and `stores.onepassword.vault` names no vault, \
+                 so no name can resolve against it: the daemon reads exactly one vault and \
+                 there is deliberately no default"
+                    .to_owned(),
+            );
+        }
+        if self.stores.onepassword.enabled && self.stores.onepassword.credentials.is_empty() {
+            // Not a misconfiguration — an operator may have signed the daemon's
+            // uid in some other way — but it is the arrangement nobody
+            // intends, and a lookup that fails for it reads as a network fault.
+            warnings.push(format!(
+                "the 1Password store is enabled and names no credential, so the daemon's `op` \
+                 has only whatever login its own uid carries, which under launchd is none. \
+                 Name `{SERVICE_ACCOUNT_TOKEN}` under `stores.onepassword.credentials` and \
+                 write it with `{} credential --store onepassword`",
+                crate::DAEMON_NAME
+            ));
+        }
+        let refused = ServiceAccount::refused(&self.stores.onepassword.credentials);
+        if !refused.is_empty() {
+            warnings.push(format!(
+                "these 1Password credential variables are refused because they are not \
+                 `OP_*`, and every 1Password lookup will degrade while they are named: {}",
+                refused.join(", ")
+            ));
+        }
+        if !self.stores.onepassword.credentials.is_empty()
+            && self.stores.file.enabled
+            && self.stores.onepassword.credentials_file.to_path_buf()
+                == self.stores.file.path.to_path_buf()
+        {
+            warnings.push(format!(
+                "the 1Password credential file is the same file the `file` store serves, so \
+                 {} {} a name any attested client can ask for; put the credential in a file \
+                 of its own and name it in `stores.onepassword.credentials_file`",
+                self.stores
+                    .onepassword
+                    .credentials
+                    .values()
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                if self.stores.onepassword.credentials.len() == 1 {
+                    "is"
+                } else {
+                    "are"
+                }
+            ));
         }
         if self.stores.infisical.enabled && !self.declares_any_infisical_environment() {
             // The operator-facing form of the rule in `infisical_routing`. Left
@@ -1107,6 +1328,153 @@ mod tests {
         assert!(
             !said.contains("INFISICAL_TOKEN"),
             "an accepted variable was reported as refused: {said}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // The 1Password vault, and the login the daemon is handed.
+    // -----------------------------------------------------------------------
+
+    /// A 1Password daemon config with everything a lookup needs, so the
+    /// warnings can be asserted SILENT — the control every warning test here
+    /// needs, or a warning could fire on every config regardless.
+    const ONEPASSWORD_WELL_FORMED: &str = r#"{"peer":{"allow_uids":[501],
+                "allow_images":["00112233445566778899aabbccddeeff00112233"]},
+                "stores":{"onepassword":{"enabled":true,"vault":"company","field":"password",
+                                         "credentials_file":"/tmp/keyless-test/onepassword.json",
+                                         "credentials":{"OP_SERVICE_ACCOUNT_TOKEN":"SERVICE_ACCOUNT"}}},
+                "secrets":{"DECOY":{"store":"onepassword","item":"Router"}}}"#;
+
+    #[test]
+    fn a_well_formed_onepassword_config_registers_the_store_and_warns_about_nothing() {
+        let config = parse(ONEPASSWORD_WELL_FORMED);
+        let ids: Vec<String> = config
+            .registry()
+            .stores()
+            .iter()
+            .map(|store| store.id().to_owned())
+            .collect();
+        assert_eq!(ids, ["onepassword"]);
+        assert!(config.warnings().is_empty(), "{:?}", config.warnings());
+    }
+
+    #[test]
+    fn a_names_onepassword_coordinates_are_read_from_the_daemons_own_config() {
+        let config = parse(
+            r#"{"stores":{"onepassword":{"vault":"company","field":"password"}},
+                "secrets":{"A":{"store":"onepassword","item":"Router","section":"other",
+                                "field":"api key"}}}"#,
+        );
+        let routing = config.onepassword_routing();
+        assert_eq!(routing.vault().expect("pinned"), "company");
+        let address = routing.address("A").expect("declared");
+        assert_eq!(address.item, "Router");
+        assert_eq!(address.section.as_deref(), Some("other"));
+        assert_eq!(address.field, "api key");
+        // An undeclared name is its own title at the store-wide field, in the
+        // one vault — there is nowhere else it could point.
+        assert_eq!(
+            routing
+                .address("A_NAME_NOBODY_EVER_DECLARED")
+                .expect("addressable")
+                .item,
+            "A_NAME_NOBODY_EVER_DECLARED"
+        );
+    }
+
+    #[test]
+    fn no_daemon_config_key_supplies_a_default_onepassword_vault() {
+        // The same shape of assertion as the Infisical environment above: every
+        // spelling somebody reaching for a default would try is dropped by
+        // serde, and the routing built from the parsed config names no vault.
+        let config = parse(
+            r#"{"stores":{"onepassword":{"enabled":true,"default_vault":"personal"},
+                          "vault":"personal"},
+                "vault":"personal","onepassword_vault":"personal"}"#,
+        );
+        let rendered = serde_json::to_string(&config).expect("serialize");
+        assert!(
+            !rendered.contains("personal"),
+            "a vault survived the parse: {rendered}"
+        );
+        assert!(config.onepassword_routing().vault().is_err());
+        let said = config.warnings().join(" ");
+        assert!(said.contains("stores.onepassword.vault"), "{said}");
+    }
+
+    #[test]
+    fn a_name_declaring_another_vault_is_refused_on_the_daemon_too() {
+        // The whole point of hosting this adapter behind the boundary is that
+        // a name cannot widen the vault. The daemon's config is the operator's,
+        // but a wrong entry in it must still fail closed.
+        let config = parse(
+            r#"{"stores":{"onepassword":{"vault":"company","field":"password"}},
+                "secrets":{"A":{"store":"onepassword","vault":"personal","item":"Router"}}}"#,
+        );
+        let said = config
+            .onepassword_routing()
+            .address("A")
+            .expect_err("another vault is not this store's");
+        assert!(said.contains("pinned to `company`"), "{said}");
+    }
+
+    #[test]
+    fn a_onepassword_store_with_no_credential_is_warned_about() {
+        let said = parse(r#"{"stores":{"onepassword":{"enabled":true,"vault":"company"}}}"#)
+            .warnings()
+            .join(" ");
+        assert!(said.contains("names no credential"), "{said}");
+        assert!(said.contains("OP_SERVICE_ACCOUNT_TOKEN"), "{said}");
+        assert!(said.contains("credential --store onepassword"), "{said}");
+    }
+
+    #[test]
+    fn a_onepassword_credential_variable_outside_the_vendors_prefix_is_named_at_startup() {
+        let said = parse(
+            r#"{"stores":{"onepassword":{"enabled":true,"vault":"company",
+                          "credentials":{"HOME":"X","OP_SERVICE_ACCOUNT_TOKEN":"Y"}}}}"#,
+        )
+        .warnings()
+        .join(" ");
+        assert!(said.contains("not `OP_*`"), "{said}");
+        assert!(said.contains("HOME"), "{said}");
+        assert!(
+            !said.contains("refused because they are not `OP_*`, and every 1Password lookup will degrade while they are named: HOME, OP_"),
+            "an accepted variable was reported as refused: {said}"
+        );
+    }
+
+    #[test]
+    fn keeping_the_service_account_in_the_served_secrets_file_is_warned_about() {
+        let said = parse(
+            r#"{"stores":{"file":{"enabled":true,"path":"/tmp/keyless-test/secrets.json"},
+                          "onepassword":{"enabled":true,"vault":"company",
+                                         "credentials_file":"/tmp/keyless-test/secrets.json",
+                                         "credentials":{"OP_SERVICE_ACCOUNT_TOKEN":"SERVICE_ACCOUNT"}},
+                          "default":"file"}}"#,
+        )
+        .warnings()
+        .join(" ");
+        assert!(said.contains("same file the `file` store serves"), "{said}");
+        assert!(said.contains("SERVICE_ACCOUNT"), "{said}");
+        assert!(
+            said.contains("stores.onepassword.credentials_file"),
+            "{said}"
+        );
+    }
+
+    #[test]
+    fn the_two_vendor_credential_files_default_to_different_paths() {
+        // One file per store is what lets a rotation of one leave the other
+        // alone, and what keeps `keylessd credential --store` meaningful.
+        let config = parse("{}");
+        assert_ne!(
+            config.stores.onepassword.credentials_file.to_path_buf(),
+            config.stores.infisical.credentials_file.to_path_buf()
+        );
+        assert_ne!(
+            config.stores.onepassword.credentials_file.to_path_buf(),
+            config.stores.file.path.to_path_buf()
         );
     }
 

@@ -38,6 +38,7 @@
 use crate::config::Config;
 use crate::error::StoreError;
 use crate::store::infisical::InfisicalStore;
+use crate::store::onepassword::OnePasswordStore;
 use crate::store::proton::{ProtonStore, Reason};
 
 /// What kind of thing a name came from.
@@ -176,6 +177,10 @@ pub fn discoverer(
         // verb enumerates only a coordinate somebody named or declared. See
         // [`crate::store::infisical`] and [`crate::store::envnames`].
         "infisical" => Ok(Box::new(InfisicalStore::from_config(config, None))),
+        // `item list` prints coordinates and no content, and it is confined to
+        // the one vault the store is pinned to — a `--vault` naming another is
+        // refused there. See [`crate::store::onepassword`].
+        "onepassword" => Ok(Box::new(OnePasswordStore::from_config(config))),
         "keychain" => Err(unavailable(KEYCHAIN_HAS_NO_LISTING)),
         "daemon" => Err(unavailable(
             "the daemon deliberately cannot be enumerated: a client that could list the store \
@@ -200,7 +205,7 @@ mod tests {
     }
 
     #[test]
-    fn the_two_vault_backends_enumerate_and_the_others_say_why_they_do_not() {
+    fn the_vault_backends_enumerate_and_the_others_say_why_they_do_not() {
         // The honest-degrade rule: a verb that works in one backend and leaks in
         // another is worse than one that is plainly absent in the second.
         assert!(discoverer(&config(), "proton", &Reason::default()).is_ok());
@@ -208,6 +213,8 @@ mod tests {
         // build where this went back to a refusal has lost the listing rather
         // than gained a protection.
         assert!(discoverer(&config(), "infisical", &Reason::default()).is_ok());
+        // 1Password lists through `item list`, which prints no content.
+        assert!(discoverer(&config(), "onepassword", &Reason::default()).is_ok());
 
         for (store, expected) in [
             ("keychain", "whole keychain file"),

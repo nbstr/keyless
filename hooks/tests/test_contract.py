@@ -162,6 +162,11 @@ def run():
                 "pass-cli inject -i template.env",
                 "pass-cli personal-access-token create",
                 "op document get deploy-key",
+                # Rows measured against `op` 2.39.0: each prints a credential.
+                "op item create --vault company --reveal -",
+                "op item edit demo --reveal 'password[password]='",
+                "op service-account create agent --vault company:read_items",
+                "op connect token create agent --server dev --vault company",
                 "vault print token",
                 "doppler secrets get STRIPE_KEY",
                 "doppler secrets download --no-file",
@@ -189,6 +194,10 @@ def run():
     for cmd in ("op run -- ./deploy.sh",
                 "op signin",
                 "op item list",
+                # The write form that keeps the value off the command line:
+                # a template on stdin, and no `--reveal`.
+                "op item create --vault company -",
+                "op vault get company",
                 "infisical run -- npm start",
                 "infisical secrets set FOO=bar",
                 "doppler run -- npm start",

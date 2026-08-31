@@ -70,6 +70,7 @@ step rm -f /usr/local/bin/keylessd
 step rm -f /usr/local/bin/keyless
 step rm -rf "$CONF_DIR"
 step rm -f "$LIB_DIR/infisical.json"
+step rm -f "$LIB_DIR/onepassword.json"
 step dscl . -delete "/Users/$DAEMON_USER"
 step dseditgroup -o delete "$ACCESS_GROUP"
 
@@ -81,9 +82,10 @@ cat <<KEPT
 #   $LOG_DIR/audit.jsonl.anchor   which row that record ends on
 #   $LIB_DIR/secrets.json         possibly your only copy of migrated credentials
 #
-# Removed above: $LIB_DIR/infisical.json, the daemon's own vendor login. If you
-# gave it an Infisical machine identity, REVOKE that identity at the vendor now.
-# The file is gone from this machine and the credential is not dead until you do.
+# Removed above: $LIB_DIR/infisical.json and $LIB_DIR/onepassword.json, the
+# daemon's own vendor logins. If you gave it an Infisical machine identity or a
+# 1Password service account, REVOKE that identity at the vendor now. The file is
+# gone from this machine and the credential is not dead until you do.
 #
 # Keep the anchor with the log or drop both. It is the only thing that says how
 # long the log is supposed to be, so a log kept without it can lose rows from

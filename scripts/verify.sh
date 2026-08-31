@@ -91,12 +91,12 @@ fi
 
 # ---- the suite, with no vendor CLI within reach ---------------------------
 #
-# The runner proved stub-independence by not having `infisical` or `pass-cli`
-# installed. This machine has both, so the PATH is scrubbed instead. See
+# The runner proved stub-independence by not having `infisical`, `pass-cli` or
+# `op` installed. This machine has them, so the PATH is scrubbed instead. See
 # scripts/vendorless_path.py.
 CLEAN_PATH="$(vendorless_path)" || fail "could not build a vendor-free PATH"
 if [ -n "${CLEAN_PATH:-}" ]; then
-  for cli in infisical pass-cli; do
+  for cli in infisical pass-cli op; do
     if PATH="$CLEAN_PATH" command -v "$cli" > /dev/null 2>&1; then
       fail "$cli is still reachable on the scrubbed PATH, so a green suite no longer proves the stubs are what it used"
     fi
