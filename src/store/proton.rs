@@ -1498,9 +1498,21 @@ pub(crate) fn scrub(value: &mut serde_json::Value) {
 ///    a custom field's name, and is **not** recursed into. That is the only rule by
 ///    which a string from a value position reaches the output.
 /// 2. **An entry whose value is a JSON scalar** contributes its KEY as a built-in
-///    field's name, unless the key is in [`NEVER_A_FIELD`].
+///    field's name, unless the key is in [`NEVER_A_FIELD`] or the slot is unfilled —
+///    `null` or an empty string.
 ///
 /// Everything else is recursed into.
+///
+/// # Why an unfilled slot is not a field
+///
+/// A login item always carries its four built-in slots — `username`, `email`,
+/// `password`, `totp_uri` — whether or not a person filled them. The template
+/// prints an unfilled one as `null`; the view prints it as `""`. Measured
+/// 2026-09-02 against `pass-cli` 2.2.5: a `pass://` reference to an unfilled
+/// slot fails with `Failed to resolve secret`, so a config entry pointed at it
+/// can never resolve, and listing it hands a declaration generator a name that
+/// is broken on the day it is written. Both spellings are skipped, because the
+/// two shapes disagree and a listing has to be right on either.
 ///
 /// # Why rule 1 requires being inside an array
 ///
@@ -1541,7 +1553,7 @@ fn collect_fields(
                     format!("{path}.{key}")
                 };
                 if is_scalar(child) {
-                    if !NEVER_A_FIELD.contains(&key.as_str()) {
+                    if !is_unfilled(child) && !NEVER_A_FIELD.contains(&key.as_str()) {
                         out.push(FieldSummary {
                             name: key.clone(),
                             kind: FieldKind::Builtin,
@@ -1599,6 +1611,16 @@ fn field_descriptor(
 }
 
 /// Whether a JSON value is a leaf rather than a container.
+/// Whether a built-in slot holds nothing: `null` on the template shape, `""` on
+/// the view shape. See the note on [`collect_fields`].
+fn is_unfilled(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Null => true,
+        serde_json::Value::String(text) => text.is_empty(),
+        _ => false,
+    }
+}
+
 fn is_scalar(value: &serde_json::Value) -> bool {
     !matches!(
         value,
@@ -3436,6 +3458,37 @@ mod tests {
             assert!(
                 !names.contains(&structural.to_owned()),
                 "`{structural}` is structure, not a field: {names:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unfilled_login_slot_is_not_listed() {
+        // A login item always carries all four built-in slots. The view prints
+        // an unfilled one as `""` and the template as `null`; the vendor cannot
+        // resolve a reference to either, so a listing that named one would hand
+        // a declaration generator a name that is broken the moment it is
+        // written. Measured 2026-09-02: this is the view's shape for a login
+        // with only an email and a password filled in, with a `null` on one
+        // slot so the template's spelling is covered by the same case.
+        let view = ItemView::parse(
+            br#"{"item":{"item_uuid":"u","content":{"title":"demo login","note":"",
+                "content":{"Login":{"username":"","email":"decoy-Vw44@example",
+                "password":"decoy-Vw44","totp_uri":null,"urls":[],"passkeys":[]}},
+                "extra_fields":[]}}}"#,
+        )
+        .expect("parse");
+        let names: Vec<String> = view
+            .field_names()
+            .into_iter()
+            .map(|field| field.name)
+            .collect();
+        assert!(names.contains(&"email".to_owned()), "{names:?}");
+        assert!(names.contains(&"password".to_owned()), "{names:?}");
+        for unfilled in ["username", "totp_uri"] {
+            assert!(
+                !names.contains(&unfilled.to_owned()),
+                "`{unfilled}` is unfilled on this item and cannot resolve: {names:?}"
             );
         }
     }
