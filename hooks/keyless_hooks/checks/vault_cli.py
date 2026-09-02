@@ -34,7 +34,8 @@ switched off. `--help`, a bare `-h`, and a leading `help` word clear every row.
 
 import re
 
-from ..shellview import head_of, interpreter_payloads, rest_after_head, statements, words
+from ..shellview import (head_of, interpreter_payloads, rest_after_head, statements,
+                         substitution_payloads, words)
 
 CHECK = "KL-VAULT"
 
@@ -131,7 +132,12 @@ def run(payload, cfg):
         return None
 
     table = _compiled(cfg)
-    texts = [cmd] + interpreter_payloads(cmd, cfg.interpreters)
+    # A command substitution is a command wherever it sits, and inside double
+    # quotes the quote-stripped view blanks it out of the statement scan — so
+    # `echo "$(op read …)"` read as a single quoted word and rendered no verdict
+    # while `echo $(op read …)` denied. The substitution bodies are scanned as
+    # statements of their own, the way KL-FILE already reads `echo "$(cat .env)"`.
+    texts = [cmd] + interpreter_payloads(cmd, cfg.interpreters) + substitution_payloads(cmd)
     for text in texts:
         for stmt in statements(text):
             head = head_of(stmt)

@@ -649,5 +649,12 @@
     "file": "keyless_hooks/checks/literal_write.py",
     "find": "    return before.count(\"\\n\") == after.count(\"\\n\")",
     "replace": "    return True  # M93: the line-structure invariant, disarmed"
+  },
+  {
+    "id": "M94-vault-blind-to-quoted-substitution",
+    "why": "Removes the substitution view from KL-VAULT. `echo \"$(op read …)\"` then reads as one quoted word and renders no verdict — the one spelling of a vault read that reaches a print verb unrefused, while the unquoted spelling still denies.",
+    "file": "keyless_hooks/checks/vault_cli.py",
+    "find": "    texts = [cmd] + interpreter_payloads(cmd, cfg.interpreters) + substitution_payloads(cmd)",
+    "replace": "    texts = [cmd] + interpreter_payloads(cmd, cfg.interpreters)"
   }
 ]
