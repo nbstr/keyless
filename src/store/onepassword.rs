@@ -33,13 +33,13 @@
 //! |---|---|---|
 //! | `op run` reads `op://` references out of its environment and hands the child the values | documented | the lookup is a `run` whose child is `printenv` |
 //! | `op run` masks values in the child's output as `<concealed by 1Password>` unless `--no-masking` is passed | measured (the marker is in the binary; the flag is in `--help`) | `--no-masking` on every probe, and a concealed value is refused |
-//! | `op run` with **no** reference in its environment runs the child without authenticating at all | measured | a health check cannot be built on `run`; it uses `vault get` |
+//! | `op run` with **no** reference in its environment runs the child without authenticating at all | measured | a health check cannot be built on `run`; it lists the vault instead |
 //! | with more than one account configured and no sign-in, every authenticated verb fails with `multiple accounts found. Use the --account flag …`, exit 1 | measured | `account` is a config field and is passed as `--account=` |
 //! | a bogus `OP_SERVICE_ACCOUNT_TOKEN` fails with `DecodeSACredentials`, exit 9 on `vault get` and exit 1 under `run` | measured | that wording is read as a refused login, never as a missing name |
 //! | `op` finds its account list under `env -i` with only `HOME` and `PATH` | measured | the probe runs in a cleared environment |
-//! | `op item list --vault … --format json` prints ids, titles and categories and no field content; archived items carry `"state": "ARCHIVED"` and appear only with `--include-archive` | documented | the listing is how a title becomes an id, and how an archived item is refused |
+//! | `op item list --vault … --format json` prints ids, titles and categories and no field content; archived items carry `"state": "ARCHIVED"` and appear only with `--include-archive` | documented | the listing is how a title becomes an id, how an archived item is refused, and the health check |
 //! | `op item get … --format json` prints every field **including its value** | documented | `fields` parses it in memory, scrubs it on drop, and prints labels only |
-//! | `op vault get <vault> --format json` prints the vault's id, name and item count | documented | the health check, which reads no item |
+//! | a service account is granted a vault as `--vault <name>:read_items`, an ITEM permission | documented | the health check lists items, because the vault RECORD is a different object and a login can be allowed one and refused the other |
 //! | the vendor writes errors as `[ERROR] <date> <time> <message>` on stderr | measured | the timestamp is stripped before a message is quoted |
 //!
 //! # The mechanism, and why it is the same one twice over
@@ -881,16 +881,6 @@ impl OnePasswordStore {
         command
     }
 
-    /// Build one `op vault get <vault> --format=json`, the health check.
-    fn vault_command(&self, vault: &str, credentials: &[(String, Secret)]) -> Command {
-        let mut command = self.base_command(credentials);
-        command.arg("vault");
-        command.arg("get");
-        command.arg(vault);
-        command.arg("--format=json");
-        command
-    }
-
     /// Build one `op item get <id> --vault=… --format=json`, for `fields`.
     ///
     /// Addressed by id, out of a listing this adapter just read, so `fields`
@@ -1120,15 +1110,25 @@ impl Store for OnePasswordStore {
             .ok_or_else(|| self.backend(format!("`{}` is not valid UTF-8", address.field)))
     }
 
-    /// Local preconditions, then one round trip that proves the login can see
-    /// the pinned vault.
+    /// Local preconditions, then the round trip every lookup starts with.
     ///
-    /// `vault get` rather than `run`, and the reason is measured: `op run`
-    /// with nothing to resolve runs its child without authenticating, so a
-    /// health check built on it would print green over a dead login. `vault
-    /// get` authenticates, names the vault, and reads no item — and a vault the
-    /// identity cannot see is exactly the failure a scoped service account
-    /// produces when it was minted for the wrong vault.
+    /// **The verb a lookup runs, and no other.** This used to be `op vault get
+    /// <vault>`, which no lookup has ever run — lookups run `item list` and
+    /// then `run`. That gap is not theoretical: the vendor grants a service
+    /// account a vault as `--vault <name>:read_items`, an **item** permission,
+    /// while `vault get` reads the vault **record**. An identity allowed one
+    /// and refused the other is the ordinary arrangement, and against it the
+    /// report printed a green row over a store where nothing resolves.
+    ///
+    /// Not `run`, and that reason is measured: `op run` with nothing to resolve
+    /// runs its child without authenticating at all, so a check built on it
+    /// would print green over a dead login. The listing authenticates, names
+    /// the vault, and reads no value — every byte it prints is a coordinate.
+    ///
+    /// What it still does not establish is the second half of a lookup: that
+    /// `op run` resolves a reference on this machine. Nothing short of reading
+    /// a value can establish that, which is what `doctor --probe` is for, and
+    /// the row says so rather than letting `proven` carry the claim.
     fn health(&self) -> Result<(), StoreError> {
         let vault = self.vault()?;
 
@@ -1139,20 +1139,17 @@ impl Store for OnePasswordStore {
             )));
         }
 
-        let captured = capture(
-            self.vault_command(vault, &self.vendor_environment()?),
-            self.timeout,
-        )
-        .map_err(|error| self.unreachable(&error))?;
-
-        if captured.status.success() {
-            return Ok(());
-        }
-        let said = vendor_said(&captured.stderr);
-        Err(self.unavailable(format!(
-            "vault `{vault}` cannot be read: {}",
-            self.explained(&said)
-        )))
+        self.cached_items(vault).map(|_| ()).map_err(|error| {
+            match error {
+                // The verb is a lookup's and so is its `Backend` wording, but a
+                // health check's verdict is about whether this machine is set
+                // up — the `Unavailable` half of the report. Re-labelled here so
+                // that changing WHICH verb proves the store did not also change
+                // which colour a refused login prints in.
+                StoreError::Backend { detail, .. } => self.unavailable(detail),
+                other => other,
+            }
+        })
     }
 }
 
@@ -1592,7 +1589,6 @@ mod tests {
         // And on every verb, not only the probe.
         for command in [
             named.list_command("company", &[]),
-            named.vault_command("company", &[]),
             named.view_command("company", "It3mOne", &[]),
         ] {
             let rendered = argv(&command);
@@ -1624,14 +1620,27 @@ mod tests {
     }
 
     #[test]
-    fn the_health_check_authenticates_against_the_vault_and_not_through_run() {
-        // Measured: `op run` with nothing to resolve runs its child without
-        // authenticating, so a health check built on it is a green line over a
-        // dead login.
+    fn no_verb_this_adapter_can_build_reads_the_vault_record() {
+        // `op vault get` is gone, and this is what keeps it gone. It was the
+        // health check, it is the one verb no lookup runs, and a login granted
+        // `--vault <name>:read_items` can be refused it while every lookup
+        // works — or allowed it while every lookup is refused, which is the
+        // direction that printed green over a dead store.
+        //
+        // Asserted over every command this adapter can build, so a health check
+        // that grows a second, private round trip is caught too.
         let store = pinned("{}");
-        let rendered = argv(&store.vault_command("company", &[]));
-        assert_eq!(&rendered[1..4], ["vault", "get", "company"]);
-        assert!(!rendered.iter().any(|arg| arg == "run"));
+        for command in [
+            store.probe_command("op://company/I/password", &[]),
+            store.list_command("company", &[]),
+            store.view_command("company", "It3mOne", &[]),
+        ] {
+            let rendered = argv(&command);
+            assert!(
+                !rendered.iter().any(|arg| arg == "vault"),
+                "a verb reads the vault record: {rendered:?}"
+            );
+        }
     }
 
     #[test]

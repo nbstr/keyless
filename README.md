@@ -1032,15 +1032,19 @@ encodes it. What the real `op` 2.39.0 did without a sign-in:
 
 | Measured | Consequence |
 |---|---|
-| `op run` with **no** reference in its environment runs the child without authenticating | the health check is `op vault get <vault>`, never `run` |
+| `op run` with **no** reference in its environment runs the child without authenticating | the health check lists the vault's items, never `run` |
 | more than one account configured, no sign-in: `multiple accounts found. Use the --account flag …`, exit 1 | `account` is a config field |
 | a bogus `OP_SERVICE_ACCOUNT_TOKEN`: `DecodeSACredentials`, exit 9 (`vault get`) / exit 1 (`run`) | read as a refused login, never as a missing name |
 | `op` finds its accounts under `env -i` with only `HOME` and `PATH` | the probe runs in a cleared environment |
 | the masking placeholder is `<concealed by 1Password>` | `--no-masking` on every probe; a concealed value is refused |
 | errors are `[ERROR] <date> <time> <message>` | the prefix is stripped before a message is quoted |
 
-A green `doctor` row for this store says the login can see the pinned vault. It
-does not say a lookup has ever worked on this machine; `doctor --probe` does.
+A green `doctor` row for this store says the login can **list** the pinned
+vault — the round trip every lookup starts with, and the one the vendor's
+`--vault <name>:read_items` grant actually covers. It does not say `op run` has
+ever resolved a reference on this machine, so no value has been read and no
+name is known to work; `doctor --probe` is what establishes that, and the row
+says so itself rather than leaving `proven` to carry both claims.
 
 ### Timeouts
 

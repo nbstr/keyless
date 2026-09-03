@@ -475,6 +475,14 @@ pub enum OnePasswordListing {
     /// `vault get` and `item list` fail as they do for a vault the login
     /// cannot see. Wording documented, not measured.
     NoSuchVault,
+    /// `vault get` ANSWERS and `item list` is refused.
+    ///
+    /// The split a health check must not read as health. It is what the
+    /// vendor's own grant syntax produces — `--vault <name>:read_items` is an
+    /// **item** permission, and the vault RECORD is a different object — so a
+    /// login can see the vault it cannot list. Wording documented, not
+    /// measured.
+    ItemsRefused,
 }
 
 impl OnePasswordListing {
@@ -488,7 +496,9 @@ impl OnePasswordListing {
     /// What `vault get` does.
     fn vault_body(&self) -> String {
         match self {
-            OnePasswordListing::Json(_) => {
+            // `ItemsRefused` answers here on purpose: the vault record is
+            // readable and the items are not, which is the whole case.
+            OnePasswordListing::Json(_) | OnePasswordListing::ItemsRefused => {
                 r#"printf '%s' '{"id":"V1","name":"company","items":1}'; exit 0"#.to_owned()
             }
             OnePasswordListing::NotSignedIn => NOT_SIGNED_IN.to_owned(),
@@ -504,6 +514,7 @@ impl OnePasswordListing {
             OnePasswordListing::Json(_) => format!("cat '{}'; exit 0", listing_file.display()),
             OnePasswordListing::NotSignedIn => NOT_SIGNED_IN.to_owned(),
             OnePasswordListing::NoSuchVault => NO_SUCH_VAULT.to_owned(),
+            OnePasswordListing::ItemsRefused => NO_ITEM_PERMISSION.to_owned(),
         }
     }
 }
@@ -515,6 +526,10 @@ const NOT_SIGNED_IN: &str =
 /// A vault the login cannot see. No apostrophe, so it survives single quotes.
 const NO_SUCH_VAULT: &str = "printf '%s\\n' '[ERROR] 2001/01/01 00:00:00 no vault named that is \
      visible to this account' >&2; exit 1";
+
+/// A vault the login can SEE and may not LIST. No apostrophe, same reason.
+const NO_ITEM_PERMISSION: &str = "printf '%s\\n' '[ERROR] 2001/01/01 00:00:00 you do not have \
+     permission to list items in this vault' >&2; exit 1";
 
 /// The shell fragment that runs, or declines to run, the probe under `op run`.
 ///

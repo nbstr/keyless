@@ -2569,3 +2569,96 @@ fn several_onepassword_names_cost_exactly_one_listing() {
         "three names must cost one listing"
     );
 }
+
+// ---------------------------------------------------------------------------
+// The health check, and the word `proven` over it.
+// ---------------------------------------------------------------------------
+
+/// One STORES row of a rendered report, by backend id.
+fn store_row<'a>(report: &'a str, id: &str) -> &'a str {
+    report
+        .lines()
+        .find(|line| line.split_whitespace().nth(1) == Some(id))
+        .unwrap_or_else(|| panic!("the report has no `{id}` row:\n{report}"))
+}
+
+#[test]
+fn doctor_never_proves_a_onepassword_vault_whose_items_it_cannot_list() {
+    // The defect this pins: the health check used to run `op vault get`, a verb
+    // NO lookup runs — lookups run `item list` and then `run`. The vendor grants
+    // a service account a vault as `--vault <name>:read_items`, an ITEM
+    // permission, while `vault get` reads the vault RECORD, so a login allowed
+    // one and refused the other is the ordinary arrangement rather than a
+    // contrived one.
+    //
+    // Against exactly that stub the row read `proven` while every name degraded.
+    // The two must agree, so both halves are asserted from the one fixture.
+    let dir = scratch("onepassword-listable-vault-only");
+    let stub = stub_op_listing(
+        &dir,
+        &Backend::Injects(ONEPASSWORD_DECOY),
+        &OnePasswordListing::ItemsRefused,
+        "{}",
+    );
+    let config = onepassword_config(&stub, ONEPASSWORD_DECOY_BY_TITLE);
+    let (report, code) = doctor_report(&dir, &config);
+    let row = store_row(&report, "onepassword");
+
+    assert!(
+        !row.contains("proven"),
+        "a vault whose items cannot be listed was reported as proven:\n{report}"
+    );
+    assert_ne!(code, 0, "{report}");
+    // The vendor's own words, so the reader knows which refusal this is.
+    assert!(
+        flattened(&report).contains("permission to list items"),
+        "{report}"
+    );
+
+    // And the lookup agrees, from the same fixture: the row and the run must
+    // not disagree about whether this store works.
+    let marker = dir.join("witness");
+    let registry = registry_from(&config, &Reason::default());
+    let (outcome, notes) = run_with(&registry, &["DECOY"], &witness(&marker, "DECOY", 0), &[]);
+    assert_eq!(outcome.state, State::Degraded, "{notes}");
+    assert_eq!(witnessed(&marker), "<unset>");
+}
+
+#[test]
+fn doctor_proves_a_listable_onepassword_vault_and_says_what_it_did_not_prove() {
+    // The control for the case above. Without it that one passes on an
+    // implementation reporting every 1Password store broken — the same defect
+    // wearing the other colour, and the one that gets a health check deleted.
+    let dir = scratch("onepassword-listable");
+    let stub = stub_op(&dir, &Backend::Injects(ONEPASSWORD_DECOY));
+    let (report, code) =
+        doctor_report(&dir, &onepassword_config(&stub, ONEPASSWORD_DECOY_BY_TITLE));
+
+    assert_eq!(state_of(store_row(&report, "onepassword")), "proven");
+    assert_eq!(code, 0, "{report}");
+
+    // It reached the vendor, and it asked for the verb a lookup starts with —
+    // never the vault record, and never a verb that prints a value.
+    let argv = recorded_lines(&dir.join("op.argv"));
+    assert_eq!(argv.first().map(String::as_str), Some("item"));
+    assert_eq!(argv.get(1).map(String::as_str), Some("list"));
+    for forbidden in ["vault", "run", "get", "read", "inject"] {
+        assert!(
+            !mentions(&argv, forbidden),
+            "a health check asked for `{forbidden}`: {argv:?}"
+        );
+    }
+
+    // And the green row says which half of a lookup it proved. `proven` beside
+    // a store where `op run` has never resolved anything is the shape this
+    // repository spent a day removing: a tick next to a word that denies it.
+    let flat = flattened(&report);
+    assert!(flat.contains("op run"), "{report}");
+    assert!(flat.contains("--probe"), "{report}");
+    assert!(
+        ["did not", "no value", "not known"]
+            .iter()
+            .any(|denial| flat.contains(denial)),
+        "the row must DENY having read a value, not merely omit it:\n{report}"
+    );
+}

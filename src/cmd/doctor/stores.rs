@@ -89,6 +89,12 @@ pub(super) fn store_rows(config: &Config, registry: &Registry) -> Vec<StoreRow> 
 /// socket are each passed to the backend verbatim, so config is what the
 /// lookup used.
 ///
+/// 1Password's row carries a caveat of a different kind. Its coordinates ARE
+/// the ones the check used, and the check is now the verb a lookup starts with
+/// — but it is only the FIRST of a lookup's two round trips. Nothing short of
+/// reading a value proves `op run` resolves a reference on this machine, so the
+/// row says which half it proved rather than letting `proven` carry both.
+///
 /// Infisical is the one where that gap is load-bearing rather than pedantic.
 /// The adapter hands the vendor CLI this process's `HOME` and every
 /// `INFISICAL_*` variable and passes neither a domain nor a token, so WHICH
@@ -133,10 +139,17 @@ fn points_at(config: &Config, id: &str) -> String {
                 Some(vault) => format!("vault \"{vault}\""),
                 None => "vault unset".to_owned(),
             };
-            match &config.stores.onepassword.account {
+            let asked = match &config.stores.onepassword.account {
                 Some(account) => format!("{vault}, account {account}"),
                 None => format!("{vault}, account chosen by the CLI"),
-            }
+            };
+            format!(
+                "{asked} — this row LISTED that vault's items, the round trip every \
+                 lookup starts with. It did not resolve a reference through `op run`, \
+                 so no value has been read and no name is known to work; \
+                 `{} doctor --probe` is what establishes that.",
+                crate::NAME
+            )
         }
         "daemon" => config.stores.daemon.socket_path().display().to_string(),
         // A backend this build does not have settings for. It answered, which

@@ -351,8 +351,11 @@ than one does.
 
 `check` prints the same two rows it prints for Infisical: `identity` is about
 the file — does it exist, is it `0600`, is it owned by the daemon — and `store
-onepassword` is the vendor accepting the token **for that vault**. A refused
-token says so and never reports a name as missing.
+onepassword` is the vendor accepting the token **and listing that vault's
+items**, which is the permission `--vault company:read_items` grants and the
+round trip every lookup starts with. A refused token says so and never reports
+a name as missing. What no green row here claims is that `op run` has resolved
+a reference on this machine; nothing short of reading a value can claim that.
 
 ### What has not been measured
 
