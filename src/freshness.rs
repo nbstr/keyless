@@ -104,6 +104,10 @@ const SOURCE_DIR: &str = env!("CARGO_MANIFEST_DIR");
 /// a test file cannot change the program.
 const SOURCES: [&str; 3] = ["src", "Cargo.toml", "Cargo.lock"];
 
+/// Where cargo keeps the source of every binary target that is not the crate's
+/// own `main.rs`.
+const BIN_DIR: &str = "bin";
+
 /// How deep the walk goes before it gives up.
 ///
 /// `src/` is two levels deep today. A bound rather than trust, because a
@@ -157,7 +161,12 @@ pub fn check_at(source_dir: &Path, binary: &Path) -> Freshness {
         Ok(time) => time,
         Err(reason) => return Freshness::Unknown { reason },
     };
-    match newest_source(source_dir) {
+    // Another binary target's source is not this binary's source. See
+    // `newest_source`.
+    let running = binary
+        .file_stem()
+        .map(|stem| stem.to_string_lossy().into_owned());
+    match newest_source(source_dir, running.as_deref()) {
         Err(reason) => Freshness::Unknown { reason },
         // A tree with no readable source file is not a fresh binary; it is a
         // question that was not answered.
@@ -175,8 +184,34 @@ pub fn check_at(source_dir: &Path, binary: &Path) -> Freshness {
 }
 
 /// The most recently modified source file, and when.
-fn newest_source(source_dir: &Path) -> Result<Option<(PathBuf, SystemTime)>, String> {
+///
+/// # Another binary's source is not this binary's source
+///
+/// `running` is the file stem of the binary being judged, and every file
+/// directly under `src/bin/` that does not carry that stem is skipped — the
+/// same rule, and the same sentence, as the `tests/` exclusion above: it cannot
+/// change this program.
+///
+/// This crate ships two binaries, and only one of them lives under `src/bin/`.
+/// Cargo does not relink `keyless` when `src/bin/keylessd.rs` changes, because
+/// that file is in no part of its image — so its mtime does not move, and a
+/// walk that counted the daemon's source reported `keyless doctor` as `stale`
+/// over a binary cargo would refuse to rebuild. The remedy printed beside it,
+/// `cargo build --release`, therefore left the row exactly as it was: a red
+/// verdict nobody could clear, on a binary that was not out of date.
+///
+/// That is the rule at the top of this module read strictly rather than
+/// loosened. "Stale" means "cargo would rebuild this", and cargo would not.
+///
+/// `None` keeps every file, which is the honest answer for a binary whose stem
+/// could not be read: the comparison then errs towards reporting a rebuild that
+/// is not needed, never towards missing one that is.
+fn newest_source(
+    source_dir: &Path,
+    running: Option<&str>,
+) -> Result<Option<(PathBuf, SystemTime)>, String> {
     let mut newest: Option<(PathBuf, SystemTime)> = None;
+    let others = source_dir.join("src").join(BIN_DIR);
     for entry in SOURCES {
         let path = source_dir.join(entry);
         // A missing entry is not an error: `Cargo.lock` is absent from a fresh
@@ -184,9 +219,20 @@ fn newest_source(source_dir: &Path) -> Result<Option<(PathBuf, SystemTime)>, Str
         if !path.exists() {
             continue;
         }
-        visit(&path, 0, &mut newest)?;
+        visit(&path, 0, &mut newest, &others, running)?;
     }
     Ok(newest)
+}
+
+/// Whether `path` is a binary target belonging to some OTHER binary.
+fn another_binarys_source(path: &Path, bin_dir: &Path, running: Option<&str>) -> bool {
+    let Some(running) = running else {
+        return false;
+    };
+    path.parent() == Some(bin_dir)
+        && path
+            .file_stem()
+            .is_some_and(|stem| stem.to_string_lossy() != running)
 }
 
 /// Walk one path, keeping the newest file seen.
@@ -194,12 +240,17 @@ fn visit(
     path: &Path,
     depth: usize,
     newest: &mut Option<(PathBuf, SystemTime)>,
+    bin_dir: &Path,
+    running: Option<&str>,
 ) -> Result<(), String> {
     if depth > MAX_DEPTH {
         return Err(format!(
             "the source tree is deeper than {MAX_DEPTH} levels at {}",
             path.display()
         ));
+    }
+    if another_binarys_source(path, bin_dir, running) {
+        return Ok(());
     }
     // `symlink_metadata`, so a link out of the tree is judged by the link and
     // never followed into somewhere this has no business walking.
@@ -212,7 +263,7 @@ fn visit(
         for entry in entries {
             let entry =
                 entry.map_err(|error| format!("cannot list {}: {error}", path.display()))?;
-            visit(&entry.path(), depth + 1, newest)?;
+            visit(&entry.path(), depth + 1, newest, bin_dir, running)?;
         }
         return Ok(());
     }
@@ -318,6 +369,42 @@ mod tests {
                 newest.display()
             ),
             other => panic!("a newer manifest must be stale, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn another_binary_targets_source_is_not_this_binarys_source() {
+        // The defect: this crate ships two binaries and cargo does not relink
+        // `keyless` when `src/bin/keylessd.rs` changes, because that file is in
+        // no part of its image. Its mtime therefore does not move, and a walk
+        // that counted the daemon's source called it `stale` — with a remedy,
+        // `cargo build --release`, that cargo declines to act on. A red verdict
+        // nobody can clear is worse than no row: it is read past, and then the
+        // real one is read past with it.
+        let (dir, binary) = tree("other-bin", 1_000_000, 999_000);
+        std::fs::create_dir_all(dir.join("src").join("bin")).expect("cannot create the tree");
+        let daemon = dir.join("src").join("bin").join("keylessd.rs");
+        write_at(&daemon, 1_000_500);
+
+        assert_eq!(
+            check_at(&dir, &binary),
+            Freshness::Current,
+            "the daemon's source was counted against the client binary"
+        );
+
+        // The control, and the half that must not be lost: the SAME file, newer
+        // than the SAME instant, is stale for the binary it does belong to. A
+        // rule that skipped `src/bin/` outright would pass the assertion above
+        // and silently stop judging the daemon at all.
+        let its_own = dir.join("keylessd");
+        write_at(&its_own, 1_000_000);
+        match check_at(&dir, &its_own) {
+            Freshness::Stale { newest } => assert!(
+                newest.ends_with("src/bin/keylessd.rs"),
+                "the wrong file was named: {}",
+                newest.display()
+            ),
+            other => panic!("a binary's own source must still be judged, got {other:?}"),
         }
     }
 
