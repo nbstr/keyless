@@ -322,6 +322,7 @@ const DECOY_COORDINATES: &[&str] = &[
     "decoy",
     "decoy alpha",
     "demo api key",
+    "demo login",
     "demo.service",
     "example-api-key",
     "keyless-decoy-alpha",
