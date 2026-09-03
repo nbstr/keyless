@@ -199,7 +199,11 @@ fn forwarded_vars() -> Vec<(std::ffi::OsString, std::ffi::OsString)> {
 }
 
 /// Why nothing can be looked up until a vault is named.
-const NO_VAULT: &str = "`stores.onepassword.vault` is not set, so this store does not know which vault to \
+///
+/// Said for an absent key and for `""` alike, because they are the same
+/// config: neither names a vault, and an empty string is the one that looks
+/// like an answer.
+const NO_VAULT: &str = "`stores.onepassword.vault` names no vault, so this store does not know which vault to \
      read and will not guess one. Name the ONE vault this machine may read there — every \
      lookup, listing and health check is confined to it";
 
@@ -264,6 +268,17 @@ impl Routing {
         vault: Option<String>,
         default_field: Option<String>,
     ) -> Self {
+        // `""` is not a vault name, and it is the one spelling that walks past
+        // every guard this store rests on: `vault()` hands it out as a pin, the
+        // reference becomes `op:///<id>/<field>`, and `--vault=` is spawned at
+        // the vendor. `item` and `field` below already filter it; the vault did
+        // not, and it is the coordinate the other two are scoped by.
+        //
+        // Normalised HERE rather than in `vault()`, because `vault()` is not the
+        // only reader: `read_route` compares a name's own `vault` against this
+        // one, and against `Some("")` it would report a name as widening a pin
+        // that is not a pin — naming an empty vault in the refusal.
+        let vault = vault.filter(|vault| !vault.is_empty());
         let routes = secrets
             .iter()
             .map(|(name, route)| {
@@ -281,6 +296,10 @@ impl Routing {
     }
 
     /// The pinned vault, or the sentence saying there is none.
+    ///
+    /// Never empty: [`Routing::new`] normalises `""` to no vault at all, so
+    /// every caller of this gets a name it can put in a reference or the
+    /// refusal, and never a third thing that reads as a pin and is not one.
     ///
     /// # Errors
     ///
@@ -1289,6 +1308,48 @@ mod tests {
         assert!(said.contains("stores.onepassword.vault"), "{said}");
         assert!(store.health().is_err());
         assert!(Discover::items(&store, None).is_err());
+    }
+
+    #[test]
+    fn an_empty_vault_is_no_vault_and_not_a_pin_that_happens_to_be_blank() {
+        // `""` is the spelling that looks answered in a config file and is not.
+        // Left unfiltered it walks past the one refusal this design rests on:
+        // the reference becomes `op:///<id>/<field>`, `--vault=` is spawned at
+        // the vendor, and the sentence naming the config key never fires.
+        //
+        // `item` and `field` are the control: both already filter `""`, which
+        // is why an empty vault reads as an omission rather than as a rule.
+        let store = store_from(
+            r#"{"stores":{"onepassword":{"enabled":true,"vault":"","field":"password",
+                                         "binary":"/nonexistent/keyless-test/op"}},
+                "secrets":{"DECOY":{"item":"Router"}}}"#,
+        );
+        let said = store
+            .resolve("DECOY")
+            .expect_err("an empty vault is not a vault")
+            .to_string();
+        // `was not asked` is the Misconfigured wording: nothing was spawned, so
+        // no `--vault=` reached the vendor and no reference was built.
+        assert!(said.contains("was not asked"), "{said}");
+        assert!(said.contains("stores.onepassword.vault"), "{said}");
+        assert!(store.routing.vault().is_err());
+        assert!(store.health().is_err());
+        assert!(Discover::items(&store, None).is_err());
+
+        // And a name that declares a vault of its own is not told it is
+        // "widening" a pin that does not exist — the sentence a reader gets
+        // must be the one about the store's own missing key.
+        let store = store_from(
+            r#"{"stores":{"onepassword":{"enabled":true,"vault":"","field":"password",
+                                         "binary":"/nonexistent/keyless-test/op"}},
+                "secrets":{"ELSEWHERE":{"vault":"personal","item":"Router"}}}"#,
+        );
+        let said = store
+            .resolve("ELSEWHERE")
+            .expect_err("an empty vault is not a vault")
+            .to_string();
+        assert!(said.contains("stores.onepassword.vault"), "{said}");
+        assert!(!said.contains("pinned to ``"), "{said}");
     }
 
     #[test]

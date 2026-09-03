@@ -1071,14 +1071,24 @@ impl DaemonConfig {
                 }
             ));
         }
-        if self.stores.onepassword.enabled && self.stores.onepassword.vault.is_none() {
+        // `""` is checked beside absence rather than after it: an empty vault
+        // is the same config as no vault — `OnePasswordRouting` normalises the
+        // two together — and it is the one that looks answered in the file.
+        if self.stores.onepassword.enabled
+            && self
+                .stores
+                .onepassword
+                .vault
+                .as_deref()
+                .is_none_or(str::is_empty)
+        {
             // The operator-facing form of the rule in `onepassword_routing`:
             // said at startup, rather than as every 1Password name degrading
             // with a sentence about a config key nobody was told belongs here.
             warnings.push(
                 "the 1Password store is enabled and `stores.onepassword.vault` names no vault, \
-                 so no name can resolve against it: the daemon reads exactly one vault and \
-                 there is deliberately no default"
+                 so no name can resolve against it: the daemon reads exactly one vault, an \
+                 empty string is not one, and there is deliberately no default"
                     .to_owned(),
             );
         }
@@ -1712,6 +1722,31 @@ mod tests {
         assert!(config.onepassword_routing().vault().is_err());
         let said = config.warnings().join(" ");
         assert!(said.contains("stores.onepassword.vault"), "{said}");
+    }
+
+    #[test]
+    fn an_empty_onepassword_vault_is_warned_about_exactly_as_a_missing_one_is() {
+        // `""` parses, so it is the one spelling that reads as answered in the
+        // file. Behind the daemon it must fail the same way `vault` absent does
+        // — at startup, in the operator's own words — rather than reaching the
+        // vendor as `--vault=` and a reference with a hole where the vault is.
+        let config =
+            parse(r#"{"stores":{"onepassword":{"enabled":true,"vault":"","field":"password"}}}"#);
+        let said = config.warnings().join(" ");
+        assert!(said.contains("stores.onepassword.vault"), "{said}");
+        assert!(said.contains("names no vault"), "{said}");
+        assert!(config.onepassword_routing().vault().is_err());
+
+        // The control: a real vault silences exactly this warning, so the
+        // assertion above is about the empty string and not about every config.
+        let named =
+            parse(r#"{"stores":{"onepassword":{"enabled":true,"vault":"company"}}}"#).warnings();
+        assert!(
+            !named
+                .iter()
+                .any(|warning| warning.contains("names no vault")),
+            "{named:?}"
+        );
     }
 
     #[test]

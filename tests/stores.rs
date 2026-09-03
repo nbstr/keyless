@@ -2430,6 +2430,54 @@ fn a_name_pinned_to_another_vault_never_spawns_op() {
 }
 
 #[test]
+fn an_empty_vault_never_spawns_op_and_names_the_config_key() {
+    // The refusal this whole backend rests on, against the one vault spelling
+    // that parses and pins nothing. Unfiltered, `""` reaches the vendor as
+    // `op item list --vault=` and builds `op:///<id>/<field>` — a listing and a
+    // reference with a hole where the scoping is supposed to be.
+    //
+    // Asserted from the vendor's side: the stub writes `op.argv` on every
+    // invocation, so its absence is the absence of a process.
+    let dir = scratch("onepassword-empty-vault");
+    let marker = dir.join("witness");
+    let stub = stub_op(&dir, &Backend::Injects(ONEPASSWORD_DECOY));
+    let registry = registry_from(
+        &format!(
+            r#"{{"stores":{{"keychain":{{"enabled":false}},
+                 "onepassword":{{"enabled":true,"binary":"{}","vault":"","field":"password",
+                                 "timeout_ms":60000}}}},
+                "secrets":{ONEPASSWORD_DECOY_BY_TITLE}}}"#,
+            stub.display()
+        ),
+        &Reason::default(),
+    );
+
+    let (outcome, notes) = run_with(&registry, &["DECOY"], &witness(&marker, "DECOY", 0), &[]);
+
+    assert_eq!(outcome.state, State::Degraded);
+    assert_eq!(witnessed(&marker), "<unset>");
+    assert!(notes.contains("stores.onepassword.vault"), "{notes}");
+    assert!(
+        !dir.join("op.argv").exists(),
+        "a vendor process was spawned for a store pinned to no vault"
+    );
+
+    // The control: the same fixture with a real vault DOES spawn `op` and
+    // injects, so the absence above is the empty string and not a stub that
+    // never runs.
+    let dir = scratch("onepassword-empty-vault-control");
+    let marker = dir.join("witness");
+    let stub = stub_op(&dir, &Backend::Injects(ONEPASSWORD_DECOY));
+    let registry = registry_from(
+        &onepassword_config(&stub, ONEPASSWORD_DECOY_BY_TITLE),
+        &Reason::default(),
+    );
+    let (outcome, _) = run_with(&registry, &["DECOY"], &witness(&marker, "DECOY", 0), &[]);
+    assert_eq!(outcome.state, State::Injected);
+    assert!(dir.join("op.argv").exists(), "the control spawned nothing");
+}
+
+#[test]
 fn a_reference_handed_back_unresolved_is_refused_rather_than_injected() {
     // Measured: `op run` with nothing to resolve runs its child untouched. A
     // vendor that did that to the probe would hand `printenv` the literal

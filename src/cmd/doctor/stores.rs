@@ -120,7 +120,16 @@ fn points_at(config: &Config, id: &str) -> String {
         // the one this store is confined to. The account is stated when the
         // config states it; otherwise the CLI chose, and the row says so.
         "onepassword" => {
-            let vault = match &config.stores.onepassword.vault {
+            // `""` prints as unset, not as `vault ""`: the store refuses it as
+            // no vault at all, so a row rendering it as a coordinate would be
+            // the report disagreeing with the store it is describing.
+            let vault = match config
+                .stores
+                .onepassword
+                .vault
+                .as_deref()
+                .filter(|vault| !vault.is_empty())
+            {
                 Some(vault) => format!("vault \"{vault}\""),
                 None => "vault unset".to_owned(),
             };
@@ -592,6 +601,15 @@ mod tests {
         let detail = points_at(&load.config, "onepassword");
         assert!(detail.contains("vault \"company\""), "{detail}");
         assert!(detail.contains("account demo"), "{detail}");
+
+        // An empty vault is not a coordinate. The store refuses it as no vault
+        // at all, so a row printing `vault ""` would be the report contradicting
+        // the store it describes — and it reads as a vault whose name is blank
+        // rather than as the config key nobody filled in.
+        let load = loaded(r#"{"stores":{"onepassword":{"enabled":true,"vault":""}}}"#);
+        let detail = points_at(&load.config, "onepassword");
+        assert!(detail.contains("vault unset"), "{detail}");
+        assert!(!detail.contains("vault \"\""), "{detail}");
 
         // With no account named, the row must not invent one: the CLI chose,
         // and which one it chose is a fact this report never read.
