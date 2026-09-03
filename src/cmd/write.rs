@@ -41,7 +41,7 @@
 //! success with nothing stored — which the next `run` would report as a missing
 //! name for a reason nobody can find.
 
-use std::io::{self, Read, Write};
+use std::io::{self, BufRead, Read, Write};
 
 use zeroize::Zeroize;
 
@@ -192,9 +192,19 @@ pub fn read_value(input: &mut dyn Read, interactive: bool) -> Result<Secret, Man
     let mut bytes: Vec<u8> = Vec::new();
     // One byte over the cap, so a payload exactly at the cap is accepted and one
     // above it is refused rather than silently truncated.
-    let read = input
-        .take((MAX_INPUT_BYTES + 1) as u64)
-        .read_to_end(&mut bytes);
+    let mut capped = input.take((MAX_INPUT_BYTES + 1) as u64);
+    // A prompt ends at Enter; a pipe ends at EOF. Reading to EOF in both cases
+    // leaves somebody who has already typed the value at a terminal that asks
+    // for nothing more, with Ctrl-D the only way out and nothing on screen
+    // saying so. `put` above assumes the other thing — its "the user's Enter
+    // produced no newline" echo only makes sense once Enter has ended the read.
+    let read = if interactive {
+        // Stops AT the first newline, so a second line is never read rather
+        // than read and then discarded.
+        io::BufReader::new(&mut capped).read_until(b'\n', &mut bytes)
+    } else {
+        capped.read_to_end(&mut bytes)
+    };
 
     if let Err(error) = read {
         bytes.zeroize();
@@ -207,14 +217,6 @@ pub fn read_value(input: &mut dyn Read, interactive: bool) -> Result<Secret, Man
         )));
     }
 
-    if interactive {
-        // Everything after the first line is discarded rather than joined: at a
-        // prompt, a second line is a mistake, and silently storing both would
-        // store something the user did not type.
-        if let Some(end) = bytes.iter().position(|byte| *byte == b'\n') {
-            bytes.truncate(end);
-        }
-    }
     crate::store::exec::strip_one_newline(&mut bytes);
     // A trailing carriage return survives `strip_one_newline` on CRLF input, and
     // a credential with an invisible `\r` on the end fails much later, somewhere
@@ -339,6 +341,49 @@ mod tests {
             "put echoed the value on stderr: {notes}"
         );
         assert!(out.starts_with("stored\tDECOY"), "{out}");
+    }
+
+    /// A reader that hands over one line and then behaves like a terminal with
+    /// nobody typing at it: the next `read` would block forever. Panicking
+    /// stands in for that, because a test cannot wait forever to prove a hang.
+    struct OneLineThenSilence {
+        line: Option<Vec<u8>>,
+    }
+
+    impl std::io::Read for OneLineThenSilence {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            match self.line.take() {
+                Some(line) => {
+                    let n = line.len().min(buf.len());
+                    buf[..n].copy_from_slice(&line[..n]);
+                    Ok(n)
+                }
+                None => panic!(
+                    "read_value asked for input again after a whole line arrived; on a \
+                     terminal that call blocks until Ctrl-D"
+                ),
+            }
+        }
+    }
+
+    #[test]
+    fn an_interactive_read_ends_at_the_newline_and_not_at_eof() {
+        // A terminal sends no EOF when somebody presses Enter. A read that waits
+        // for one hangs with the value already typed, the prompt gone, and
+        // nothing on screen naming Ctrl-D as the way out.
+        let mut source = OneLineThenSilence {
+            line: Some(b"decoy-first-line\n".to_vec()),
+        };
+        let value = read_value(&mut source, true).expect("a value");
+        assert_eq!(value.expose(), "decoy-first-line");
+    }
+
+    #[test]
+    fn a_piped_read_still_takes_every_line() {
+        // The other half of the branch: a pipe carries whatever the writer sent,
+        // newlines included, and only the one trailing newline comes off.
+        let (_, _, _, stored) = run_put("decoy-line-one\ndecoy-line-two\n", false);
+        assert_eq!(stored.as_deref(), Some("decoy-line-one\ndecoy-line-two"));
     }
 
     #[test]
