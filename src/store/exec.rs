@@ -74,10 +74,27 @@ pub const MAX_DETAIL: usize = 200;
 /// name, each spawning a vendor CLI, is exactly the shape above.
 ///
 /// The lock is held across `spawn` and released before the wait, so lookups
-/// still overlap — what is serialised is the microsecond in which a child's
-/// descriptors are visible to another `fork`, never the seconds spent waiting
-/// for an answer. [`spawn_persistently`] is the only thing that takes it, and
-/// the only thing in this crate that creates a process.
+/// still overlap: what is serialised is the interval in which a child's
+/// descriptors are visible to another `fork`, never the wait for an answer.
+/// [`spawn_persistently`] is the only thing that takes it, and the only thing
+/// in this crate that creates a process.
+///
+/// # The gate is short. The QUEUE behind it is not, and that is a different
+/// quantity
+///
+/// One `spawn` costs a fraction of a millisecond on an idle machine, which
+/// makes it tempting to call the cost of this lock negligible. It is not, and
+/// the arithmetic says why: a lookup's wait here is roughly the number of
+/// lookups ahead of it multiplied by what a spawn costs, and BOTH terms grow
+/// together on a loaded machine — more concurrency, and each spawn slower
+/// because the child it is waiting to see exec cannot get the CPU.
+///
+/// Measured under a saturated CPU quota, at the concurrency a suite reaches:
+/// the queue is the MAJORITY of a lookup's elapsed time, and against a short
+/// deadline it exceeds the whole budget on its own. That is not an argument
+/// against the lock — it closes a deadlock, and a deadlock has no upper bound
+/// at all — but it is the reason [`CaptureError::TimedOut`] reports the queue
+/// separately instead of charging it to the backend.
 static SPAWNING: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// How many times to try again when the machine, not the command, said no.
@@ -354,7 +371,42 @@ pub enum CaptureError {
     /// The binary could not be started: absent, not executable, bad path.
     Spawn(io::Error),
     /// The deadline expired and the child was killed.
-    TimedOut(Duration),
+    ///
+    /// # Why this carries two durations and not one
+    ///
+    /// One budget covers two different things: getting permission to create a
+    /// child — [`SPAWNING`] serialises that across the whole process — and then
+    /// waiting for the child to answer. The clock starts before the first, so
+    /// time spent queued behind another lookup's spawn is charged to this one.
+    ///
+    /// Reported as a single number, that reads as a statement about the
+    /// BACKEND: `no answer within N ms` says the backend was given N
+    /// milliseconds and did not use them. It can be false in the worst way — a
+    /// lookup whose whole budget went to the queue creates its child with
+    /// nothing left, kills it in the same breath, and blames it for a silence
+    /// it was never given time to break. Measured under a saturated CPU quota,
+    /// with the concurrency a suite reaches: a majority of every lookup's
+    /// elapsed time is queue, and at a short budget the queue alone exceeds the
+    /// whole of it.
+    ///
+    /// That is the class this repository spends its effort on — a fault
+    /// reported as the wrong fault — and it has a repair the reader cannot
+    /// guess from the sentence, because "the machine is oversubscribed" and
+    /// "the backend is not answering" send them to different places.
+    ///
+    /// So the split is carried and rendered: `starting` is how much of `budget`
+    /// was gone before the child existed. It is rendered in milliseconds like
+    /// the budget beside it, and the clause appears exactly when it is non-zero
+    /// AT THAT RESOLUTION — no threshold, and nothing to tune. An uncontended
+    /// spawn costs far less than a millisecond and reads exactly as it always
+    /// did; contention makes itself visible in the one message a reader is
+    /// already looking at.
+    TimedOut {
+        /// The whole deadline the caller asked for.
+        budget: Duration,
+        /// How much of `budget` was spent before the child existed.
+        starting: Duration,
+    },
     /// The child started but its output could not be collected.
     Collect(io::Error),
     /// The operating system refused a thread.
@@ -399,8 +451,19 @@ impl std::fmt::Display for CaptureError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             CaptureError::Spawn(source) => write!(f, "cannot run it: {source}"),
-            CaptureError::TimedOut(after) => {
-                write!(f, "no answer within {} ms", after.as_millis())
+            CaptureError::TimedOut { budget, starting } => {
+                write!(f, "no answer within {} ms", budget.as_millis())?;
+                // The budget is the whole sentence when all of it reached the
+                // child. When it did not, saying so is the difference between
+                // naming the backend and naming the machine.
+                if starting.as_millis() > 0 {
+                    write!(
+                        f,
+                        ", {} ms of which went to starting it",
+                        starting.as_millis()
+                    )?;
+                }
+                Ok(())
             }
             CaptureError::Collect(source) => write!(f, "cannot read its output: {source}"),
             CaptureError::Threads(source) => {
@@ -434,26 +497,84 @@ pub fn capture(mut command: Command, timeout: Duration) -> Result<Captured, Capt
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
-    let deadline = deadline_for(timeout);
+    let mut budget = Budget::starting_now(timeout);
     // Under `RLIMIT_NPROC` this is the difference between a lookup and a
     // spurious `DEGRADED` banner — see [`spawn_persistently`]. The deadline is
     // handed in so the retry spends the lookup's own budget and never more.
-    let child = spawn_persistently(&mut command, Some(deadline)).map_err(CaptureError::Spawn)?;
-    Pending::start(child)?.finish(timeout, deadline)
+    let child =
+        spawn_persistently(&mut command, Some(budget.until)).map_err(CaptureError::Spawn)?;
+    budget.the_child_now_exists();
+    Pending::start(child)?.finish(budget)
 }
 
-/// The instant `timeout` expires, counted from now.
+/// One capture's deadline, and how much of it the child never saw.
 ///
-/// `Instant + Duration` PANICS on overflow, and this crate's release profile
-/// sets `panic = "abort"` — so a caller passing a duration the clock cannot
-/// hold would end the process with no child, no exit code and no message,
-/// which is the exact failure [`CaptureError::Threads`] exists to avoid.
-/// A timeout no clock can represent is not a timeout anyone meant, so it
-/// becomes one that has already expired: the child is killed and the caller
-/// gets a [`CaptureError::TimedOut`] it can read.
-fn deadline_for(timeout: Duration) -> Instant {
-    let now = Instant::now();
-    now.checked_add(timeout).unwrap_or(now)
+/// Carried as one value rather than as three arguments because two of the three
+/// are durations and the third is the instant they are about: a call site that
+/// transposed them would compile, and the thing it would get wrong is the
+/// number in an error message nobody re-derives.
+#[derive(Clone, Copy)]
+struct Budget {
+    /// The whole deadline the caller asked for. Reported, never enforced —
+    /// [`Budget::until`] is what the waits are measured against.
+    total: Duration,
+    /// When the clock started, which is before anything can ask to spawn.
+    began: Instant,
+    /// The instant the whole of it expires, fixed before anything is spawned.
+    until: Instant,
+    /// How long it took for the child to exist. Zero until
+    /// [`Budget::the_child_now_exists`] is called.
+    ///
+    /// **Not clamped to [`Budget::total`], and that is the point.** A lookup can
+    /// spend longer queued than its entire budget, and a number capped at the
+    /// budget would report that as "all of it" — true, but it throws away the
+    /// only figure that says HOW oversubscribed the machine is. A startup
+    /// interval larger than the budget it was drawn from is not a contradiction;
+    /// it is the measurement.
+    starting: Duration,
+}
+
+impl Budget {
+    /// A budget of `total`, counted from now.
+    ///
+    /// `Instant + Duration` PANICS on overflow, and this crate's release profile
+    /// sets `panic = "abort"` — so a caller passing a duration the clock cannot
+    /// hold would end the process with no child, no exit code and no message,
+    /// which is the exact failure [`CaptureError::Threads`] exists to avoid.
+    /// A timeout no clock can represent is not a timeout anyone meant, so it
+    /// becomes one that has already expired: the child is killed and the caller
+    /// gets a [`CaptureError::TimedOut`] it can read.
+    fn starting_now(total: Duration) -> Self {
+        let began = Instant::now();
+        Budget {
+            total,
+            began,
+            until: began.checked_add(total).unwrap_or(began),
+            starting: Duration::ZERO,
+        }
+    }
+
+    /// Mark the moment a child exists, closing the startup interval.
+    ///
+    /// Everything before this is queue and spawn; everything after is the
+    /// backend's own silence. Splitting them is the whole reason
+    /// [`CaptureError::TimedOut`] carries two numbers.
+    fn the_child_now_exists(&mut self) {
+        self.starting = self.began.elapsed();
+    }
+
+    /// How much of the budget is still unspent.
+    fn left(&self) -> Duration {
+        self.until.saturating_duration_since(Instant::now())
+    }
+
+    /// The deadline as the error that expiring it produces.
+    fn expired(&self) -> CaptureError {
+        CaptureError::TimedOut {
+            budget: self.total,
+            starting: self.starting,
+        }
+    }
 }
 
 /// Run `command` with `input` on its stdin, under the same deadline as
@@ -516,9 +637,10 @@ pub fn capture_with_input(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
-    let deadline = deadline_for(timeout);
+    let mut budget = Budget::starting_now(timeout);
     let mut child =
-        spawn_persistently(&mut command, Some(deadline)).map_err(CaptureError::Spawn)?;
+        spawn_persistently(&mut command, Some(budget.until)).map_err(CaptureError::Spawn)?;
+    budget.the_child_now_exists();
     // Taken before the child moves into the collector, which owns it afterwards.
     let stdin = child.stdin.take();
     // The readers are started BEFORE the write, so the child is free to answer
@@ -526,7 +648,7 @@ pub fn capture_with_input(
     let pending = Pending::start(child)?;
 
     let sent = match stdin {
-        Some(pipe) => deliver(pipe, input, deadline),
+        Some(pipe) => deliver(pipe, input, budget.until),
         // Unreachable while the stdio above says `piped`, and a silent success
         // would be a write that never happened.
         None => Delivery::Stalled(0),
@@ -539,7 +661,7 @@ pub fn capture_with_input(
         });
     }
 
-    pending.finish(timeout, deadline)
+    pending.finish(budget)
 }
 
 /// What became of the value on its way to the child's stdin.
@@ -786,20 +908,19 @@ impl Pending {
         }
     }
 
-    /// Wait for the child until `deadline`, killing it when the deadline
-    /// expires.
+    /// Wait for the child until the budget expires, killing it when it does.
     ///
-    /// `timeout` is carried only to say how long the wait was in the error; the
-    /// wait itself runs against `deadline`, so time already spent writing to the
-    /// child is time this does not get to spend again.
+    /// The wait runs against [`Budget::until`], so time already spent starting
+    /// the child or writing to it is time this does not get to spend again —
+    /// and [`Budget::starting`] is what stops that from being reported as the
+    /// child's own silence.
     ///
     /// # Errors
     ///
     /// [`CaptureError::TimedOut`] at the deadline, [`CaptureError::TooLarge`]
     /// past the capture cap, [`CaptureError::Collect`] when the pipes fail.
-    fn finish(self, timeout: Duration, deadline: Instant) -> Result<Captured, CaptureError> {
-        let left = deadline.saturating_duration_since(Instant::now());
-        let outcome = self.done.recv_timeout(left);
+    fn finish(self, budget: Budget) -> Result<Captured, CaptureError> {
+        let outcome = self.done.recv_timeout(budget.left());
         match outcome {
             Ok(Ok((status, mut bytes, overflowed))) => {
                 if overflowed {
@@ -830,7 +951,7 @@ impl Pending {
             Ok(Err(source)) => Err(CaptureError::Collect(source)),
             Err(RecvTimeoutError::Timeout) => {
                 self.abandon();
-                Err(CaptureError::TimedOut(timeout))
+                Err(budget.expired())
             }
             // The sender was dropped without sending, which means the collector
             // thread panicked. Nothing was captured and nothing leaked.
@@ -856,7 +977,7 @@ impl Pending {
 pub fn unavailable(store: &str, binary: &std::path::Path, error: &CaptureError) -> StoreError {
     let detail = match error {
         CaptureError::Spawn(_) => format!("{} {error}", binary.display()),
-        CaptureError::TimedOut(_)
+        CaptureError::TimedOut { .. }
         | CaptureError::Collect(_)
         | CaptureError::Threads(_)
         | CaptureError::TooLarge(_)
@@ -1104,7 +1225,7 @@ mod tests {
         let error = capture(command, Duration::from_millis(300)).expect_err("must not wait 60s");
         let elapsed = started.elapsed();
 
-        assert!(matches!(error, CaptureError::TimedOut(_)));
+        assert!(matches!(error, CaptureError::TimedOut { .. }));
         assert!(
             elapsed < Duration::from_secs(5),
             "the deadline was not enforced: waited {elapsed:?}"
@@ -1113,8 +1234,131 @@ mod tests {
 
     #[test]
     fn a_timeout_says_how_long_it_waited_and_nothing_else() {
-        let error = CaptureError::TimedOut(Duration::from_millis(2500));
+        let error = CaptureError::TimedOut {
+            budget: Duration::from_millis(2500),
+            starting: Duration::ZERO,
+        };
         assert_eq!(error.to_string(), "no answer within 2500 ms");
+    }
+
+    /// A budget the queue ate must not be reported as the backend's silence.
+    ///
+    /// [`super::SPAWNING`] serialises every child creation in the process, and
+    /// the deadline starts before a lookup can even ask for it. So a lookup can
+    /// reach the wait with none of its budget left, create a child, kill it in
+    /// the same breath, and — with one number in the sentence — blame it for a
+    /// silence it was never given time to break. "The machine is oversubscribed"
+    /// and "the backend is not answering" have different repairs, and a reader
+    /// cannot tell them apart from `no answer within N ms`.
+    #[test]
+    fn a_timeout_the_backend_never_saw_says_so() {
+        let error = CaptureError::TimedOut {
+            budget: Duration::from_millis(300),
+            starting: Duration::from_millis(384),
+        };
+        assert_eq!(
+            error.to_string(),
+            "no answer within 300 ms, 384 ms of which went to starting it"
+        );
+
+        // The prefix is unchanged, which is what lets the clause be added
+        // without rewriting every caller that reads the budget out of the
+        // sentence.
+        assert!(error.to_string().starts_with("no answer within 300 ms"));
+    }
+
+    /// The clause is a fact about the run, not a decoration on the variant.
+    ///
+    /// Its threshold is the resolution the message already prints in: it
+    /// appears exactly when the startup interval is non-zero in whole
+    /// milliseconds. An uncontended spawn costs far less than one and reads as
+    /// it always did, so the clause's presence IS the signal that something
+    /// stood between the lookup and its child.
+    #[test]
+    fn a_startup_too_short_to_print_adds_no_clause() {
+        let error = CaptureError::TimedOut {
+            budget: Duration::from_millis(2500),
+            starting: Duration::from_micros(999),
+        };
+        assert_eq!(error.to_string(), "no answer within 2500 ms");
+
+        // The control: one microsecond more is a whole millisecond, and the
+        // clause appears. Without this the assertion above is satisfied by a
+        // Display that never renders the clause at all.
+        let error = CaptureError::TimedOut {
+            budget: Duration::from_millis(2500),
+            starting: Duration::from_micros(1000),
+        };
+        assert_eq!(
+            error.to_string(),
+            "no answer within 2500 ms, 1 ms of which went to starting it"
+        );
+    }
+
+    /// The wiring: the startup interval is MEASURED, not left at zero.
+    ///
+    /// Every assertion above builds the error by hand, so a `capture` that had
+    /// stopped closing the interval would leave all of them green while the
+    /// shipped sentence went back to naming the wrong fault. This one drives
+    /// the real path.
+    ///
+    /// The child is spawned behind the real spawn gate, held by this test, so
+    /// the startup interval is a genuine queue wait rather than a contrived
+    /// number — which is the exact shape the defect has in a run resolving
+    /// several names at once.
+    ///
+    /// The gate is held for several times the lookup's budget, so the assertion
+    /// is `starting` LARGER than the whole budget. That is what separates a
+    /// measured interval from one clamped at the budget: a clamp reports
+    /// exactly the budget and no more, which reads as "all of it" and loses the
+    /// figure that says how far past the machine actually was.
+    ///
+    /// The worker announces itself before it calls [`capture`], and the hold is
+    /// long relative to the two statements between that announcement and the
+    /// clock starting — the same rendezvous `tty::relay`'s signal tests use.
+    #[test]
+    fn the_startup_interval_a_real_capture_reports_is_the_time_it_actually_queued() {
+        // Short, because it is spent entirely on the queue and never on a
+        // child: the gate below is what expires it.
+        let budget = Duration::from_millis(100);
+        let held = Duration::from_millis(400);
+
+        let gate = super::SPAWNING
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let (ready, waiting_now) = std::sync::mpsc::channel();
+        let waiting = thread::spawn(move || {
+            let mut command = Command::new("/bin/sh");
+            command.args(["-c", "printf 'out'"]);
+            let _ = ready.send(());
+            capture(command, budget)
+        });
+        waiting_now
+            .recv_timeout(Duration::from_secs(30))
+            .expect("the worker must reach its lookup");
+        thread::sleep(held);
+        drop(gate);
+
+        let error = waiting
+            .join()
+            .expect("the queued lookup must not panic")
+            .expect_err("a lookup whose whole budget went to the queue cannot succeed");
+        let CaptureError::TimedOut { budget, starting } = error else {
+            panic!("expected a deadline, got {error:?}");
+        };
+        assert!(
+            starting > budget,
+            "the startup interval was {starting:?} against a {budget:?} budget; a lookup that \
+             spent longer queued than it had to spend at all is reporting the queue as the \
+             backend's own silence"
+        );
+        // And the sentence a reader gets says it, rather than making them
+        // derive it from a variant they cannot see.
+        let said = CaptureError::TimedOut { budget, starting }.to_string();
+        assert!(
+            said.contains("went to starting it"),
+            "the message names the backend for a wait it never got: {said}"
+        );
     }
 
     #[test]
