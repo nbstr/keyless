@@ -1,6 +1,6 @@
 //! `keylessd` — the daemon binary.
 //!
-//! Five verbs, and none of them prints a value. That is the same structural
+//! Six verbs, and none of them prints a value. That is the same structural
 //! property the session binary has, and it holds for the same reason: a verb
 //! that writes plaintext to stdout would be the shortest path, and the shortest
 //! path is the one that gets used.
@@ -10,19 +10,25 @@
 //! - `check` — parse the config and say what it would do.
 //! - `verify` — recompute the audit chain.
 //! - `credential` — put the daemon's own vendor login into its `0600` file.
+//! - `login` — establish a vendor SESSION and record the credential that
+//!   re-establishes it.
 //!
-//! `credential` is the one that READS a value, and it reads it from stdin with
-//! the terminal's echo off. There is no `--value` flag and no positional value,
-//! for the reason `keyless put` has none: an argument is readable from the
-//! process table for as long as the process lives, and a value typed into a
-//! command is a value in a shell history. Offering the flag guarantees it gets
-//! used, so it does not exist.
+//! `credential` and `login` are the two that READ a value, and both read it
+//! from stdin with the terminal's echo off through the one function in
+//! [`keyless::daemon::credential`]. There is no `--value` flag and no
+//! positional value, for the reason `keyless put` has none: an argument is
+//! readable from the process table for as long as the process lives, and a
+//! value typed into a command is a value in a shell history. Offering the flag
+//! guarantees it gets used, so it does not exist.
 //!
-//! `pin`, `check` and `credential` are the install-time verbs. They exist so
-//! an operator never has to hand-compute a hash, guess whether a config is doing
-//! what they meant, or reach for a shell to get a credential into a file — the
-//! first two are how an allowlist ends up authorising nothing and being widened
-//! in frustration, and the third is how a credential ends up in a history file.
+//! `pin`, `check`, `credential` and `login` are the install-time verbs. They
+//! exist so an operator never has to hand-compute a hash, guess whether a
+//! config is doing what they meant, reach for a shell to get a credential into
+//! a file, or assemble a vendor command out of four settings the config already
+//! holds — the first two are how an allowlist ends up authorising nothing and
+//! being widened in frustration, the third is how a credential ends up in a
+//! history file, and the fourth is how a daemon ends up logged into a directory
+//! nothing reads.
 //!
 //! # macOS only, and it SAYS so rather than being missing
 //!

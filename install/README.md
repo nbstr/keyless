@@ -469,24 +469,6 @@ perform user key operations."*
 **Write down the day it expires.** The next section needs it, and it cannot be
 recovered later — see *What `check` can and cannot tell you* below.
 
-### Log the daemon's own session in
-
-As the daemon, because whoever runs this owns the files it creates, and a
-session store the daemon cannot open fails in a way that reads exactly like a
-wrong token. The token is a value, so it goes in the environment and never in
-an argument:
-
-```console
-$ sudo -u _keyless env \
-    PROTON_PASS_SESSION_DIR=/usr/local/var/lib/keyless/proton-session \
-    PROTON_PASS_KEY_PROVIDER=fs \
-    PROTON_PASS_PERSONAL_ACCESS_TOKEN=<the token `agent create` printed> \
-    pass-cli login
-```
-
-Afterwards that directory holds the session store, the local key and a
-timestamp file, all `0600` under `_keyless`.
-
 ### Configure the store
 
 Coordinates only; there is no field in `keylessd.json` a credential fits in:
@@ -534,16 +516,53 @@ there is no query to make: no `pass-cli` process runs, no vault is listed, and
 no audit entry is written at Proton for a name nobody declared. Guessing any
 one of the three would cost a real read against a real vault.
 
-### Put the token in the daemon's own file too
+### Log the daemon in
 
-The session above holds a login; this is what re-establishes it if the vendor
-ever drops that session, which it does without warning. Prompts, echoes
-nothing, takes no value on the command line:
+One command. It prompts for the token, echoes nothing, and takes no value on
+the command line:
 
 ```console
-$ sudo keylessd credential --store proton --name AGENT_TOKEN
+$ sudo keylessd login --store proton
 $ sudo keylessd check --config /usr/local/etc/keyless/keylessd.json
 ```
+
+It reads every coordinate out of the config you just wrote — which is why the
+store is configured first, and why there is no `--session-dir` or
+`--key-provider` flag here. A flag that disagreed with the config would log a
+session into a directory the daemon never opens, and that fails in a way that
+reads exactly like a wrong token.
+
+What it does, and why each part of it is not optional:
+
+- **Creates the session directory `0700` under the daemon**, or repairs one that
+  is not — including giving back any file inside it that a hand-run login left
+  owned by root. Whoever runs a `pass-cli` owns what it writes, and `pass-cli`
+  rewrites its session store on invocations that only read.
+- **Runs the login as the daemon's uid**, read off the audit log, which the
+  installer creates owned by the daemon. No audit log, no login: guessing the
+  uid is the one mistake here that produces a working-looking install.
+- **Sets `PROTON_PASS_KEY_PROVIDER`** from `key_provider`, for the reason at the
+  top of this section — without it the vendor looks in a keyring the daemon's
+  uid does not have, and reinitialises the session store instead.
+- **Puts the token in the child's environment**, never in `--pat`. `ps` is
+  world-readable, and an argument is in it for as long as the process lives.
+- **Records the token in `proton.json` only after the account has accepted it.**
+  That file is what re-establishes the session when the vendor drops one, which
+  it does without warning. A token written before the login would be a
+  credential `check` reports as sound — its `token` row judges shape — sitting
+  in a `0600` file and unlocking nothing.
+
+**Run it twice and nothing breaks.** `pass-cli` refuses to replace a session it
+already holds (`Client is already authenticated`), so the second run touches
+neither the session nor `proton.json` and says so. To ROTATE the token, add
+`--replace`, which logs the old session out first — deliberately a flag, because
+a logout followed by a token the account refuses leaves the directory with no
+identity at all.
+
+`keylessd credential --store proton --name <entry>` still writes that file on
+its own, without touching the session. That is the verb for a `key_provider` of
+`env`, whose local key is a second credential the login reads back rather than
+prompting for twice.
 
 ### What `check` can and cannot tell you
 

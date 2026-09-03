@@ -726,23 +726,10 @@ cat <<'NEXT'
 #
 #    Viewer, not editor. With the daemon enabled, keyless refuses every write
 #    for every store, so an editor token here would be a larger prize with no
-#    way to be used. Write down the day it expires -- step (c) needs it, and
+#    way to be used. Write down the day it expires -- step (b) needs it, and
 #    the vendor cannot be asked later.
 #
-# b. Log the daemon's own session in, AS the daemon, with that token. The token
-#    is a value, so it goes in the environment and never in an argument:
-#
-#      sudo -u $DAEMON_USER env \
-#        PROTON_PASS_SESSION_DIR=$LIB_DIR/proton-session \
-#        PROTON_PASS_KEY_PROVIDER=fs \
-#        PROTON_PASS_PERSONAL_ACCESS_TOKEN=<the token agent create printed> \
-#        pass-cli login
-#
-#    As the daemon, because whoever runs this owns the files it creates, and a
-#    session store the daemon cannot open is a failure that reads exactly like
-#    a wrong token.
-#
-# c. Add the store to /usr/local/etc/keyless/keylessd.json. Coordinates only;
+# b. Add the store to /usr/local/etc/keyless/keylessd.json. Coordinates only;
 #    there is no field in this file a credential fits in:
 #
 #      "proton": {
@@ -774,14 +761,29 @@ cat <<'NEXT'
 #      "secrets": { "OPENAI_API_KEY": { "store": "proton", "vault": "<VAULT>",
 #                                       "item": "<title>", "field": "password" } }
 #
-# d. Put the token in the daemon's own file too. The session above holds a
-#    login; this is what re-establishes it if the vendor ever drops it, which
-#    it does without warning. Prompts, echoes nothing, takes no value on the
-#    command line:
+# c. Log the daemon in. One command. It prompts for the token, echoes nothing,
+#    and takes no value on the command line:
 #
-#      sudo keylessd credential --store proton --name AGENT_TOKEN
+#      sudo keylessd login --store proton
 #
-# e. Check it. `identity` reports the file, the two `token` rows report what is
+#    Every coordinate comes out of the config in step (b), which is why that
+#    step comes first and why there is no --session-dir flag here: one that
+#    disagreed with the config would log a session into a directory the daemon
+#    never opens, and that fails in a way that reads exactly like a wrong
+#    token. The verb creates the session directory 0700 under the daemon --
+#    or repairs one that is not, including files a hand-run login left owned
+#    by root -- runs the login AS the daemon's uid, sets the key provider,
+#    puts the token in the child's ENVIRONMENT and never in an argument, and
+#    records it in proton.json only once the account has accepted it. A token
+#    written before that would sit in a 0600 file that `check` calls sound and
+#    unlock nothing.
+#
+#    Safe to run twice: `pass-cli` refuses to replace a session it already
+#    holds, so a second run touches neither the session nor the file and says
+#    so. To ROTATE the token, add --replace, which logs the old session out
+#    first.
+#
+# d. Check it. `identity` reports the file, the two `token` rows report what is
 #    IN it and when it stops, and `store proton` is the vendor accepting it:
 #
 #      sudo keylessd check --config /usr/local/etc/keyless/keylessd.json
