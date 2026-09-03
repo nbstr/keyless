@@ -310,7 +310,16 @@ fn a_fixture_that_spawns_a_vendor_cli_names_its_deadline() {
                 // A store that is not switched on spawns nothing, and one with
                 // no `binary` cannot reach a stub — neither has a deadline to
                 // miss.
-                if !object.contains(r#""enabled":true"#) || !object.contains(r#""binary""#) {
+                //
+                // Read with the whitespace taken out, because JSON puts none of
+                // it under a rule: a fixture written `"enabled": true` is the
+                // same fixture as one written `"enabled":true`, and a scan that
+                // could see only the second reported the first as compliant
+                // without ever having looked at it. That is this gate's own
+                // failure shape — a fixture invisible to it reads exactly like
+                // a fixture that passed.
+                let dense: String = object.chars().filter(|c| !c.is_whitespace()).collect();
+                if !dense.contains(r#""enabled":true"#) || !object.contains(r#""binary""#) {
                     continue;
                 }
                 spawning += 1;
