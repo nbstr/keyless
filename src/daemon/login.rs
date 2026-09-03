@@ -79,6 +79,20 @@ pub const SESSION_DIR_MODE: u32 = 0o700;
 pub const STORE: &str = proton::STORE_ID;
 
 /// A file's owning uid and gid, which for the daemon's own files are one fact.
+///
+/// # The gid is the access group, not the daemon's primary group
+///
+/// Both numbers come from one `stat` of the audit log, and the installer
+/// creates every state file as `<daemon>:<access group>` — including the
+/// session directory this login writes into. So a login run this way produces
+/// files with the same ownership pair as everything else the install made,
+/// which `sudo -u <daemon>` would not: that takes the daemon's PRIMARY group
+/// instead, and the two are not the same on this install or on any other.
+///
+/// Nothing depends on which one it is — the directory is `0700` and the files
+/// in it `0600`, so no group can read either — but a pair read from one file is
+/// a pair that cannot disagree with itself, and that is the property worth
+/// having when the alternative is two lookups that can.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Owner {
     pub uid: u32,
@@ -677,11 +691,13 @@ pub fn perform(
 fn cannot_spawn(coordinates: &Coordinates, owner: Owner, error: &std::io::Error) -> String {
     if error.kind() == std::io::ErrorKind::PermissionDenied {
         return format!(
-            "this process cannot become uid {} to run the login, so nothing has happened: \
-             {error}. Whoever runs the login owns the session store `pass-cli` creates, and a \
-             store the daemon cannot open fails in a way that reads exactly like a wrong \
-             token — so this verb will not run it as anybody else. Run it with `sudo`",
-            owner.uid
+            "this process cannot become uid {} / gid {} to run the login, so nothing has \
+             happened: {error}. Whoever runs the login owns the session store `pass-cli` \
+             creates, and a store the daemon cannot open fails in a way that reads exactly \
+             like a wrong token — so this verb will not run it as anybody else. Run it with \
+             `sudo`. Both numbers are read off the audit log named in this config, and either \
+             one of the two can be the half that was refused",
+            owner.uid, owner.gid
         );
     }
     format!(
