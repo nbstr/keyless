@@ -1506,3 +1506,71 @@ fn init_reports_the_guards_without_installing_them() {
     );
     assert!(report.contains("--hooks"), "{report}");
 }
+
+// ---------------------------------------------------------------------------
+// The 1Password probe's environment, at the binary boundary.
+//
+// Here rather than in the adapter's own tests because the thing under test is
+// the WIRING. The filter is a pure function and is unit-tested as one, but a
+// unit test cannot see the call being deleted — the Proton adapter records
+// exactly that: with its filter tested on its own, removing the call left the
+// suite green. Only a child process with an environment of its own can prove
+// the rule is applied on the path a real lookup takes.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn an_ambient_op_reference_never_reaches_the_vendor() {
+    // `OP_*` is forwarded BY NAME, because `OP_SESSION_<account>` cannot be
+    // spelled in advance. So a caller who exported `OP_ANYTHING=op://…` walked
+    // straight through `env_clear()` — and `op run` resolves every reference it
+    // finds in the whole environment, which buys a read nobody asked for and
+    // fails the probe with a message naming a variable unrelated to the lookup.
+    let dir = support::scratch("e2e-op-ambient-reference");
+    let stub = support::stub_op(&dir, &Backend::Injects(support::ONEPASSWORD_DECOY));
+    let config = dir.join("config.json");
+    std::fs::write(
+        &config,
+        format!(
+            r#"{{"stores":{{"keychain":{{"enabled":false}},
+                 "onepassword":{{"enabled":true,"binary":"{}","vault":"company",
+                                 "field":"password","timeout_ms":60000}}}},
+                "secrets":{{"DECOY":{{"item":"DECOY"}}}}}}"#,
+            stub.display()
+        ),
+    )
+    .expect("write config");
+
+    let output = keyless_env(
+        &[
+            // The stray reference, and a login variable beside it that MUST
+            // survive — the control that stops this passing on a build which
+            // simply forwards no `OP_*` at all.
+            ("OP_KEYLESS_REVIEW", "op://company/Router/password"),
+            ("OP_ACCOUNT", "demo"),
+        ],
+        &[
+            "--config",
+            &config.display().to_string(),
+            "--audit",
+            &dir.join("audit.jsonl").display().to_string(),
+            "run",
+            "-s",
+            "DECOY",
+            "--",
+            "/usr/bin/true",
+        ],
+    );
+    assert!(output.status.success(), "{output:?}");
+
+    // Read from the vendor's side: the stub records the NAMES of the
+    // environment it was handed, and never their values.
+    let handed = support::recorded_lines(&dir.join("op.env"));
+    assert!(
+        !handed.iter().any(|name| name == "OP_KEYLESS_REVIEW"),
+        "an ambient op:// reference reached the vendor: {handed:?}"
+    );
+    assert!(
+        handed.iter().any(|name| name == "OP_ACCOUNT"),
+        "the login half of the prefix stopped being forwarded: {handed:?}"
+    );
+}

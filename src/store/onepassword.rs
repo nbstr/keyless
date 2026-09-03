@@ -87,12 +87,40 @@
 //! carried, and `op run` resolves every reference it finds in the whole
 //! environment, so an unrelated `SOMETHING=op://…` in the caller's shell would
 //! cost a read nobody asked for and fail the probe with a message about a
-//! variable that has nothing to do with the name. Clearing closes both.
+//! variable that has nothing to do with the name.
+//!
+//! **Clearing closes the first and only most of the second**, and the gap is
+//! the prefix: `OP_*` is handed back in by name, so an `OP_ANYTHING=op://…`
+//! walked straight through the clear and would be resolved like any other
+//! reference. Names cannot decide this — the prefix has to stay wide enough for
+//! `OP_SESSION_<account>`, whose spelling depends on the account — so the
+//! VALUE decides instead: a forwarded variable holding a reference is dropped.
+//! That is [`crate::store::proton::remove_ambient_references`]'s rule, arrived
+//! at there for this exact hazard, and no login variable's value is an `op://`
+//! reference, so nothing that authenticates is filtered by it.
 //!
 //! Clearing is safe here in a way it was not for Proton: measured, `op`
 //! locates its accounts with `HOME` alone, and it keeps its login in the
 //! desktop app or in the system keyring rather than in a session store it
 //! rewrites on every call.
+//!
+//! What the value rule does not decide is WHICH SERVER an ambient `OP_*`
+//! points the vendor at:
+//!
+//! ```text
+//! debt: an ambient `OP_CONNECT_HOST` / `OP_CONNECT_TOKEN` is forwarded, and
+//!       it selects which server answers — the Proton adapter's
+//!       `PROTON_PASS_KEY_PROVIDER` hazard, one vendor over.
+//!       Ceiling: session-only. On a session the caller owns that environment
+//!       already and gains nothing; a daemon's environment is launchd's, and
+//!       no client can write it. So this widens no boundary today.
+//!       Upgrade trigger: a host that runs `keyless` under an environment the
+//!       requester can set and the caller cannot audit — a CI runner, a shared
+//!       agent — or the vendor gaining an `OP_*` that redirects a read without
+//!       an `op://` in its value. Then the prefix becomes an exact allowlist
+//!       plus `OP_SESSION_`, which needs a signed-in `op` to enumerate and
+//!       cannot be written blind.
+//! ```
 //!
 //! # What this adapter never touches
 //!
@@ -185,17 +213,56 @@ pub const FORWARDED_PREFIX: &str = "OP_";
 /// which is what makes it usable by a daemon.
 pub const SERVICE_ACCOUNT_TOKEN: &str = "OP_SERVICE_ACCOUNT_TOKEN";
 
-/// Whether a variable of this process is handed to the vendor CLI.
+/// Whether a variable's NAME is one the vendor CLI is handed.
 #[must_use]
 fn is_forwarded(name: &str) -> bool {
     FORWARDED_EXACT.contains(&name) || name.starts_with(FORWARDED_PREFIX)
 }
 
+/// Whether a value is something `op run` would go and resolve.
+///
+/// The half a name cannot decide. [`FORWARDED_PREFIX`] has to stay wide enough
+/// for `OP_SESSION_<account>`, whose spelling depends on which account signed
+/// in, so an `OP_ANYTHING=op://…` in the caller's shell passes the name rule —
+/// and `op run` resolves every reference it finds in the whole environment,
+/// which costs a read nobody asked for and fails the probe with a message
+/// about a variable that has nothing to do with the name being looked up.
+///
+/// So the value decides. This is the Proton adapter's
+/// [`crate::store::proton::remove_ambient_references`] rule, reached there for
+/// this exact vendor behaviour, and it is safe to apply to the login variables
+/// too: a token, a Connect host and an account shorthand are none of them an
+/// `op://` reference, so nothing that authenticates is filtered out by it.
+#[must_use]
+fn carries_a_reference(value: &str) -> bool {
+    value.contains(REFERENCE_SCHEME)
+}
+
+/// The subset of `environment` the vendor CLI is handed.
+///
+/// `environment` is a parameter rather than a call to [`std::env::vars_os`]
+/// inside this function so the rule can be tested against a hand-written list:
+/// mutating this process's environment would be `unsafe` in a suite that runs
+/// on several threads. That leaves the WIRING untested from here, which is a
+/// gap the Proton adapter names out loud — with its filter tested on its own,
+/// deleting the call left the suite green — so the wiring is covered at the
+/// binary boundary in `tests/cli.rs` instead, where a child process can be
+/// given an environment of its own.
+fn forwarded_from<I>(environment: I) -> Vec<(std::ffi::OsString, std::ffi::OsString)>
+where
+    I: IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
+{
+    environment
+        .into_iter()
+        .filter(|(name, value)| {
+            is_forwarded(&name.to_string_lossy()) && !carries_a_reference(&value.to_string_lossy())
+        })
+        .collect()
+}
+
 /// This process's forwarded variables, name and value.
 fn forwarded_vars() -> Vec<(std::ffi::OsString, std::ffi::OsString)> {
-    std::env::vars_os()
-        .filter(|(name, _)| is_forwarded(&name.to_string_lossy()))
-        .collect()
+    forwarded_from(std::env::vars_os())
 }
 
 /// Why nothing can be looked up until a vault is named.
@@ -1247,14 +1314,14 @@ impl Discover for OnePasswordStore {
 mod tests {
     use super::{
         FORWARDED_EXACT, ItemRecord, ItemView, Matched, OnePasswordStore, PROBE_VAR,
-        REFERENCE_SCHEME, Routing, ServiceAccount, is_forwarded, looks_concealed, looks_unresolved,
-        match_item, refused_login, vendor_said,
+        REFERENCE_SCHEME, Routing, ServiceAccount, forwarded_from, is_forwarded, looks_concealed,
+        looks_unresolved, match_item, refused_login, vendor_said,
     };
     use crate::config::Config;
     use crate::store::Store;
     use crate::store::discover::{Discover, FieldKind};
     use std::collections::BTreeMap;
-    use std::ffi::OsStr;
+    use std::ffi::{OsStr, OsString};
 
     fn config_from(json: &str) -> Config {
         serde_json::from_str(json).expect("valid config")
@@ -1562,6 +1629,55 @@ mod tests {
             "the probe must never be forwarded"
         );
         assert_eq!(FORWARDED_EXACT.len(), 10);
+    }
+
+    #[test]
+    fn a_forwarded_variable_holding_a_reference_is_dropped_by_its_value() {
+        // The gap the prefix leaves. `OP_*` is forwarded BY NAME because
+        // `OP_SESSION_<account>` cannot be spelled in advance, so an
+        // `OP_ANYTHING=op://…` in the caller's shell walks through the clear —
+        // and `op run` resolves every reference it finds in the whole
+        // environment, buying a read nobody asked for and a refusal that names
+        // a variable unrelated to the lookup.
+        let env = |pairs: &[(&str, &str)]| {
+            pairs
+                .iter()
+                .map(|(name, value)| (OsString::from(*name), OsString::from(*value)))
+                .collect::<Vec<_>>()
+        };
+        let kept: Vec<String> = forwarded_from(env(&[
+            ("OP_SERVICE_ACCOUNT_TOKEN", "ops_decoy"),
+            ("OP_ACCOUNT", "demo"),
+            ("OP_SESSION_my", "sess_decoy"),
+            ("HOME", "/decoy/home"),
+            ("OP_STRAY", "op://company/Router/password"),
+            ("SOMETHING", "op://company/Router/password"),
+            ("DATABASE_URL", "postgres://decoy"),
+        ]))
+        .into_iter()
+        .map(|(name, _)| name.to_string_lossy().into_owned())
+        .collect();
+
+        assert!(!kept.contains(&"OP_STRAY".to_owned()), "{kept:?}");
+        // The controls, and they are the point: every LOGIN variable survives,
+        // because none of their values is a reference. A fix that narrowed the
+        // prefix instead would have taken `OP_SESSION_my` with it, and this is
+        // what says so.
+        for name in [
+            "OP_SERVICE_ACCOUNT_TOKEN",
+            "OP_ACCOUNT",
+            "OP_SESSION_my",
+            "HOME",
+        ] {
+            assert!(
+                kept.contains(&name.to_owned()),
+                "`{name}` was dropped: {kept:?}"
+            );
+        }
+        // And the name rule still bites on its own, so this did not replace it.
+        for name in ["SOMETHING", "DATABASE_URL"] {
+            assert!(!kept.contains(&name.to_owned()), "{kept:?}");
+        }
     }
 
     #[test]
