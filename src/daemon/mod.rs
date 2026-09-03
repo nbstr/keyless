@@ -44,6 +44,7 @@
 pub mod check;
 pub mod config;
 pub mod credential;
+pub mod login;
 pub mod resolver;
 pub mod shadow;
 

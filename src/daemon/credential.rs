@@ -96,7 +96,22 @@ fn io_error(path: &Path, detail: impl Into<String>) -> CredentialError {
 /// convenient: see the module header.
 #[must_use]
 pub fn daemon_uid(audit: &Path) -> Option<u32> {
-    fs::metadata(audit).ok().map(|meta| meta.uid())
+    daemon_owner(audit).map(|owner| owner.uid)
+}
+
+/// The uid AND gid the daemon runs as, read off the same file.
+///
+/// One function rather than two, because the two facts have to come from the
+/// same `stat` of the same file: a login that dropped to one file's uid and
+/// another file's gid would create a session store under a pair no install ever
+/// chose. [`daemon_uid`] is the narrow view of this, for the report that only
+/// judges ownership.
+#[must_use]
+pub fn daemon_owner(audit: &Path) -> Option<super::login::Owner> {
+    fs::metadata(audit).ok().map(|meta| super::login::Owner {
+        uid: meta.uid(),
+        gid: meta.gid(),
+    })
 }
 
 /// What `keylessd check` says about the credential file.
@@ -368,8 +383,10 @@ fn proton_token(config: &super::config::DaemonConfig, out: &mut dyn io::Write) -
                 writeln!(
                     out,
                     "token    PROBLEM the agent token EXPIRED on {date}, {} day(s) ago. Every \
-                     Proton name is degrading now. Mint a fresh token, log the session in \
-                     with it, and write it with `{} credential --store {}`",
+                     Proton name is degrading now. Mint a fresh token, then run `{} login \
+                     --store {} --replace`, which logs the dead session out, logs the new \
+                     token in and records it — in that order, so nothing is written until \
+                     the account has taken it",
                     -days,
                     crate::DAEMON_NAME,
                     proton::STORE_ID
@@ -571,6 +588,66 @@ fn orphaned(login: &VendorLogin, out: &mut dyn io::Write) -> io::Result<bool> {
         login.store
     )?;
     Ok(false)
+}
+
+/// Read one credential from stdin, echoed nowhere.
+///
+/// # Why this is one function and not one per verb
+///
+/// Two verbs now read a credential — `credential`, which writes it, and
+/// `login`, which presents it to a vendor. The rules below are the whole of
+/// what keeps a typed credential out of a scrollback, and a second copy of them
+/// would be free to lose one:
+///
+/// - **Echo is switched off around the read, on the same descriptor the
+///   `is_terminal` test asked about.** Testing one fd and muting another is how
+///   a prompt echoes.
+/// - **A terminal whose echo cannot be switched off is NOT prompted at all.**
+///   Printing the credential as it is typed is worse than refusing, so the
+///   refusal names the pipe form instead.
+/// - **A pipe is read whole and a terminal is read to the first newline**,
+///   which is [`read_value`](crate::cmd::write::read_value)'s rule and not this
+///   function's.
+///
+/// `subject` names what is being asked for, and `remedy` is the exact pipeline
+/// to run instead when the terminal will not go quiet.
+///
+/// # Errors
+///
+/// The sentence to print. Nothing here carries any part of the value.
+pub fn prompt_for(subject: &str, remedy: &str) -> Result<Secret, String> {
+    use std::io::{IsTerminal, Write};
+
+    let interactive = io::stdin().is_terminal();
+    let quiet = if interactive {
+        match crate::tty::without_echo() {
+            Ok(guard) => Some(guard),
+            Err(error) => {
+                return Err(format!(
+                    "cannot switch terminal echo off ({error}), so the value would be printed \
+                     as you typed it. Pipe it in instead: `{remedy}`"
+                ));
+            }
+        }
+    } else {
+        None
+    };
+
+    if interactive {
+        let _ = write!(
+            io::stderr(),
+            "{}: {subject} (not echoed): ",
+            crate::DAEMON_NAME
+        );
+        let _ = io::stderr().flush();
+    }
+    let value = crate::cmd::write::read_value(&mut io::stdin(), interactive);
+    drop(quiet);
+    if interactive {
+        // Echo was off, so the user's Enter produced no newline on screen.
+        let _ = writeln!(io::stderr());
+    }
+    value.map_err(|error| error.to_string())
 }
 
 /// Put one value into the credential file, leaving its owner and mode alone.

@@ -50,7 +50,6 @@ mod daemon {
 
     use keyless::attest::is_interpreter;
     use keyless::audit::AuditLog;
-    use keyless::cmd::write::read_value;
     use keyless::daemon::check::report as check_report;
     use keyless::daemon::config::{DaemonConfig, refuse_interpreter_pin};
     use keyless::daemon::credential;
@@ -95,6 +94,9 @@ mod daemon {
         Verify(VerifyArgs),
         /// Put one value into the daemon's own credential file. Prints nothing.
         Credential(CredentialArgs),
+        /// Log the daemon into a vendor and record the credential that
+        /// re-establishes that session. Prints no value.
+        Login(LoginArgs),
     }
 
     #[derive(Args)]
@@ -132,6 +134,26 @@ mod daemon {
     }
 
     #[derive(Args)]
+    struct LoginArgs {
+        /// Which vendor to log in. `proton` is the only store with a session;
+        /// the other two are credentials and `credential` writes those.
+        #[arg(long, value_name = "STORE")]
+        store: String,
+        /// Log an EXISTING session out first, then log in.
+        ///
+        /// The token-rotation path, and deliberately not the default: without
+        /// it the vendor refuses to replace a session it already has, which is
+        /// what makes a second run safe.
+        #[arg(long)]
+        replace: bool,
+        /// Config file. Every coordinate the login needs is read from it, and
+        /// none of them can be given here — a flag that disagreed with this
+        /// file would log a session into a directory the daemon never opens.
+        #[arg(long, value_name = "PATH", default_value = DEFAULT_CONFIG)]
+        config: PathBuf,
+    }
+
+    #[derive(Args)]
     struct VerifyArgs {
         /// Audit log. Defaults to the path in the config.
         #[arg(long, value_name = "PATH")]
@@ -155,6 +177,7 @@ mod daemon {
             Verb::Check(args) => check(&args.config),
             Verb::Verify(args) => verify(&args),
             Verb::Credential(args) => credential(&args),
+            Verb::Login(args) => login(&args),
         }
     }
 
@@ -312,8 +335,6 @@ mod daemon {
     /// carry the value — so it is in no shell history, no process table and no
     /// transcript.
     fn credential(args: &CredentialArgs) -> ExitCode {
-        use std::io::IsTerminal;
-
         let config = match DaemonConfig::load(&args.config) {
             Ok(config) => config,
             Err(error) => return fail(&error.to_string()),
@@ -391,44 +412,19 @@ mod daemon {
             ));
         }
 
-        let interactive = io::stdin().is_terminal();
-        // Echo is switched off around the read and restored afterwards. If it
-        // cannot be switched off, the prompt is NOT offered: a prompt that
-        // echoes would print the credential, which is worse than refusing.
-        let quiet = if interactive {
-            match keyless::tty::without_echo() {
-                Ok(guard) => Some(guard),
-                Err(error) => {
-                    return fail(&format!(
-                        "cannot switch terminal echo off ({error}), so the value would be \
-                         printed as you typed it. Pipe it in instead: `printf '%s' \"$value\" \
-                         | keylessd credential --name {}`",
-                        args.name
-                    ));
-                }
-            }
-        } else {
-            None
-        };
-
-        if interactive {
-            let _ = write!(
-                io::stderr(),
-                "keylessd: value for {} (not echoed): ",
+        // Echo off, on the descriptor the terminal test asked about, and no
+        // prompt at all when it cannot be switched off. See
+        // `credential::prompt_for`, which both this verb and `login` read
+        // through so neither can lose one of those rules.
+        let value = match credential::prompt_for(
+            &format!("value for {}", args.name),
+            &format!(
+                "printf '%s' \"$value\" | keylessd credential --name {}",
                 args.name
-            );
-            let _ = io::stderr().flush();
-        }
-        let value = read_value(&mut io::stdin(), interactive);
-        drop(quiet);
-        if interactive {
-            // Echo was off, so the user's Enter produced no newline on screen.
-            let _ = writeln!(io::stderr());
-        }
-
-        let value = match value {
+            ),
+        ) {
             Ok(value) => value,
-            Err(error) => return fail(&error.to_string()),
+            Err(detail) => return fail(&detail),
         };
 
         if let Err(error) = credential::store_entry(&path, &args.name, &value) {
@@ -450,6 +446,121 @@ mod daemon {
             );
         }
 
+        ExitCode::SUCCESS
+    }
+
+    /// Log the daemon into a vendor, and record the token that re-establishes
+    /// that session.
+    ///
+    /// Every coordinate comes from the config and none of them is a flag; the
+    /// token arrives on stdin with echo off, exactly as `credential`'s does.
+    /// The sequencing is `daemon::login`'s, so what is left here is the exit
+    /// code and the order the checks are made in — and that order is the point:
+    /// everything that can refuse this config refuses BEFORE a credential is
+    /// asked for, so nobody types a token into a setup that was never going to
+    /// use it.
+    fn login(args: &LoginArgs) -> ExitCode {
+        use keyless::daemon::login;
+
+        if args.store != login::STORE {
+            return fail(&login::refuse_store(&args.store));
+        }
+
+        let config = match DaemonConfig::load(&args.config) {
+            Ok(config) => config,
+            Err(error) => return fail(&error.to_string()),
+        };
+        let coordinates = match login::coordinates(&config) {
+            Ok(coordinates) => coordinates,
+            Err(detail) => return fail(&detail),
+        };
+        let Some(owner) = credential::daemon_owner(config.audit.as_path()) else {
+            return fail(&login::no_daemon_uid(config.audit.as_path()));
+        };
+
+        match login::ensure_session_dir(&coordinates.session_dir, owner) {
+            Ok(login::Ensured::Created) => {
+                let _ = writeln!(
+                    io::stdout(),
+                    "session\tcreated\t{}",
+                    coordinates.session_dir.display()
+                );
+            }
+            Ok(login::Ensured::Sound) => {
+                let _ = writeln!(
+                    io::stdout(),
+                    "session\tready\t{}",
+                    coordinates.session_dir.display()
+                );
+            }
+            Ok(login::Ensured::Repaired(repairs)) => {
+                let _ = writeln!(
+                    io::stdout(),
+                    "session\trepaired\t{}",
+                    coordinates.session_dir.display()
+                );
+                for repair in repairs {
+                    let _ = writeln!(io::stderr(), "keylessd: {repair}");
+                }
+            }
+            Err(detail) => return fail(&detail),
+        }
+
+        let extra = match login::extra_credentials(&coordinates) {
+            Ok(extra) => extra,
+            Err(detail) => return fail(&detail),
+        };
+
+        let token = match credential::prompt_for(
+            &format!("agent token for {}", login::STORE),
+            &format!(
+                "printf '%s' \"$token\" | keylessd login --store {}",
+                login::STORE
+            ),
+        ) {
+            Ok(token) => token,
+            Err(detail) => return fail(&detail),
+        };
+
+        // Checked before the vendor is spawned. Every structural fault here
+        // arrives from the account as one sentence covering an invalid token,
+        // an expired one and a deleted one — which sends the reader to a
+        // dashboard to look for a token that was never wrong.
+        if let Err(detail) = keyless::store::proton::classify_token(token.expose()) {
+            return fail(&format!(
+                "that is not a personal access token: {detail}. Nothing was sent to Proton Pass \
+                 and nothing was written. No part of what you typed is printed here"
+            ));
+        }
+
+        if let Err(detail) = login::perform(
+            &coordinates,
+            owner,
+            args.replace,
+            &token,
+            extra,
+            &mut io::stdout(),
+        ) {
+            return fail(&detail);
+        }
+
+        // Said afterwards rather than refused beforehand: a date is a thing an
+        // operator writes down from the vendor's own output, and refusing the
+        // login over it would mean refusing the step that produced it.
+        if config.stores.proton.token_expires.is_none() {
+            let _ = writeln!(
+                io::stderr(),
+                "keylessd: `stores.{}.token_expires` names no date, so nothing will warn you \
+                 before this token stops. The vendor cannot be asked — its refusal reads the \
+                 same for expired, revoked and wrong — so write the expiry down there now",
+                login::STORE
+            );
+        }
+        let _ = writeln!(
+            io::stderr(),
+            "keylessd: run `keylessd check --config {}` to see whether the account accepts it",
+            args.config.display()
+        );
         ExitCode::SUCCESS
     }
 
