@@ -1023,6 +1023,18 @@ the daemon's uid can read, read per lookup and written to nothing. The daemon
 carries this adapter with the same `vault` rule; the recipe is in
 [`install/README.md`](install/README.md#serving-names-out-of-one-1password-vault).
 
+And say the other half just as plainly: **behind the daemon, with a store-wide
+`field` set, the pinned vault is the allowlist.** An item needs three
+coordinates — vault, title, field — the vault is the store's and the title
+defaults to the name being asked for, so a store-wide `field` supplies the last
+one, and a name in no `secrets` entry resolves anyway. Any client the policy
+attests can then ask for anything the vault holds by guessing an item's title,
+because `secrets` is routing rather than a gate. Keep in that vault only what
+every attested client may read. To serve declared names and nothing else, leave
+`stores.onepassword.field` out and give each name its own `"field"`: an
+undeclared name then has no field, and a field is the one coordinate this tool
+will not guess. `keylessd` says so at startup rather than leaving it here.
+
 #### What was measured, and what was not
 
 No account was signed in when this adapter was measured, so the

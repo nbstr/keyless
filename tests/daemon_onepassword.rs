@@ -53,6 +53,13 @@ const TOKEN_DECOY: &str = "decoy-Sa11-service-account-never-real-0606";
 /// From JSON rather than a struct literal, so the coordinates travel through a
 /// file the way an operator's do, and `timeout_ms` is spelled for the reason
 /// `tests/suite_hygiene.rs` enforces.
+///
+/// Each name carries its own `field` and the store carries no store-wide one,
+/// deliberately: a store-wide `field` supplies the last coordinate an
+/// UNDECLARED name is missing, which makes the pinned vault itself the
+/// allowlist for every attested client. The daemon warns about that at startup,
+/// so putting it back here would trade a silent fixture for a noisy one — and
+/// this file's `warnings().is_empty()` is what would catch it.
 fn daemon_config_with_onepassword(dir: &Path, vendor: &Path) -> DaemonConfig {
     let credentials = dir.join("onepassword-credentials.json");
     write_secrets(&credentials, &[(TOKEN_ENTRY, TOKEN_DECOY)]);
@@ -66,11 +73,12 @@ fn daemon_config_with_onepassword(dir: &Path, vendor: &Path) -> DaemonConfig {
              "peer":{{"allow_uids":[501],
                       "allow_images":["00112233445566778899aabbccddeeff00112233"]}},
              "stores":{{"onepassword":{{"enabled":true,"binary":"{vendor}","timeout_ms":60000,
-                                        "vault":"company","field":"password",
+                                        "vault":"company",
                                         "credentials_file":"{credentials}",
                                         "credentials":{{"OP_SERVICE_ACCOUNT_TOKEN":"{TOKEN_ENTRY}"}}}}}},
-             "secrets":{{"{DECLARED}":{{"store":"onepassword","item":"DECOY"}},
-                         "{ELSEWHERE}":{{"store":"onepassword","vault":"personal","item":"DECOY"}}}}}}"#,
+             "secrets":{{"{DECLARED}":{{"store":"onepassword","item":"DECOY","field":"password"}},
+                         "{ELSEWHERE}":{{"store":"onepassword","vault":"personal","item":"DECOY",
+                                         "field":"password"}}}}}}"#,
         socket = short_socket_path(dir).display(),
         audit = dir.join("audit.jsonl").display(),
         vendor = vendor.display(),

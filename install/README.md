@@ -304,7 +304,6 @@ field in this file a credential fits in:
   "enabled": true,
   "binary": "/absolute/path/to/op",
   "vault": "company",
-  "field": "password",
   "config_dir": "/usr/local/var/lib/keyless/op",
   "credentials_file": "/usr/local/var/lib/keyless/onepassword.json",
   "credentials": { "OP_SERVICE_ACCOUNT_TOKEN": "SERVICE_ACCOUNT" }
@@ -316,9 +315,10 @@ field in this file a credential fits in:
   written down, never inferred from what the login happens to see — and it
   should be the vault the service account was minted for, or every lookup is
   refused by the vendor.
-- **`field`** is the field a name reads when its own entry names none. Set it
-  when every item in the vault has the same shape; leave it out otherwise and
-  put `field` on each name.
+- **`field` decides whether this store serves the names you declared or the
+  whole vault.** Read the box below before you set it. It is the field a name
+  reads when its own entry names none — convenient when every item in the vault
+  has the same shape, and it has a consequence behind the socket.
 - **`config_dir`** names a directory the daemon's uid can write. `op` keeps an
   account list and a cache socket under the calling user's config directory,
   and a daemon's home may not be one it can write to. Create it owned by the
@@ -327,8 +327,37 @@ field in this file a credential fits in:
 - **`OP_*` only** under `credentials`. Anything else is refused by every
   lookup and named by `keylessd check`.
 
+> ### ⚠️ With `field` set, the vault itself is the allowlist
+>
+> A 1Password item needs three coordinates: the vault, the item's title, and
+> the field. The vault is the store's, and the title defaults to the name being
+> asked for — so `field` is the **last one missing**. Set it store-wide, and a
+> name that appears in **no** `secrets` entry still resolves: it is looked up as
+> the item of that title, in the pinned vault, at that field.
+>
+> On a session that changes nothing — the person at the keyboard already has a
+> login that reads the whole vault. Behind the daemon it is the access model.
+> The daemon holds an identity no client has, `secrets` is routing rather than a
+> gate, and `keylessd` has no list of declared names to check a request against.
+> So **any client the policy attests can ask for anything the vault holds, by
+> guessing an item's title.**
+>
+> That is deliberate, and it is why the store is pinned to one vault and why the
+> service account is minted for that vault and no other: **put in it only what
+> every attested client on this machine may read.**
+>
+> **To serve declared names and nothing else**, leave `stores.onepassword.field`
+> out and put `"field"` on each name under `secrets`. An undeclared name then
+> has no field to read, and it is refused before anything is spawned — a field
+> is the one coordinate this tool will not guess.
+>
+> `keylessd` warns at startup, and `keylessd check` prints the same line, naming
+> the vault, whenever this store is enabled with a store-wide `field`. Nobody
+> has to remember to come back and read this.
+
 Each name is an item in that vault, by title, and the item's id when two share
-one:
+one. Giving every name its own `field` is what keeps the store to the names you
+declared:
 
 ```json
 "secrets": {

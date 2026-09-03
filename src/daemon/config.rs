@@ -1092,6 +1092,44 @@ impl DaemonConfig {
                     .to_owned(),
             );
         }
+        // The one property of this backend an operator cannot read off its
+        // config, and the one that changes meaning when it moves behind the
+        // socket. A store-wide `field` supplies the ONLY coordinate an
+        // undeclared name is missing — the vault is the store's and the title
+        // is the name itself — so with it set, every item in the vault is
+        // reachable by title by any attested client, whether or not `secrets`
+        // mentions it. That is this backend's design and it is exactly why the
+        // vault is pinned; what it is not is discoverable, and nothing else in
+        // this tool says it.
+        //
+        // Not a refusal, because it is the merged and tested behaviour of an
+        // adapter whose whole scoping story is the vault. It is a warning at
+        // the one moment the operator is reading: the vault they just named is
+        // now the allowlist, and the switch that narrows it is one line away.
+        if let Some(vault) = self
+            .stores
+            .onepassword
+            .vault
+            .as_deref()
+            .filter(|vault| !vault.is_empty())
+            && self.stores.onepassword.enabled
+            && self
+                .stores
+                .onepassword
+                .field
+                .as_deref()
+                .is_some_and(|field| !field.is_empty())
+        {
+            warnings.push(format!(
+                "the 1Password store is enabled with `stores.onepassword.field` set, which \
+                 makes vault `{vault}` itself the allowlist: a name in NO `secrets` entry \
+                 resolves as the item of that title in that vault, so an attested client can \
+                 ask for anything the vault holds by guessing its title. Keep only what every \
+                 client may read in it. To serve declared names and nothing else, drop \
+                 `stores.onepassword.field` and put \"field\" on each name under `secrets` — an \
+                 undeclared name is then refused before anything is spawned"
+            ));
+        }
         if self.stores.onepassword.enabled && self.stores.onepassword.credentials.is_empty() {
             // Not a misconfiguration — an operator may have signed the daemon's
             // uid in some other way — but it is the arrangement nobody
@@ -1660,12 +1698,17 @@ mod tests {
     /// A 1Password daemon config with everything a lookup needs, so the
     /// warnings can be asserted SILENT — the control every warning test here
     /// needs, or a warning could fire on every config regardless.
+    ///
+    /// The name carries its own `field` and the store sets no store-wide one,
+    /// which is the config that serves DECLARED names and nothing else. A
+    /// store-wide `field` is warned about — see the test below — because it is
+    /// the switch that turns the vault into the allowlist.
     const ONEPASSWORD_WELL_FORMED: &str = r#"{"peer":{"allow_uids":[501],
                 "allow_images":["00112233445566778899aabbccddeeff00112233"]},
-                "stores":{"onepassword":{"enabled":true,"vault":"company","field":"password",
+                "stores":{"onepassword":{"enabled":true,"vault":"company",
                                          "credentials_file":"/tmp/keyless-test/onepassword.json",
                                          "credentials":{"OP_SERVICE_ACCOUNT_TOKEN":"SERVICE_ACCOUNT"}}},
-                "secrets":{"DECOY":{"store":"onepassword","item":"Router"}}}"#;
+                "secrets":{"DECOY":{"store":"onepassword","item":"Router","field":"password"}}}"#;
 
     #[test]
     fn a_well_formed_onepassword_config_registers_the_store_and_warns_about_nothing() {
@@ -1722,6 +1765,58 @@ mod tests {
         assert!(config.onepassword_routing().vault().is_err());
         let said = config.warnings().join(" ");
         assert!(said.contains("stores.onepassword.vault"), "{said}");
+    }
+
+    #[test]
+    fn a_store_wide_field_is_told_that_it_makes_the_vault_the_allowlist() {
+        // Behind the socket this is the property nobody can read off the
+        // config. A store-wide `field` supplies the ONLY coordinate an
+        // undeclared name lacks — the vault is the store's and the title is the
+        // name itself — so every item in the pinned vault becomes reachable by
+        // title to any attested client, `secrets` entry or not.
+        //
+        // The daemon has no declared-name population to check against (see
+        // `crate::daemon::resolver`), and this adapter has no refusal of its
+        // own, so nothing downstream would ever say it. It is said here, once,
+        // where the operator is looking at the file they just wrote.
+        let config = parse(
+            r#"{"peer":{"allow_uids":[501],
+                "allow_images":["00112233445566778899aabbccddeeff00112233"]},
+                "stores":{"onepassword":{"enabled":true,"vault":"company","field":"password",
+                                         "credentials_file":"/tmp/keyless-test/onepassword.json",
+                                         "credentials":{"OP_SERVICE_ACCOUNT_TOKEN":"SA"}}},
+                "secrets":{"DECOY":{"store":"onepassword","item":"Router"}}}"#,
+        );
+        let said = config.warnings().join(" ");
+        assert!(said.contains("stores.onepassword.field"), "{said}");
+        assert!(said.contains("allowlist"), "{said}");
+        assert!(
+            said.contains("company"),
+            "the warning must name the vault: {said}"
+        );
+        // And the way out, or the warning is a fact with no action attached.
+        assert!(said.contains("\"field\" on each name"), "{said}");
+
+        // The behaviour the warning describes, asserted rather than assumed —
+        // a warning about a property the code does not have is worse than none.
+        let routing = config.onepassword_routing();
+        let address = routing
+            .address("A_NAME_NOBODY_EVER_DECLARED")
+            .expect("a store-wide field makes an undeclared name addressable");
+        assert_eq!(address.item, "A_NAME_NOBODY_EVER_DECLARED");
+
+        // The control, which is also the remedy: with each name carrying its
+        // own field and the store carrying none, the warning is silent AND an
+        // undeclared name is refused before anything is spawned.
+        let narrowed = parse(ONEPASSWORD_WELL_FORMED);
+        assert!(narrowed.warnings().is_empty(), "{:?}", narrowed.warnings());
+        assert!(
+            narrowed
+                .onepassword_routing()
+                .address("A_NAME_NOBODY_EVER_DECLARED")
+                .is_err(),
+            "with no store-wide field an undeclared name must have nowhere to point"
+        );
     }
 
     #[test]
