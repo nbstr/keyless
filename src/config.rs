@@ -411,9 +411,9 @@ impl Default for ProtonConfig {
 /// reachable by anything running as this uid — the same fact
 /// [`crate::daemon`] exists to change. Locally the split is advisory. The
 /// enforced version needs the manager token to live behind the daemon's uid,
-/// and `keylessd` carries no Proton adapter and no write operation yet, which
-/// is why [`crate::store::manage::manager`] refuses to write locally when the
-/// daemon is enabled rather than reaching around it.
+/// and the daemon's Proton adapter reads only — the protocol carries no write
+/// operation — which is why [`crate::store::manage::manager`] refuses to write
+/// locally when the daemon is enabled rather than reaching around it.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ProtonManagerConfig {
     /// `PROTON_PASS_SESSION_DIR` for the write verbs' children.
