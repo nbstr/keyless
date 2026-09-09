@@ -117,6 +117,13 @@ pub fn spawn(config: &DaemonConfig) -> Result<Option<Keeper>, String> {
 
 /// The loop itself, with its clock and its two waits.
 ///
+/// Two triggers, and both are needed. **Age** replaces a session before the
+/// vendor's two-hour cap reaches it. **Liveness** catches the session the
+/// vendor dropped early -- which it does without warning, and which age alone
+/// would sit out for the whole lifetime. Proton's own published loop is the
+/// second one; the first is what keeps it from only ever acting after an
+/// outage has started.
+///
 /// # Why the first tick always logs in
 ///
 /// The daemon has just started and the session directory may hold anything: no
@@ -136,7 +143,13 @@ fn run(coordinates: &Coordinates, owner: Owner, settings: SessionRenewal, stop: 
     let mut failures: u32 = 0;
 
     while !stop.load(Ordering::Relaxed) {
-        let due = established.is_none_or(|at| at.elapsed() >= lifetime);
+        // Two triggers, and the second is not redundant. Age alone would sit
+        // for the whole lifetime over a session the vendor had already taken
+        // away — and it does take them away without warning, ahead of the cap.
+        // So each tick asks the vendor whether one still answers, which is the
+        // `pass-cli info || login` Proton publishes.
+        let due =
+            established.is_none_or(|at| at.elapsed() >= lifetime) || !alive(coordinates, owner);
         if due {
             match attempt(coordinates, owner) {
                 Ok(()) => {
@@ -171,6 +184,49 @@ fn run(coordinates: &Coordinates, owner: Owner, settings: SessionRenewal, stop: 
     }
 }
 
+/// What to say when the session directory cannot be made the daemon's.
+///
+/// Reached almost always for one reason: something ran the vendor as root
+/// against this directory and left files behind that this uid cannot take
+/// back. `keylessd check` under `sudo` was that something until the adapter
+/// began dropping privilege, and a hand-run `pass-cli` still is.
+///
+/// The remedy is a privileged `chown`, so it is written out rather than
+/// described: nothing this daemon can do will fix it, and a message that only
+/// reports the errno leaves an operator watching a loop retry for ever.
+fn undirectable(coordinates: &Coordinates, owner: Owner, detail: &str) -> String {
+    format!(
+        "the Proton session directory cannot be made this daemon's, so no login can succeed \
+         against it: {detail}\n\
+         Only a privileged process may change a file's owner, so this is not something the \
+         daemon can repair — it is almost always a `pass-cli` that ran as root against this \
+         directory. Give it back:\n\
+         \tsudo chown -R {}:{} {}",
+        owner.uid,
+        owner.gid,
+        coordinates.session_dir.display()
+    )
+}
+
+/// Does a session still answer in the daemon's own directory?
+///
+/// # Why a failed probe is read as "no session" rather than ignored
+///
+/// The three ways this comes back false are a dead session, a vendor binary
+/// that will not spawn, and a directory the daemon cannot open — and the
+/// response to all three is the same: try to log in, and report what that says.
+/// A login is safe against every one of them (`--replace` treats "already
+/// logged out" as success), and the failure path already carries the vendor's
+/// own sentence, which is more specific than anything a probe could add.
+///
+/// The alternative — treating an unanswerable probe as healthy — is the reading
+/// that produces silence over an outage.
+fn alive(coordinates: &Coordinates, owner: Owner) -> bool {
+    login::run(login::info_command(coordinates, owner))
+        .map(|(status, _)| status.success())
+        .unwrap_or(false)
+}
+
 /// One renewal: read the token the daemon already holds, and use it.
 ///
 /// The token is re-read from the credential file on every attempt rather than
@@ -179,6 +235,41 @@ fn run(coordinates: &Coordinates, owner: Owner, settings: SessionRenewal, stop: 
 /// with what it now says.
 fn attempt(coordinates: &Coordinates, owner: Owner) -> Result<(), String> {
     use crate::store::Store;
+
+    // The directory before the login that writes into it.
+    //
+    // `pass-cli` creates `.session/` inside it and owns what it creates, so a
+    // session directory belonging to anyone but the daemon produces
+    // `Permission denied` while creating the local key — a failure that reads
+    // nothing like its cause, and that a reader spends the afternoon
+    // attributing to the token.
+    //
+    // What this can and cannot do is worth being exact about, because the
+    // difference is a privilege the daemon does not have. It CREATES a missing
+    // directory, and it re-asserts the mode, both of which an owner may do. It
+    // CANNOT take a file back from root: only a privileged process may change
+    // a file's owner, so a `.session/local.key` left behind by something that
+    // ran as root is diagnosed here and repaired by nobody. Saying which is the
+    // whole value — the alternative is the vendor's own sentence, which names
+    // neither the file nor the fix.
+    //
+    // Here rather than at startup, because a directory can go wrong while the
+    // daemon runs, and a check made once cannot see that. It is a `stat` per
+    // renewal, not per lookup.
+    match login::ensure_session_dir(&coordinates.session_dir, owner)
+        .map_err(|detail| undirectable(coordinates, owner, &detail))?
+    {
+        login::Ensured::Sound => {}
+        login::Ensured::Created => report(&format!(
+            "created the Proton session directory {}",
+            coordinates.session_dir.display()
+        )),
+        login::Ensured::Repaired(repairs) => {
+            for repair in repairs {
+                report(&format!("Proton session directory: {repair}"));
+            }
+        }
+    }
 
     let file = crate::store::file::FileStore::new(coordinates.credentials_file.clone());
     let token = match file.resolve(&coordinates.token_entry) {
