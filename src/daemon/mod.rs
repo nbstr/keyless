@@ -46,6 +46,7 @@ pub mod config;
 pub mod credential;
 pub mod login;
 pub mod resolver;
+pub mod session;
 pub mod shadow;
 
 use std::io::{self, Write};

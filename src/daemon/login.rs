@@ -607,6 +607,51 @@ pub fn perform(
     extra: Vec<(String, Secret)>,
     out: &mut dyn std::io::Write,
 ) -> Result<(), String> {
+    establish(coordinates, owner, replace, token, extra, out)?;
+
+    super::credential::store_entry(
+        &coordinates.credentials_file,
+        &coordinates.token_entry,
+        token,
+    )
+    .map_err(|error| logged_in_but_unwritten(coordinates, &error.to_string()))?;
+
+    writeln!(
+        out,
+        "stored\t{}\t{}",
+        coordinates.token_entry,
+        coordinates.credentials_file.display()
+    )
+    .map_err(|error| format!("the report could not be written: {error}"))
+}
+
+/// Establish the session, and record nothing.
+///
+/// The half of [`perform`] that talks to the vendor, split out so the renewal
+/// loop in [`super::session`] can reuse it without rewriting a token the file
+/// already holds.
+///
+/// # Why the renewal must NOT write the token back
+///
+/// It is the same value, so the write looks free — and it is the one step in
+/// this verb that can fail on a healthy renewal. A full disk, a read-only
+/// filesystem or a credential file an operator has just chmod'd turns a
+/// successful login into [`logged_in_but_unwritten`], which backs the loop off
+/// and eventually notifies, over a session that is in fact alive. Writing the
+/// token belongs to the verb that has just been HANDED one; a loop that read
+/// it out of the file has nothing new to record.
+///
+/// # Errors
+///
+/// The sentence to print. `Ok` means the vendor has taken the token.
+pub fn establish(
+    coordinates: &Coordinates,
+    owner: Owner,
+    replace: bool,
+    token: &Secret,
+    extra: Vec<(String, Secret)>,
+    out: &mut dyn std::io::Write,
+) -> Result<(), String> {
     if replace {
         let (status, said) = run(logout_command(coordinates, owner))
             .map_err(|error| cannot_spawn(coordinates, owner, &error))?;
@@ -664,22 +709,7 @@ pub fn perform(
     }
 
     writeln!(out, "login\t{STORE}\t{}", coordinates.session_dir.display())
-        .map_err(|error| format!("the report could not be written: {error}"))?;
-
-    super::credential::store_entry(
-        &coordinates.credentials_file,
-        &coordinates.token_entry,
-        token,
-    )
-    .map_err(|error| logged_in_but_unwritten(coordinates, &error.to_string()))?;
-
-    writeln!(
-        out,
-        "stored\t{}\t{}",
-        coordinates.token_entry,
-        coordinates.credentials_file.display()
-    )
-    .map_err(|error| format!("the report could not be written: {error}"))
+        .map_err(|error| format!("the report could not be written: {error}"))
 }
 
 /// What to tell an operator whose child could not even be started.

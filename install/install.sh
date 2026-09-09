@@ -739,7 +739,8 @@ cat <<'NEXT'
 #        "key_provider": "fs",
 #        "token_expires": "<YYYY-MM-DD, the day step (a) printed>",
 #        "credentials_file": "$LIB_DIR/proton.json",
-#        "credentials": { "PROTON_PASS_PERSONAL_ACCESS_TOKEN": "AGENT_TOKEN" }
+#        "credentials": { "PROTON_PASS_PERSONAL_ACCESS_TOKEN": "AGENT_TOKEN" },
+#        "session": { "auto_login": true }
 #      }
 #
 #    "session_dir" is required and is never defaulted: with none, the vendor
@@ -787,6 +788,30 @@ cat <<'NEXT'
 #    IN it and when it stops, and `store proton` is the vendor accepting it:
 #
 #      sudo keylessd check --config /usr/local/etc/keyless/keylessd.json
+#
+# e. Nothing further, and this is the step people expect to find here. A
+#    personal-access-token session lasts TWO HOURS -- the vendor's cap, at
+#    https://protonpass.github.io/pass-cli/commands/personal-access-token/ --
+#    and there is no renewal verb, so logging in again IS the renewal.
+#
+#    "session": { "auto_login": true } in step (b) is what runs that loop,
+#    inside the daemon. It replaces the session every 90 minutes, backs off
+#    from 1s to 5 minutes on failure, never stops trying, and re-reads the
+#    token from proton.json on every attempt -- so a rotation takes effect on
+#    the next tick without a restart. Leave it out and every Proton name stops
+#    resolving two hours after step (c), with nothing running that could put
+#    the session back.
+#
+#    There is no cron job and no LaunchDaemon to install for this. A job
+#    outside the daemon has to rediscover which uid may own the session store,
+#    where the credential file is, and how to read the vendor's answer -- and
+#    it runs as root by default, which creates a session store the daemon
+#    cannot open and fails in a way that reads exactly like a wrong token.
+#
+#    Tune it only if you have a reason: "login_after_minutes" (90, and it has
+#    to stay under 120), "probe_interval_seconds" (300),
+#    "min_backoff_seconds" (1), "max_backoff_seconds" (300). Startup warns
+#    about a combination that cannot work.
 #
 NEXT
 

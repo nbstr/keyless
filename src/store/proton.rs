@@ -343,11 +343,15 @@ static PROBE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 /// How bad that is depends on how the session was created, and the difference
 /// is worth knowing before anyone experiments here:
 ///
-/// - A **personal-access-token** session recovers by itself. The token is held
+/// - A **personal-access-token** session recovers by itself **from an emptied
+///   store, which is the only case this section is about**. The token is held
 ///   outside the session database, so the next command re-establishes the
 ///   session — with a **new share id for the same vault**, which is why a
 ///   reference is written against the session that will resolve it and not
-///   copied from anywhere else.
+///   copied from anywhere else. Do not read it as covering EXPIRY: an expired
+///   session leaves the store populated and invalid, `pass-cli` answers a
+///   login over it with `Client is already authenticated`, and nothing
+///   re-establishes it. That is [`crate::daemon::session`]'s job.
 /// - A **web-login** session does not. It is gone, the only way back is
 ///   `pass-cli login`, and nothing on disk restores it. That is not a
 ///   hypothetical: stripping the environment of a probe is enough to destroy a
@@ -989,11 +993,22 @@ const fn is_base64url(byte: u8) -> bool {
 /// established — a session store the caller owns, encrypted with a key in the
 /// caller's keyring. A daemon inherits neither half. It is given a session
 /// directory of its own, and it must be able to put that session back when the
-/// vendor drops it: measured behaviour recorded in [`remove_ambient_references`]
-/// is that a personal-access-token session **re-establishes itself** on the next
-/// command, because the token lives outside the session database. Without the
-/// token in the environment there is nothing to re-establish it from, and the
-/// first time anything disturbs that directory every Proton name stops
+/// vendor drops it. Two different things drop it, and they do not heal alike.
+///
+/// - The directory is **emptied** — a probe run under a stripped environment
+///   reinitialises it, which is the measured behaviour recorded in
+///   [`remove_ambient_references`]. The token lives outside the session
+///   database, so with it in the environment the next command re-establishes
+///   the session and nothing has to notice.
+/// - The session **expires**. Proton caps a personal-access-token session at
+///   two hours and publishes no renewal verb, so logging in again IS the
+///   renewal. Expiry leaves the store populated and INVALID, and `pass-cli`
+///   answers a login over it with `Client is already authenticated` — so the
+///   case above does not reach this one, and nothing re-establishes it on its
+///   own. [`crate::daemon::session`] is the loop that does, switched on with
+///   `stores.proton.session.auto_login`.
+///
+/// Without the token in the environment neither heals: every Proton name stops
 /// resolving until somebody notices and logs it back in by hand.
 ///
 /// Under [`KeyProvider::Env`] it carries the local encryption key too, which is
