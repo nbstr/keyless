@@ -876,7 +876,7 @@ pub fn daemon_config(dir: &Path) -> DaemonConfig {
 #[cfg(any(target_os = "macos", keyless_force_xnu))]
 pub fn start_daemon(config: &DaemonConfig, policy: Policy) -> Running {
     let daemon = Daemon::bind(config, policy).expect("bind the daemon");
-    Running::spawn(daemon).expect("start the accept loop")
+    Running::spawn(daemon, config).expect("start the accept loop")
 }
 
 /// A session config that routes through `socket` and has no local fallback.

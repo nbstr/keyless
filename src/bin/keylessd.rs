@@ -238,23 +238,13 @@ mod daemon {
         };
         let socket = daemon.socket().to_path_buf();
 
-        let running = match Running::spawn(daemon) {
+        // The renewal loop starts with the accept loop and stops with it: its
+        // lifetime is the daemon's, not this function's. See `Running::spawn`.
+        let running = match Running::spawn(daemon, &config) {
             Ok(running) => running,
-            Err(error) => return fail(&format!("cannot start the accept loop: {error}")),
+            Err(error) => return fail(&format!("cannot start the daemon: {error}")),
         };
-
-        // After the socket is listening, so a renewal that takes a few seconds
-        // does not delay the sessions waiting to connect. Before the wait
-        // below, so a config that asks for the loop and cannot support one
-        // fails at startup rather than two hours later.
-        let session = match keyless::daemon::session::spawn(&config) {
-            Ok(session) => session,
-            Err(error) => {
-                drop(running);
-                return fail(&error);
-            }
-        };
-        if session.is_some() {
+        if running.renews_its_session() {
             let _ = writeln!(
                 io::stderr(),
                 "keylessd: keeping the Proton session alive, replacing it every {} minutes",
@@ -278,9 +268,8 @@ mod daemon {
             }
         }
 
-        // Dropping stops the renewal loop and joins it, then stops the accept
-        // loop, joins it, and removes the socket.
-        drop(session);
+        // Dropping stops the renewal loop, then the accept loop, joins both,
+        // and removes the socket.
         drop(running);
         ExitCode::SUCCESS
     }
