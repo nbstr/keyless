@@ -619,9 +619,14 @@ the session back.
 }
 ```
 
-- **`login_after_minutes`** (90) has to stay under the vendor's 120. The margin
-  absorbs a failed attempt and its backoff, so the session is never renewed at
-  the edge of the cliff.
+- **Two triggers, and both are needed.** `login_after_minutes` (90) replaces the
+  session before the vendor's 120-minute cap reaches it; the margin absorbs a
+  failed attempt and its backoff. `probe_interval_seconds` (300) runs
+  `pass-cli info` against the daemon's own session directory each tick and logs
+  in again if nothing answers — the vendor drops sessions ahead of the cap and
+  without warning, and age alone would sit out the whole lifetime over one that
+  had already gone. The probe is Proton's own published loop; the age check is
+  what stops it from only ever acting after an outage has started.
 - **The renewal is a logout followed by a login**, because `pass-cli` answers a
   login over a live session with `Client is already authenticated` and changes
   nothing. So there is a window of roughly a second, once every 90 minutes, in

@@ -117,6 +117,13 @@ pub fn spawn(config: &DaemonConfig) -> Result<Option<Keeper>, String> {
 
 /// The loop itself, with its clock and its two waits.
 ///
+/// Two triggers, and both are needed. **Age** replaces a session before the
+/// vendor's two-hour cap reaches it. **Liveness** catches the session the
+/// vendor dropped early -- which it does without warning, and which age alone
+/// would sit out for the whole lifetime. Proton's own published loop is the
+/// second one; the first is what keeps it from only ever acting after an
+/// outage has started.
+///
 /// # Why the first tick always logs in
 ///
 /// The daemon has just started and the session directory may hold anything: no
@@ -136,7 +143,13 @@ fn run(coordinates: &Coordinates, owner: Owner, settings: SessionRenewal, stop: 
     let mut failures: u32 = 0;
 
     while !stop.load(Ordering::Relaxed) {
-        let due = established.is_none_or(|at| at.elapsed() >= lifetime);
+        // Two triggers, and the second is not redundant. Age alone would sit
+        // for the whole lifetime over a session the vendor had already taken
+        // away — and it does take them away without warning, ahead of the cap.
+        // So each tick asks the vendor whether one still answers, which is the
+        // `pass-cli info || login` Proton publishes.
+        let due =
+            established.is_none_or(|at| at.elapsed() >= lifetime) || !alive(coordinates, owner);
         if due {
             match attempt(coordinates, owner) {
                 Ok(()) => {
@@ -169,6 +182,25 @@ fn run(coordinates: &Coordinates, owner: Owner, settings: SessionRenewal, stop: 
         };
         sleep_until_stopped(wait, stop);
     }
+}
+
+/// Does a session still answer in the daemon's own directory?
+///
+/// # Why a failed probe is read as "no session" rather than ignored
+///
+/// The three ways this comes back false are a dead session, a vendor binary
+/// that will not spawn, and a directory the daemon cannot open — and the
+/// response to all three is the same: try to log in, and report what that says.
+/// A login is safe against every one of them (`--replace` treats "already
+/// logged out" as success), and the failure path already carries the vendor's
+/// own sentence, which is more specific than anything a probe could add.
+///
+/// The alternative — treating an unanswerable probe as healthy — is the reading
+/// that produces silence over an outage.
+fn alive(coordinates: &Coordinates, owner: Owner) -> bool {
+    login::run(login::info_command(coordinates, owner))
+        .map(|(status, _)| status.success())
+        .unwrap_or(false)
 }
 
 /// One renewal: read the token the daemon already holds, and use it.

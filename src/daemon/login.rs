@@ -389,6 +389,27 @@ pub fn login_command(
     command
 }
 
+/// One `pass-cli info` invocation — does a session answer in this directory?
+///
+/// The liveness half of the loop Proton publishes: `pass-cli info 2>/dev/null
+/// || … pass-cli login`. It carries no credential, because the question is
+/// about the session store rather than about the token: a directory with a live
+/// identity answers, and one whose identity has gone answers `This operation
+/// requires an authenticated client`.
+///
+/// Scoped exactly as the two verbs beside it. `info` is on
+/// [`crate::store::proton::SESSION_SCOPED_VERBS`], so run without
+/// `PROTON_PASS_SESSION_DIR` it reports on the DEFAULT session — a different
+/// identity, usually a healthy one, which is the answer that makes a dead
+/// daemon session read as fine.
+#[must_use]
+pub fn info_command(coordinates: &Coordinates, owner: Owner) -> Command {
+    let mut command = Command::new(&coordinates.binary);
+    command.arg("info");
+    scope(&mut command, coordinates, &[], owner);
+    command
+}
+
 /// One `pass-cli logout` invocation, for the rotation path only.
 #[must_use]
 pub fn logout_command(coordinates: &Coordinates, owner: Owner) -> Command {
@@ -820,6 +841,60 @@ pub fn logged_in_but_unwritten(coordinates: &Coordinates, detail: &str) -> Strin
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The probe asks about the DAEMON's session, never the ambient one.
+    ///
+    /// `info` is session-scoped, so run without `PROTON_PASS_SESSION_DIR` it
+    /// reports on the caller's default session — usually healthy — and a dead
+    /// daemon session reads as fine. That is a probe that can only ever say
+    /// yes.
+    #[test]
+    fn the_liveness_probe_names_the_session_it_is_asking_about_and_carries_no_token() {
+        let coordinates = Coordinates {
+            binary: PathBuf::from("/nonexistent/pass-cli"),
+            session_dir: PathBuf::from("/var/lib/keyless/proton-session"),
+            key_provider: KeyProvider::Fs,
+            credentials_file: PathBuf::from("/var/lib/keyless/proton.json"),
+            token_entry: "AGENT_TOKEN".to_owned(),
+            extra: BTreeMap::new(),
+        };
+        let command = info_command(&coordinates, Owner { uid: 1, gid: 1 });
+
+        let environment: Vec<_> = command
+            .get_envs()
+            .map(|(key, value)| {
+                (
+                    key.to_string_lossy().into_owned(),
+                    value.map(|value| value.to_string_lossy().into_owned()),
+                )
+            })
+            .collect();
+        assert!(
+            environment
+                .iter()
+                .any(|(key, value)| key == proton::SESSION_DIR_VAR
+                    && value.as_deref() == Some("/var/lib/keyless/proton-session")),
+            "the probe does not name the session directory: {environment:?}"
+        );
+        assert!(
+            environment
+                .iter()
+                .any(|(key, _)| key == proton::KEY_PROVIDER_VAR),
+            "the probe does not name the key provider: {environment:?}"
+        );
+        // It asks whether a session answers; it is not a place a credential
+        // belongs, and one here would be a token in a child spawned every tick.
+        assert!(
+            !environment.iter().any(|(key, _)| key == proton::TOKEN_VAR),
+            "the probe carries the token: {environment:?}"
+        );
+
+        let argv: Vec<_> = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(argv, vec!["info".to_owned()]);
+    }
 
     fn scratch(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
