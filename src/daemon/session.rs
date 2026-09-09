@@ -212,6 +212,32 @@ fn alive(coordinates: &Coordinates, owner: Owner) -> bool {
 fn attempt(coordinates: &Coordinates, owner: Owner) -> Result<(), String> {
     use crate::store::Store;
 
+    // The directory before the login that writes into it.
+    //
+    // `pass-cli` creates `.session/` inside it and owns what it creates, so a
+    // session directory belonging to anyone but the daemon produces
+    // `Permission denied` while creating the local key — a failure that reads
+    // nothing like its cause. Until this call, only the `login` VERB asserted
+    // that, so a daemon whose directory went wrong could never repair it: the
+    // loop would retry against it for ever and every message would be about the
+    // vendor.
+    //
+    // Here rather than at startup, because a directory can go wrong while the
+    // daemon runs, and a check made once cannot see that. It is a `stat` per
+    // renewal, not per lookup.
+    match login::ensure_session_dir(&coordinates.session_dir, owner)? {
+        login::Ensured::Sound => {}
+        login::Ensured::Created => report(&format!(
+            "created the Proton session directory {}",
+            coordinates.session_dir.display()
+        )),
+        login::Ensured::Repaired(repairs) => {
+            for repair in repairs {
+                report(&format!("Proton session directory: {repair}"));
+            }
+        }
+    }
+
     let file = crate::store::file::FileStore::new(coordinates.credentials_file.clone());
     let token = match file.resolve(&coordinates.token_entry) {
         Ok(Some(token)) => token,
