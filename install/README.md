@@ -522,13 +522,29 @@ one of the three would cost a real read against a real vault.
 
 ### Log the daemon in
 
-One command. It prompts for the token, echoes nothing, and takes no value on
-the command line:
+One command. It takes no value on the command line, and it asks for the token
+only if it does not already have one:
 
 ```console
 $ sudo keylessd login --store proton
 $ sudo keylessd check --config /usr/local/etc/keyless/keylessd.json
 ```
+
+**Where the token comes from, in order.** A piped value wins; otherwise the
+credential file answers; otherwise you are prompted, with echo off.
+
+| You run | The token comes from |
+| --- | --- |
+| `printf '%s' "$t" \| sudo keylessd login --store proton` | the pipe, and it is recorded once the account accepts it |
+| `sudo keylessd login --store proton`, at a terminal, nothing written yet | a prompt, and it is recorded the same way |
+| `sudo keylessd login --store proton`, credential already written | **that file** — nothing is asked, and nothing is rewritten |
+| `sudo keylessd login --store proton --prompt --replace` | a prompt, always, which is how a replacement is typed without `credential` |
+
+The third row is the one worth knowing. `keylessd credential --store proton
+--name AGENT_TOKEN` writes the file and `login` uses it, so wiring a machine
+with both verbs asks for one token **once**, not twice. HashiCorp's Vault Agent
+draws the same line and offers no prompt at all: its AppRole auto-auth reads
+`secret_id_file_path`, and rotation is writing that file again.
 
 It reads every coordinate out of the config you just wrote — which is why the
 store is configured first, and why there is no `--session-dir` or
