@@ -577,8 +577,16 @@ mod daemon {
         };
         let interactive = std::io::IsTerminal::is_terminal(&io::stdin());
 
-        let (token, record) = if !args.prompt
-            && interactive
+        // Decided before the file is read on the terminal path, because a
+        // prompt reached is a prompt already answered.
+        let source = login::TokenSource::decide(
+            interactive,
+            args.prompt,
+            args.replace,
+            interactive && login::stored_token(&coordinates).ok().flatten().is_some(),
+        );
+
+        let (token, record) = if source == login::TokenSource::Held
             && let Some(token) = held(&coordinates)
         {
             (token, false)
