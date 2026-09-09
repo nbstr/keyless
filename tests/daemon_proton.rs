@@ -116,6 +116,11 @@ fn vendor_key_provider(dir: &Path) -> std::path::PathBuf {
     dir.join("pass-cli.key-provider")
 }
 
+/// Where it records the uid and gid it actually ran as, as `uid:gid`.
+fn vendor_identity(dir: &Path) -> std::path::PathBuf {
+    dir.join("pass-cli.identity")
+}
+
 /// A `pass-cli` stand-in that also records the key provider it was given.
 ///
 /// `stub_pass_cli_listing` records the session directory and the reason, which
@@ -134,9 +139,11 @@ fn stub_recording_key_provider(
         "#!/bin/sh\n\
          printf '%s' \"${{PROTON_PASS_KEY_PROVIDER-<unset>}}\" > '{provider}'\n\
          printf '%s' \"${{PROTON_PASS_PERSONAL_ACCESS_TOKEN-<unset>}}\" > '{token}'\n\
+         printf '%s:%s' \"$(id -u)\" \"$(id -g)\" > '{identity}'\n\
          exec '{inner}' \"$@\"\n",
         provider = vendor_key_provider(dir).display(),
         token = vendor_token(dir).display(),
+        identity = vendor_identity(dir).display(),
         inner = inner.display(),
     );
     std::fs::write(&wrapper, body).expect("write the wrapper");
@@ -224,6 +231,60 @@ fn a_declared_name_resolves_through_the_daemon_and_names_the_provider_it_ran_und
         support::recorded(&vendor_key_provider(&dir)),
         "fs",
         "the key provider did not reach the vendor"
+    );
+
+    drop(running);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ---------------------------------------------------------------------------
+// Whoever runs the vendor owns what it writes, and it writes on reads.
+// ---------------------------------------------------------------------------
+
+/// The vendor runs as the uid the audit log names, not as whoever invoked us.
+///
+/// `pass-cli` WRITES to the session directory on invocations that only read:
+/// against a directory holding no identity it creates `.session/pass-cli.db`
+/// and `.session/local.key`, owned by whoever ran it. Inside the daemon that is
+/// the daemon. Under `keylessd check`, which runs beneath `sudo` and resolves
+/// every store to fill in its rows, it was ROOT — so the diagnostic left two
+/// root-owned files in the daemon's own session directory, and every later
+/// access answered `Error creating local key file: Permission denied`. That
+/// reads like a broken token and is a directory the check broke.
+///
+/// Measured on a real install: a session cleared for repair, one
+/// `sudo keylessd check`, and the renewal loop could not recover it.
+///
+/// This asserts the drop happens AND that dropping to the uid already in force
+/// still succeeds — the case that runs inside the daemon itself, on every
+/// lookup, where a wrong call here would break every read rather than one.
+#[test]
+fn the_vendor_runs_as_the_uid_the_audit_log_names() {
+    let dir = scratch("daemon-proton-runs-as");
+    let vendor = stub_recording_key_provider(
+        &dir,
+        &Backend::Injects(PROTON_DECOY),
+        &Listing::Json(LISTING),
+    );
+    let config = daemon_config_with_proton(&dir, &vendor);
+    let running = start_daemon(&config, policy_allowing_self());
+
+    let client = client_config(running.socket(), 3_000);
+    let registry = store::build(&client, &Invocation::default()).registry;
+    assert!(
+        matches!(registry.resolve(DECLARED), Resolution::Found { .. }),
+        "the lookup failed, so nothing below is a statement about its uid"
+    );
+
+    // The audit log is what the login verbs read the daemon's identity off, so
+    // it is what this has to agree with. Comparing against the test process
+    // instead would pass on a daemon that never dropped at all.
+    use std::os::unix::fs::MetadataExt;
+    let audit = std::fs::metadata(dir.join("audit.jsonl")).expect("the audit log");
+    assert_eq!(
+        support::recorded(&vendor_identity(&dir)),
+        format!("{}:{}", audit.uid(), audit.gid()),
+        "the vendor ran as somebody other than the uid that owns the daemon's files"
     );
 
     drop(running);

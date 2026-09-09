@@ -1073,6 +1073,13 @@ impl DaemonConfig {
                 // none, and `pass-cli` answers that by reinitialising the
                 // session store it was asked to read.
                 .with_key_provider(Some(settings.key_provider))
+                // Whoever runs the vendor owns what it writes, and it writes on
+                // invocations that only read. Read off the audit log, which is
+                // the same source the login verbs use.
+                .with_run_as(
+                    super::credential::daemon_owner(&self.audit)
+                        .map(|owner| (owner.uid, owner.gid)),
+                )
                 .with_timeout(settings.timeout_ms)
                 .with_listing_ttl(settings.listing_ttl_ms)
                 .with_agent_token(self.agent_token()),

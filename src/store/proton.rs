@@ -1722,6 +1722,8 @@ pub struct ProtonStore {
     /// The daemon's own login, or `None` on a session, which inherits one.
     /// See [`AgentToken`].
     credentials: Option<AgentToken>,
+    /// Whom to spawn the vendor as. See [`ProtonStore::with_run_as`].
+    run_as: Option<(u32, u32)>,
     timeout: Duration,
     reason: Reason,
     /// name -> where its value lives.
@@ -1817,6 +1819,7 @@ impl ProtonStore {
             session_dir: None,
             key_provider: None,
             credentials: None,
+            run_as: None,
             timeout: crate::config::bounded_timeout(crate::config::DEFAULT_TIMEOUT_MS),
             reason,
             routing,
@@ -1857,6 +1860,38 @@ impl ProtonStore {
     /// uid's keyring is empty, and [`KeyProvider`] documents what `pass-cli`
     /// does about an empty one. So the daemon always names a provider, and it
     /// is a config field there rather than a constant here.
+    /// Which uid and gid the vendor runs as, when this store is used from a
+    /// process that is not already the daemon.
+    ///
+    /// # Why a read needs this at all
+    ///
+    /// `pass-cli` WRITES to the session directory on invocations that only
+    /// read: against a directory with no identity in it, it creates
+    /// `.session/pass-cli.db` and `.session/local.key`, owned by whoever ran
+    /// it. Inside the daemon that is the daemon, and this is a no-op.
+    ///
+    /// `keylessd check` is the case that is not. It runs under `sudo`,
+    /// resolves every store to fill in its rows, and so spawned the vendor AS
+    /// ROOT into the daemon's own session directory. Every later access by the
+    /// daemon then answered `Error creating local key file: Permission denied`
+    /// — which reads like a broken token, and is a directory the diagnostic
+    /// broke while reporting on it.
+    ///
+    /// Measured on a real install: a session cleared for repair, one
+    /// `sudo keylessd check`, and the store was unrecoverable by the renewal
+    /// loop until the directory was given back by hand.
+    ///
+    /// Set unconditionally by the config, exactly as
+    /// [`crate::daemon::login`] sets it for the login verbs: from root it is
+    /// the privilege drop, and from the daemon's own uid it is a call that
+    /// changes nothing and still succeeds — so there is no branch here that
+    /// could be right on one machine and wrong on another.
+    #[must_use]
+    pub fn with_run_as(mut self, run_as: Option<(u32, u32)>) -> Self {
+        self.run_as = run_as;
+        self
+    }
+
     #[must_use]
     pub fn with_key_provider(mut self, key_provider: Option<KeyProvider>) -> Self {
         self.key_provider = key_provider;
@@ -1955,6 +1990,13 @@ impl ProtonStore {
         login: &[(String, Secret)],
         reason: String,
     ) {
+        if let Some((uid, gid)) = self.run_as {
+            use std::os::unix::process::CommandExt;
+            // gid before uid: dropping the uid first would give up the
+            // privilege needed to set the gid.
+            command.gid(gid);
+            command.uid(uid);
+        }
         command.env(SESSION_DIR_VAR, session_dir);
         if let Some(provider) = self.key_provider {
             command.env(KEY_PROVIDER_VAR, provider.as_str());
