@@ -1407,8 +1407,8 @@ advisory.**
 The only thing on this machine that can hold a credential your uid cannot reach
 is [`keylessd`](#keylessd--the-uid-boundary), behind a second uid. So the
 enforced version of this split is "the manager token lives on the daemon's
-side", and it is not built: `keylessd` carries no Proton adapter, and the
-protocol has no write operation.
+side", and it is not built: the daemon's Proton adapter reads, and the protocol
+has no write operation to carry a manager identity over.
 
 Given that, **`keyless` refuses every local write while the daemon is enabled**
 rather than reaching around it:
@@ -2088,22 +2088,6 @@ Deliberately out of scope, with the seams left clean:
   on stdin, which is the shape `put` and `new` need. Until it exists, `keyless
   put` against this store refuses and names that form, so nobody reaches for
   the assignment form that puts the value in argv.
-- **Proton Pass *behind* the daemon.** This is a gap with teeth, so it is stated
-  rather than buried. Enabling the daemon suppresses every local backend — that
-  is the [rule](#many-sessions-at-once) that keeps a fallback from re-opening the
-  hole — and `keylessd` has no Proton adapter to serve those names instead. So a
-  user who resolves names through Proton today and switches the daemon on will
-  find them **degrading**, loudly, with a warning naming the suppressed backend.
-  Closing it needs more than the adapter. `pass-cli` links `Security.framework`
-  and its **login** demonstrably needs the logging-in user's keychain, so whether
-  a daemon uid can `run` against a session directory at all is the first
-  unanswered question — and the second is that `pass-cli` may rewrite its session
-  store on any invocation, which makes a stripped environment, exactly what
-  launchd hands a daemon, able to destroy a web-login session outright. Both are
-  measurements, not opinions, and neither has been taken. It also needs a
-  decision about the mandatory audit reason: the daemon would have to synthesise
-  one from what it can verify — the peer's uid and pid, and the name — because
-  the request's `argv` is a claim and this tool never reads a claim as a fact.
 - **A write operation on the daemon, and the manager identity behind its uid.**
   This is the same gap read from the write side, and it is the one that makes the
   [reader/manager split](#what-the-split-is-and-what-it-is-not) advisory rather

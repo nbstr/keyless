@@ -232,9 +232,10 @@ fn entries_in(path: &Path) -> Result<String, String> {
 
     match contents {
         Contents::Empty => Err(format!(
-            "{} is mode {MODE:04o} and the daemon's, and it is EMPTY — no login has been put \
-             in it, so every Infisical lookup will degrade. That is the state a fresh \
-             install leaves; fill it with `{} credential --name <entry>`, which takes no \
+            "{0} is mode {MODE:04o} and the daemon's, and it is EMPTY — no login has been \
+             put in it, so every lookup through that store will degrade. That is the state a \
+             fresh install leaves; fill it with `{1} credential --name <entry>`, or with \
+             `{1} login --store <vendor>` where the vendor keeps a session. Neither takes a \
              value on a command line",
             path.display(),
             crate::DAEMON_NAME
@@ -242,7 +243,7 @@ fn entries_in(path: &Path) -> Result<String, String> {
         Contents::Malformed { line, column } => Err(format!(
             "{} is mode {MODE:04o} and the daemon's, and it is not a JSON object of name to \
              value (line {line}, column {column}) — so nothing can be read out of it and \
-             every Infisical lookup will degrade. `{} credential` will not rewrite it, \
+             every lookup through that store will degrade. `{} credential` will not rewrite it, \
              because that would lose whatever is in it; move it aside and write the entries \
              again",
             path.display(),
