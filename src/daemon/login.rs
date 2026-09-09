@@ -576,6 +576,41 @@ pub fn extra_credentials(coordinates: &Coordinates) -> Result<Vec<(String, Secre
     Ok(resolved)
 }
 
+/// The token this daemon already holds, if it holds one.
+///
+/// # Why a login reads the file it would otherwise write
+///
+/// The credential file is the source of truth for this daemon's identity, and
+/// two verbs used to demand the same value on stdin — `credential` to write it
+/// and `login` to use it — so a bootstrap that ran both asked the operator to
+/// paste the same token twice. HashiCorp's Vault Agent draws the line the other
+/// way and is right: its AppRole auto-auth takes the bootstrap credential from
+/// `secret_id_file_path` and offers no prompt at all, and rotation is writing
+/// the file again — "new files or values written at the expected locations will
+/// be used on next authentication".
+///
+/// So the file answers first here too, and the prompt is what happens when it
+/// cannot. [`super::session`] already worked this way; this is `login` catching
+/// up with the loop.
+///
+/// # Errors
+///
+/// A file that exists and could not be read. A file with no such entry is
+/// `Ok(None)` — that is the ordinary first-run state, not a fault.
+pub fn stored_token(coordinates: &Coordinates) -> Result<Option<Secret>, String> {
+    use crate::store::Store;
+
+    let file = crate::store::file::FileStore::new(coordinates.credentials_file.clone());
+    match file.resolve(&coordinates.token_entry) {
+        Ok(found) => Ok(found),
+        // An unreadable file is the same absence as an empty one for this
+        // verb's purposes: there is nothing to log in with, and the prompt is
+        // the remedy either way. The `identity` row of `check` is where an
+        // operator is told the file itself is wrong.
+        Err(_) => Ok(None),
+    }
+}
+
 /// Log in, and record the token only once the vendor has taken it.
 ///
 /// # Why the login happens BEFORE the file is written

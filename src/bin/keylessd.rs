@@ -152,6 +152,15 @@ mod daemon {
         /// what makes a second run safe.
         #[arg(long)]
         replace: bool,
+        /// Ask for a token even though this daemon already holds one.
+        ///
+        /// The credential file answers first, so an ordinary login uses the
+        /// token already written there and asks for nothing. This is the way
+        /// to type a REPLACEMENT without running `credential` first — and
+        /// pairs with `--replace`, since a new token needs the old session
+        /// logged out.
+        #[arg(long)]
+        prompt: bool,
         /// Config file. Every coordinate the login needs is read from it, and
         /// none of them can be given here — a flag that disagreed with this
         /// file would log a session into a directory the daemon never opens.
@@ -479,13 +488,14 @@ mod daemon {
     /// Log the daemon into a vendor, and record the token that re-establishes
     /// that session.
     ///
-    /// Every coordinate comes from the config and none of them is a flag; the
-    /// token arrives on stdin with echo off, exactly as `credential`'s does.
-    /// The sequencing is `daemon::login`'s, so what is left here is the exit
-    /// code and the order the checks are made in — and that order is the point:
-    /// everything that can refuse this config refuses BEFORE a credential is
-    /// asked for, so nobody types a token into a setup that was never going to
-    /// use it.
+    /// Every coordinate comes from the config and none of them is a flag. The
+    /// token comes from the credential file this daemon already holds; a piped
+    /// one wins over it, and a prompt with echo off is what happens when
+    /// neither answers. The sequencing is `daemon::login`'s, so what is left
+    /// here is the exit code and the order the checks are made in — and that
+    /// order is the point: everything that can refuse this config refuses
+    /// BEFORE a credential is asked for, so nobody types a token into a setup
+    /// that was never going to use it.
     fn login(args: &LoginArgs) -> ExitCode {
         use keyless::daemon::login;
 
@@ -538,15 +548,59 @@ mod daemon {
             Err(detail) => return fail(&detail),
         };
 
-        let token = match credential::prompt_for(
-            &format!("agent token for {}", login::STORE),
-            &format!(
-                "printf '%s' \"$token\" | keylessd login --store {}",
-                login::STORE
-            ),
-        ) {
-            Ok(token) => token,
-            Err(detail) => return fail(&detail),
+        // The file answers first. Two verbs used to demand this same value on
+        // stdin -- `credential` to write it and `login` to use it -- so
+        // wiring a machine meant pasting one token twice. Vault Agent's
+        // AppRole auto-auth has no prompt at all and reads
+        // `secret_id_file_path`; this is the same order, with the prompt kept
+        // for the case the file cannot answer.
+        //
+        // A PIPED token still wins, unconditionally: that is the first-write
+        // path, and it is the one that must record what the vendor accepted.
+        //
+        // On a terminal the file is consulted BEFORE the prompt, because a
+        // prompt reached is a prompt already answered — checking afterwards
+        // would ask the question this exists to remove. On a pipe the value
+        // arrives first and only an EMPTY one falls through, which is what
+        // makes `keylessd login < /dev/null` mean "use what you hold".
+        let held = |coordinates: &login::Coordinates| match login::stored_token(coordinates) {
+            Ok(Some(token)) => {
+                let _ = writeln!(
+                    io::stdout(),
+                    "token\theld\t{}\t{}",
+                    coordinates.token_entry,
+                    coordinates.credentials_file.display()
+                );
+                Some(token)
+            }
+            _ => None,
+        };
+        let interactive = std::io::IsTerminal::is_terminal(&io::stdin());
+
+        let (token, record) = if !args.prompt
+            && interactive
+            && let Some(token) = held(&coordinates)
+        {
+            (token, false)
+        } else {
+            match credential::prompt_for(
+                &format!("agent token for {}", login::STORE),
+                &format!(
+                    "printf '%s' \"$token\" | keylessd login --store {}",
+                    login::STORE
+                ),
+            ) {
+                Ok(typed) => (typed, true),
+                // An empty stdin refuses here rather than returning an empty
+                // value, and that refusal is exactly the case that means "use
+                // what you hold": `keylessd login < /dev/null` on a machine
+                // whose credential is already written. Only when nothing is
+                // held does it stay a refusal.
+                Err(detail) => match held(&coordinates) {
+                    Some(token) if !args.prompt => (token, false),
+                    _ => return fail(&detail),
+                },
+            }
         };
 
         // Checked before the vendor is spawned. Every structural fault here
@@ -560,14 +614,31 @@ mod daemon {
             ));
         }
 
-        if let Err(detail) = login::perform(
-            &coordinates,
-            owner,
-            args.replace,
-            &token,
-            extra,
-            &mut io::stdout(),
-        ) {
+        // A token that came OUT of the credential file is not written back
+        // into it. The value is identical, so the write looks free — and it is
+        // the one step here that can fail over a session that is in fact
+        // alive, reporting `logged_in_but_unwritten` about a file that was
+        // never wrong.
+        let outcome = if record {
+            login::perform(
+                &coordinates,
+                owner,
+                args.replace,
+                &token,
+                extra,
+                &mut io::stdout(),
+            )
+        } else {
+            login::establish(
+                &coordinates,
+                owner,
+                args.replace,
+                &token,
+                extra,
+                &mut io::stdout(),
+            )
+        };
+        if let Err(detail) = outcome {
             return fail(&detail);
         }
 

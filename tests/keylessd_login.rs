@@ -275,6 +275,101 @@ fn the_token_reaches_the_vendor_in_the_environment_and_never_in_its_argument_vec
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// The double-paste this verb used to demand, and no longer does.
+///
+/// `credential` writes the token and `login` uses it — two verbs, one value.
+/// Until the file answered first, wiring a machine meant typing the same token
+/// into both. Vault Agent's AppRole auto-auth reads `secret_id_file_path` and
+/// has no prompt at all; this is the same order.
+#[test]
+fn a_login_with_nothing_on_stdin_uses_the_token_the_daemon_already_holds() {
+    let dir = scratch("held");
+    let session = dir.join("session");
+    let vendor = stub_vendor(&dir, &Vendor::Accepts);
+    let config = config_at(&dir, &vendor, &session, r#","token_expires":"2099-01-01""#);
+
+    let credentials = dir.join("proton.json");
+    std::fs::write(
+        &credentials,
+        format!(r#"{{"AGENT_TOKEN":"{TOKEN_DECOY}"}}"#),
+    )
+    .expect("seed");
+    std::fs::set_permissions(&credentials, std::fs::Permissions::from_mode(0o600)).expect("chmod");
+    let before = read(&credentials);
+
+    // Nothing on stdin at all: the shape a script takes once the credential is
+    // already written.
+    let output = login(&config, "", &[]);
+    let rendered = said(&output);
+    assert!(
+        output.status.success(),
+        "a login with a token already on disk failed: {rendered}"
+    );
+    assert!(
+        rendered.contains("token\theld\t"),
+        "the verb did not say which token it used: {rendered}"
+    );
+    // The vendor was reached with the held value, so the file WAS the source.
+    assert!(
+        read(&dir.join("pass-cli.env")).contains(TOKEN_DECOY),
+        "the held token never reached the vendor: {rendered}"
+    );
+    // And it was not written back: the value is identical, and the write is the
+    // one step that can fail over a session that is in fact alive.
+    assert_eq!(
+        read(&credentials),
+        before,
+        "the held token was rewritten into its own file"
+    );
+    assert!(
+        !rendered.contains(TOKEN_DECOY),
+        "the verb printed it: {rendered}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The rotation path, which must not silently reuse the old token.
+#[test]
+fn a_piped_token_wins_over_the_one_on_disk_and_is_recorded() {
+    let dir = scratch("piped-wins");
+    let session = dir.join("session");
+    let vendor = stub_vendor(&dir, &Vendor::Accepts);
+    let config = config_at(&dir, &vendor, &session, r#","token_expires":"2099-01-01""#);
+
+    let credentials = dir.join("proton.json");
+    std::fs::write(
+        &credentials,
+        format!(r#"{{"AGENT_TOKEN":"{OTHER_DECOY}"}}"#),
+    )
+    .expect("seed");
+    std::fs::set_permissions(&credentials, std::fs::Permissions::from_mode(0o600)).expect("chmod");
+
+    let output = login(&config, TOKEN_DECOY, &["--replace"]);
+    let rendered = said(&output);
+    assert!(output.status.success(), "the rotation failed: {rendered}");
+    assert!(
+        !rendered.contains("token\theld\t"),
+        "the piped token lost to the one on disk: {rendered}"
+    );
+    assert!(
+        read(&dir.join("pass-cli.env")).contains(TOKEN_DECOY),
+        "the piped token never reached the vendor: {rendered}"
+    );
+    // Recorded, because this is the value the vendor has just accepted and the
+    // file did not have.
+    assert!(
+        read(&credentials).contains(TOKEN_DECOY),
+        "the accepted token was not recorded"
+    );
+    assert!(
+        !read(&credentials).contains(OTHER_DECOY),
+        "the superseded token is still on disk"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn a_second_run_leaves_a_working_session_and_the_credential_file_untouched() {
     // The second of the two properties, and the one with the worst failure: a
