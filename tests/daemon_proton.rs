@@ -43,6 +43,10 @@ use support::{
     short_socket_path, start_daemon, stub_pass_cli_listing, write_secrets,
 };
 
+/// A name the FILE store answers, so the assertion is about another store.
+const NEIGHBOUR: &str = "A_NAME_THE_FILE_STORE_HOLDS";
+const NEIGHBOUR_VALUE: &str = "file-store-decoy-not-a-credential";
+
 /// The one name the daemon's config declares, with all three coordinates.
 const DECLARED: &str = "FIXTURE_DECLARED";
 
@@ -234,6 +238,157 @@ fn a_declared_name_resolves_through_the_daemon_and_names_the_provider_it_ran_und
     );
 
     drop(running);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ---------------------------------------------------------------------------
+// One daemon, several stores: a Proton login that keeps failing is Proton's
+// problem and nobody else's.
+// ---------------------------------------------------------------------------
+
+/// A config with BOTH stores, and a renewal loop that cannot possibly succeed.
+///
+/// The vendor refuses every login, so `session::attempt` fails on its first
+/// tick and on every tick after it. `min_backoff_seconds` is 1 and
+/// `probe_interval_seconds` is 1 so the loop is actually spinning through
+/// failures while the assertion below runs, rather than asleep on a default
+/// five-minute timer and passing for the wrong reason.
+fn daemon_config_with_a_failing_renewal(dir: &Path, vendor: &Path) -> DaemonConfig {
+    // The audit log is what the daemon's uid is read off — `session::spawn`
+    // refuses without it, which is the same refusal the login verb makes.
+    std::fs::write(dir.join("audit.jsonl"), b"").expect("audit");
+    let secrets = dir.join("secrets.json");
+    write_secrets(&secrets, &[(NEIGHBOUR, NEIGHBOUR_VALUE)]);
+    let credentials = dir.join("proton.json");
+    write_secrets(&credentials, &[("AGENT_TOKEN", TOKEN_DECOY)]);
+
+    serde_json::from_str(&format!(
+        r#"{{"socket":"{socket}","audit":"{audit}",
+             "cache_ttl_seconds":0,"idle_timeout_seconds":5,
+             "stores":{{
+               "file":{{"enabled":true,"path":"{secrets}"}},
+               "proton":{{"enabled":true,"binary":"{vendor}",
+                          "session_dir":"{session}",
+                          "timeout_ms":60000,
+                          "credentials_file":"{credentials}",
+                          "credentials":{{"PROTON_PASS_PERSONAL_ACCESS_TOKEN":"AGENT_TOKEN"}},
+                          "session":{{"auto_login":true,"login_after_minutes":1,
+                                      "probe_interval_seconds":1,
+                                      "min_backoff_seconds":1,"max_backoff_seconds":1}}}}}},
+             "secrets":{{"{NEIGHBOUR}":{{"store":"file"}}}}}}"#,
+        socket = short_socket_path(dir).display(),
+        audit = dir.join("audit.jsonl").display(),
+        secrets = secrets.display(),
+        credentials = credentials.display(),
+        session = session_dir(dir).display(),
+        vendor = vendor.display(),
+    ))
+    .expect("valid daemon config")
+}
+
+/// A Proton session that will not come back does not take the file store with it.
+///
+/// This is the claim the renewal loop was landed on, and it is the reason it
+/// carries no counterpart to Vault Agent's `auto_auth.exit_on_err`: Vault Agent
+/// brokers ONE identity, so exiting takes away only what was already broken,
+/// while this daemon serves several stores and exiting to fix Proton would take
+/// the file store, the keychain and Infisical with it.
+///
+/// Stated in a doc comment, that claim is unfalsifiable. Here it can fail: the
+/// vendor refuses every login, the loop is spinning through failures at a
+/// one-second backoff, and a name belonging to another store still has to
+/// resolve over the same socket.
+#[test]
+fn a_proton_login_that_keeps_failing_leaves_the_other_stores_answering() {
+    let dir = scratch("daemon-proton-latches");
+    // `Backend::OwnFailure` fails before the probe runs, which is what a
+    // refused token, an absent binary and a dead network all look like from
+    // here — the loop cannot tell them apart and must not exit for any of them.
+    let vendor = stub_pass_cli_listing(&dir, &Backend::OwnFailure, &Listing::Json(LISTING));
+    let config = daemon_config_with_a_failing_renewal(&dir, &vendor);
+    let running = start_daemon(&config, policy_allowing_self());
+
+    // Long enough for several ticks at a one-second interval, so the assertion
+    // is made against a loop that has already failed repeatedly rather than one
+    // that has not started.
+    std::thread::sleep(std::time::Duration::from_secs(4));
+
+    let client = client_config(running.socket(), 3_000);
+    let registry = store::build(&client, &Invocation::default()).registry;
+
+    match registry.resolve(NEIGHBOUR) {
+        Resolution::Found { secret, store } => {
+            assert_eq!(secret.expose(), NEIGHBOUR_VALUE);
+            assert_eq!(store, "daemon");
+        }
+        other => panic!(
+            "a failing Proton renewal took another store down with it: {}",
+            other.reason()
+        ),
+    }
+
+    // And the daemon is still there to be asked a second time — a loop that
+    // exited would answer the first read from a socket nobody is listening on
+    // only by accident of timing.
+    assert!(
+        matches!(registry.resolve(NEIGHBOUR), Resolution::Found { .. }),
+        "the daemon stopped answering while its Proton loop was failing"
+    );
+
+    // The control, and without it this case passes for the wrong reason. A
+    // loop that never STARTED — a config the spawn declined, a thread that
+    // died at birth — leaves the file store answering too, and the assertions
+    // above cannot tell that apart from a loop that is failing and latching.
+    // So the vendor must have been spawned, and spawned for a login.
+    let argv = support::recorded(&dir.join("pass-cli.argv"));
+    assert!(
+        argv.contains("login") || argv.contains("logout"),
+        "the renewal loop never reached the vendor, so nothing was latching: {argv:?}"
+    );
+
+    drop(running);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A daemon whose vendor has stopped answering still shuts down.
+///
+/// `login::run` is `Command::output()`, deliberately unbounded — the reasoning
+/// recorded there is that a deadline killing a login part way is how a session
+/// store ends up half-written, which is the one damage this vendor cannot
+/// repair. That reasoning is about the LOGIN VERB, where a person is waiting.
+///
+/// Inside the daemon it collides with shutdown: the renewal thread is stopped
+/// by a flag it only reads between ticks, so a thread parked in
+/// `Command::output()` against a vendor that never returns cannot see it. Join
+/// that thread on the way out and SIGTERM never completes — the socket is not
+/// removed, the port is not released, and launchd's own timeout is the only
+/// thing that ends it.
+///
+/// So shutdown waits for the renewal loop and then stops waiting. The child is
+/// left to finish rather than killed, which keeps the half-write reasoning
+/// intact; what is given up is the join, not the process.
+#[test]
+fn a_vendor_that_stopped_answering_does_not_wedge_shutdown() {
+    let dir = scratch("daemon-proton-shutdown");
+    // `sleep 60` — a black-holed connection, and 60s is far past any patience a
+    // shutdown can have.
+    let vendor = stub_pass_cli_listing(&dir, &Backend::Hangs, &Listing::Json(LISTING));
+    let config = daemon_config_with_a_failing_renewal(&dir, &vendor);
+    let running = start_daemon(&config, policy_allowing_self());
+
+    // Long enough for the loop's first tick to be inside the vendor call.
+    std::thread::sleep(std::time::Duration::from_secs(2));
+
+    let began = std::time::Instant::now();
+    drop(running);
+    let took = began.elapsed();
+
+    assert!(
+        took < std::time::Duration::from_secs(30),
+        "shutdown blocked on a hung vendor for {took:?} — a daemon that cannot be \
+         stopped is one launchd has to kill, and its socket outlives it"
+    );
+
     let _ = std::fs::remove_dir_all(&dir);
 }
 

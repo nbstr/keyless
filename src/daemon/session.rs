@@ -64,17 +64,61 @@ const MIN_INTERVAL: Duration = Duration::from_secs(5);
 /// The loop sleeps for minutes at a time, and a shutdown must not wait one out.
 const STOP_POLL: Duration = Duration::from_millis(100);
 
-/// A running renewal loop. Dropping it stops the thread and joins it.
+/// How long shutdown waits for the renewal loop before it stops waiting.
+///
+/// # Why waiting for ever is not an option here
+///
+/// The loop is stopped by a flag it reads BETWEEN ticks. A tick spends most of
+/// its time inside [`login::run`], which is `Command::output()` and
+/// deliberately unbounded — the reasoning recorded there is that a deadline
+/// killing a login part way is how a session store ends up half-written, which
+/// is the one damage this vendor cannot repair.
+///
+/// That reasoning holds, and it is about the login VERB, where a person is
+/// waiting. Inside a daemon it collides with shutdown: a thread parked against
+/// a vendor that never returns cannot see the flag, so joining it unconditionally
+/// means SIGTERM never completes, the socket is never removed, and launchd's
+/// `ExitTimeOut` SIGKILL is the only thing that ends the process.
+///
+/// Measured, not reasoned: with a vendor stubbed as `sleep 60`, dropping a
+/// `Running` blocked for the whole sixty seconds.
+///
+/// So shutdown waits this long and then stops waiting. The child is left to
+/// finish rather than killed, which keeps the half-write reasoning intact —
+/// what is given up is the join, not the process. Well under any plausible
+/// `ExitTimeOut`, whose default the manual page declines to name, so that a
+/// daemon which is merely slow still exits on its own terms.
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
+
+/// A running renewal loop. Dropping it stops the thread.
 pub struct Keeper {
     stop: Arc<AtomicBool>,
+    /// Disconnects when the loop's thread returns. A `Receiver` rather than a
+    /// timed join, which `std` does not offer.
+    done: std::sync::mpsc::Receiver<Never>,
     handle: Option<JoinHandle<()>>,
 }
+
+/// Carried by a channel that only ever closes, never sends.
+enum Never {}
 
 impl Drop for Keeper {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
-        if let Some(handle) = self.handle.take() {
-            let _ = handle.join();
+        match self.done.recv_timeout(SHUTDOWN_GRACE) {
+            // The sender was dropped, so the loop has returned and the join
+            // below is immediate.
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                if let Some(handle) = self.handle.take() {
+                    let _ = handle.join();
+                }
+            }
+            // Still inside a vendor call. Leave the thread detached: it holds
+            // no lock this process needs, and the alternative is not exiting.
+            _ => report(
+                "the Proton renewal loop is still waiting on the vendor; shutting down without \
+                 it rather than holding the process open",
+            ),
         }
     }
 }
@@ -104,13 +148,20 @@ pub fn spawn(config: &DaemonConfig) -> Result<Option<Keeper>, String> {
 
     let stop = Arc::new(AtomicBool::new(false));
     let flag = Arc::clone(&stop);
+    let (alive, done) = std::sync::mpsc::channel::<Never>();
     let handle = thread::Builder::new()
         .name(format!("{NAME}d-session"))
-        .spawn(move || run(&coordinates, owner, settings, &flag))
+        .spawn(move || {
+            // Moved in so it is dropped when this thread returns, however it
+            // returns. That drop is what shutdown waits on.
+            let _alive = alive;
+            run(&coordinates, owner, settings, &flag);
+        })
         .map_err(|error| format!("cannot start the Proton session loop: {error}"))?;
 
     Ok(Some(Keeper {
         stop,
+        done,
         handle: Some(handle),
     }))
 }

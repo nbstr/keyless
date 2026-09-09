@@ -440,11 +440,45 @@ pub struct Running {
     socket: PathBuf,
     resolver: Arc<Resolver>,
     thread: Option<thread::JoinHandle<()>>,
+    /// The Proton session renewal loop, when this config asked for one.
+    ///
+    /// Held here rather than by `main` so its lifetime is the daemon's. See
+    /// [`Running::spawn`].
+    session: Option<self::session::Keeper>,
 }
 
 impl Running {
-    /// Start serving on a background thread.
-    pub fn spawn(daemon: Daemon) -> io::Result<Self> {
+    /// Start serving on a background thread, and keep the session alive.
+    ///
+    /// # Why the renewal loop starts HERE and not in `main`
+    ///
+    /// It started in the binary, and that was wrong in two ways that only
+    /// showed up when something tried to test it.
+    ///
+    /// A daemon is a thing that serves names and keeps the identity it serves
+    /// them with; `main` is argument parsing and a signal wait. Wiring the loop
+    /// there made "is this daemon renewing?" a question about which entry point
+    /// happened to construct it — so every integration case in this crate, all
+    /// of which build a daemon through this function, ran against one that
+    /// never renewed. A test asserting the loop's behaviour passed by
+    /// describing a loop that was not running.
+    ///
+    /// It also meant an embedder using this crate as a library got a daemon
+    /// whose Proton session lapsed in two hours, with nothing to say so.
+    ///
+    /// After the socket is bound, so a renewal taking a few seconds does not
+    /// delay the sessions waiting to connect.
+    ///
+    /// # Errors
+    ///
+    /// The accept thread not starting, or a config that asks for the renewal
+    /// loop and cannot support a login — the second carried verbatim from
+    /// [`self::session::spawn`], because an operator who wrote `auto_login`
+    /// has said the session matters and starting without it is the silent
+    /// outage that loop exists to end.
+    pub fn spawn(daemon: Daemon, config: &DaemonConfig) -> io::Result<Self> {
+        let session = self::session::spawn(config)
+            .map_err(|detail| io::Error::new(io::ErrorKind::InvalidInput, detail))?;
         let stop = Arc::new(AtomicBool::new(false));
         let socket = daemon.socket.clone();
         let resolver = Arc::clone(&daemon.resolver);
@@ -457,7 +491,14 @@ impl Running {
             socket,
             resolver,
             thread: Some(thread),
+            session,
         })
+    }
+
+    /// Whether this daemon is keeping a Proton session alive.
+    #[must_use]
+    pub fn renews_its_session(&self) -> bool {
+        self.session.is_some()
     }
 
     /// Where it is listening.
@@ -475,6 +516,10 @@ impl Running {
 
 impl Drop for Running {
     fn drop(&mut self) {
+        // The renewal loop first: it spawns vendor children, and stopping the
+        // accept loop while one is in flight leaves the process waiting on a
+        // join for something nobody is stopping.
+        drop(self.session.take());
         self.stop.store(true, Ordering::Relaxed);
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
