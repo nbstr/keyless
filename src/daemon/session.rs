@@ -20,6 +20,26 @@
 //! and no clock, so every Proton name degraded two hours after the last time a
 //! person typed something, on a schedule nobody chose.
 //!
+//! # Why no other store has one of these
+//!
+//! Not an omission, and not a thing to generalise at the second vendor. A
+//! renewal loop exists here because a Proton Pass identity is a session — a
+//! DIRECTORY the vendor's own binary establishes and expires on a clock this
+//! crate does not set.
+//!
+//! An Infisical machine identity and a 1Password service account are
+//! credentials and nothing else: writing the value is the whole of their setup,
+//! and there is no session to lapse, so there is nothing for a loop to do.
+//! [`super::login::refuse_store`] says the same thing to an operator who asks
+//! for a login on one of them, and it is the same fact.
+//!
+//! So the seam this module would need to be generic — a background task each
+//! store adapter offers — has exactly one implementer and no second one in
+//! sight. It is deliberately not built. The daemon stays general in what it
+//! serves, this module stays specific in what it maintains, and a store that
+//! never needs maintaining pays nothing for either: [`spawn`] returns `None`
+//! the moment `stores.proton.enabled` is false.
+//!
 //! # Why a thread rather than an external timer
 //!
 //! Three facts already live in this process and nowhere else, and each one an
