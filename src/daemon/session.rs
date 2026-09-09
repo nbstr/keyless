@@ -184,6 +184,30 @@ fn run(coordinates: &Coordinates, owner: Owner, settings: SessionRenewal, stop: 
     }
 }
 
+/// What to say when the session directory cannot be made the daemon's.
+///
+/// Reached almost always for one reason: something ran the vendor as root
+/// against this directory and left files behind that this uid cannot take
+/// back. `keylessd check` under `sudo` was that something until the adapter
+/// began dropping privilege, and a hand-run `pass-cli` still is.
+///
+/// The remedy is a privileged `chown`, so it is written out rather than
+/// described: nothing this daemon can do will fix it, and a message that only
+/// reports the errno leaves an operator watching a loop retry for ever.
+fn undirectable(coordinates: &Coordinates, owner: Owner, detail: &str) -> String {
+    format!(
+        "the Proton session directory cannot be made this daemon's, so no login can succeed \
+         against it: {detail}\n\
+         Only a privileged process may change a file's owner, so this is not something the \
+         daemon can repair — it is almost always a `pass-cli` that ran as root against this \
+         directory. Give it back:\n\
+         \tsudo chown -R {}:{} {}",
+        owner.uid,
+        owner.gid,
+        coordinates.session_dir.display()
+    )
+}
+
 /// Does a session still answer in the daemon's own directory?
 ///
 /// # Why a failed probe is read as "no session" rather than ignored
@@ -217,15 +241,24 @@ fn attempt(coordinates: &Coordinates, owner: Owner) -> Result<(), String> {
     // `pass-cli` creates `.session/` inside it and owns what it creates, so a
     // session directory belonging to anyone but the daemon produces
     // `Permission denied` while creating the local key — a failure that reads
-    // nothing like its cause. Until this call, only the `login` VERB asserted
-    // that, so a daemon whose directory went wrong could never repair it: the
-    // loop would retry against it for ever and every message would be about the
-    // vendor.
+    // nothing like its cause, and that a reader spends the afternoon
+    // attributing to the token.
+    //
+    // What this can and cannot do is worth being exact about, because the
+    // difference is a privilege the daemon does not have. It CREATES a missing
+    // directory, and it re-asserts the mode, both of which an owner may do. It
+    // CANNOT take a file back from root: only a privileged process may change
+    // a file's owner, so a `.session/local.key` left behind by something that
+    // ran as root is diagnosed here and repaired by nobody. Saying which is the
+    // whole value — the alternative is the vendor's own sentence, which names
+    // neither the file nor the fix.
     //
     // Here rather than at startup, because a directory can go wrong while the
     // daemon runs, and a check made once cannot see that. It is a `stat` per
     // renewal, not per lookup.
-    match login::ensure_session_dir(&coordinates.session_dir, owner)? {
+    match login::ensure_session_dir(&coordinates.session_dir, owner)
+        .map_err(|detail| undirectable(coordinates, owner, &detail))?
+    {
         login::Ensured::Sound => {}
         login::Ensured::Created => report(&format!(
             "created the Proton session directory {}",
