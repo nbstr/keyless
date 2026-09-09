@@ -350,6 +350,48 @@ fn a_proton_login_that_keeps_failing_leaves_the_other_stores_answering() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A daemon whose vendor has stopped answering still shuts down.
+///
+/// `login::run` is `Command::output()`, deliberately unbounded — the reasoning
+/// recorded there is that a deadline killing a login part way is how a session
+/// store ends up half-written, which is the one damage this vendor cannot
+/// repair. That reasoning is about the LOGIN VERB, where a person is waiting.
+///
+/// Inside the daemon it collides with shutdown: the renewal thread is stopped
+/// by a flag it only reads between ticks, so a thread parked in
+/// `Command::output()` against a vendor that never returns cannot see it. Join
+/// that thread on the way out and SIGTERM never completes — the socket is not
+/// removed, the port is not released, and launchd's own timeout is the only
+/// thing that ends it.
+///
+/// So shutdown waits for the renewal loop and then stops waiting. The child is
+/// left to finish rather than killed, which keeps the half-write reasoning
+/// intact; what is given up is the join, not the process.
+#[test]
+fn a_vendor_that_stopped_answering_does_not_wedge_shutdown() {
+    let dir = scratch("daemon-proton-shutdown");
+    // `sleep 60` — a black-holed connection, and 60s is far past any patience a
+    // shutdown can have.
+    let vendor = stub_pass_cli_listing(&dir, &Backend::Hangs, &Listing::Json(LISTING));
+    let config = daemon_config_with_a_failing_renewal(&dir, &vendor);
+    let running = start_daemon(&config, policy_allowing_self());
+
+    // Long enough for the loop's first tick to be inside the vendor call.
+    std::thread::sleep(std::time::Duration::from_secs(2));
+
+    let began = std::time::Instant::now();
+    drop(running);
+    let took = began.elapsed();
+
+    assert!(
+        took < std::time::Duration::from_secs(30),
+        "shutdown blocked on a hung vendor for {took:?} — a daemon that cannot be \
+         stopped is one launchd has to kill, and its socket outlives it"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 // ---------------------------------------------------------------------------
 // Whoever runs the vendor owns what it writes, and it writes on reads.
 // ---------------------------------------------------------------------------
