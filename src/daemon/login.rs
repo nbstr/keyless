@@ -597,6 +597,58 @@ pub fn extra_credentials(coordinates: &Coordinates) -> Result<Vec<(String, Secre
     Ok(resolved)
 }
 
+/// Where a login's token comes from, decided before anything is read.
+///
+/// # Why this is a value and not four lines inside the verb
+///
+/// The rule has four inputs — a terminal or a pipe, `--prompt`, `--replace`,
+/// and whether the daemon already holds a token — and one of the sixteen
+/// combinations is a silent wrong-credential rotation. Written inline it can
+/// only be exercised by running the binary under a pseudo-terminal, which is
+/// why the branch that mattered went untested: a piped test never reaches the
+/// terminal arm at all, and passes while proving nothing about it.
+///
+/// As a value the whole matrix is decidable in a unit test.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub enum TokenSource {
+    /// Read it from whoever is on the other end — a pipe, or a person.
+    Read,
+    /// Use the entry the credential file already holds, and do not rewrite it.
+    Held,
+}
+
+impl TokenSource {
+    /// Decide, from the four things that bear on it.
+    ///
+    /// # The case this exists for
+    ///
+    /// `--replace` is this verb's rotation flag — "the token-rotation path, and
+    /// deliberately not the default". At a terminal it says a person is here
+    /// and means to install a NEW value. Letting the credential file answer
+    /// there produces the worst outcome this verb has: the daemon logs back in
+    /// with the OLD token, the command reports success, and an operator walks
+    /// away believing a rotation happened. The old credential keeps working
+    /// until the day it stops, and nothing anywhere says why.
+    ///
+    /// So a terminal plus `--replace` asks, even with a token on disk.
+    ///
+    /// Unattended repair is untouched, and it is the reason the rule reads the
+    /// terminal rather than `--replace` alone: `keylessd login --replace`
+    /// with no terminal — from a script, or `< /dev/null` — still uses what the
+    /// daemon holds, because there is nobody to ask and re-establishing a
+    /// session from the stored token is exactly what it wants.
+    #[must_use]
+    pub fn decide(interactive: bool, prompt: bool, replace: bool, holds_one: bool) -> Self {
+        if prompt || !holds_one {
+            return TokenSource::Read;
+        }
+        if interactive && replace {
+            return TokenSource::Read;
+        }
+        TokenSource::Held
+    }
+}
+
 /// The token this daemon already holds, if it holds one.
 ///
 /// # Why a login reads the file it would otherwise write
@@ -876,6 +928,63 @@ pub fn logged_in_but_unwritten(coordinates: &Coordinates, detail: &str) -> Strin
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every combination of the four inputs, and the one that used to be wrong.
+    ///
+    /// Sixteen cases, written out rather than generated, because the value of
+    /// this table is that a reader can see the rotation case sitting among the
+    /// others and check it by eye.
+    #[test]
+    fn the_token_source_matrix_holds_and_replace_at_a_terminal_asks() {
+        use TokenSource::{Held, Read};
+        // interactive, --prompt, --replace, holds one  ->  source
+        let matrix = [
+            // Nothing held: there is nothing to use, so every row reads.
+            (false, false, false, false, Read),
+            (false, false, true, false, Read),
+            (false, true, false, false, Read),
+            (false, true, true, false, Read),
+            (true, false, false, false, Read),
+            (true, false, true, false, Read),
+            (true, true, false, false, Read),
+            (true, true, true, false, Read),
+            // Piped, holding one: the file answers, and `--replace` changes
+            // nothing — an unattended repair has nobody to ask.
+            (false, false, false, true, Held),
+            (false, false, true, true, Held),
+            // `--prompt` always asks, whoever is listening.
+            (false, true, false, true, Read),
+            (false, true, true, true, Read),
+            // A terminal, holding one: the file answers an ordinary login.
+            (true, false, false, true, Held),
+            // THE ROW THIS EXISTS FOR. A person typed the rotation flag, so
+            // the file must not answer: reusing the old token here logs the
+            // daemon back in with a credential the operator believes they
+            // just replaced, and reports success.
+            (true, false, true, true, Read),
+            (true, true, false, true, Read),
+            (true, true, true, true, Read),
+        ];
+        for (interactive, prompt, replace, holds_one, expected) in matrix {
+            assert_eq!(
+                TokenSource::decide(interactive, prompt, replace, holds_one),
+                expected,
+                "interactive={interactive} prompt={prompt} replace={replace} \
+                 holds_one={holds_one}"
+            );
+        }
+    }
+
+    /// The regression, stated on its own so a failure names it.
+    #[test]
+    fn a_rotation_typed_at_a_terminal_is_never_served_from_disk() {
+        assert_eq!(
+            TokenSource::decide(true, false, true, true),
+            TokenSource::Read,
+            "`--replace` at a terminal reused the token on disk — a rotation that \
+             reports success and installs nothing"
+        );
+    }
 
     /// The probe asks about the DAEMON's session, never the ambient one.
     ///
