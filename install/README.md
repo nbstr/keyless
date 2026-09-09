@@ -481,7 +481,8 @@ Coordinates only; there is no field in `keylessd.json` a credential fits in:
   "key_provider": "fs",
   "token_expires": "<YYYY-MM-DD>",
   "credentials_file": "/usr/local/var/lib/keyless/proton.json",
-  "credentials": { "PROTON_PASS_PERSONAL_ACCESS_TOKEN": "AGENT_TOKEN" }
+  "credentials": { "PROTON_PASS_PERSONAL_ACCESS_TOKEN": "AGENT_TOKEN" },
+  "session": { "auto_login": true }
 }
 ```
 
@@ -493,6 +494,9 @@ Coordinates only; there is no field in `keylessd.json` a credential fits in:
   key from `PROTON_PASS_ENCRYPTION_KEY`, which then has to be named under
   `credentials` beside the token. `keyring` is refused at parse time.
 - **`token_expires`** is a date you write down, not one anything can discover.
+- **`session.auto_login`** keeps the session alive. Off by default; see *Keeping
+  the session alive* below, which is the section to read before deciding you do
+  not need it.
 - **An absolute `binary`**, for the reason the Infisical section gives.
 - **Two variables only** under `credentials`:
   `PROTON_PASS_PERSONAL_ACCESS_TOKEN` and `PROTON_PASS_ENCRYPTION_KEY`. This is
@@ -585,6 +589,75 @@ that into a scheduled task.
 
 With no date declared, that row reads `unproven` and says so. A check nobody
 could make must not read as one that passed.
+
+### Keeping the session alive
+
+**A personal-access-token session lasts two hours.** That is the vendor's cap,
+and it is not a failure mode:
+
+> "Sessions established with a personal access token have a lifetime of 2 hours,
+> so you need to log in again once it expires."
+> — [pass-cli, personal access
+> tokens](https://protonpass.github.io/pass-cli/commands/personal-access-token/)
+
+There is no renewal verb. **Logging in again IS the renewal**, and the daemon
+already holds everything it needs to do that unattended: the token in a `0600`
+file only its uid can open, the login verb, and `--replace`. What it lacked was
+a clock. `"session": { "auto_login": true }` is that clock.
+
+Leave it out and every Proton name stops resolving two hours after the last
+`keylessd login`, at an hour nobody chose, with nothing running that could put
+the session back.
+
+```json
+"session": {
+  "auto_login": true,
+  "login_after_minutes": 90,
+  "probe_interval_seconds": 300,
+  "min_backoff_seconds": 1,
+  "max_backoff_seconds": 300
+}
+```
+
+- **`login_after_minutes`** (90) has to stay under the vendor's 120. The margin
+  absorbs a failed attempt and its backoff, so the session is never renewed at
+  the edge of the cliff.
+- **The renewal is a logout followed by a login**, because `pass-cli` answers a
+  login over a live session with `Client is already authenticated` and changes
+  nothing. So there is a window of roughly a second, once every 90 minutes, in
+  which a lookup degrades. That is the cost of the vendor having no renewal
+  verb, and it is stated rather than hidden: one second in 5400, against a
+  guaranteed outage every two hours.
+- **A failing login never stops the daemon.** Vault Agent's `auto_auth` carries
+  `exit_on_err` and there is deliberately no counterpart here: Vault Agent
+  brokers one identity, while this daemon serves several stores, and a Proton
+  login that keeps failing would take the file store, the keychain and Infisical
+  down with it. The loop latches at `max_backoff_seconds` and keeps trying.
+- **The token is re-read on every attempt**, so `keylessd credential` is enough
+  to rotate it — the next tick logs in with what the file now says, and nothing
+  restarts.
+- **Off by default**, because the loop logs a session out before it logs one in,
+  and a patch release should not start doing that to a session directory an
+  operator manages by hand.
+
+Startup says so when it is on:
+
+```
+keylessd: keeping the Proton session alive, replacing it every 90 minutes
+```
+
+and warns rather than refuses on a combination that cannot work — a renewal age
+at or past the cap, a probe slower than that age, a backoff ceiling under its
+floor, or `auto_login` on a store that is disabled.
+
+**There is no cron job or LaunchDaemon to install for this, and writing one is
+the wrong answer.** Three facts live inside the daemon and nowhere else: which
+uid may own the session store, where the credential file is, and what the
+vendor's answer meant. An external job gets the first wrong by running as root
+— which creates a session store the daemon cannot open, failing in a way that
+reads exactly like a wrong token — parses the second out of the config itself,
+and judges the third by re-reading the session, which `pass-cli` does not update
+in time, so successful logins get filed as failures.
 
 ### Removing it
 

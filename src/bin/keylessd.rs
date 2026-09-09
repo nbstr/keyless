@@ -234,6 +234,25 @@ mod daemon {
             Err(error) => return fail(&format!("cannot start the accept loop: {error}")),
         };
 
+        // After the socket is listening, so a renewal that takes a few seconds
+        // does not delay the sessions waiting to connect. Before the wait
+        // below, so a config that asks for the loop and cannot support one
+        // fails at startup rather than two hours later.
+        let session = match keyless::daemon::session::spawn(&config) {
+            Ok(session) => session,
+            Err(error) => {
+                drop(running);
+                return fail(&error);
+            }
+        };
+        if session.is_some() {
+            let _ = writeln!(
+                io::stderr(),
+                "keylessd: keeping the Proton session alive, replacing it every {} minutes",
+                config.stores.proton.session.login_after_minutes
+            );
+        }
+
         let _ = writeln!(
             io::stderr(),
             "keylessd: listening on {}, audit at {}",
@@ -250,7 +269,9 @@ mod daemon {
             }
         }
 
-        // Dropping stops the accept loop, joins it, and removes the socket.
+        // Dropping stops the renewal loop and joins it, then stops the accept
+        // loop, joins it, and removes the socket.
+        drop(session);
         drop(running);
         ExitCode::SUCCESS
     }
