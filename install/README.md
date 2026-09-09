@@ -680,6 +680,23 @@ reads exactly like a wrong token — parses the second out of the config itself,
 and judges the third by re-reading the session, which `pass-cli` does not update
 in time, so successful logins get filed as failures.
 
+### Turning it off, without removing the daemon
+
+`"enabled": false` on the Proton store, and a restart. That is the whole of it:
+the renewal loop is started by the daemon only where this config asked for one,
+so a store that is off runs **nothing** — no thread, no vendor process, no
+launchd job to find and unload. `the_renewal_loop_runs_only_where_proton_asked_for_it`
+is the test that says so, and it fails if that guard is removed.
+
+Setting `"session": {"auto_login": false}` instead keeps the store serving names
+and stops only the renewal, which is the arrangement for a machine where
+something else owns the session.
+
+An operator serving names out of 1Password or Infisical never turns anything
+off, because nothing of Proton's was ever running: those are credentials rather
+than sessions, so there is no session to keep alive and no loop to keep it. See
+`src/daemon/session.rs`, which records why this is the only store with one.
+
 ### Removing it
 
 `install/uninstall.sh` deletes `proton.json` **and** the session directory,

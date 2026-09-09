@@ -350,6 +350,68 @@ fn a_proton_login_that_keeps_failing_leaves_the_other_stores_answering() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A daemon serving other stores runs no Proton machinery at all.
+///
+/// This is the property an operator on 1Password or Infisical is entitled to:
+/// nothing of Proton's runs on their machine, and there is no background job
+/// for them to find, understand, or unload. HashiCorp's Vault gives the same
+/// guarantee for an optional secrets engine — `vault secrets disable` is one
+/// act, after which the engine "stops functioning entirely" and the operator
+/// hunts for nothing.
+///
+/// It rests on three lines in [`session::spawn`], which is exactly the kind of
+/// guard that reads as obviously correct and is worth one test: a later change
+/// that spawns the thread before consulting the config would leave every case
+/// in this suite green.
+///
+/// Both directions are asserted. The negative alone would also pass against a
+/// `renews_its_session` that is always false, which is a daemon that renews
+/// nothing for anybody.
+#[test]
+fn the_renewal_loop_runs_only_where_proton_asked_for_it() {
+    let dir = scratch("daemon-proton-off");
+    let vendor = stub_pass_cli_listing(&dir, &Backend::OwnFailure, &Listing::Json(LISTING));
+
+    // The control: with the store on and `auto_login` true, there IS a loop.
+    let on = daemon_config_with_a_failing_renewal(&dir, &vendor);
+    let running = start_daemon(&on, policy_allowing_self());
+    assert!(
+        running.renews_its_session(),
+        "a daemon that asked for the renewal loop is not running one, so the \
+         negative cases below prove nothing"
+    );
+    drop(running);
+
+    // `auto_login` false — the default every config gets by saying nothing.
+    let mut off = daemon_config_with_a_failing_renewal(&dir, &vendor);
+    off.stores.proton.session.auto_login = false;
+    let running = start_daemon(&off, policy_allowing_self());
+    assert!(
+        !running.renews_its_session(),
+        "a daemon that did not ask for the loop started one anyway"
+    );
+    drop(running);
+
+    // The store disabled outright: the 1Password or Infisical operator's case.
+    // `auto_login` stays TRUE here on purpose — a config can carry a leftover
+    // session block, and a disabled store must run nothing regardless.
+    let mut disabled = daemon_config_with_a_failing_renewal(&dir, &vendor);
+    disabled.stores.proton.enabled = false;
+    assert!(
+        disabled.stores.proton.session.auto_login,
+        "this case is only meaningful while auto_login is still true"
+    );
+    let running = start_daemon(&disabled, policy_allowing_self());
+    assert!(
+        !running.renews_its_session(),
+        "a disabled Proton store still started a renewal loop — an operator who \
+         serves no Proton name has a thread spawning vendor processes"
+    );
+    drop(running);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// A daemon whose vendor has stopped answering still shuts down.
 ///
 /// `login::run` is `Command::output()`, deliberately unbounded — the reasoning
