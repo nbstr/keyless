@@ -123,10 +123,12 @@ fn socket_path() -> std::path::PathBuf {
 }
 
 /// One request and one reply on an already-connected socket.
+///
+/// Reads exactly one frame, so it asks for no heartbeat.
 fn exchange_on(stream: &UnixStream, name: &str) -> Result<Reply, String> {
-    let frame = Request::resolve(name)
-        .encode()
-        .map_err(|error| error.to_string())?;
+    let mut request = Request::resolve(name);
+    request.progress = false;
+    let frame = request.encode().map_err(|error| error.to_string())?;
     write_frame(&mut { stream }, &frame).map_err(|error| error.to_string())?;
     let mut reader = std::io::BufReader::new(stream);
     match read_frame(&mut reader) {
@@ -195,6 +197,9 @@ fn report(tag: &str, outcome: Result<Reply, String>) {
         Ok(Reply::Denied(reason)) => format!("{tag} status=denied reason={reason}"),
         Ok(Reply::Failed(reason)) => format!("{tag} status=failed reason={reason}"),
         Ok(Reply::Info { .. }) => format!("{tag} status=info"),
+        // Neither path here yields one: `Client` waits heartbeats out, and
+        // `exchange_on` asks for none.
+        Ok(Reply::Working) => format!("{tag} status=working"),
         Err(error) => format!("{tag} status=error reason={error}"),
     };
     let _ = writeln!(std::io::stdout(), "{line}");

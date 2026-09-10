@@ -1,5 +1,29 @@
 //! Talking to the daemon, with a deadline that cannot be missed.
 //!
+//! # The deadline is on SILENCE, not on the answer
+//!
+//! This is the one thing to hold on to in this file, because the other reading
+//! is the natural one and it was wrong.
+//!
+//! A daemon that has to ask a vendor CLI over the network takes seconds to
+//! answer, and it is ALLOWED to: its own store budget says so. A daemon that is
+//! wedged takes for ever. Both look identical from here — nothing arrives —
+//! and a client that bounds the ANSWER has to guess a number that separates
+//! them. That guess lives on the side that does not do the work, so it goes
+//! stale the moment the daemon's config changes, and it fails in the direction
+//! that reads as an outage: a lookup that was going to succeed in 4.4 seconds
+//! is abandoned at 3 and the run degrades.
+//!
+//! So the daemon says it is still there, every half second, and the deadline
+//! below bounds how long it may say NOTHING. A working daemon can take as long
+//! as its own budget allows; a wedged one is caught in the same three seconds
+//! as before. Nothing here has to know how long a lookup should take.
+//! [`crate::ipc::protocol::Reply::Working`] carries the reasoning and the
+//! HTTP/2 precedent.
+//!
+//! [`MAX_EXCHANGE`] is the backstop for the remaining case — a daemon that
+//! heartbeats for ever without finishing.
+//!
 //! # Why the whole exchange runs on a thread
 //!
 //! `UnixStream` can be given a read and a write timeout. It cannot be given a
@@ -16,6 +40,11 @@
 //! non-blocking connect written in `unsafe`, and this boundary already carries
 //! all the `unsafe` it needs.
 //!
+//! The worker also reports the connect itself, so the wait above starts being
+//! fed as soon as there is anything to feed it. Without that the connect and
+//! the answer would share one deadline again, and a slow connect would spend
+//! the budget the answer needed.
+//!
 //! # Scrubbing
 //!
 //! The reply frame holds a plaintext value. It is read into a buffer this
@@ -29,17 +58,56 @@ use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use zeroize::Zeroize;
 
 use crate::ipc::protocol::{ProtocolError, Reply, Request, read_frame, write_frame};
+
+/// The longest one exchange may run, however talkative the daemon is.
+///
+/// The silence deadline cannot bound this on its own: a daemon that heartbeats
+/// on schedule and never finishes resets it for ever, which is the wedge this
+/// module exists to make impossible expressed as a well-behaved peer.
+///
+/// # Derived from the daemon's worst case, not chosen beside it
+///
+/// A ceiling below the work it bounds is the outage the heartbeat exists to
+/// end, moved from three seconds to wherever the ceiling sits. The daemon's
+/// longest legitimate lookup is [`VENDOR_CALLS_PER_LOOKUP`] vendor calls, and
+/// every store clamps one call to [`crate::config::MAX_TIMEOUT_MS`] — so this is
+/// their product, read from that constant so the two cannot drift apart.
+///
+/// What it does not cover: a daemon running `"policy": "ordered"` across
+/// several vendor stores tries them in turn, and a chain of slow ones can run
+/// past it. That lookup ends as [`ClientError::Overran`], whose message says the
+/// daemon was still working — which points at the right place.
+const MAX_EXCHANGE: Duration =
+    Duration::from_millis(VENDOR_CALLS_PER_LOOKUP * crate::config::MAX_TIMEOUT_MS);
+
+/// A store that resolves a name through a vault listing makes two calls: the
+/// listing, then the read.
+const VENDOR_CALLS_PER_LOOKUP: u64 = 2;
 
 /// A configured route to a daemon.
 #[derive(Debug, Clone)]
 pub struct Client {
     socket: PathBuf,
     timeout: Duration,
+}
+
+/// What the worker thread tells the waiting caller.
+///
+/// Both signs of life reset the silence deadline. They are kept apart because
+/// only one of them says the daemon is WORKING: a connect proves a listener is
+/// there and nothing about whether it will ever answer.
+enum Event {
+    /// The connect returned.
+    Connected,
+    /// A heartbeat arrived: the daemon has the request and has not finished.
+    Working,
+    /// The exchange is over, one way or the other.
+    Done(Result<Reply, ClientError>),
 }
 
 /// Why a request did not produce a reply.
@@ -52,8 +120,16 @@ pub enum ClientError {
     /// The socket could not be reached: absent, not a socket, wrong
     /// permissions, or nothing listening.
     Unreachable(io::Error),
-    /// The deadline passed with no reply.
+    /// The daemon said nothing at all for this long — no answer and no
+    /// heartbeat — so it is not working on this, it is gone or stuck.
     Timeout(Duration),
+    /// The daemon kept saying it was working until the whole exchange ran out
+    /// of time.
+    ///
+    /// Distinct from [`ClientError::Timeout`] because it sends a reader
+    /// somewhere else: the daemon is alive and answering, and what to look at
+    /// is what its lookup is waiting on.
+    Overran(Duration),
     /// The connection failed mid-exchange.
     Transport(io::Error),
     /// The daemon answered something this build does not understand.
@@ -65,8 +141,12 @@ impl std::fmt::Display for ClientError {
         match self {
             ClientError::Unreachable(source) => write!(f, "cannot reach the daemon: {source}"),
             ClientError::Timeout(after) => {
-                write!(f, "the daemon did not answer within {after:?}")
+                write!(f, "the daemon went quiet for {after:?} without answering")
             }
+            ClientError::Overran(after) => write!(
+                f,
+                "the daemon was still working on this after {after:?}, so it was given up on"
+            ),
             ClientError::Transport(source) => write!(f, "the connection failed: {source}"),
             ClientError::Protocol(source) => write!(f, "{source}"),
         }
@@ -76,7 +156,7 @@ impl std::fmt::Display for ClientError {
 impl std::error::Error for ClientError {}
 
 impl Client {
-    /// Point at a socket, with a deadline for the whole exchange.
+    /// Point at a socket, with a deadline for how long it may say nothing.
     #[must_use]
     pub fn new(socket: PathBuf, timeout: Duration) -> Self {
         Client { socket, timeout }
@@ -89,52 +169,141 @@ impl Client {
     }
 
     /// Send one request and wait for one reply, or give up.
+    ///
+    /// Waits `timeout` for each sign of life and [`MAX_EXCHANGE`] for the whole
+    /// conversation. See the module header for why those are two numbers.
     pub fn request(&self, request: &Request) -> Result<Reply, ClientError> {
         let frame = request.encode().map_err(ClientError::Transport)?;
         let socket = self.socket.clone();
-        let timeout = self.timeout;
+        let silence = self.timeout;
         let (sender, receiver) = mpsc::channel();
 
         thread::Builder::new()
             .name(format!("{}-ipc", crate::NAME))
             .spawn(move || {
-                // A send failure means the caller already gave up; the reply is
-                // dropped, which zeroizes the value it carried.
-                let _ = sender.send(exchange(&socket, &frame, timeout));
+                let progress = sender.clone();
+                let result = exchange(&socket, &frame, silence, |event| {
+                    progress.send(event).is_ok()
+                });
+                // The caller may already have gone, and the reply is then
+                // dropped here, which zeroizes the value it carried.
+                let _ = sender.send(Event::Done(result));
             })
             .map_err(ClientError::Transport)?;
 
-        match receiver.recv_timeout(timeout) {
-            Ok(result) => result,
-            Err(mpsc::RecvTimeoutError::Timeout) => Err(ClientError::Timeout(timeout)),
-            Err(mpsc::RecvTimeoutError::Disconnected) => Err(ClientError::Transport(
-                io::Error::other("the request thread ended without answering"),
-            )),
+        self.wait(&receiver, silence)
+    }
+
+    /// Wait on the worker, resetting the silence deadline at every sign of life.
+    fn wait(
+        &self,
+        receiver: &mpsc::Receiver<Event>,
+        silence: Duration,
+    ) -> Result<Reply, ClientError> {
+        let started = Instant::now();
+        let mut working = false;
+        loop {
+            let spent = started.elapsed();
+            let Some(left) = MAX_EXCHANGE.checked_sub(spent) else {
+                return Err(gave_up(working, true, silence));
+            };
+            match receiver.recv_timeout(silence.min(left)) {
+                Ok(Event::Done(result)) => return result,
+                Ok(Event::Connected) => {}
+                Ok(Event::Working) => working = true,
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    return Err(gave_up(working, left <= silence, silence));
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    return Err(ClientError::Transport(io::Error::other(
+                        "the request thread ended without answering",
+                    )));
+                }
+            }
         }
     }
 }
 
-fn exchange(socket: &Path, frame: &[u8], timeout: Duration) -> Result<Reply, ClientError> {
+/// Which deadline ran out, in the words its reader needs.
+///
+/// Only a heartbeat earns [`ClientError::Overran`]. A daemon that never said it
+/// was working went quiet, even when the silence setting is at its maximum and
+/// the two deadlines coincide — which is the one configuration where "which
+/// timer fired" would otherwise give the wrong answer.
+fn gave_up(working: bool, ceiling_reached: bool, silence: Duration) -> ClientError {
+    if working && ceiling_reached {
+        ClientError::Overran(MAX_EXCHANGE)
+    } else {
+        ClientError::Timeout(silence.min(MAX_EXCHANGE))
+    }
+}
+
+/// What the worker ends on once nobody is waiting for it.
+///
+/// Nobody reads it. It exists so the worker has something to return, which is
+/// what ends its thread and closes the socket.
+fn abandoned() -> ClientError {
+    ClientError::Transport(io::Error::other("the caller stopped waiting"))
+}
+
+/// Connect, send, and read until something that is not a heartbeat arrives.
+///
+/// `report` is called for each sign of life and answers whether anybody is
+/// still listening. The exchange ends the moment nobody is.
+///
+/// # Why it has to be told
+///
+/// The caller gives up at its ceiling and reports its own error; this worker
+/// cannot see that. Left to run, it would keep reading heartbeats on behalf of
+/// no one for as long as the daemon kept sending them — holding a thread and a
+/// socket open through the whole of the child's run, since `keyless run` waits
+/// on its child with this thread still alive.
+fn exchange(
+    socket: &Path,
+    frame: &[u8],
+    silence: Duration,
+    report: impl Fn(Event) -> bool,
+) -> Result<Reply, ClientError> {
     let stream = UnixStream::connect(socket).map_err(ClientError::Unreachable)?;
+    // The connect returning is itself evidence, and it is the only evidence
+    // there will be until the daemon has read the request.
+    if !report(Event::Connected) {
+        return Err(abandoned());
+    }
     stream
-        .set_read_timeout(Some(timeout))
+        .set_read_timeout(Some(silence))
         .map_err(ClientError::Transport)?;
     stream
-        .set_write_timeout(Some(timeout))
+        .set_write_timeout(Some(silence))
         .map_err(ClientError::Transport)?;
 
     write_frame(&mut &stream, frame).map_err(ClientError::Transport)?;
 
     let mut reader = ScrubbedReader::new(&stream);
-    let raw = read_frame(&mut reader).map_err(ClientError::Protocol)?;
-    let Some(mut raw) = raw else {
-        return Err(ClientError::Transport(io::Error::other(
-            "the daemon closed the connection without answering",
-        )));
-    };
-    let reply = Reply::decode(&raw).map_err(ClientError::Protocol);
-    raw.zeroize();
-    reply
+    loop {
+        // A read deadline here and the caller's own silence deadline are the
+        // same duration and race each other, so both have to name the same
+        // thing or which one fires decides what the operator reads.
+        let raw = read_frame(&mut reader).map_err(|error| match error {
+            ProtocolError::Silent => ClientError::Timeout(silence),
+            other => ClientError::Protocol(other),
+        })?;
+        let Some(mut raw) = raw else {
+            return Err(ClientError::Transport(io::Error::other(
+                "the daemon closed the connection without answering",
+            )));
+        };
+        let reply = Reply::decode(&raw).map_err(ClientError::Protocol);
+        raw.zeroize();
+        match reply? {
+            Reply::Working => {
+                if !report(Event::Working) {
+                    return Err(abandoned());
+                }
+            }
+            answered => return Ok(answered),
+        }
+    }
 }
 
 /// A `BufRead` whose buffer is scrubbed when it is dropped.
@@ -259,6 +428,77 @@ mod tests {
             client.request(&Request::ping()),
             Err(ClientError::Unreachable(_))
         ));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn only_a_heartbeat_earns_overran() {
+        // With the silence setting at its maximum the two deadlines coincide,
+        // and a daemon that never said a word must still read as quiet.
+        assert!(matches!(
+            super::gave_up(false, true, super::MAX_EXCHANGE),
+            ClientError::Timeout(_)
+        ));
+        assert!(matches!(
+            super::gave_up(true, true, Duration::from_secs(3)),
+            ClientError::Overran(_)
+        ));
+        // Heartbeats, then silence well inside the ceiling: it went quiet.
+        assert!(matches!(
+            super::gave_up(true, false, Duration::from_secs(3)),
+            ClientError::Timeout(_)
+        ));
+    }
+
+    #[test]
+    fn a_worker_nobody_is_waiting_for_stops_at_the_next_heartbeat() {
+        // The ceiling ends the caller's wait; this is what ends the worker's.
+        // A daemon heartbeating past the ceiling would otherwise hold this
+        // thread and its socket for as long as it kept talking.
+        let path = short_socket_path(std::path::Path::new("ipc-client-abandoned"));
+        let _ = std::fs::remove_file(&path);
+        let listener = std::os::unix::net::UnixListener::bind(&path).expect("bind");
+        let daemon = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accept");
+            let mut reader = std::io::BufReader::new(stream.try_clone().expect("clone"));
+            let _ = crate::ipc::protocol::read_frame(&mut reader);
+            let beat = crate::ipc::protocol::Reply::Working
+                .encode()
+                .expect("encode");
+            // Talks until the client hangs up, and never answers.
+            for _ in 0..400 {
+                if crate::ipc::protocol::write_frame(&mut &stream, &beat).is_err() {
+                    return true;
+                }
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            false
+        });
+
+        let (done, finished) = std::sync::mpsc::channel();
+        let frame = Request::resolve("DECOY").encode().expect("encode");
+        let socket = path.clone();
+        std::thread::spawn(move || {
+            let heard = std::cell::Cell::new(0_u32);
+            // Listening for the connect and the first heartbeat, gone after.
+            let result = super::exchange(&socket, &frame, Duration::from_secs(5), |event| {
+                if matches!(event, super::Event::Working) {
+                    heard.set(heard.get() + 1);
+                }
+                heard.get() < 2
+            });
+            let _ = done.send(result.is_err());
+        });
+
+        assert_eq!(
+            finished.recv_timeout(ABSENT_SOCKET_CEILING),
+            Ok(true),
+            "the worker kept reading heartbeats for a caller that had gone"
+        );
+        assert!(
+            daemon.join().expect("the daemon thread"),
+            "the daemon never saw the client hang up"
+        );
         let _ = std::fs::remove_file(&path);
     }
 

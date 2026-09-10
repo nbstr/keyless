@@ -126,11 +126,12 @@ pub struct DaemonClientConfig {
     /// `KEYLESS_SOCKET`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub socket: Option<ConfigPath>,
-    /// Deadline for the whole exchange, in milliseconds.
+    /// How long the daemon may say nothing at all, in milliseconds.
     ///
-    /// This is a ceiling on how long `keyless run` can be delayed by a daemon
-    /// that is wedged. It is short on purpose: waiting is indistinguishable
-    /// from blocking to whoever is watching a terminal.
+    /// A ceiling on how long `keyless run` can be delayed by a daemon that is
+    /// **wedged**, and not a ceiling on how long a lookup may take: a daemon
+    /// that is working says so while it works, and each of those resets this.
+    /// [`crate::ipc::client`] carries why the two are different numbers.
     #[serde(default = "default_daemon_timeout_ms")]
     pub timeout_ms: u64,
 }
@@ -155,17 +156,34 @@ impl DaemonClientConfig {
             .unwrap_or_else(crate::ipc::default_socket_path)
     }
 
-    /// The exchange deadline, clamped to [`MAX_TIMEOUT_MS`].
+    /// The silence deadline, clamped to [`MAX_TIMEOUT_MS`].
     #[must_use]
     pub const fn timeout(&self) -> std::time::Duration {
         bounded_timeout(self.timeout_ms)
     }
 }
 
-/// Deadline for one socket exchange with the daemon.
+/// How long the daemon may go without saying anything.
 ///
-/// Distinct from the vendor-CLI deadline further down, and much shorter: this
-/// is a local socket round trip, not a process spawn that may hit the network.
+/// Three seconds is six of the daemon's heartbeats, so a working daemon has
+/// five to lose before this fires, and a daemon that is not running at all is
+/// still noticed inside a pause a person barely registers.
+///
+/// # What this number used to mean, and why that was wrong
+///
+/// It bounded the whole exchange, on the reasoning that talking to the daemon
+/// is "a local socket round trip, not a process spawn that may hit the
+/// network". The round trip is local; **what happens between its two halves is
+/// not.** The daemon answers by asking a vendor CLI, which spawns a process and
+/// goes to the internet, and it allows itself [`DEFAULT_TIMEOUT_MS`] per call
+/// and up to two calls on a name whose vault listing has expired.
+///
+/// So the two ends of one exchange disagreed by a factor of six, and the short
+/// end was the one with no way to know better. Measured 2026-09-10 against a
+/// live Proton Pass account: 1.45 to 4.38 seconds per cold lookup, and the
+/// first lookup after a sixty-second idle gap failed every time while the
+/// daemon resolved the name correctly and wrote `allow` to its audit log three
+/// seconds in, with nobody left to hand it to.
 const fn default_daemon_timeout_ms() -> u64 {
     3_000
 }

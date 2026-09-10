@@ -97,6 +97,20 @@ const MAX_NAME_CHARS: usize = 128;
 /// How often the accept loop checks whether it has been told to stop.
 const ACCEPT_POLL: Duration = Duration::from_millis(5);
 
+/// How often a resolve in flight tells the client it is still there.
+///
+/// Sized against the thing it has to stay inside: the client's silence
+/// deadline, which defaults to three seconds. Half a second leaves five missed
+/// heartbeats of margin before a working daemon is mistaken for a wedged one,
+/// and costs one short line on a socket per tick of a lookup that was going to
+/// take seconds anyway.
+///
+/// It is deliberately not derived from that deadline. The two ends are
+/// configured separately and by different people, and a heartbeat that shrank
+/// to match a client's short deadline would let one careless session make every
+/// other session's daemon chatty.
+pub const HEARTBEAT: Duration = Duration::from_millis(500);
+
 /// A bound, listening daemon.
 pub struct Daemon {
     listener: UnixListener,
@@ -263,8 +277,8 @@ impl Connection {
         // The listener is non-blocking so the accept loop can poll its stop
         // flag, and on BSD an accepted socket INHERITS that flag. Left set, the
         // first read that arrives a moment before its data returns EAGAIN, the
-        // frame reader calls that a framing error, and the connection is torn
-        // down under a client that did nothing wrong. It survives a single
+        // frame reader takes that for a read deadline passing, and the
+        // connection is torn down under a client that did nothing wrong. It survives a single
         // request-and-reply — the request is usually already buffered by the
         // time accept returns — and fails the moment a client sends a second
         // one, which is why it has to be cleared here rather than trusted to
@@ -335,11 +349,11 @@ impl Connection {
             Op::Names => Reply::Info {
                 names: self.names.as_ref().clone(),
             },
-            Op::Resolve => self.resolve(&request, &attestation),
+            Op::Resolve => self.resolve(stream, &request, &attestation),
         }
     }
 
-    fn resolve(&self, request: &Request, attestation: &Attestation) -> Reply {
+    fn resolve(&self, stream: &UnixStream, request: &Request, attestation: &Attestation) -> Reply {
         if request.name.is_empty() || request.name.chars().count() > MAX_NAME_CHARS {
             self.record(request, attestation, "bad-name", State::Degraded, None);
             return Reply::Failed(format!(
@@ -347,7 +361,13 @@ impl Connection {
             ));
         }
 
-        match self.resolver.resolve(&request.name) {
+        let outcome = if request.progress {
+            self.resolve_aloud(stream, &request.name)
+        } else {
+            self.resolver.resolve(&request.name)
+        };
+
+        match outcome {
             Outcome::Found(secret) => {
                 self.record(
                     request,
@@ -368,6 +388,64 @@ impl Connection {
             Outcome::Failed(reason) => {
                 self.record(request, attestation, "store-failed", State::Degraded, None);
                 Reply::Failed(reason)
+            }
+        }
+    }
+
+    /// Resolve on a worker thread, saying so on the socket every
+    /// [`HEARTBEAT`] until it finishes.
+    ///
+    /// # Why the work moves off this thread
+    ///
+    /// A resolve is a vendor CLI and a network round trip, and this thread is
+    /// the only one that may write to this connection. Doing both here means
+    /// the client hears nothing until the answer exists, which is the silence
+    /// it cannot tell apart from a wedge.
+    ///
+    /// # What happens when the client has already gone
+    ///
+    /// The heartbeat write fails, and this keeps waiting anyway. The lookup is
+    /// already paid for; letting it finish records the audit row the request
+    /// earned and leaves the value in the resolver's cache, so the retry the
+    /// caller is about to make is answered from memory. Abandoning it here
+    /// would throw away the work and make the next attempt pay for it again —
+    /// which, on a store that is slow enough to have reached this code, is how
+    /// a client ends up unable to resolve a name it asks for repeatedly.
+    fn resolve_aloud(&self, stream: &UnixStream, name: &str) -> Outcome {
+        let resolver = Arc::clone(&self.resolver);
+        let asked = name.to_owned();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        if thread::Builder::new()
+            .name(format!("{NAME}d-lookup"))
+            .spawn(move || {
+                let _ = sender.send(resolver.resolve(&asked));
+            })
+            .is_err()
+        {
+            // No thread to be had. Answering late is better than not answering,
+            // and late is exactly what this daemon did before it could speak.
+            return self.resolver.resolve(name);
+        }
+
+        let mut heard = true;
+        loop {
+            match receiver.recv_timeout(HEARTBEAT) {
+                Ok(outcome) => return outcome,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    if heard {
+                        heard = write_frame(
+                            &mut &*stream,
+                            &Reply::Working.encode().unwrap_or_default(),
+                        )
+                        .is_ok();
+                    }
+                }
+                // The worker ended without sending, which a panic under
+                // `panic = "unwind"` is the only way to reach. Under the
+                // release profile's `abort` the daemon is already gone.
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    return Outcome::Failed("the lookup ended without a result".to_owned());
+                }
             }
         }
     }

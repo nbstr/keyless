@@ -23,10 +23,14 @@ use keyless::State;
 use keyless::audit::AuditLog;
 use keyless::cmd::run::{Binding, RunRequest, TtyPolicy, run};
 use keyless::daemon::config::DaemonConfig;
+use keyless::ipc::client::{Client, ClientError};
 use keyless::store::Invocation;
 use keyless::store::Store;
 use keyless::store::daemon::DaemonStore;
-use keyless::{ipc::protocol::Request, store};
+use keyless::{
+    ipc::protocol::{Reply, Request},
+    store,
+};
 
 use support::{
     DECOY_VALUE, client_config, daemon_config, echoes, policy_allowing_self, scratch,
@@ -364,7 +368,10 @@ fn a_second_request_on_one_connection_is_answered() {
     let mut reader = std::io::BufReader::new(stream.try_clone().expect("clone"));
 
     for attempt in 0..3 {
-        let frame = Request::resolve("DECOY").encode().expect("encode");
+        // This reads one frame per request, so it asks for no heartbeat.
+        let mut request = Request::resolve("DECOY");
+        request.progress = false;
+        let frame = request.encode().expect("encode");
         keyless::ipc::protocol::write_frame(&mut &stream, &frame)
             .unwrap_or_else(|error| panic!("request {attempt} could not be sent: {error}"));
         let raw = keyless::ipc::protocol::read_frame(&mut reader)
@@ -377,6 +384,57 @@ fn a_second_request_on_one_connection_is_answered() {
             other => panic!("request {attempt}: expected a value, got {other:?}"),
         }
     }
+
+    drop(running);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_lookup_slower_than_the_clients_deadline_still_reaches_the_caller() {
+    // The outage this closes, reproduced at a tenth of the scale.
+    //
+    // Measured 2026-09-10 on a live install: the daemon allowed itself ten
+    // seconds per vendor call and spent two of them on a name whose vault
+    // listing had expired, so a cold lookup took 1.45 to 4.38 seconds — while
+    // the session gave up after three. The daemon resolved the name correctly
+    // and wrote `allow` to its audit log with nobody left to hand the value to,
+    // and every first lookup after a sixty-second idle gap degraded.
+    //
+    // Both requests below go to one daemon, over one store, and differ in one
+    // field. That is the control: if the value arrives either way the deadline
+    // was never the thing under test, and if it arrives neither way the
+    // heartbeat is not what carries it.
+    let dir = scratch("daemon-heartbeat");
+    let mut config = daemon_config(&dir);
+    // Nothing cached, so the second lookup pays the store's full cost too and
+    // cannot be answered out of the first one's success.
+    config.cache_ttl_seconds = 0;
+    config.stores.file.enabled = false;
+    config.stores.keychain.enabled = true;
+    config.stores.keychain.binary = slow_store_stub(&dir, DECOY_VALUE, 2_500).into();
+    let running = start_daemon(&config, policy_allowing_self());
+
+    let silence = Duration::from_secs(1);
+    let client = Client::new(running.socket().to_path_buf(), silence);
+
+    let mut mute = Request::resolve("DECOY_MUTE");
+    mute.progress = false;
+    match client.request(&mute) {
+        Err(ClientError::Timeout(after)) => assert_eq!(after, silence),
+        other => panic!("a daemon that says nothing must time out, got {other:?}"),
+    }
+
+    let started = std::time::Instant::now();
+    match client.request(&Request::resolve("DECOY_LOUD")) {
+        Ok(Reply::Value(secret)) => assert_eq!(secret.expose(), DECOY_VALUE),
+        other => panic!("a daemon that says it is working must be waited for, got {other:?}"),
+    }
+    assert!(
+        started.elapsed() > silence,
+        "the value came back inside the silence deadline, so the store was not slow \
+         and this proves nothing: {:?}",
+        started.elapsed()
+    );
 
     drop(running);
     let _ = std::fs::remove_dir_all(&dir);
