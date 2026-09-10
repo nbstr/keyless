@@ -419,7 +419,8 @@ pub fn logout_command(coordinates: &Coordinates, owner: Owner) -> Command {
     command
 }
 
-/// Everything both verbs need, applied in one place so neither can lack one.
+/// Everything every verb below needs, applied in one place so none can lack
+/// one.
 ///
 /// Deliberately not [`Command::env_clear`]: a stripped environment is one of
 /// the ways the vendor loses its local key and force-logs-out. This ADDS.
@@ -436,6 +437,10 @@ fn scope(
     for (variable, secret) in login {
         command.env(variable, secret.expose());
     }
+    // The daemon's login, info and logout are `pass-cli` invocations like any
+    // other this crate spawns: no telemetry row, no update check. See
+    // `proton::set_vendor_switch_offs`.
+    proton::set_vendor_switch_offs(command);
     // Whoever runs this owns what the vendor creates. Set unconditionally: from
     // root it is the privilege drop, and from the daemon's own uid it is a
     // no-op that still succeeds, so there is no branch here that could be right
@@ -1040,6 +1045,31 @@ mod tests {
         assert_eq!(argv, vec!["info".to_owned()]);
     }
 
+    #[test]
+    fn login_info_and_logout_all_switch_off_the_vendors_telemetry_and_update_check() {
+        let coordinates = coordinates_at(Path::new("/nonexistent/keyless-login-switch-off"));
+        let owner = Owner { uid: 1, gid: 1 };
+        let login = login_vector();
+
+        // Every verb's own argv, alongside the switch-off check below: setting
+        // an environment variable cannot append an argument, so this is the
+        // same argv each verb has always produced.
+        let cases: [(Command, &[&str]); 3] = [
+            (login_command(&coordinates, &login, owner), &["login"]),
+            (info_command(&coordinates, owner), &["info"]),
+            (logout_command(&coordinates, owner), &["logout"]),
+        ];
+
+        for (command, expected_argv) in cases {
+            let argv: Vec<String> = command
+                .get_args()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect();
+            assert_eq!(argv, expected_argv, "{argv:?}");
+            proton::assert_vendor_switch_offs(&command);
+        }
+    }
+
     fn scratch(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
             "keyless-login-{tag}-{}-{:?}",
@@ -1074,6 +1104,14 @@ mod tests {
     /// any output would mean a real leak.
     const TOKEN_DECOY: &str = "pst_decoy0Login0never0real0Aa1::ZGVjb3ktbG9naW4tMDkwMw==";
 
+    /// The `login` argument every test below passes, wrapping [`TOKEN_DECOY`].
+    fn login_vector() -> Vec<(String, Secret)> {
+        vec![(
+            proton::TOKEN_VAR.to_owned(),
+            Secret::new(TOKEN_DECOY.to_owned()),
+        )]
+    }
+
     #[test]
     fn the_token_is_in_the_environment_and_the_argument_vector_is_two_words() {
         // The whole reason this file builds a `Command` rather than spawning
@@ -1081,10 +1119,7 @@ mod tests {
         // and the argv is what `ps` shows every user on the machine.
         let dir = scratch("argv");
         let coordinates = coordinates_at(&dir);
-        let login = vec![(
-            proton::TOKEN_VAR.to_owned(),
-            Secret::new(TOKEN_DECOY.to_owned()),
-        )];
+        let login = login_vector();
         let command = login_command(&coordinates, &login, own(&dir));
 
         let argv: Vec<String> = command

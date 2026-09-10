@@ -1093,6 +1093,45 @@ fn occurrences(haystack: &[u8], needle: &str) -> Vec<usize> {
         .collect()
 }
 
+/// Every occurrence of `word` in `haystack`, classified against the literals
+/// in `allowed` by the bytes around it — never by a second scan of `haystack`
+/// per literal.
+///
+/// Returns which of `allowed` each classified hit matched, and the offsets of
+/// every hit that matched none of them. `haystack` is a built binary, tens of
+/// megabytes, so this runs the one scan for `word` and then, per hit, a cheap
+/// bounds check against each literal — not a full re-scan for each.
+fn classify<'a>(haystack: &[u8], word: &str, allowed: &[&'a str]) -> (Vec<&'a str>, Vec<usize>) {
+    let mut matched = Vec::new();
+    let mut unmatched = Vec::new();
+    'hits: for at in occurrences(haystack, word) {
+        for literal in allowed {
+            // The offset of `word` within `literal`, so the literal's own
+            // start can be found from where `word` was found.
+            let offset = literal
+                .to_ascii_lowercase()
+                .find(&word.to_ascii_lowercase())
+                .unwrap_or_else(|| {
+                    panic!("`{word}` does not appear in the allowed literal `{literal}`")
+                });
+            if at < offset {
+                continue;
+            }
+            let start = at - offset;
+            let end = start + literal.len();
+            if haystack
+                .get(start..end)
+                .is_some_and(|window| window.eq_ignore_ascii_case(literal.as_bytes()))
+            {
+                matched.push(*literal);
+                continue 'hits;
+            }
+        }
+        unmatched.push(at);
+    }
+    (matched, unmatched)
+}
+
 #[test]
 fn the_binary_contains_no_network_endpoint() {
     // The reference implementation posted the user's email to a hard-coded
@@ -1137,6 +1176,20 @@ fn scan_for_endpoints(path: &str) {
     }
 }
 
+/// `pass-cli`'s own telemetry switch-off, in the shape it is set — see
+/// `store::proton::DISABLE_TELEMETRY_VAR`. Written out here rather than
+/// imported from the crate, for the same reason as `ONLY_ALLOWED` in each
+/// test below: a test that reads the same constant the implementation uses
+/// would keep passing if that constant were renamed away from the word it
+/// exists to allow.
+const PROTON_DISABLE_TELEMETRY: &str = "PROTON_PASS_DISABLE_TELEMETRY";
+
+/// `pass-cli`'s own update-check switch-off — see
+/// `store::proton::NO_UPDATE_CHECK_VAR`. Written out here for the same reason
+/// as `PROTON_DISABLE_TELEMETRY` above: it contains no `telemetry`, so a hit
+/// on it is never found by the scan for that word and is checked on its own.
+const PROTON_NO_UPDATE_CHECK: &str = "PROTON_PASS_NO_UPDATE_CHECK";
+
 #[test]
 fn the_only_telemetry_string_in_the_binary_is_the_one_that_switches_it_off() {
     // The Infisical CLI's telemetry defaults to ON, so the adapter passes
@@ -1151,21 +1204,29 @@ fn the_only_telemetry_string_in_the_binary_is_the_one_that_switches_it_off() {
     const ONLY_ALLOWED: &str = "--telemetry=false";
 
     let binary = std::fs::read(BIN).expect("read the built binary");
-    let allowed: Vec<usize> = occurrences(&binary, ONLY_ALLOWED)
-        .into_iter()
-        // The offset of the word within the allowed string.
-        .map(|at| at + "--".len())
-        .collect();
-
-    for at in occurrences(&binary, "telemetry") {
-        assert!(
-            allowed.contains(&at),
-            "the binary contains a `telemetry` string that is not `{ONLY_ALLOWED}`"
-        );
-    }
+    let (matched, unmatched) = classify(
+        &binary,
+        "telemetry",
+        &[ONLY_ALLOWED, PROTON_DISABLE_TELEMETRY],
+    );
     assert!(
-        !allowed.is_empty(),
+        unmatched.is_empty(),
+        "the binary contains a `telemetry` string that is not `{ONLY_ALLOWED}` or \
+         `{PROTON_DISABLE_TELEMETRY}`: at {unmatched:?}"
+    );
+    assert!(
+        matched.contains(&ONLY_ALLOWED),
         "`{ONLY_ALLOWED}` is absent; the vendor CLI's telemetry is no longer being disabled"
+    );
+    assert!(
+        matched.contains(&PROTON_DISABLE_TELEMETRY),
+        "`{PROTON_DISABLE_TELEMETRY}` is absent; the Proton Pass CLI's telemetry is no longer \
+         being disabled"
+    );
+    assert!(
+        !occurrences(&binary, PROTON_NO_UPDATE_CHECK).is_empty(),
+        "`{PROTON_NO_UPDATE_CHECK}` is absent; the Proton Pass CLI's update check is no longer \
+         being disabled"
     );
 }
 
@@ -1176,9 +1237,15 @@ fn the_daemon_carries_no_telemetry_string_of_its_own() {
     // the same library, so `--telemetry=false` may legitimately appear; what
     // must not appear is any OTHER telemetry string.
     //
-    // Presence is not asserted here, unlike for the client: the daemon does not
-    // construct the Infisical adapter, so whether the literal survives is a
-    // linker decision and not a property worth pinning.
+    // Presence is not asserted for `--telemetry=false` here, unlike for the
+    // client: the daemon does not construct the Infisical adapter, so whether
+    // that literal survives is a linker decision and not a property worth
+    // pinning. `PROTON_PASS_DISABLE_TELEMETRY` and `PROTON_PASS_NO_UPDATE_CHECK`
+    // are different: the daemon's own login verb is built to set both on every
+    // `pass-cli login` / `info` / `logout` it spawns. A hit here only proves
+    // the literal survived linking, never that a call site reaches it — that
+    // is a property of the source, and the scan that proves it reads the
+    // source rather than this binary.
     const ONLY_ALLOWED: &str = "--telemetry=false";
     let daemon = std::path::Path::new(BIN)
         .parent()
@@ -1186,16 +1253,26 @@ fn the_daemon_carries_no_telemetry_string_of_its_own() {
         .expect("the test binary has a parent directory");
     let binary = std::fs::read(&daemon).expect("read the built daemon");
 
-    let allowed: Vec<usize> = occurrences(&binary, ONLY_ALLOWED)
-        .into_iter()
-        .map(|at| at + "--".len())
-        .collect();
-    for at in occurrences(&binary, "telemetry") {
-        assert!(
-            allowed.contains(&at),
-            "keylessd contains a `telemetry` string that is not `{ONLY_ALLOWED}`"
-        );
-    }
+    let (matched, unmatched) = classify(
+        &binary,
+        "telemetry",
+        &[ONLY_ALLOWED, PROTON_DISABLE_TELEMETRY],
+    );
+    assert!(
+        unmatched.is_empty(),
+        "keylessd contains a `telemetry` string that is not `{ONLY_ALLOWED}` or \
+         `{PROTON_DISABLE_TELEMETRY}`: at {unmatched:?}"
+    );
+    assert!(
+        matched.contains(&PROTON_DISABLE_TELEMETRY),
+        "`{PROTON_DISABLE_TELEMETRY}` is absent from keylessd; the Proton Pass CLI's telemetry \
+         is no longer being disabled there"
+    );
+    assert!(
+        !occurrences(&binary, PROTON_NO_UPDATE_CHECK).is_empty(),
+        "`{PROTON_NO_UPDATE_CHECK}` is absent from keylessd; the Proton Pass CLI's update check \
+         is no longer being disabled there"
+    );
 }
 
 // ---------------------------------------------------------------------------

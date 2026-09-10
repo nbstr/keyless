@@ -42,6 +42,18 @@
 //! [`Policy::Ordered`] restores the first-hit behaviour for anyone whose
 //! backends all hold secrets of the same trust level. It is opt-in because the
 //! failure it enables is silent.
+//!
+//! # What a backend does about its vendor's telemetry and update checks
+//!
+//! Each of the four adapters that spawn a vendor binary states this itself,
+//! in its own module doc, because the answer is vendor-specific and the
+//! property is not: [`infisical`] passes a flag on every invocation,
+//! [`proton`] sets two environment variables on every command it spawns, and
+//! [`onepassword`] and [`keychain`] switch nothing off, each because its
+//! vendor offers nothing to switch. Not a [`Store`] method: the vendors
+//! disagree on the SHAPE of the answer, not merely its value, so a method
+//! here would either default to a no-op the two of them never override, or
+//! force every adapter to implement a property half of them do not have.
 
 pub mod daemon;
 pub mod discover;

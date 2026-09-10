@@ -58,6 +58,7 @@ use crate::store::manage::{Manage, ManageError, Stored, mint_a_manager_token};
 use crate::store::proton::{
     ItemListing, Matched, REASON_VAR, REFERENCE_SCHEME, Reason, SESSION_DIR_VAR, flag_value,
     match_title, relative_session_dir, remove_ambient_references, resolve_executable, scrub,
+    set_vendor_switch_offs,
 };
 
 /// The fields a `login` item has of its own.
@@ -234,6 +235,34 @@ impl ProtonManager {
         })
     }
 
+    /// Put the things every child of this manager needs on one command.
+    ///
+    /// This manager's own analogue of `ProtonStore::scope` and
+    /// `daemon::login::scope`: a builder that quietly lacked one of these
+    /// would fail as a missing item, or a duplicate title, rather than as a
+    /// missing variable.
+    ///
+    /// - **The ambient filter** runs first, so a caller who exported a
+    ///   `pass://` reference cannot have it removed again once the variables
+    ///   below are set.
+    /// - **The session directory** is the MANAGER's, never the reader's — see
+    ///   [`ProtonManager::from_config`].
+    /// - **The reason** is required by the vendor and is what the remote audit
+    ///   entry is filed under.
+    /// - **The two vendor switch-offs**, so a listing or a create writes no
+    ///   telemetry row, and asks about no update even if a later release
+    ///   stops skipping that check for a child whose stderr is a pipe. See
+    ///   [`set_vendor_switch_offs`].
+    fn scope<I>(&self, command: &mut Command, ambient: I, reason: String)
+    where
+        I: IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
+    {
+        remove_ambient_references(command, ambient);
+        command.env(SESSION_DIR_VAR, &self.session_dir);
+        command.env(REASON_VAR, reason);
+        set_vendor_switch_offs(command);
+    }
+
     /// Build one `pass-cli item list --vault-name … --output json` invocation.
     ///
     /// Under the MANAGER's session, deliberately: the pre-flight check has to see
@@ -257,9 +286,11 @@ impl ProtonManager {
         flag_value(&mut command, "--vault-name", vault);
         command.arg("--output");
         command.arg("json");
-        remove_ambient_references(&mut command, ambient);
-        command.env(SESSION_DIR_VAR, &self.session_dir);
-        command.env(REASON_VAR, self.reason.for_action("listing", vault));
+        self.scope(
+            &mut command,
+            ambient,
+            self.reason.for_action("listing", vault),
+        );
         command
     }
 
@@ -278,10 +309,9 @@ impl ProtonManager {
         flag_value(&mut command, "--vault-name", &address.vault);
         command.arg("--from-template");
         command.arg("-");
-        remove_ambient_references(&mut command, ambient);
-        command.env(SESSION_DIR_VAR, &self.session_dir);
-        command.env(
-            REASON_VAR,
+        self.scope(
+            &mut command,
+            ambient,
             self.reason.for_action("creating", &address.item),
         );
         command
@@ -578,7 +608,7 @@ mod tests {
     use crate::config::{Config, SecretRoute};
     use crate::secret::Secret;
     use crate::store::manage::Manage;
-    use crate::store::proton::{REASON_VAR, Reason, SESSION_DIR_VAR};
+    use crate::store::proton::{REASON_VAR, Reason, SESSION_DIR_VAR, assert_vendor_switch_offs};
     use std::ffi::OsStr;
 
     /// The reader's session directory, and the manager's. Two literals, written
@@ -666,6 +696,17 @@ mod tests {
         assert!(reason.contains("creating"), "{reason}");
         assert!(reason.contains("decoy"), "{reason}");
         assert!(!reason.trim().is_empty());
+    }
+
+    #[test]
+    fn every_write_switches_off_the_vendors_telemetry_and_update_check() {
+        let manager = manager();
+        for command in [
+            manager.create_command("custom", &address(), ambient()),
+            manager.list_command("personal", ambient()),
+        ] {
+            assert_vendor_switch_offs(&command);
+        }
     }
 
     #[test]
