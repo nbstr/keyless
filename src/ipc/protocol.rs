@@ -2,7 +2,8 @@
 //!
 //! One JSON object per line, in each direction. Newline framing rather than a
 //! length prefix because the whole conversation is one short request and one
-//! short reply, and a format a person can read with `nc` is a format whose bugs
+//! short reply — with, for a resolve that asks for them, bare heartbeat lines
+//! in between — and a format a person can read with `nc` is a format whose bugs
 //! are visible.
 //!
 //! # What crosses, and what never does
@@ -77,10 +78,32 @@ pub struct Request {
     /// The caller's claimed command line.
     #[serde(default)]
     pub argv: Vec<String>,
+    /// Whether this client understands [`Reply::Working`].
+    ///
+    /// # Why a field rather than the version number
+    ///
+    /// A daemon and a client are two binaries installed by one script, and
+    /// between one run of it and the next they can differ. Bumping
+    /// [`PROTOCOL_VERSION`] to introduce a heartbeat would make every such pair
+    /// refuse each other outright — a total outage in exchange for a frame that
+    /// carries no value and that either side can do without.
+    ///
+    /// So the capability is negotiated in the one direction that needs it. A
+    /// client that says nothing gets no heartbeats and behaves exactly as it
+    /// did, because `serde` defaults this to false; a daemon that has never
+    /// heard of the field ignores it and answers as it always has. Neither end
+    /// has to know the other's build.
+    #[serde(default)]
+    pub progress: bool,
 }
 
 impl Request {
     /// A resolve request for one name.
+    ///
+    /// Asks for heartbeats, which [`crate::ipc::client::Client`] waits out. A
+    /// reader that takes exactly one frame per request clears
+    /// [`Request::progress`] first, or it reads a heartbeat where it expected
+    /// the answer.
     #[must_use]
     pub fn resolve(name: &str) -> Self {
         Request {
@@ -91,10 +114,15 @@ impl Request {
                 .map(|p| p.display().to_string())
                 .unwrap_or_default(),
             argv: std::env::args().take(MAX_CLAIMED_ARGS).collect(),
+            progress: true,
         }
     }
 
     /// A version and liveness check.
+    ///
+    /// Asks for no heartbeat: this reads no store, so there is nothing it could
+    /// be slow about, and a ping that needed one would be measuring the wrong
+    /// thing.
     #[must_use]
     pub fn ping() -> Self {
         Request {
@@ -103,6 +131,7 @@ impl Request {
             name: String::new(),
             cwd: String::new(),
             argv: Vec::new(),
+            progress: false,
         }
     }
 
@@ -154,6 +183,29 @@ pub enum Reply {
         /// Declared names. Empty for a ping.
         names: Vec<String>,
     },
+    /// The daemon has the request and has not finished it yet.
+    ///
+    /// # What this exists to make decidable
+    ///
+    /// A client waiting on a socket cannot tell a daemon that is working from
+    /// one that is wedged, and both look like silence. Without a signal the only
+    /// way to choose between them is a number — how long a lookup "should" take
+    /// — held by the side that does not do the work. That number was three
+    /// seconds while the daemon was allowed ten per vendor call and spent up to
+    /// two calls on a cold lookup, so a name that resolved correctly in 4.4
+    /// seconds reached a caller that had already given up and degraded.
+    ///
+    /// Sent every [`crate::daemon::HEARTBEAT`] while a resolve is in flight, so
+    /// the client's deadline can be on SILENCE rather than on completion. That
+    /// is HTTP/2's answer too, and gRPC states the same split: its keepalive
+    /// timeout is "the timeout in milliseconds for a PING frame to be
+    /// acknowledged", never a bound on how long the call may take
+    /// (<https://grpc.io/docs/guides/keepalive/>).
+    ///
+    /// It carries nothing. An elapsed time or a progress fraction would be a
+    /// second thing to keep true, and no client decision needs one: the frame's
+    /// arrival is the whole message.
+    Working,
 }
 
 /// The reply as it appears on the wire, minus the value.
@@ -183,6 +235,7 @@ impl Reply {
             Reply::Denied(_) => "denied",
             Reply::Failed(_) => "failed",
             Reply::Info { .. } => "info",
+            Reply::Working => "working",
         }
     }
 
@@ -199,7 +252,7 @@ impl Reply {
             Reply::Value(secret) => wire.value = Some(secret.expose().to_owned()),
             Reply::Denied(reason) | Reply::Failed(reason) => wire.reason = Some(reason.clone()),
             Reply::Info { names } => wire.names.clone_from(names),
-            Reply::Absent => {}
+            Reply::Absent | Reply::Working => {}
         }
         let result = serde_json::to_vec(&wire).map_err(io::Error::other);
         // The plaintext copy this function made is scrubbed whatever happened,
@@ -238,6 +291,7 @@ impl Reply {
             "info" => Reply::Info {
                 names: std::mem::take(&mut wire.names),
             },
+            "working" => Reply::Working,
             other => {
                 return Err(ProtocolError::Malformed(format!(
                     "unknown status `{other}`"
@@ -257,6 +311,15 @@ pub enum ProtocolError {
     Version(u32),
     /// A frame exceeded [`MAX_FRAME_BYTES`] or the connection ended mid-frame.
     Framing(String),
+    /// The read deadline on this socket passed with the peer saying nothing.
+    ///
+    /// Kept apart from [`ProtocolError::Framing`] because the two send a reader
+    /// to opposite places. A framing error means the bytes were wrong and the
+    /// bug is in one of the two builds; this means there were no bytes yet, and
+    /// the question is whether the peer is slow or gone. Folded together, a
+    /// deadline arrived as `framing error: Resource temporarily unavailable` —
+    /// the errno for "nothing to read", rendered as a corruption report.
+    Silent,
 }
 
 impl std::fmt::Display for ProtocolError {
@@ -268,8 +331,21 @@ impl std::fmt::Display for ProtocolError {
                 "peer speaks protocol version {v}, this build speaks {PROTOCOL_VERSION}"
             ),
             ProtocolError::Framing(detail) => write!(f, "framing error: {detail}"),
+            ProtocolError::Silent => f.write_str("the peer said nothing before the deadline"),
         }
     }
+}
+
+/// Whether an io error is a read deadline passing rather than a broken stream.
+///
+/// Both kinds, because `std` does not promise which one a platform uses:
+/// `UnixStream::set_read_timeout` documents that Unix typically answers
+/// `WouldBlock` (`EAGAIN`) and that other platforms may answer `TimedOut`.
+fn is_deadline(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+    )
 }
 
 impl std::error::Error for ProtocolError {}
@@ -285,6 +361,7 @@ pub fn read_frame<R: BufRead>(reader: &mut R) -> Result<Option<Vec<u8>>, Protoco
         let available = match reader.fill_buf() {
             Ok(buf) => buf,
             Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) if is_deadline(&error) => return Err(ProtocolError::Silent),
             Err(error) => return Err(ProtocolError::Framing(error.to_string())),
         };
         if available.is_empty() {
@@ -375,6 +452,29 @@ mod tests {
             Reply::Denied(reason) => assert_eq!(reason, "unknown-image"),
             other => panic!("expected a denial, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_heartbeat_round_trips_and_carries_nothing() {
+        let frame = Reply::Working.encode().expect("encode");
+        assert!(matches!(
+            Reply::decode(&frame[..frame.len() - 1]).expect("decode"),
+            Reply::Working
+        ));
+        let rendered = String::from_utf8_lossy(&frame).into_owned();
+        assert!(!rendered.contains("value"), "{rendered}");
+        assert!(!rendered.contains("reason"), "{rendered}");
+    }
+
+    #[test]
+    fn a_request_from_a_build_that_predates_heartbeats_asks_for_none() {
+        // The version number is unchanged on purpose, so a client installed
+        // before this field existed still talks to a daemon that has it. What
+        // stops that pair breaking is this default: no field means no
+        // heartbeats, which is exactly the exchange that client can read.
+        let raw = br#"{"v":1,"op":"resolve","name":"DECOY"}"#;
+        let request = Request::decode(raw).expect("decode");
+        assert!(!request.progress);
     }
 
     #[test]

@@ -75,6 +75,10 @@ impl DaemonStore {
             ClientError::Unreachable(_) | ClientError::Timeout(_) => {
                 self.unavailable(error.to_string())
             }
+            // The daemon answered every heartbeat and never finished, so it is
+            // there — but nothing it holds is reachable, which is what
+            // `Unavailable` means to `doctor`.
+            ClientError::Overran(_) => self.unavailable(error.to_string()),
             ClientError::Transport(_) | ClientError::Protocol(_) => self.backend(error.to_string()),
         }
     }
@@ -96,6 +100,10 @@ impl Store for DaemonStore {
             Ok(Reply::Info { .. }) => {
                 Err(self.backend("the daemon answered a resolve with an info reply"))
             }
+            // The client consumes heartbeats and returns the frame after them,
+            // so one arriving here is a client that stopped doing that.
+            Ok(Reply::Working) => Err(self
+                .backend("the daemon's heartbeat reached the store instead of being waited out")),
             Err(error) => Err(self.transport_error(&error)),
         }
     }
