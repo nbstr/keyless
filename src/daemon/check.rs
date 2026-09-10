@@ -88,7 +88,7 @@ pub fn report(
     // below asks whether the vendor accepts it.
     sound &= credential::report(config, out)?;
 
-    for store in config.registry().stores() {
+    for store in config.registry(None).stores() {
         match store.health() {
             Ok(()) => writeln!(out, "store    {} ok", store.id())?,
             Err(error) => {

@@ -763,9 +763,14 @@ pub const DEFAULT_TIMEOUT_MS: u64 = 10_000;
 /// listing with no expiry means an item trashed after startup keeps resolving
 /// until somebody restarts it.
 ///
-/// Sixty seconds is also what [`crate::daemon`] gives its own resolved-value
-/// cache, so the two staleness windows a name can sit behind are one number
-/// rather than two that drift apart.
+/// Sixty seconds is also the freshness window [`crate::daemon`] gives its own
+/// resolved-value cache, and the two STACK rather than overlapping: a value is
+/// served for its own window, and the listing that found the item was itself
+/// reused for up to this long before that. So the age of the newest listing a
+/// trashed item can still be missing from is the sum, and the daemon's stale
+/// window sits on top of it again while a store cannot answer. Each window is
+/// bounded and none of them is the whole bound — see
+/// `crate::daemon::config::DaemonConfig::stale`.
 ///
 /// `pub(crate)` because the 1Password adapter is hosted by the daemon too, and
 /// its config there must default the same window a session does.

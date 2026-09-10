@@ -169,7 +169,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use serde::Deserialize;
@@ -1786,6 +1786,177 @@ impl Routing {
     }
 }
 
+/// Words in a vendor failure that mean the request never reached Proton's
+/// service, or lost it before an answer came back.
+///
+/// The first two are `pass-cli`'s own, observed verbatim in the daemon's log on
+/// 2026-09-09 during a network outage: `failed to connect to host: error
+/// resolving destination: unknown error errno=None`. The rest are this
+/// platform's `strerror` text, read from libc rather than recalled, for
+/// `ECONNREFUSED`, `ENETUNREACH`, `EHOSTUNREACH`, `ECONNRESET`, `ETIMEDOUT` and
+/// `ECONNABORTED` — which the vendor passes through as `std` renders an
+/// `io::Error`, `<strerror> (os error <n>)`.
+///
+/// A connection lost mid-command belongs here too: nothing came back, so
+/// nothing was decided.
+const UNREACHABLE: &[&str] = &[
+    "failed to connect to host",
+    "error resolving destination",
+    "connection refused",
+    "network is unreachable",
+    "no route to host",
+    "connection reset by peer",
+    "operation timed out",
+    "software caused connection abort",
+];
+
+/// Did a vendor failure happen because nothing reached the service?
+///
+/// # Why this is an allowlist, and why it must stay one
+///
+/// The two readings of a vendor failure are not symmetric, and the daemon's
+/// cache is what makes the asymmetry expensive. A verdict read as transport
+/// means a value the account has disowned keeps being served for the whole
+/// stale window. Transport read as a verdict costs one eviction and a cold
+/// lookup — today's behaviour, on a path that already works.
+///
+/// So the recognised set is the measured phrases and nothing else, and every
+/// sentence outside it is a verdict. A new phrase joins the list only after it
+/// has been seen, which is the direction the `Active` filter takes too.
+#[must_use]
+pub fn reached_no_service(said: &str) -> bool {
+    let lowered = said.to_ascii_lowercase();
+    UNREACHABLE.iter().any(|words| lowered.contains(words))
+}
+
+/// Holds vendor reads out of the session directory while the session in it is
+/// being replaced.
+///
+/// # The gap this closes
+///
+/// A renewal is a logout followed by a login (`crate::daemon::session`), and
+/// between them the directory holds no session at all. A read landing in that
+/// gap gets the vendor's own "not authenticated" — a sentence about the
+/// DAEMON's login that says nothing about the item, and that a caller cannot
+/// tell from an account that has revoked its token.
+///
+/// # Why a hand-rolled gate rather than an `RwLock`
+///
+/// The shape is exactly a reader-writer lock, and `std`'s is the wrong one for
+/// two reasons. A read has to be able to give up — it waits at most its own
+/// per-call ceiling and then reports the store unavailable — and `std` offers
+/// no timed acquire. And a stream of reads must not starve the replace, which
+/// `std::sync::RwLock` does not promise: this gate closes first and drains
+/// second, so a read arriving after `replace` waits behind it.
+///
+/// The drain needs no bound of its own. A pass spans one vendor child and the
+/// capture around it is bounded by `timeout_ms`, so the longest a replace waits
+/// is one ceiling — a number the operator already set, rather than a second one
+/// invented here.
+#[derive(Default)]
+pub struct SessionGate {
+    state: Mutex<GateState>,
+    changed: Condvar,
+}
+
+#[derive(Default)]
+struct GateState {
+    /// A replace is holding the gate closed.
+    closed: bool,
+    /// Vendor children that entered before it closed and have not finished.
+    passes: usize,
+}
+
+/// One vendor child's permission to read the session directory.
+///
+/// Dropping it releases the pass, on the ordinary path and on an unwinding
+/// panic alike — which is what stops a replace waiting for a child that has
+/// already gone.
+pub struct Pass<'gate> {
+    gate: &'gate SessionGate,
+}
+
+impl Drop for Pass<'_> {
+    fn drop(&mut self) {
+        let mut state = self.gate.lock();
+        state.passes = state.passes.saturating_sub(1);
+        drop(state);
+        self.gate.changed.notify_all();
+    }
+}
+
+/// A replace in progress. Dropping it reopens the gate.
+pub struct Replacing<'gate> {
+    gate: &'gate SessionGate,
+}
+
+impl Drop for Replacing<'_> {
+    fn drop(&mut self) {
+        let mut state = self.gate.lock();
+        state.closed = false;
+        drop(state);
+        self.gate.changed.notify_all();
+    }
+}
+
+/// The gate was still closed when a read ran out of patience.
+#[derive(Debug)]
+pub struct GateClosed;
+
+impl SessionGate {
+    /// Wait for the gate, for at most `deadline`.
+    ///
+    /// # Errors
+    ///
+    /// A replace still holds the gate when `deadline` passes.
+    pub fn enter(&self, deadline: Duration) -> Result<Pass<'_>, GateClosed> {
+        let until = Instant::now() + deadline;
+        let mut state = self.lock();
+        while state.closed {
+            let Some(left) = until.checked_duration_since(Instant::now()) else {
+                return Err(GateClosed);
+            };
+            let (guard, timeout) = self
+                .changed
+                .wait_timeout(state, left)
+                .unwrap_or_else(PoisonError::into_inner);
+            state = guard;
+            if timeout.timed_out() && state.closed {
+                return Err(GateClosed);
+            }
+        }
+        state.passes += 1;
+        Ok(Pass { gate: self })
+    }
+
+    /// Close the gate and wait for the reads already running to finish.
+    ///
+    /// Reopens when the returned guard drops — after a failed replace and after
+    /// a panic, because a gate left closed by a failure would turn one bad
+    /// login into an outage on every name.
+    #[must_use]
+    pub fn replace(&self) -> Replacing<'_> {
+        let mut state = self.lock();
+        state.closed = true;
+        while state.passes > 0 {
+            state = self
+                .changed
+                .wait(state)
+                .unwrap_or_else(PoisonError::into_inner);
+        }
+        drop(state);
+        Replacing { gate: self }
+    }
+
+    /// A poisoned gate is recovered rather than propagated, for the reason the
+    /// listing cache is: the state behind it is two counters with no invariant
+    /// a panic could break, and refusing to serve after an unrelated panic
+    /// would degrade every name for no gain.
+    fn lock(&self) -> std::sync::MutexGuard<'_, GateState> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
 /// Reads one Proton Pass item at a time through `pass-cli run`.
 pub struct ProtonStore {
     binary: PathBuf,
@@ -1807,6 +1978,10 @@ pub struct ProtonStore {
     routing: Routing,
     /// How long a listing may be reused. See [`ProtonStore::cached_items`].
     listing_ttl: Duration,
+    /// Held across each vendor child so a session replace does not land in the
+    /// middle of one. `None` wherever nothing replaces the session — a
+    /// `keyless` session inherits one and never touches it. See [`SessionGate`].
+    session_gate: Option<Arc<SessionGate>>,
     /// vault name -> that vault's items, until they expire.
     ///
     /// In memory and nowhere else. A cache on disk that the client can read is
@@ -1902,6 +2077,7 @@ impl ProtonStore {
             routing,
             listing_ttl: bounded_listing_ttl(crate::config::default_listing_ttl_ms()),
             listings: Mutex::new(BTreeMap::new()),
+            session_gate: None,
         }
     }
 
@@ -1990,6 +2166,49 @@ impl ProtonStore {
     pub fn with_listing_ttl(mut self, listing_ttl_ms: u64) -> Self {
         self.listing_ttl = bounded_listing_ttl(listing_ttl_ms);
         self
+    }
+
+    /// Share a [`SessionGate`] with whatever replaces this session.
+    ///
+    /// The gate is the caller's to build and to hand to both sides, because the
+    /// side that replaces the session is the daemon and this adapter must not
+    /// depend on it.
+    #[must_use]
+    pub fn with_session_gate(mut self, gate: Option<Arc<SessionGate>>) -> Self {
+        self.session_gate = gate;
+        self
+    }
+
+    /// Permission to run one vendor child, or the reason there is none.
+    ///
+    /// A read that waits out its whole ceiling at a closed gate reports the
+    /// store UNAVAILABLE rather than failed: a replace is this daemon's own
+    /// business and says nothing about the item, so a cached value stands and
+    /// the next read gets the session that replace was establishing.
+    fn enter_session(&self) -> Result<Option<Pass<'_>>, StoreError> {
+        let Some(gate) = self.session_gate.as_ref() else {
+            return Ok(None);
+        };
+        gate.enter(self.timeout).map(Some).map_err(|GateClosed| {
+            self.unavailable(format!(
+                "the Proton session was still being replaced after {} ms",
+                self.timeout.as_millis()
+            ))
+        })
+    }
+
+    /// What a vendor child's failure says about the item.
+    ///
+    /// [`StoreError::Unavailable`] where its own words name a transport
+    /// failure, because nothing was decided; [`StoreError::Backend`] otherwise,
+    /// which is the vendor answering about this name. The daemon's cache reads
+    /// the variant: a `Backend` evicts the value, an `Unavailable` keeps it.
+    fn vendor_failed(&self, detail: String, said: &str) -> StoreError {
+        if reached_no_service(said) {
+            self.unavailable(detail)
+        } else {
+            self.backend(detail)
+        }
     }
 
     /// The configured session directory, or the reason there will be no lookup.
@@ -2267,6 +2486,7 @@ impl ProtonStore {
         vault: &str,
         name: &str,
     ) -> Result<Vec<ItemRecord>, StoreError> {
+        let pass = self.enter_session()?;
         let captured = capture(
             self.list_command(
                 session_dir,
@@ -2278,16 +2498,15 @@ impl ProtonStore {
             self.timeout,
         )
         .map_err(|error| self.unreachable(&error))?;
+        drop(pass);
 
         if !captured.status.success() {
             // The vendor names the vault it could not find, which is a name
             // rather than a credential, so quoting its first line is safe and is
             // the only way "I typed the vault wrong" is distinguishable from "my
             // token expired".
-            return Err(self.backend(format!(
-                "cannot list vault `{vault}`: {}",
-                summarise(&captured.stderr)
-            )));
+            let said = summarise(&captured.stderr);
+            return Err(self.vendor_failed(format!("cannot list vault `{vault}`: {said}"), &said));
         }
 
         serde_json::from_slice::<ItemListing>(&captured.stdout)
@@ -2421,17 +2640,17 @@ impl ProtonStore {
 
     /// Every vault this identity can see.
     fn vaults(&self, session_dir: &Path) -> Result<Vec<String>, StoreError> {
+        let pass = self.enter_session()?;
         let captured = capture(
             self.vault_list_command(session_dir, &self.vendor_login()?, std::env::vars_os()),
             self.timeout,
         )
         .map_err(|error| self.unreachable(&error))?;
+        drop(pass);
 
         if !captured.status.success() {
-            return Err(self.backend(format!(
-                "cannot list vaults: {}",
-                summarise(&captured.stderr)
-            )));
+            let said = summarise(&captured.stderr);
+            return Err(self.vendor_failed(format!("cannot list vaults: {said}"), &said));
         }
 
         serde_json::from_slice::<VaultListing>(&captured.stdout)
@@ -2501,6 +2720,7 @@ impl Store for ProtonStore {
             self.unavailable(format!("cannot write a probe env file: {source}"))
         })?;
 
+        let pass = self.enter_session()?;
         let mut captured = capture(
             self.probe_command(
                 session_dir,
@@ -2512,9 +2732,11 @@ impl Store for ProtonStore {
             self.timeout,
         )
         .map_err(|error| self.unreachable(&error))?;
+        drop(pass);
 
         if !captured.status.success() {
-            return Err(self.backend(summarise(&captured.stderr)));
+            let said = summarise(&captured.stderr);
+            return Err(self.vendor_failed(said.clone(), &said));
         }
 
         let mut bytes = std::mem::take(&mut captured.stdout);
@@ -2592,11 +2814,13 @@ impl Store for ProtonStore {
             )));
         }
 
+        let pass = self.enter_session()?;
         let captured = capture(
             self.vault_list_command(session_dir, &self.vendor_login()?, std::env::vars_os()),
             self.timeout,
         )
         .map_err(|error| self.unreachable(&error))?;
+        drop(pass);
 
         if captured.status.success() {
             // Deliberately no forensics on the success path. An orphan temp file
@@ -2726,6 +2950,7 @@ impl Discover for ProtonStore {
             }
         };
 
+        let pass = self.enter_session()?;
         let captured = capture(
             self.view_command(
                 session_dir,
@@ -2736,15 +2961,14 @@ impl Discover for ProtonStore {
             self.timeout,
         )
         .map_err(|error| self.unreachable(&error))?;
+        drop(pass);
 
         if !captured.status.success() {
             // stderr only, as everywhere else in this crate. `item view` puts the
             // item's contents on stdout, so a message built from stdout would be
             // the leak this verb exists to avoid.
-            return Err(self.backend(format!(
-                "cannot inspect `{item}`: {}",
-                summarise(&captured.stderr)
-            )));
+            let said = summarise(&captured.stderr);
+            return Err(self.vendor_failed(format!("cannot inspect `{item}`: {said}"), &said));
         }
 
         // From here to the end of this function the plaintext is in this process.
@@ -2810,10 +3034,12 @@ mod tests {
         env_value, looks_concealed, resolve_executable,
     };
     use crate::config::Config;
+    use crate::error::StoreError;
     use crate::store::Store;
     use crate::store::discover::Discover;
     use std::ffi::{OsStr, OsString};
     use std::path::Path;
+    use std::sync::Arc;
     use std::time::Duration;
 
     /// The session directory these tests pretend was configured.
@@ -3979,5 +4205,172 @@ mod tests {
         assert!(resolve_executable(Path::new("/bin/sh")).is_some());
         assert!(resolve_executable(Path::new("/bin")).is_none());
         assert!(resolve_executable(Path::new("sh")).is_some());
+    }
+
+    /// A store built from parts, with no config behind it.
+    fn parts_store() -> ProtonStore {
+        let secrets: std::collections::BTreeMap<String, crate::config::SecretRoute> =
+            serde_json::from_str(SHARED_SECRETS).expect("valid secrets");
+        ProtonStore::new(
+            std::path::PathBuf::from("/nonexistent/pass-cli"),
+            std::path::PathBuf::from("/usr/bin/printenv"),
+            super::Routing::from_secrets(&secrets),
+            Reason::default(),
+        )
+    }
+
+    #[test]
+    fn a_vendor_that_never_reached_the_service_is_not_a_verdict_on_the_item() {
+        // Each sentence is the vendor's own or this platform's `strerror`, and
+        // each arrives inside a longer line, which is how it arrives in the log.
+        for phrase in [
+            "Error in personal access token login flow: failed to connect to host",
+            "error resolving destination: unknown error errno=None",
+            "Connection refused (os error 61)",
+            "Network is unreachable (os error 51)",
+            "No route to host (os error 65)",
+            "Connection reset by peer (os error 54)",
+            "Operation timed out (os error 60)",
+            "Software caused connection abort (os error 53)",
+        ] {
+            assert!(
+                super::reached_no_service(phrase),
+                "a transport failure was read as a verdict: {phrase}"
+            );
+        }
+
+        // The controls, and they are what the allowlist is for: each of these
+        // is the account answering ABOUT the item, so each has to evict a
+        // cached value rather than extend its life.
+        for verdict in [
+            "vault `company` holds no item titled `decoy`",
+            "the personal access token was refused",
+            "some sentence no release has ever printed",
+            "",
+        ] {
+            assert!(
+                !super::reached_no_service(verdict),
+                "a verdict was read as a transport failure: {verdict}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_error_variant_is_what_carries_that_distinction_to_the_cache() {
+        // The daemon's cache reads the VARIANT, never the sentence: an
+        // `Unavailable` keeps a value alive past its freshness window and a
+        // `Backend` evicts it. So the classification has to survive the trip
+        // through the store, not merely hold inside the predicate above.
+        let store = parts_store();
+
+        let silent = store.vendor_failed(
+            "cannot list vault `company`: failed to connect to host".to_owned(),
+            "failed to connect to host",
+        );
+        assert!(
+            matches!(silent, StoreError::Unavailable { .. }),
+            "a store that could not answer was reported as a verdict: {silent}"
+        );
+
+        let verdict = store.vendor_failed(
+            "cannot list vault `company`: no such vault".to_owned(),
+            "no such vault",
+        );
+        assert!(
+            matches!(verdict, StoreError::Backend { .. }),
+            "a vendor verdict was reported as a store that could not answer: {verdict}"
+        );
+    }
+
+    #[test]
+    fn a_store_with_no_gate_reads_without_waiting_for_one() {
+        // The session side has no renewal loop, so it has no gate — and a gate
+        // that is absent must not become a deadline every read pays.
+        let store = parts_store();
+        assert!(
+            store
+                .enter_session()
+                .expect("no gate is not a refusal")
+                .is_none(),
+            "a store with no gate handed out a pass"
+        );
+    }
+
+    #[test]
+    fn a_read_at_a_closed_gate_proceeds_once_the_replace_finishes() {
+        let gate = Arc::new(super::SessionGate::default());
+        let replacing = gate.replace();
+
+        let waiter = Arc::clone(&gate);
+        let read =
+            std::thread::spawn(move || waiter.enter(Duration::from_secs(5)).map(drop).is_ok());
+
+        // Long enough that the reader is certainly parked at the gate, and far
+        // short of its own five-second ceiling.
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(!read.is_finished(), "a read started during a replace");
+
+        drop(replacing);
+        assert!(
+            read.join().expect("the reader thread panicked"),
+            "a read did not proceed after the replace finished"
+        );
+    }
+
+    #[test]
+    fn a_read_that_waits_out_its_ceiling_says_the_session_is_being_replaced() {
+        let store = parts_store().with_timeout(50);
+        let gate = Arc::new(super::SessionGate::default());
+        let store = store.with_session_gate(Some(Arc::clone(&gate)));
+        let _replacing = gate.replace();
+
+        let Err(error) = store.enter_session() else {
+            panic!("a closed gate must refuse a read that waits it out");
+        };
+        assert!(
+            matches!(error, StoreError::Unavailable { .. }),
+            "a replace was reported as a verdict on the item: {error}"
+        );
+        assert!(
+            error.to_string().contains("being replaced"),
+            "the refusal does not name the replace: {error}"
+        );
+    }
+
+    #[test]
+    fn a_replace_waits_for_a_read_already_running() {
+        let gate = Arc::new(super::SessionGate::default());
+        let pass = gate.enter(Duration::from_secs(5)).expect("an open gate");
+
+        let closer = Arc::clone(&gate);
+        let replace = std::thread::spawn(move || drop(closer.replace()));
+
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(
+            !replace.is_finished(),
+            "a replace started while a vendor child was still reading the session"
+        );
+
+        drop(pass);
+        replace.join().expect("the replace thread panicked");
+    }
+
+    #[test]
+    fn a_panicking_replace_still_reopens_the_gate() {
+        // A gate left closed by a failed login would turn one bad renewal into
+        // an outage on every name, so the reopen is a `Drop` rather than a line
+        // at the end of the happy path.
+        let gate = Arc::new(super::SessionGate::default());
+        let closer = Arc::clone(&gate);
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _replacing = closer.replace();
+            panic!("the login blew up");
+        }));
+        assert!(panicked.is_err(), "the test's own panic did not happen");
+
+        assert!(
+            gate.enter(Duration::from_millis(50)).is_ok(),
+            "the gate stayed closed after the replace panicked"
+        );
     }
 }
