@@ -34,13 +34,17 @@
 mod support;
 
 use std::path::Path;
+use std::time::{Duration, Instant};
 
 use keyless::daemon::config::DaemonConfig;
+use keyless::ipc::client::{Client, ClientError};
+use keyless::ipc::protocol::{Reply, Request};
 use keyless::store::{self, Invocation, Resolution};
 
 use support::{
-    Backend, Listing, PROTON_DECOY, client_config, policy_allowing_self, scratch,
-    short_socket_path, start_daemon, stub_pass_cli_listing, write_secrets,
+    Backend, Listing, NextCall, PROTON_DECOY, client_config, policy_allowing_self, scratch,
+    set_next_call, short_socket_path, start_daemon, stub_pass_cli_listing, vendor_call_count,
+    vendor_decoy, write_secrets,
 };
 
 /// A name the FILE store answers, so the assertion is about another store.
@@ -882,6 +886,482 @@ fn no_client_can_name_a_vault_the_daemons_config_did_not() {
         support::recorded_lines(&vendor_argv(&dir))
     );
     assert!(!reason.contains(PROTON_DECOY), "{reason}");
+
+    drop(running);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ---------------------------------------------------------------------------
+// The warm cache: what a slow, silent or disowning vendor does to a value the
+// daemon is already holding.
+//
+// # Why these are here rather than beside the resolver
+//
+// `src/daemon/resolver.rs` already drives every one of these transitions
+// against a scripted `Store`, and that store returns whichever `StoreError`
+// variant the case asked for. So the resolver's cases assume the classification
+// they are testing the consequences of: they say what a `Backend` error does
+// and what an `Unavailable` error does, and nothing there fails if the Proton
+// adapter starts producing the other one.
+//
+// That classification is `reached_no_service` plus `vendor_failed` in
+// `src/store/proton.rs`, and its input is a SENTENCE a vendor process printed
+// on stderr. The cases below are the only ones that hand it a real sentence
+// from a real child of a real daemon and read the result at the client's own
+// seam — which is where the cost lands: a verdict read as transport keeps
+// serving a credential the account has disowned.
+//
+// # Why nothing below is timed
+//
+// The stand-in hands out a different decoy on every call, so "which value came
+// back" answers "was the store asked" outright. Where a delay is unavoidable it
+// is several times the window it has to lose to, and it is a SLEEP — which can
+// only ever overshoot, so a loaded machine pushes every one of these further
+// into the case being true rather than out of it.
+// ---------------------------------------------------------------------------
+
+/// A second name at the same address as [`DECLARED`].
+///
+/// For the one case that needs two lookups running at once: single-flight
+/// coalesces per name, so two reads of one name would be one vendor call and
+/// the second read would prove nothing about a cold one.
+const DECLARED_AGAIN: &str = "FIXTURE_DECLARED_TOO";
+
+/// The freshness window for the cases that have to go PAST it.
+///
+/// One second, which is the smallest there is — `cache_ttl_seconds` is whole
+/// seconds. Everything below sleeps [`PAST_FRESHNESS`] rather than 1 001 ms so
+/// that a loaded machine lands further past the window rather than short of it.
+const FRESHNESS_SECONDS: u64 = 1;
+
+/// The freshness window for the case that has to stay INSIDE it.
+///
+/// A minute, and generous on purpose: the case asserts that a second read costs
+/// no vendor call, so the window has to be wide enough that no amount of load
+/// can push the second read out of it and turn a correct daemon red.
+const GENEROUS_FRESHNESS_SECONDS: u64 = 60;
+
+/// How long a value may still be served once it is past freshness.
+///
+/// A minute, so no case below reaches the far edge of it and none of them is
+/// accidentally measuring the sweep.
+const STALE_SECONDS: u64 = 60;
+
+/// Comfortably past [`FRESHNESS_SECONDS`].
+const PAST_FRESHNESS: Duration = Duration::from_millis(1_200);
+
+/// How long a vendor takes when it has to lose a race against the resolver's
+/// one-second refresh grace.
+///
+/// Five times that grace. The margin is not politeness: the reader's grace
+/// expires on a timed wait, and a machine loaded enough to wake that thread
+/// four seconds late would be the only way this stand-in answers in time. A
+/// sleep cannot finish early, so nothing can shrink the gap from the other end.
+const SLOWER_THAN_THE_GRACE: Duration = Duration::from_secs(5);
+
+/// How long a vendor takes when it has to outlast the CLIENT's silence
+/// deadline.
+///
+/// Three times [`SILENCE_MS`], for the same reason and in the same direction.
+const SLOWER_THAN_THE_SILENCE: Duration = Duration::from_secs(3);
+
+/// How long the client will hear nothing at all before it gives up.
+///
+/// The SUBJECT of the cold-read case rather than a ceiling on it, which is why
+/// it is small where the rest of this suite is generous: the case is about a
+/// lookup that outlives it.
+const SILENCE_MS: u64 = 1_000;
+
+/// The longest any poll below waits before reporting what never happened.
+///
+/// It bounds a FAILURE and nothing else — every case here converges in seconds
+/// — so being generous costs a passing run nothing and buys a loaded machine
+/// all the room it needs.
+const NEVER_HAPPENED: Duration = Duration::from_secs(20);
+
+/// What `pass-cli` printed while the network was gone.
+///
+/// Verbatim, measured 2026-09-09 in the daemon's own log and quoted in the
+/// adapter's `UNREACHABLE` list. Quoted here rather than approximated: the
+/// adapter matches on these words, so a fixture that paraphrased them would be
+/// proving the match against a sentence no release has ever printed.
+const TRANSPORT_FAILURE: &str =
+    "failed to connect to host: error resolving destination: unknown error errno=None";
+
+/// Enough of it to recognise in a degraded run's reason.
+const TRANSPORT_FRAGMENT: &str = "failed to connect to host";
+
+/// The vendor answering about the ITEM rather than about its own reach.
+///
+/// What makes this a verdict is that it is OUTSIDE the adapter's allowlist, not
+/// its wording — the allowlist holds the measured transport phrases and every
+/// other sentence is the account speaking about the name. The wording of the
+/// allowlist itself is pinned by that adapter's own unit tests; all a fixture
+/// here has to be is outside it.
+const ITEM_VERDICT: &str = "no item titled decoy is readable in vault company";
+
+/// The same daemon as [`daemon_config_with_proton`], with its cache turned on.
+///
+/// The fixture next door pins `cache_ttl_seconds` at zero because every case
+/// above it is about a vendor process that must not be created, and a cache
+/// would answer some of those reads without asking anything. These cases are
+/// about the cache itself, so they say what they want.
+///
+/// Set on the parsed struct rather than in the JSON: both keys are read from
+/// JSON by the daemon's own config tests, and what these cases need is the
+/// window the daemon runs with, not a second proof that the key is spelled
+/// right.
+fn daemon_config_with_a_warm_cache(
+    dir: &Path,
+    vendor: &Path,
+    freshness_seconds: u64,
+    stale_seconds: u64,
+) -> DaemonConfig {
+    let mut config = daemon_config_with_proton(dir, vendor);
+    config.cache_ttl_seconds = freshness_seconds;
+    config.cache_stale_seconds = stale_seconds;
+    config
+}
+
+/// The value a name resolved to, or a panic naming why there was none.
+///
+/// The reason is safe to print: every refusal this daemon produces is built
+/// from a store's own error text, and the cases above this section are what
+/// hold that down.
+fn value_from(registry: &store::Registry, name: &str) -> String {
+    match registry.resolve(name) {
+        Resolution::Found { secret, store } => {
+            assert_eq!(
+                store, "daemon",
+                "the value came from the session's own side"
+            );
+            secret.expose().to_owned()
+        }
+        other => panic!("`{name}` did not resolve: {}", other.reason()),
+    }
+}
+
+/// Wait until the stand-in vendor has been asked for a value `times` over.
+///
+/// The tally is appended when a call STARTS, so this waits for a spawn rather
+/// than for an answer — which is what a case wants before it changes what the
+/// next call will do.
+fn until_the_vendor_has_been_asked(dir: &Path, times: usize) {
+    let deadline = Instant::now() + NEVER_HAPPENED;
+    while Instant::now() < deadline {
+        if vendor_call_count(dir) >= times {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    panic!(
+        "the vendor was asked {} time(s), never {times}",
+        vendor_call_count(dir)
+    );
+}
+
+/// Read `name` until the answer stops being `held`, and hand back the new one.
+///
+/// A poll rather than a sleep of the right length: what it is waiting for is a
+/// vendor child finishing and a worker thread publishing what it fetched, and
+/// the only sleep long enough for that on every machine is one far longer than
+/// it takes on this one. A daemon that never refreshes fails this just as
+/// surely, at [`NEVER_HAPPENED`].
+fn until_the_value_stops_being(registry: &store::Registry, name: &str, held: &str) -> String {
+    let deadline = Instant::now() + NEVER_HAPPENED;
+    while Instant::now() < deadline {
+        let answer = value_from(registry, name);
+        if answer != held {
+            return answer;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    panic!("`{name}` was still being answered from the value it started with");
+}
+
+/// Read `name` until it degrades, and hand back the reason it gave.
+fn until_the_read_degrades(registry: &store::Registry, name: &str) -> String {
+    let deadline = Instant::now() + NEVER_HAPPENED;
+    while Instant::now() < deadline {
+        match registry.resolve(name) {
+            Resolution::Found { .. } => std::thread::sleep(Duration::from_millis(50)),
+            other => return other.reason(),
+        }
+    }
+    panic!("`{name}` never stopped resolving, so nothing was ever evicted");
+}
+
+#[test]
+fn two_reads_inside_the_freshness_window_cost_one_vendor_probe() {
+    // CONTROL — the change that makes this fail: `cache_ttl_seconds: 0`, which
+    // is what the fixture next door uses. The second read then reaches the
+    // vendor, comes back as the SECOND decoy, and both assertions below break.
+    //
+    // Nothing here is timed. The stand-in hands out a different value on every
+    // call, so a second read answered by a vendor process is visible in the
+    // string it returned and does not have to be inferred from how long it
+    // took.
+    let dir = scratch("daemon-proton-warm-twice");
+    let vendor = stub_pass_cli_listing(&dir, &Backend::Controlled, &Listing::Json(LISTING));
+    // No stale window: this case is about freshness, and a stale window would
+    // give a second read a second route to an answer.
+    let config = daemon_config_with_a_warm_cache(&dir, &vendor, GENEROUS_FRESHNESS_SECONDS, 0);
+    let running = start_daemon(&config, policy_allowing_self());
+
+    let client = client_config(running.socket(), 3_000);
+    let registry = store::build(&client, &Invocation::default()).registry;
+
+    // What the stand-in answers with on its first call, by the FIXTURE's own
+    // definition. Both reads are compared against this rather than against each
+    // other: two answers from one daemon agree whatever that daemon does, which
+    // is the shape `tests/oracle_independence.rs` refuses.
+    let first_answer = vendor_decoy(1);
+
+    assert_eq!(
+        value_from(&registry, DECLARED),
+        first_answer,
+        "the cold read did not come from the vendor, so nothing below it is about a cache"
+    );
+    assert_eq!(
+        value_from(&registry, DECLARED),
+        first_answer,
+        "the second read was answered by a vendor process"
+    );
+    assert_eq!(
+        vendor_call_count(&dir),
+        1,
+        "a name read twice inside its freshness window cost more than one vendor process"
+    );
+
+    drop(running);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_vendor_slower_than_the_grace_leaves_the_held_value_in_front_of_the_caller() {
+    // The property the whole mechanism exists for, asked of a real vendor
+    // process: past freshness, against a store that takes longer than a caller
+    // should wait, the caller gets the value the daemon already had.
+    //
+    // CONTROL — the change that makes this fail: a daemon that waits for the
+    // refresh instead of serving what it holds. It would hand back the SECOND
+    // decoy, five seconds later, and the assertion on `served` breaks. A daemon
+    // that serves the held value and never refreshes fails the second half at
+    // `NEVER_HAPPENED`.
+    let dir = scratch("daemon-proton-warm-slow");
+    let vendor = stub_pass_cli_listing(&dir, &Backend::Controlled, &Listing::Json(LISTING));
+    let config = daemon_config_with_a_warm_cache(&dir, &vendor, FRESHNESS_SECONDS, STALE_SECONDS);
+    let running = start_daemon(&config, policy_allowing_self());
+
+    let client = client_config(running.socket(), 3_000);
+    let registry = store::build(&client, &Invocation::default()).registry;
+
+    let held = vendor_decoy(1);
+    assert_eq!(value_from(&registry, DECLARED), held);
+
+    set_next_call(&dir, &NextCall::Slow(SLOWER_THAN_THE_GRACE));
+    std::thread::sleep(PAST_FRESHNESS);
+
+    assert_eq!(
+        value_from(&registry, DECLARED),
+        held,
+        "the caller waited on the vendor instead of being handed the value the daemon held"
+    );
+
+    // The refresh was started, off this caller's request. Without this the case
+    // above would also pass against a daemon that serves a stale value for ever
+    // and asks nobody.
+    until_the_vendor_has_been_asked(&dir, 2);
+
+    // From here the stand-in answers at once, so the poll below converges as
+    // fast as the machine allows. The call already sleeping read its
+    // instruction when it started and still sleeps out its five seconds.
+    set_next_call(&dir, &NextCall::Answers);
+    let refreshed = until_the_value_stops_being(&registry, DECLARED, &held);
+
+    // Which call's decoy this is, is deliberately not asserted: a poll that
+    // lands in the wrong second starts a third call, and a third refresh is the
+    // same daemon behaving the same way. What is pinned is that the held value
+    // stopped being the answer, which no daemon without a refresh can produce.
+    assert_ne!(refreshed, vendor_decoy(1));
+    assert!(
+        vendor_call_count(&dir) >= 2,
+        "the value changed without a vendor process being asked for it"
+    );
+
+    drop(running);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_vendor_that_could_not_reach_the_service_leaves_the_value_being_served() {
+    // The expensive half of the classification. A transport failure says
+    // nothing about the item, so the value stands — and the discriminator is
+    // that while the vendor is refusing every call, the first decoy can only
+    // have come from the daemon's memory.
+    //
+    // CONTROL — three changes, each making this fail: dropping the phrase from
+    // the adapter's `UNREACHABLE` list, so the sentence is read as the account
+    // disowning the item; the adapter reporting a `Backend` error where it
+    // reports `Unavailable`; and the resolver evicting on a store that could
+    // not answer. Under any of them the reads below degrade instead of
+    // answering, because the vendor cannot supply a value any more.
+    let dir = scratch("daemon-proton-warm-unreachable");
+    let vendor = stub_pass_cli_listing(&dir, &Backend::Controlled, &Listing::Json(LISTING));
+    let config = daemon_config_with_a_warm_cache(&dir, &vendor, FRESHNESS_SECONDS, STALE_SECONDS);
+    let running = start_daemon(&config, policy_allowing_self());
+
+    let client = client_config(running.socket(), 3_000);
+    let registry = store::build(&client, &Invocation::default()).registry;
+
+    let held = vendor_decoy(1);
+    assert_eq!(value_from(&registry, DECLARED), held);
+
+    set_next_call(&dir, &NextCall::Fails(TRANSPORT_FAILURE));
+    std::thread::sleep(PAST_FRESHNESS);
+
+    assert_eq!(
+        value_from(&registry, DECLARED),
+        held,
+        "a vendor that never reached its service took the value with it"
+    );
+    until_the_vendor_has_been_asked(&dir, 2);
+
+    // And it is still there afterwards, which is the half a single read cannot
+    // show: the refresh has now failed, and the entry it failed on is what
+    // answers the next reader.
+    assert_eq!(
+        value_from(&registry, DECLARED),
+        held,
+        "the value survived the failing refresh and then did not survive the read after it"
+    );
+
+    drop(running);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_vendor_that_answers_about_the_item_evicts_the_value_and_the_next_read_degrades() {
+    // The other half, and the one that costs a credential if it is wrong: the
+    // account has spoken about this name, so what the daemon holds is worthless
+    // and serving it would hand out a credential its owner has disowned.
+    //
+    // The vendor is turned SILENT after the verdict, and that is what makes the
+    // eviction observable rather than assumed. A transport failure is the one
+    // shape that keeps a value alive — the case above this one is exactly that
+    // — so if the verdict had left the entry in place, every read below would
+    // be answered from it for the whole stale window. Degrading is therefore
+    // only possible if the entry is gone.
+    //
+    // CONTROL — the change that makes this fail: the resolver keeping a value
+    // when a store answers about it, or the adapter reporting this sentence as
+    // a transport failure. Either way the poll below never degrades and fails
+    // at `NEVER_HAPPENED`.
+    let dir = scratch("daemon-proton-warm-verdict");
+    let vendor = stub_pass_cli_listing(&dir, &Backend::Controlled, &Listing::Json(LISTING));
+    let config = daemon_config_with_a_warm_cache(&dir, &vendor, FRESHNESS_SECONDS, STALE_SECONDS);
+    let running = start_daemon(&config, policy_allowing_self());
+
+    let client = client_config(running.socket(), 3_000);
+    let registry = store::build(&client, &Invocation::default()).registry;
+
+    let held = vendor_decoy(1);
+    assert_eq!(value_from(&registry, DECLARED), held);
+
+    set_next_call(&dir, &NextCall::Fails(ITEM_VERDICT));
+    std::thread::sleep(PAST_FRESHNESS);
+    let _ = registry.resolve(DECLARED);
+    until_the_vendor_has_been_asked(&dir, 2);
+
+    set_next_call(&dir, &NextCall::Fails(TRANSPORT_FAILURE));
+    let reason = until_the_read_degrades(&registry, DECLARED);
+
+    // Which failure the degraded read carried, and it is load-bearing. A read
+    // that degraded on the VERDICT itself proves nothing about eviction: it
+    // would be the vendor's answer travelling to the caller with the entry
+    // still in place behind it. Only a read that reached the store and found it
+    // unreachable — the shape that keeps a value — says the entry was gone.
+    assert!(
+        reason.contains(TRANSPORT_FRAGMENT),
+        "the read degraded before the value's absence was what caused it: {reason}"
+    );
+    assert!(
+        !reason.contains(&held),
+        "the refusal carried the value it had just disowned"
+    );
+
+    drop(running);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_cold_read_slower_than_the_clients_own_deadline_still_reaches_the_caller() {
+    // The Proton adapter's own version of the outage the heartbeat closed. It
+    // is worth asking here as well as at `tests/daemon.rs`'s keychain stub,
+    // because a cold Proton lookup is TWO vendor children — the vault listing,
+    // then the read — so the latency a caller waits out is their sum, and that
+    // sum is what was measured overrunning a session's deadline.
+    //
+    // Both halves go to one daemon over one store and differ in one field, the
+    // way that case does. That pairing is the control: if the value arrives
+    // either way the deadline was never the thing under test, and if it arrives
+    // neither way the heartbeat is not what carries it.
+    //
+    // Two DIFFERENT names, because single-flight coalesces per name: one name
+    // read twice would be one vendor call, and the second read would be handed
+    // the first one's answer without ever having been slow.
+    let dir = scratch("daemon-proton-cold-and-slow");
+    let vendor = stub_pass_cli_listing(&dir, &Backend::Controlled, &Listing::Json(LISTING));
+    set_next_call(&dir, &NextCall::Slow(SLOWER_THAN_THE_SILENCE));
+    // The fixture's own `cache_ttl_seconds: 0`, deliberately: with nothing
+    // cached the second lookup pays the vendor's whole cost too, and cannot be
+    // answered out of the first one's success.
+    let mut config = daemon_config_with_proton(&dir, &vendor);
+    config.secrets.insert(
+        DECLARED_AGAIN.to_owned(),
+        serde_json::from_str(&format!(
+            r#"{{"store":"proton","vault":"{VAULT}","item":"{ITEM}","field":"password"}}"#
+        ))
+        .expect("a valid route"),
+    );
+    let running = start_daemon(&config, policy_allowing_self());
+
+    // ONE client for both requests, so the deadline in force is provably this
+    // one. Built through the two halves' shared object rather than through a
+    // config on each: a loud read that outran a deadline nobody in the case can
+    // see would pass just as well against a client that had quietly been given
+    // a longer one.
+    let silence = Duration::from_millis(SILENCE_MS);
+    let client = Client::new(running.socket().to_path_buf(), silence);
+
+    let mut asks_for_no_heartbeat = Request::resolve(DECLARED_AGAIN);
+    asks_for_no_heartbeat.progress = false;
+    match client.request(&asks_for_no_heartbeat) {
+        Err(ClientError::Timeout(after)) => assert_eq!(after, silence),
+        other => panic!("a daemon that says nothing must time out, got {other:?}"),
+    }
+
+    let began = Instant::now();
+    let answered = client.request(&Request::resolve(DECLARED));
+    let took = began.elapsed();
+
+    match answered {
+        // The SECOND decoy, so this read reached a vendor process of its own
+        // rather than being handed whatever the mute lookup left behind. The
+        // ordinal is settled: the mute lookup's child has been sleeping for a
+        // second by the time this request is made.
+        Ok(Reply::Value(secret)) => assert_eq!(
+            secret.expose(),
+            vendor_decoy(2),
+            "the value did not come from this lookup's own vendor process"
+        ),
+        other => panic!("a daemon that says it is working must be waited for, got {other:?}"),
+    }
+    assert!(
+        took > silence,
+        "the value came back inside the silence deadline, so nothing outran it and this \
+         proves nothing: {took:?}"
+    );
 
     drop(running);
     let _ = std::fs::remove_dir_all(&dir);
