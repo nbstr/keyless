@@ -461,6 +461,7 @@ CONFIG_JSON=$(cat <<JSON
   "socket": "$RUN_DIR/keylessd.sock",
   "audit": "$LOG_DIR/audit.jsonl",
   "cache_ttl_seconds": 60,
+  "cache_stale_seconds": 240,
   "idle_timeout_seconds": 15,
   "peer": {
     "allow_uids": [$TARGET_UID],

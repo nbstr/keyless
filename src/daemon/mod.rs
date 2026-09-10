@@ -67,7 +67,7 @@ use crate::secret::Secret;
 use crate::{NAME, State};
 
 use self::config::DaemonConfig;
-use self::resolver::{Outcome, Resolver};
+use self::resolver::{Outcome, Refresher, Resolver};
 
 /// Socket mode: owner and group may connect, nobody else.
 ///
@@ -149,7 +149,9 @@ impl Daemon {
             listener,
             socket: config.socket.to_path_buf(),
             policy: Arc::new(policy),
-            resolver: Arc::new(Resolver::new(config.registry(), config.ttl())),
+            resolver: Arc::new(
+                Resolver::new(config.registry(), config.ttl()).with_stale_window(config.stale()),
+            ),
             audit: Arc::new(
                 AuditLog::new(config.audit.to_path_buf())
                     .with_mode(crate::audit::MODE_GROUP_READABLE),
@@ -364,7 +366,7 @@ impl Connection {
         let outcome = if request.progress {
             self.resolve_aloud(stream, &request.name)
         } else {
-            self.resolver.resolve(&request.name)
+            self.resolver.resolve(&request.name).outcome
         };
 
         match outcome {
@@ -418,13 +420,13 @@ impl Connection {
         if thread::Builder::new()
             .name(format!("{NAME}d-lookup"))
             .spawn(move || {
-                let _ = sender.send(resolver.resolve(&asked));
+                let _ = sender.send(resolver.resolve(&asked).outcome);
             })
             .is_err()
         {
             // No thread to be had. Answering late is better than not answering,
             // and late is exactly what this daemon did before it could speak.
-            return self.resolver.resolve(name);
+            return self.resolver.resolve(name).outcome;
         }
 
         let mut heard = true;
@@ -523,6 +525,9 @@ pub struct Running {
     /// Held here rather than by `main` so its lifetime is the daemon's. See
     /// [`Running::spawn`].
     session: Option<self::session::Keeper>,
+    /// The refresh workers that keep recently read names warm. Held here for
+    /// the same reason: they are the daemon's, and dropping this stops them.
+    refresher: Option<Refresher>,
 }
 
 impl Running {
@@ -564,12 +569,14 @@ impl Running {
         let thread = thread::Builder::new()
             .name(format!("{NAME}d-accept"))
             .spawn(move || daemon.serve_until(&flag))?;
+        let refresher = Some(Resolver::start(&resolver));
         Ok(Running {
             stop,
             socket,
             resolver,
             thread: Some(thread),
             session,
+            refresher,
         })
     }
 
@@ -596,8 +603,11 @@ impl Drop for Running {
     fn drop(&mut self) {
         // The renewal loop first: it spawns vendor children, and stopping the
         // accept loop while one is in flight leaves the process waiting on a
-        // join for something nobody is stopping.
+        // join for something nobody is stopping. The refresh workers spawn the
+        // same children, so they stop on the same terms and for the same
+        // reason.
         drop(self.session.take());
+        drop(self.refresher.take());
         self.stop.store(true, Ordering::Relaxed);
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();

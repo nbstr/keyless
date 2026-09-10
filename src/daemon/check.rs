@@ -53,8 +53,10 @@ pub fn report(
     writeln!(out, "audit    {}", config.audit.display())?;
     writeln!(
         out,
-        "cache    {}s in memory, never on disk",
-        config.cache_ttl_seconds
+        "cache    {}s fresh in memory, then up to {}s more while a store cannot answer, \
+         never on disk",
+        config.ttl().as_secs(),
+        config.stale().as_secs()
     )?;
 
     let mut sound = true;
