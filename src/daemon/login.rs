@@ -476,6 +476,9 @@ pub enum Outcome {
     /// The account will not accept the token. One sentence for three causes —
     /// invalid, expired, deleted — and the vendor cannot be asked which.
     TokenRefused(String),
+    /// The login never reached the vendor's service, so nothing was decided
+    /// about the token at all.
+    Unreachable(String),
     /// Anything else, in the vendor's own words.
     Failed(String),
 }
@@ -489,6 +492,30 @@ const KEY_LOST: &str = "local encryption key not found";
 /// The vendor's own noun for a token it will not take.
 const REFUSED: &str = "personal access token";
 
+/// Words that mean the request never reached the vendor's service, or lost it
+/// before an answer came back.
+///
+/// The first two are `pass-cli`'s own, observed verbatim in the daemon's log on
+/// 2026-09-09 during a network outage: `failed to connect to host: error
+/// resolving destination: unknown error errno=None`. The rest are this
+/// platform's `strerror` text, read from libc rather than recalled, for
+/// `ECONNREFUSED`, `ENETUNREACH`, `EHOSTUNREACH`, `ECONNRESET`, `ETIMEDOUT` and
+/// `ECONNABORTED` — which the vendor passes through as `std` renders an
+/// `io::Error`, `<strerror> (os error <n>)`.
+///
+/// A connection lost mid-login belongs here too. It is not a verdict on the
+/// token for the same reason a connection never made is not: nothing came back.
+const UNREACHABLE: &[&str] = &[
+    "failed to connect to host",
+    "error resolving destination",
+    "connection refused",
+    "network is unreachable",
+    "no route to host",
+    "connection reset by peer",
+    "operation timed out",
+    "software caused connection abort",
+];
+
 /// Read the vendor's answer.
 ///
 /// # Why the TEXT decides before the exit code does
@@ -500,6 +527,16 @@ const REFUSED: &str = "personal access token";
 /// verb must never make wrongly — it is what decides whether a token gets
 /// written. So the words are read first, in both streams, and the status only
 /// decides between success and a failure nothing else recognised.
+///
+/// # Why a network failure is checked before a refused token
+///
+/// The vendor names its whole login flow after the token, so every line of a
+/// failure it reports carries [`REFUSED`] — including one that never left the
+/// machine: `Error in personal access token login flow … failed to connect to
+/// host: error resolving destination`. Tested for the noun alone, a laptop
+/// waking without a network was filed as an account that had refused its
+/// token, and the message sent its reader to the vendor's dashboard to inspect
+/// a token nobody had checked.
 #[must_use]
 pub fn classify(status: ExitStatus, said: &str) -> Outcome {
     let lowered = said.to_ascii_lowercase();
@@ -511,6 +548,9 @@ pub fn classify(status: ExitStatus, said: &str) -> Outcome {
     }
     if status.success() {
         return Outcome::LoggedIn;
+    }
+    if UNREACHABLE.iter().any(|words| lowered.contains(words)) {
+        return Outcome::Unreachable(said.trim().to_owned());
     }
     if lowered.contains(REFUSED) {
         return Outcome::TokenRefused(said.trim().to_owned());
@@ -806,6 +846,7 @@ pub fn establish(
         }
         Outcome::KeyLost(said) => return Err(key_lost(coordinates, &said)),
         Outcome::TokenRefused(said) => return Err(token_refused(coordinates, &said)),
+        Outcome::Unreachable(said) => return Err(unreachable(coordinates, &said)),
         Outcome::Failed(said) => {
             return Err(format!(
                 "the login into {} failed for a reason nothing here recognises, and nothing \
@@ -898,6 +939,25 @@ pub fn token_refused(coordinates: &Coordinates, said: &str) -> String {
          `{} check` would report its SHAPE as sound while every Proton name degraded",
         coordinates.credentials_file.display(),
         crate::DAEMON_NAME
+    )
+}
+
+/// What to tell an operator whose login never reached the vendor.
+///
+/// Says what was NOT learned as plainly as what failed: the token was never
+/// presented, so this is no evidence about it either way, and the fix is a
+/// connection rather than a new token.
+#[must_use]
+pub fn unreachable(coordinates: &Coordinates, said: &str) -> String {
+    format!(
+        "Proton Pass could not be reached from this machine, so the token was never checked: \
+         {said}\n\
+         \n\
+         This is the network — DNS, a VPN, a captive portal, a machine that has just woken — \
+         and says nothing about the token. Nothing was written to {}. A daemon with \
+         `session.auto_login` on keeps retrying on its own backoff, and a login typed by hand \
+         succeeds once the connection is back",
+        coordinates.credentials_file.display()
     )
 }
 
@@ -1222,6 +1282,35 @@ mod tests {
         ));
         assert!(matches!(
             classify(failed, "connection refused"),
+            Outcome::Unreachable(_)
+        ));
+        // Verbatim from the daemon's log during an outage. Every line names the
+        // token, and none of it is about the token.
+        assert!(matches!(
+            classify(
+                failed,
+                "Error: Error in personal access token login flow\n\nCaused by:\n    0: Error \
+                 creating personal access token session\n    1: Error requesting personal access \
+                 token session\n    2: failed to connect to host: error resolving destination: \
+                 unknown error errno=None\n    3: error resolving destination: unknown error \
+                 errno=None"
+            ),
+            Outcome::Unreachable(_)
+        ));
+        // A connection lost after the token was sent: still no answer, so
+        // still nothing learned about the token, although the flow's own
+        // lines name it throughout.
+        assert!(matches!(
+            classify(
+                failed,
+                "Error: Error in personal access token login flow\n\nCaused by:\n    0: Error \
+                 requesting personal access token session\n    1: Operation timed out (os \
+                 error 60)"
+            ),
+            Outcome::Unreachable(_)
+        ));
+        assert!(matches!(
+            classify(failed, "the login flow hit an error nothing names"),
             Outcome::Failed(_)
         ));
         assert_eq!(
