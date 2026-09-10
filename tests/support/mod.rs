@@ -855,6 +855,10 @@ pub fn daemon_config(dir: &Path) -> DaemonConfig {
         socket: short_socket_path(dir).into(),
         audit: dir.join("audit.jsonl").into(),
         cache_ttl_seconds: 60,
+        // No stale window in the fixtures: a test that wants one says so, and
+        // one that does not gets the pre-existing behaviour — a value is
+        // served for its freshness window and then fetched again.
+        cache_stale_seconds: 0,
         idle_timeout_seconds: 5,
         peer: PeerConfig::default(),
         stores: DaemonStores {

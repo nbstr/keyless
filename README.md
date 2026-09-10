@@ -1771,6 +1771,19 @@ live on the client's side of the boundary — a `get` verb with extra steps. Thi
 one never touches disk and dies with the daemon, so killing `keylessd` strictly
 reduces what is obtainable.
 
+**A recently read name is refreshed off the request path, and outlives its
+freshness window only while a store cannot answer.** `cache_ttl_seconds` — 60 by
+default — is how long a value is served without asking anyone. Past it the next
+reader hands the name to a refresh worker, waits **one second** for it, and takes
+the older value if the store is slower than that, for up to `cache_stale_seconds`
+— 240 by default — beyond freshness. That second window belongs to a store's
+*silence* alone: a store that answers replaces the value, and an answer that
+disowns it — no such item, a refused token — evicts it on the spot. Neither
+window may be configured past **15 minutes**, and `cache_ttl_seconds: 0` turns
+both off. So a vendor CLI that has gone slow costs a lookup a second rather than
+its whole latency, while a vendor that has revoked a credential still stops that
+credential dead on the first refresh that reaches it.
+
 **And there is no local fallback.** Enabling the daemon *disables* every local
 backend — keychain, Infisical, 1Password and Proton Pass alike — whatever each
 one's own flag says. It is enforced in `store::build`, not documented as a convention,

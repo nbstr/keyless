@@ -64,9 +64,21 @@ pub struct DaemonConfig {
     /// write; the installer is what makes that true.
     #[serde(default = "default_audit")]
     pub audit: ConfigPath,
-    /// How long a resolved value may be reused from memory.
+    /// How long a resolved value is served from memory without asking a store.
     #[serde(default = "default_ttl_seconds")]
     pub cache_ttl_seconds: u64,
+    /// How long past that a value may still be served, while its refresh runs
+    /// or after a refresh could not reach its store.
+    ///
+    /// Zero turns stale serving off and leaves the freshness window alone. A
+    /// zero `cache_ttl_seconds` turns both off, because a daemon told to cache
+    /// nothing has nothing to serve stale.
+    ///
+    /// This is the window a store's SILENCE opens. A store that answers ends
+    /// it either way: a value replaces the entry, and an answer that disowns it
+    /// — no such item, a refused token — evicts it.
+    #[serde(default = "default_stale_seconds")]
+    pub cache_stale_seconds: u64,
     /// How long a connection may sit idle before it is dropped.
     #[serde(default = "default_idle_seconds")]
     pub idle_timeout_seconds: u64,
@@ -110,6 +122,7 @@ impl Default for DaemonConfig {
             socket: default_socket(),
             audit: default_audit(),
             cache_ttl_seconds: default_ttl_seconds(),
+            cache_stale_seconds: default_stale_seconds(),
             idle_timeout_seconds: default_idle_seconds(),
             peer: PeerConfig::default(),
             stores: DaemonStores::default(),
@@ -718,6 +731,32 @@ const fn default_ttl_seconds() -> u64 {
     60
 }
 
+/// Four minutes past freshness, so the two windows together reach five.
+///
+/// The AWS Secrets Manager Agent's own default TTL is 300 seconds, and Vault
+/// Proxy's static-secret cache accepts a five-minute bound on how late a
+/// permission change takes effect. This daemon's window is narrower than
+/// either: it opens only while a store cannot answer.
+const fn default_stale_seconds() -> u64 {
+    240
+}
+
+/// The longest either cache window may be, whatever a config says.
+///
+/// Both windows bound how long a value the vendor has replaced can still be
+/// handed to a child, so neither is a number a config may set to a day. Fifteen
+/// minutes matches the listing cache's own ceiling.
+pub const MAX_CACHE_SECONDS: u64 = 900;
+
+/// A configured window in seconds, clamped to [`MAX_CACHE_SECONDS`].
+const fn bounded_cache_seconds(seconds: u64) -> u64 {
+    if seconds > MAX_CACHE_SECONDS {
+        MAX_CACHE_SECONDS
+    } else {
+        seconds
+    }
+}
+
 const fn default_idle_seconds() -> u64 {
     15
 }
@@ -779,10 +818,23 @@ impl DaemonConfig {
         })
     }
 
-    /// The cache TTL.
+    /// The freshness window: how long a value is served without asking.
     #[must_use]
     pub const fn ttl(&self) -> Duration {
-        Duration::from_secs(self.cache_ttl_seconds)
+        Duration::from_secs(bounded_cache_seconds(self.cache_ttl_seconds))
+    }
+
+    /// The stale window: how long past freshness a value may still be served
+    /// while its store cannot answer.
+    ///
+    /// Zero whenever caching itself is off, so one key turns the whole
+    /// mechanism off rather than leaving a second one to be remembered.
+    #[must_use]
+    pub const fn stale(&self) -> Duration {
+        if self.cache_ttl_seconds == 0 {
+            return Duration::ZERO;
+        }
+        Duration::from_secs(bounded_cache_seconds(self.cache_stale_seconds))
     }
 
     /// The per-connection idle timeout.
@@ -2235,6 +2287,38 @@ mod tests {
         // Counted, not tested for emptiness: `ELSEWHERE` says nothing about
         // Proton and must not be projected, and a `> 0` check cannot see that.
         assert_eq!(routing.declared(), 1);
+    }
+
+    #[test]
+    fn neither_cache_window_can_be_configured_past_the_ceiling() {
+        // Both windows bound how long a value the vendor has replaced can
+        // still reach a child, so neither is a number a config file may set to
+        // a day. A config is not a trusted input: it can be handed in with
+        // `--config`.
+        let config = parse(r#"{"cache_ttl_seconds": 86400, "cache_stale_seconds": 86400}"#);
+        assert_eq!(config.ttl().as_secs(), super::MAX_CACHE_SECONDS);
+        assert_eq!(config.stale().as_secs(), super::MAX_CACHE_SECONDS);
+    }
+
+    #[test]
+    fn caching_switched_off_leaves_no_stale_window_behind() {
+        // One key turns the whole mechanism off. A daemon told to cache
+        // nothing must not keep serving values for four minutes because a
+        // second key still holds its default.
+        let config = parse(r#"{"cache_ttl_seconds": 0}"#);
+        assert_eq!(config.ttl(), std::time::Duration::ZERO);
+        assert_eq!(
+            config.stale(),
+            std::time::Duration::ZERO,
+            "a zero freshness window left a stale window standing"
+        );
+    }
+
+    #[test]
+    fn a_config_that_names_neither_window_takes_both_defaults() {
+        let config = parse("{}");
+        assert_eq!(config.ttl().as_secs(), 60);
+        assert_eq!(config.stale().as_secs(), 240);
     }
 
     #[test]

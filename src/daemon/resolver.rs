@@ -37,11 +37,14 @@
 //! not pin every session into degraded mode for the whole TTL; the in-flight
 //! coalescing already stops a failure storm from becoming a request storm.
 
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::io::Write;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+use crate::error::StoreError;
 use crate::secret::Secret;
 use crate::store::{Registry, Resolution};
 
@@ -52,6 +55,45 @@ use crate::store::{Registry, Resolution};
 /// daemon's heap by naming secrets that do not exist — though only successes
 /// are cached, which already makes that hard.
 const MAX_CACHE_ENTRIES: usize = 256;
+
+/// How many refreshes may be in flight at once.
+///
+/// Two rather than one, so a single slow name does not hold the queue, and not
+/// more, because every refresh is a vendor process and the point of this whole
+/// mechanism is to ask the vendor no more often than expiry already did.
+const REFRESH_WORKERS: usize = 2;
+
+/// How long the first read past freshness waits for its own refresh before it
+/// is handed the older value.
+///
+/// A store that answers inside this keeps a rotated value's served age at
+/// roughly the freshness window, which is the bound this daemon had before
+/// stale serving existed. Past it the caller gets the older value rather than
+/// a vendor process's latency.
+const REFRESH_GRACE: Duration = Duration::from_secs(1);
+
+/// How long a name whose refresh failed transiently waits before another is
+/// started.
+///
+/// Mirrors the renewal loop's own floor: a store that is down must not be
+/// asked once per read while every reader is being served from memory anyway.
+const REFRESH_RETRY_FLOOR: Duration = Duration::from_secs(5);
+
+/// How often the workers drop entries nobody has read since they went stale.
+///
+/// Without it a value stays resident until something asks for it again, and
+/// residency is the one cost of holding plaintext in memory at all.
+const SWEEP_INTERVAL: Duration = Duration::from_secs(30);
+
+/// How long a worker's idle wait runs before it re-checks the stop flag.
+const WORKER_POLL: Duration = Duration::from_millis(250);
+
+/// How long shutdown waits for the refresh workers before it stops waiting.
+///
+/// The same bound and the same reasoning as the renewal loop's: a worker
+/// parked inside a vendor call cannot see the stop flag, and holding the
+/// process open for it is worse than leaving it to finish.
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 
 /// What resolving a name produced.
 ///
@@ -79,6 +121,59 @@ impl std::fmt::Debug for Outcome {
     }
 }
 
+/// Where the value a caller received came from.
+///
+/// Recorded rather than inferred, because "the daemon answered" and "a store
+/// answered" are different facts about the same reply, and only the daemon can
+/// tell them apart.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Source {
+    /// A store was asked during this request.
+    Store,
+    /// Served from memory, inside the freshness window.
+    Memory,
+    /// Served from memory past freshness, while a refresh was running or after
+    /// one could not reach the store.
+    Stale,
+}
+
+impl Source {
+    /// The word an audit row carries.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Source::Store => "store",
+            Source::Memory => "memory",
+            Source::Stale => "stale",
+        }
+    }
+}
+
+/// One resolution, and where it came from.
+pub struct Answer {
+    /// What resolving produced.
+    pub outcome: Outcome,
+    /// Which of the three routes produced it.
+    pub source: Source,
+    /// How long ago the store answered, on a `Memory` or `Stale` answer.
+    pub age: Option<Duration>,
+}
+
+/// What one upstream call produced, and whether a failure was the store's
+/// verdict or its silence.
+///
+/// The distinction decides eviction: a store that ANSWERED — no such item, the
+/// token is refused — has told this daemon its cached value is worthless, and
+/// keeping it would serve a credential the vendor has disowned. A store that
+/// could not answer has said nothing about the value, and dropping it would
+/// turn a slow vendor back into the outage this cache exists to prevent.
+#[derive(Clone)]
+struct Fetched {
+    outcome: Outcome,
+    /// Every error was a store that could not answer.
+    silent: bool,
+}
+
 struct Cached {
     outcome: Outcome,
     at: Instant,
@@ -86,7 +181,7 @@ struct Cached {
 
 /// One resolution in progress, and the waiters on it.
 struct Flight {
-    done: Mutex<Option<Outcome>>,
+    done: Mutex<Option<Fetched>>,
     ready: Condvar,
 }
 
@@ -94,18 +189,73 @@ struct Flight {
 struct Shared {
     cache: HashMap<String, Cached>,
     inflight: HashMap<String, Arc<Flight>>,
+    /// Names waiting for a refresh worker, and the set that says which are
+    /// already waiting — the queue is a list, and a list cannot answer
+    /// "already queued?" without a scan.
+    queue: VecDeque<String>,
+    queued: HashSet<String>,
+    /// When a name's refresh last failed without reaching its store.
+    silent_since: HashMap<String, Instant>,
+    /// Bumped by every clear. A fetch that started before one lands after it
+    /// and must not refill the cache the clear emptied — the reload that
+    /// cleared it would otherwise get the old value back from a call already
+    /// in the air.
+    generation: u64,
 }
 
 /// Resolves names against the configured stores, once each.
 pub struct Resolver {
     registry: Registry,
     ttl: Duration,
+    /// How long past freshness a value may still be served while its refresh
+    /// runs, or after a refresh could not reach the store. Zero disables stale
+    /// serving, and a zero `ttl` disables it whatever this holds.
+    stale: Duration,
     shared: Mutex<Shared>,
+    /// Wakes a refresh worker when a name is queued, and on shutdown.
+    work: Condvar,
+    stop: AtomicBool,
     /// Counts calls that actually reached a store. The single-flight test reads
     /// it; without an independent counter, "twenty requests made one call"
     /// could only be asserted by looking at the implementation, which is not
     /// evidence.
     upstream_calls: AtomicU64,
+}
+
+/// Running refresh workers. Dropping it stops them.
+pub struct Refresher {
+    resolver: Arc<Resolver>,
+    /// Disconnects when the last worker returns — a timed join, which `std`
+    /// does not offer. Same shape as the renewal loop's.
+    done: std::sync::mpsc::Receiver<Never>,
+    handles: Vec<JoinHandle<()>>,
+}
+
+/// Carried by a channel that only ever closes, never sends.
+enum Never {}
+
+impl Drop for Refresher {
+    fn drop(&mut self) {
+        self.resolver.stop.store(true, Ordering::Relaxed);
+        self.resolver.work.notify_all();
+        match self.done.recv_timeout(SHUTDOWN_GRACE) {
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                for handle in self.handles.drain(..) {
+                    let _ = handle.join();
+                }
+            }
+            // A worker is still inside a vendor call. Left detached, exactly
+            // as the renewal loop leaves its own: it holds no lock this
+            // process needs, and the alternative is not exiting.
+            _ => {
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "{}d: a refresh is still waiting on its store; shutting down without it",
+                    crate::NAME
+                );
+            }
+        }
+    }
 }
 
 impl Resolver {
@@ -118,8 +268,51 @@ impl Resolver {
         Resolver {
             registry,
             ttl,
+            stale: Duration::ZERO,
             shared: Mutex::new(Shared::default()),
+            work: Condvar::new(),
+            stop: AtomicBool::new(false),
             upstream_calls: AtomicU64::new(0),
+        }
+    }
+
+    /// How long past freshness a value may still be served.
+    ///
+    /// The window only ever covers a store that could not answer: a store that
+    /// answers replaces the value, and an answer that disowns it — no such
+    /// item, a refused token — evicts it on the spot.
+    #[must_use]
+    pub fn with_stale_window(mut self, stale: Duration) -> Self {
+        self.stale = stale;
+        self
+    }
+
+    /// Start the refresh workers. Dropping the returned handle stops them.
+    ///
+    /// Separate from construction so a caller that never serves — a check, a
+    /// test reading the cache directly — starts no threads at all.
+    #[must_use]
+    pub fn start(resolver: &Arc<Self>) -> Refresher {
+        let (alive, done) = std::sync::mpsc::channel::<Never>();
+        let mut handles = Vec::with_capacity(REFRESH_WORKERS);
+        for worker in 0..REFRESH_WORKERS {
+            let resolver = Arc::clone(resolver);
+            let alive = alive.clone();
+            if let Ok(handle) = std::thread::Builder::new()
+                .name(format!("{}d-refresh-{worker}", crate::NAME))
+                .spawn(move || {
+                    resolver.refresh_loop();
+                    drop(alive);
+                })
+            {
+                handles.push(handle);
+            }
+        }
+        drop(alive);
+        Refresher {
+            resolver: Arc::clone(resolver),
+            done,
+            handles,
         }
     }
 
@@ -130,21 +323,182 @@ impl Resolver {
     }
 
     /// Resolve one name, coalescing with any concurrent request for it.
-    pub fn resolve(&self, name: &str) -> Outcome {
+    ///
+    /// Three routes, and the answer says which one it took: inside the
+    /// freshness window the value comes from memory and no store is asked;
+    /// past it, within the stale window, a refresh is queued and this call
+    /// waits [`REFRESH_GRACE`] for it before falling back to the older value;
+    /// with no entry, or one past both windows, a store is asked here.
+    pub fn resolve(&self, name: &str) -> Answer {
+        if let Some(answer) = self.cached_answer(name) {
+            return answer;
+        }
+        let fetched = self.fetch(name);
+        Answer {
+            outcome: fetched.outcome,
+            source: Source::Store,
+            age: None,
+        }
+    }
+
+    /// The cached routes, or `None` when a store has to be asked here.
+    fn cached_answer(&self, name: &str) -> Option<Answer> {
+        if self.ttl.is_zero() {
+            return None;
+        }
+        let (outcome, age) = {
+            let shared = self.lock();
+            let cached = shared.cache.get(name)?;
+            let age = cached.at.elapsed();
+            if age >= self.ttl + self.stale {
+                return None;
+            }
+            (cached.outcome.clone(), age)
+        };
+
+        if age < self.ttl {
+            return Some(Answer {
+                outcome,
+                source: Source::Memory,
+                age: Some(age),
+            });
+        }
+
+        // Past freshness, inside the stale window. Ask for a refresh, then wait
+        // briefly for it: a store that answers quickly keeps the served age at
+        // the freshness window, and one that does not costs this caller a
+        // second rather than a vendor process's whole latency.
+        let flight = self.queue_refresh(name);
+        if let Some(fetched) = flight.and_then(|flight| wait_for_timeout(&flight, REFRESH_GRACE)) {
+            match fetched {
+                // The store answered. Its answer replaced or evicted the entry
+                // in the worker; either way it is what this caller gets.
+                Fetched { outcome, silent } if !silent => {
+                    return Some(Answer {
+                        outcome,
+                        source: Source::Store,
+                        age: None,
+                    });
+                }
+                // It could not answer, which says nothing about the value.
+                _ => {}
+            }
+        }
+        Some(Answer {
+            outcome,
+            source: Source::Stale,
+            age: Some(age),
+        })
+    }
+
+    /// Queue a refresh for `name`, unless one is already queued, already
+    /// running, or its last attempt failed inside [`REFRESH_RETRY_FLOOR`].
+    ///
+    /// Returns the flight to wait on — the one already running, or the one
+    /// this call just created for the worker to fulfil.
+    ///
+    /// The flight is created HERE rather than in the worker, so the reader that
+    /// asked for the refresh has something to wait its grace on. Created in the
+    /// worker instead, the reader would find nothing to wait for and would fall
+    /// straight through to the older value, and the grace would never apply to
+    /// the case it exists for.
+    fn queue_refresh(&self, name: &str) -> Option<Arc<Flight>> {
+        let mut shared = self.lock();
+        if let Some(flight) = shared.inflight.get(name) {
+            return Some(Arc::clone(flight));
+        }
+        if let Some(since) = shared.silent_since.get(name)
+            && since.elapsed() < REFRESH_RETRY_FLOOR
+        {
+            return None;
+        }
+        if shared.queued.contains(name) {
+            return None;
+        }
+        let flight = Arc::new(Flight {
+            done: Mutex::new(None),
+            ready: Condvar::new(),
+        });
+        shared.inflight.insert(name.to_owned(), Arc::clone(&flight));
+        shared.queued.insert(name.to_owned());
+        shared.queue.push_back(name.to_owned());
+        drop(shared);
+        self.work.notify_one();
+        Some(flight)
+    }
+
+    /// One refresh worker: take a name, refresh it, and sweep between names.
+    fn refresh_loop(&self) {
+        let mut last_sweep = Instant::now();
+        while !self.stop.load(Ordering::Relaxed) {
+            let next = {
+                let mut shared = self.lock();
+                loop {
+                    if self.stop.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    if let Some(name) = shared.queue.pop_front() {
+                        break Some(name);
+                    }
+                    let (guard, timeout) = self
+                        .work
+                        .wait_timeout(shared, WORKER_POLL)
+                        .unwrap_or_else(PoisonError::into_inner);
+                    shared = guard;
+                    if timeout.timed_out() {
+                        break None;
+                    }
+                }
+            };
+
+            match next {
+                Some(name) => {
+                    // The flight was created when the name was queued, and the
+                    // reader that queued it may be waiting on that one — so
+                    // this fulfils it rather than opening a second.
+                    let queued = self.lock().inflight.get(&name).map(Arc::clone);
+                    match queued {
+                        Some(flight) => {
+                            self.run_fetch(&name, &flight);
+                        }
+                        None => {
+                            self.fetch(&name);
+                        }
+                    }
+                    self.lock().queued.remove(&name);
+                }
+                None => {
+                    if last_sweep.elapsed() >= SWEEP_INTERVAL {
+                        self.sweep();
+                        last_sweep = Instant::now();
+                    }
+                }
+            }
+        }
+    }
+
+    /// Drop every entry past both windows, so a value nobody reads again does
+    /// not sit in memory until something else evicts it.
+    fn sweep(&self) {
+        let horizon = self.ttl + self.stale;
+        let mut shared = self.lock();
+        shared
+            .cache
+            .retain(|_, cached| cached.at.elapsed() < horizon);
+        shared
+            .silent_since
+            .retain(|_, since| since.elapsed() < REFRESH_RETRY_FLOOR);
+    }
+
+    /// Ask a store, coalescing with any concurrent fetch for the same name,
+    /// and put what comes back into the cache.
+    fn fetch(&self, name: &str) -> Fetched {
         // Either this call becomes the leader for `name`, or it joins the
         // flight already under way. The lock is held only long enough to decide
         // which; the upstream call happens with nothing locked, or twenty
         // sessions would serialise behind one slow keychain.
         let flight = {
             let mut shared = self.lock();
-
-            if let Some(cached) = shared.cache.get(name) {
-                if cached.at.elapsed() < self.ttl {
-                    return cached.outcome.clone();
-                }
-                shared.cache.remove(name);
-            }
-
             match shared.inflight.get(name) {
                 Some(existing) => {
                     let existing = Arc::clone(existing);
@@ -161,21 +515,59 @@ impl Resolver {
                 }
             }
         };
+        self.run_fetch(name, &flight)
+    }
 
-        let outcome = self.ask_upstream(name);
+    /// Ask a store for `name` and publish the answer to `flight`, which is
+    /// already registered as this name's in-flight resolution.
+    fn run_fetch(&self, name: &str, flight: &Arc<Flight>) -> Fetched {
+        let generation = self.lock().generation;
+        let fetched = self.ask_upstream(name);
 
         {
             let mut shared = self.lock();
             shared.inflight.remove(name);
-            if matches!(outcome, Outcome::Found(_)) && !self.ttl.is_zero() {
-                evict_if_full(&mut shared.cache);
-                shared.cache.insert(
-                    name.to_owned(),
-                    Cached {
-                        outcome: outcome.clone(),
-                        at: Instant::now(),
-                    },
-                );
+            if shared.generation != generation {
+                // Cleared while this was in the air. Publishing to the waiters
+                // still happens — they asked, and the store answered them — but
+                // nothing of it is kept.
+                shared.silent_since.remove(name);
+                drop(shared);
+                let mut done = flight.done.lock().unwrap_or_else(PoisonError::into_inner);
+                *done = Some(fetched.clone());
+                drop(done);
+                flight.ready.notify_all();
+                return fetched;
+            }
+            match &fetched {
+                // A value: it replaces whatever was there, and its clock starts
+                // again.
+                Fetched {
+                    outcome: outcome @ Outcome::Found(_),
+                    ..
+                } if !self.ttl.is_zero() => {
+                    shared.silent_since.remove(name);
+                    evict_if_full(&mut shared.cache);
+                    shared.cache.insert(
+                        name.to_owned(),
+                        Cached {
+                            outcome: outcome.clone(),
+                            at: Instant::now(),
+                        },
+                    );
+                }
+                // The store could not answer. The entry stands, and the floor
+                // stops the next reader asking again immediately.
+                Fetched { silent: true, .. } => {
+                    shared.silent_since.insert(name.to_owned(), Instant::now());
+                }
+                // The store answered about this name and had nothing, or
+                // refused. Whatever is held is disowned by the only party that
+                // could say so.
+                _ => {
+                    shared.cache.remove(name);
+                    shared.silent_since.remove(name);
+                }
             }
         }
 
@@ -183,18 +575,25 @@ impl Resolver {
         // woken waiter that re-enters `resolve` sees the cache already filled.
         {
             let mut done = flight.done.lock().unwrap_or_else(PoisonError::into_inner);
-            *done = Some(outcome.clone());
+            *done = Some(fetched.clone());
         }
         flight.ready.notify_all();
 
-        outcome
+        fetched
     }
 
     /// Drop every cached value.
     ///
     /// Used on a reload, and by tests that need the next call to be a real one.
+    /// A refresh already in flight lands after this and finds its own entry
+    /// gone, so the cache stays empty rather than refilling behind the caller.
     pub fn clear_cache(&self) {
-        self.lock().cache.clear();
+        let mut shared = self.lock();
+        shared.cache.clear();
+        shared.queue.clear();
+        shared.queued.clear();
+        shared.silent_since.clear();
+        shared.generation = shared.generation.wrapping_add(1);
     }
 
     /// How many values are cached right now.
@@ -203,9 +602,15 @@ impl Resolver {
         self.lock().cache.len()
     }
 
-    fn ask_upstream(&self, name: &str) -> Outcome {
+    fn ask_upstream(&self, name: &str) -> Fetched {
         self.upstream_calls.fetch_add(1, Ordering::Relaxed);
-        match self.registry.resolve(name) {
+        let silent = |errors: &[StoreError]| {
+            !errors.is_empty()
+                && errors
+                    .iter()
+                    .all(|error| matches!(error, StoreError::Unavailable { .. }))
+        };
+        let outcome = match self.registry.resolve(name) {
             Resolution::Found { secret, .. } => Outcome::Found(Arc::new(secret)),
             // One shape of absence arrives here, not two, and the wildcard is
             // what records that rather than a collapse of two live cases:
@@ -228,13 +633,21 @@ impl Resolver {
             // to be missing. `tests/daemon.rs` holds that down by watching the
             // store be asked, because it is not readable from here.
             Resolution::NotFound { .. } => Outcome::Absent,
-            Resolution::Failed(errors) => Outcome::Failed(
-                errors
+            Resolution::Failed(errors) => {
+                // Read before the errors are flattened into one sentence: the
+                // variants are what say whether a store answered, and a string
+                // cannot be asked that afterwards.
+                let could_not_answer = silent(&errors);
+                let reason = errors
                     .iter()
                     .map(ToString::to_string)
                     .collect::<Vec<_>>()
-                    .join("; "),
-            ),
+                    .join("; ");
+                return Fetched {
+                    outcome: Outcome::Failed(reason),
+                    silent: could_not_answer,
+                };
+            }
             // Several of the daemon's own backends could have meant this name
             // and none is pinned. Nothing was asked, so nothing is known about
             // whether the name exists — and guessing is the cross-tenant leak
@@ -256,6 +669,13 @@ impl Resolver {
                  a session cannot settle which of the daemon's stores a name means",
                 ambiguous.reason()
             )),
+        };
+        // Everything that reaches here is the store's own answer about the
+        // name, including an ambiguity, which is this daemon's config saying
+        // no store may be asked at all.
+        Fetched {
+            outcome,
+            silent: false,
         }
     }
 
@@ -269,7 +689,7 @@ impl Resolver {
     }
 }
 
-fn wait_for(flight: &Arc<Flight>) -> Outcome {
+fn wait_for(flight: &Arc<Flight>) -> Fetched {
     let mut done = flight.done.lock().unwrap_or_else(PoisonError::into_inner);
     while done.is_none() {
         done = flight
@@ -277,9 +697,32 @@ fn wait_for(flight: &Arc<Flight>) -> Outcome {
             .wait(done)
             .unwrap_or_else(PoisonError::into_inner);
     }
-    done.clone().unwrap_or(Outcome::Failed(
-        "the resolution finished without a result".to_owned(),
-    ))
+    done.clone().unwrap_or(Fetched {
+        outcome: Outcome::Failed("the resolution finished without a result".to_owned()),
+        silent: true,
+    })
+}
+
+/// The flight's answer, or `None` when it has not landed inside `grace`.
+///
+/// A reader past freshness holds a value already, so waiting longer buys a
+/// fresher answer at the cost of the latency this whole mechanism exists to
+/// take off the request path.
+fn wait_for_timeout(flight: &Arc<Flight>, grace: Duration) -> Option<Fetched> {
+    let deadline = Instant::now() + grace;
+    let mut done = flight.done.lock().unwrap_or_else(PoisonError::into_inner);
+    while done.is_none() {
+        let left = deadline.checked_duration_since(Instant::now())?;
+        let (guard, timeout) = flight
+            .ready
+            .wait_timeout(done, left)
+            .unwrap_or_else(PoisonError::into_inner);
+        done = guard;
+        if timeout.timed_out() {
+            return done.clone();
+        }
+    }
+    done.clone()
 }
 
 fn evict_if_full(cache: &mut HashMap<String, Cached>) {
@@ -377,7 +820,7 @@ mod tests {
                 let gate = Arc::clone(&gate);
                 scope.spawn(move || {
                     gate.wait();
-                    match resolver.resolve("SHARED") {
+                    match resolver.resolve("SHARED").outcome {
                         Outcome::Found(secret) => {
                             assert_eq!(secret.expose(), "decoy-single-flight");
                         }
@@ -426,7 +869,7 @@ mod tests {
             Duration::from_secs(60),
         );
         for _ in 0..5 {
-            assert!(matches!(resolver.resolve("X"), Outcome::Found(_)));
+            assert!(matches!(resolver.resolve("X").outcome, Outcome::Found(_)));
         }
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         assert_eq!(resolver.cached_len(), 1);
@@ -441,9 +884,9 @@ mod tests {
             Some("decoy-expiring"),
             Duration::from_millis(30),
         );
-        assert!(matches!(resolver.resolve("X"), Outcome::Found(_)));
+        assert!(matches!(resolver.resolve("X").outcome, Outcome::Found(_)));
         std::thread::sleep(Duration::from_millis(60));
-        assert!(matches!(resolver.resolve("X"), Outcome::Found(_)));
+        assert!(matches!(resolver.resolve("X").outcome, Outcome::Found(_)));
         assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 
@@ -473,8 +916,8 @@ mod tests {
             Registry::new(vec![Box::new(Broken)]),
             Duration::from_secs(600),
         );
-        assert!(matches!(resolver.resolve("X"), Outcome::Failed(_)));
-        assert!(matches!(resolver.resolve("X"), Outcome::Failed(_)));
+        assert!(matches!(resolver.resolve("X").outcome, Outcome::Failed(_)));
+        assert!(matches!(resolver.resolve("X").outcome, Outcome::Failed(_)));
         assert_eq!(resolver.cached_len(), 0);
         assert_eq!(resolver.upstream_calls(), 2);
     }
@@ -483,8 +926,8 @@ mod tests {
     fn an_absence_is_never_cached_either() {
         let calls = Arc::new(AtomicU64::new(0));
         let resolver = resolver(&calls, Duration::ZERO, None, Duration::from_secs(600));
-        assert!(matches!(resolver.resolve("X"), Outcome::Absent));
-        assert!(matches!(resolver.resolve("X"), Outcome::Absent));
+        assert!(matches!(resolver.resolve("X").outcome, Outcome::Absent));
+        assert!(matches!(resolver.resolve("X").outcome, Outcome::Absent));
         assert_eq!(calls.load(Ordering::SeqCst), 2);
         assert_eq!(resolver.cached_len(), 0);
     }
@@ -533,7 +976,10 @@ mod tests {
             }),
             Box::new(Named("other")),
         ]);
-        match Resolver::new(registry, Duration::ZERO).resolve("DATABASE_URL") {
+        match Resolver::new(registry, Duration::ZERO)
+            .resolve("DATABASE_URL")
+            .outcome
+        {
             Outcome::Failed(reason) => {
                 assert!(reason.contains("keylessd"), "{reason}");
                 assert!(reason.contains("stores.default"), "{reason}");
@@ -541,6 +987,342 @@ mod tests {
             }
             other => panic!("expected a failure naming the candidates, got {other:?}"),
         }
+    }
+
+    /// What a scripted store answers on one call.
+    #[derive(Clone, Copy)]
+    enum Reply {
+        Value(&'static str),
+        /// The store was asked and had nothing.
+        Absent,
+        /// The store could not be reached — the one shape that keeps a cached
+        /// value alive.
+        Silent,
+        /// The store answered and disowned the value.
+        Verdict,
+    }
+
+    /// A store whose answer changes per call, so a refresh can answer
+    /// differently from the read that filled the cache. The last reply repeats.
+    struct Scripted {
+        calls: Arc<AtomicU64>,
+        delay: Duration,
+        replies: Vec<Reply>,
+    }
+
+    impl Store for Scripted {
+        fn id(&self) -> &str {
+            "scripted"
+        }
+        fn resolve(&self, _name: &str) -> Result<Option<Secret>, StoreError> {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst) as usize;
+            std::thread::sleep(self.delay);
+            let reply = self
+                .replies
+                .get(call)
+                .or_else(|| self.replies.last())
+                .copied()
+                .unwrap_or(Reply::Absent);
+            match reply {
+                Reply::Value(value) => Ok(Some(Secret::new(value.to_owned()))),
+                Reply::Absent => Ok(None),
+                Reply::Silent => Err(StoreError::Unavailable {
+                    store: "scripted".to_owned(),
+                    detail: "no answer".to_owned(),
+                }),
+                Reply::Verdict => Err(StoreError::Backend {
+                    store: "scripted".to_owned(),
+                    detail: "the item is in the trash".to_owned(),
+                }),
+            }
+        }
+        fn health(&self) -> Result<(), StoreError> {
+            Ok(())
+        }
+    }
+
+    fn scripted(
+        calls: &Arc<AtomicU64>,
+        delay: Duration,
+        replies: Vec<Reply>,
+        ttl: Duration,
+        stale: Duration,
+    ) -> Arc<Resolver> {
+        Arc::new(
+            Resolver::new(
+                Registry::new(vec![Box::new(Scripted {
+                    calls: Arc::clone(calls),
+                    delay,
+                    replies,
+                })]),
+                ttl,
+            )
+            .with_stale_window(stale),
+        )
+    }
+
+    fn value_of(answer: &super::Answer) -> String {
+        match &answer.outcome {
+            Outcome::Found(secret) => secret.expose().to_owned(),
+            other => panic!("expected a value, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_fresh_value_is_served_from_memory_and_says_where_it_came_from() {
+        let calls = Arc::new(AtomicU64::new(0));
+        let resolver = scripted(
+            &calls,
+            Duration::ZERO,
+            vec![Reply::Value("decoy-warm")],
+            Duration::from_secs(60),
+            Duration::from_secs(60),
+        );
+        assert_eq!(resolver.resolve("X").source, super::Source::Store);
+        let second = resolver.resolve("X");
+        assert_eq!(second.source, super::Source::Memory);
+        assert_eq!(value_of(&second), "decoy-warm");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn a_store_slower_than_the_grace_is_answered_from_memory_meanwhile() {
+        // The property the whole mechanism exists for: past freshness, with a
+        // store that takes longer than a caller should wait, the caller gets
+        // the value it had rather than the vendor's latency.
+        let calls = Arc::new(AtomicU64::new(0));
+        let resolver = scripted(
+            &calls,
+            Duration::from_secs(2),
+            vec![Reply::Value("decoy-first"), Reply::Value("decoy-second")],
+            Duration::from_millis(50),
+            Duration::from_secs(60),
+        );
+        let refresher = Resolver::start(&resolver);
+
+        let cold = resolver.resolve("X");
+        assert_eq!(cold.source, super::Source::Store);
+        assert_eq!(value_of(&cold), "decoy-first");
+
+        std::thread::sleep(Duration::from_millis(120));
+        let stale = resolver.resolve("X");
+        assert_eq!(stale.source, super::Source::Stale, "{:?}", stale.outcome);
+        assert_eq!(value_of(&stale), "decoy-first");
+
+        // The refresh lands on its own, off this caller's request.
+        std::thread::sleep(Duration::from_secs(3));
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "the store was asked more than once for the one refresh"
+        );
+        // What it fetched is what the next reader gets. That reader is past the
+        // 50 ms window too, so it is served the new value and starts its own
+        // refresh — the source it carries is not what this case is about.
+        assert_eq!(value_of(&resolver.resolve("X")), "decoy-second");
+        drop(refresher);
+    }
+
+    #[test]
+    fn a_stale_read_starts_one_refresh_however_many_readers() {
+        let calls = Arc::new(AtomicU64::new(0));
+        let resolver = scripted(
+            &calls,
+            Duration::from_millis(400),
+            vec![Reply::Value("decoy")],
+            Duration::from_millis(50),
+            Duration::from_secs(60),
+        );
+        let refresher = Resolver::start(&resolver);
+        let _ = resolver.resolve("X");
+        std::thread::sleep(Duration::from_millis(120));
+
+        std::thread::scope(|scope| {
+            for _ in 0..10 {
+                let resolver = Arc::clone(&resolver);
+                scope.spawn(move || {
+                    let _ = resolver.resolve("X");
+                });
+            }
+        });
+        std::thread::sleep(Duration::from_millis(600));
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "ten readers past freshness must start one refresh between them"
+        );
+        drop(refresher);
+    }
+
+    #[test]
+    fn a_store_that_could_not_answer_keeps_the_value_and_is_not_asked_again_at_once() {
+        let calls = Arc::new(AtomicU64::new(0));
+        let resolver = scripted(
+            &calls,
+            Duration::ZERO,
+            vec![Reply::Value("decoy-held"), Reply::Silent],
+            Duration::from_millis(50),
+            Duration::from_secs(60),
+        );
+        let refresher = Resolver::start(&resolver);
+        let _ = resolver.resolve("X");
+        std::thread::sleep(Duration::from_millis(120));
+
+        let served = resolver.resolve("X");
+        assert_eq!(served.source, super::Source::Stale);
+        assert_eq!(value_of(&served), "decoy-held");
+
+        // The floor holds the next reads off the store while the value is
+        // being served from memory anyway.
+        for _ in 0..5 {
+            let again = resolver.resolve("X");
+            assert_eq!(value_of(&again), "decoy-held");
+        }
+        std::thread::sleep(Duration::from_millis(200));
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        drop(refresher);
+    }
+
+    #[test]
+    fn a_store_that_disowns_the_value_evicts_it_rather_than_serving_it_stale() {
+        let calls = Arc::new(AtomicU64::new(0));
+        let resolver = scripted(
+            &calls,
+            Duration::ZERO,
+            vec![Reply::Value("decoy-gone"), Reply::Verdict],
+            Duration::from_millis(50),
+            Duration::from_secs(60),
+        );
+        let refresher = Resolver::start(&resolver);
+        let _ = resolver.resolve("X");
+        std::thread::sleep(Duration::from_millis(120));
+
+        let answered = resolver.resolve("X");
+        assert_eq!(answered.source, super::Source::Store);
+        assert!(
+            matches!(answered.outcome, Outcome::Failed(ref reason) if reason.contains("trash")),
+            "{:?}",
+            answered.outcome
+        );
+        assert_eq!(resolver.cached_len(), 0, "a disowned value stayed cached");
+        drop(refresher);
+    }
+
+    #[test]
+    fn an_absence_from_a_refresh_evicts_the_value_too() {
+        let calls = Arc::new(AtomicU64::new(0));
+        let resolver = scripted(
+            &calls,
+            Duration::ZERO,
+            vec![Reply::Value("decoy-removed"), Reply::Absent],
+            Duration::from_millis(50),
+            Duration::from_secs(60),
+        );
+        let refresher = Resolver::start(&resolver);
+        let _ = resolver.resolve("X");
+        std::thread::sleep(Duration::from_millis(120));
+
+        let answered = resolver.resolve("X");
+        assert!(
+            matches!(answered.outcome, Outcome::Absent),
+            "expected the store's own absence, got {:?} from {:?}",
+            answered.outcome,
+            answered.source
+        );
+        assert_eq!(resolver.cached_len(), 0);
+        drop(refresher);
+    }
+
+    #[test]
+    fn a_zero_ttl_disables_stale_serving_too() {
+        // One key turns the whole mechanism off. A daemon told to cache
+        // nothing must not acquire a five-minute window through a second key.
+        let calls = Arc::new(AtomicU64::new(0));
+        let resolver = scripted(
+            &calls,
+            Duration::ZERO,
+            vec![Reply::Value("decoy")],
+            Duration::ZERO,
+            Duration::from_secs(60),
+        );
+        for _ in 0..3 {
+            assert_eq!(resolver.resolve("X").source, super::Source::Store);
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        assert_eq!(resolver.cached_len(), 0);
+    }
+
+    #[test]
+    fn a_value_past_both_windows_is_fetched_on_the_request_itself() {
+        let calls = Arc::new(AtomicU64::new(0));
+        let resolver = scripted(
+            &calls,
+            Duration::ZERO,
+            vec![Reply::Value("decoy-old"), Reply::Value("decoy-new")],
+            Duration::from_millis(40),
+            Duration::from_millis(40),
+        );
+        let _ = resolver.resolve("X");
+        std::thread::sleep(Duration::from_millis(150));
+        let answered = resolver.resolve("X");
+        assert_eq!(answered.source, super::Source::Store);
+        assert_eq!(value_of(&answered), "decoy-new");
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn stale_serving_asks_no_more_often_than_expiry_alone_did() {
+        // The volume claim, measured rather than argued: the same read
+        // schedule against a resolver with a stale window and one without.
+        fn calls_under(stale: Duration) -> u64 {
+            let calls = Arc::new(AtomicU64::new(0));
+            let resolver = scripted(
+                &calls,
+                Duration::ZERO,
+                vec![Reply::Value("decoy")],
+                Duration::from_millis(40),
+                stale,
+            );
+            let refresher = Resolver::start(&resolver);
+            for _ in 0..4 {
+                let _ = resolver.resolve("X");
+                let _ = resolver.resolve("X");
+                std::thread::sleep(Duration::from_millis(60));
+            }
+            std::thread::sleep(Duration::from_millis(300));
+            drop(refresher);
+            calls.load(Ordering::SeqCst)
+        }
+        let without = calls_under(Duration::ZERO);
+        let with = calls_under(Duration::from_secs(60));
+        assert!(
+            with <= without,
+            "stale serving asked the store more often: {with} against {without}"
+        );
+    }
+
+    #[test]
+    fn clearing_the_cache_during_a_refresh_leaves_it_empty() {
+        let calls = Arc::new(AtomicU64::new(0));
+        let resolver = scripted(
+            &calls,
+            Duration::from_millis(500),
+            vec![Reply::Value("decoy-one"), Reply::Value("decoy-two")],
+            Duration::from_millis(40),
+            Duration::from_secs(60),
+        );
+        let refresher = Resolver::start(&resolver);
+        let _ = resolver.resolve("X");
+        std::thread::sleep(Duration::from_millis(80));
+        let _ = resolver.resolve("X"); // starts a refresh, serves the old value
+        resolver.clear_cache();
+        std::thread::sleep(Duration::from_secs(1));
+        assert_eq!(
+            resolver.cached_len(),
+            0,
+            "a refresh in flight refilled a cache that had been cleared"
+        );
+        drop(refresher);
     }
 
     #[test]
