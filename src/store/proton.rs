@@ -97,7 +97,7 @@
 //! `printenv`, and the env file is written for that one lookup and deleted
 //! after it.
 //!
-//! Two details of the vendor's contract shape the code:
+//! Three details of the vendor's contract shape the code:
 //!
 //! - **`--no-masking` is required for the probe.** Proton's own output masking
 //!   is on by default and replaces a value in the child's output with
@@ -110,6 +110,17 @@
 //!   and non-empty, is capped at 300 characters, and is stored end-to-end
 //!   encrypted beside the audit entry. See [`Reason`] for what goes in it and
 //!   what deliberately does not.
+//! - **Every child is told to keep quiet.** The vendor writes a row to its own
+//!   local telemetry database on every command and, by its own FAQ, phones it
+//!   home unless [`DISABLE_TELEMETRY_VAR`] is set. [`NO_UPDATE_CHECK_VAR`]
+//!   stops the same child asking a manifest endpoint whether a newer version
+//!   exists — a check the vendor already skips when stderr is not a terminal,
+//!   which is every child spawned here, so the variable is what holds that
+//!   shut if a release ever reads the terminal differently. Replacing the
+//!   binary at `stores.proton.binary` is the operator's own act either way.
+//!   See [`set_vendor_switch_offs`], set on every command this adapter
+//!   spawns, read or write — and on none of the command lines this crate
+//!   PRINTS for a person to paste, which carry the session directory alone.
 //!
 //! # What this adapter never touches
 //!
@@ -187,6 +198,72 @@ pub const KEY_PROVIDER_VAR: &str = "PROTON_PASS_KEY_PROVIDER";
 
 /// The environment variable [`KeyProvider::Env`] reads that key out of.
 pub const ENCRYPTION_KEY_VAR: &str = "PROTON_PASS_ENCRYPTION_KEY";
+
+/// Switches the vendor's telemetry off.
+///
+/// The FAQ documents the name and what it does — "If the environment variable
+/// is set telemetry will not be saved and the currently saved locally will be
+/// cleared" — but no value, only that it must be "set". See
+/// [`set_vendor_switch_offs`] for the value this crate sends.
+pub(crate) const DISABLE_TELEMETRY_VAR: &str = "PROTON_PASS_DISABLE_TELEMETRY";
+
+/// Switches the vendor's automatic update check off.
+///
+/// Undocumented: found only in the installed binary's own strings, beside its
+/// update-check code and the manifest URL it would otherwise fetch. There is
+/// nothing here for that check to offer: `stores.proton.binary` names one
+/// absolute, operator-chosen path, and this crate never rewrites what is
+/// there — replacing it, like installing it, is the operator's own act, not
+/// something a spawned child should attempt on its own initiative.
+pub(crate) const NO_UPDATE_CHECK_VAR: &str = "PROTON_PASS_NO_UPDATE_CHECK";
+
+/// Put both vendor switch-offs on one command.
+///
+/// # Why `1`, for both
+///
+/// Neither variable's value is documented — see [`DISABLE_TELEMETRY_VAR`] and
+/// [`NO_UPDATE_CHECK_VAR`]. `1` is this crate's default for a boolean-shaped
+/// variable the vendor never published a value for.
+pub(crate) fn set_vendor_switch_offs(command: &mut Command) {
+    command.env(DISABLE_TELEMETRY_VAR, "1");
+    command.env(NO_UPDATE_CHECK_VAR, "1");
+}
+
+/// The value a built [`Command`] would export for `key`, read off it directly
+/// rather than off the process's own environment.
+///
+/// Written once for this module's own tests and for
+/// [`assert_vendor_switch_offs`], which the sibling adapters' tests call
+/// rather than reaching for this.
+///
+/// A variable somebody removed with `env_remove` arrives here as the same
+/// `None` an untouched variable gives, because `get_envs` reports a removal as
+/// a `None` value. A test that has to tell those apart reads `get_envs`
+/// itself, the way the ambient-filter tests do.
+#[cfg(test)]
+fn env_value(command: &Command, key: &str) -> Option<String> {
+    command
+        .get_envs()
+        .find(|(k, _)| *k == std::ffi::OsStr::new(key))
+        .and_then(|(_, value)| value)
+        .map(|value| value.to_string_lossy().into_owned())
+}
+
+/// Both vendor switch-offs are on `command`, each with the value
+/// [`set_vendor_switch_offs`] sends.
+#[cfg(test)]
+pub(crate) fn assert_vendor_switch_offs(command: &Command) {
+    for variable in [DISABLE_TELEMETRY_VAR, NO_UPDATE_CHECK_VAR] {
+        // The observed value, never the `Command` itself: its `Debug` prints
+        // every variable it carries, and these commands carry a login token.
+        let observed = env_value(command, variable);
+        assert_eq!(
+            observed.as_deref(),
+            Some("1"),
+            "`{variable}` reads {observed:?} on this command, not `1`"
+        );
+    }
+}
 
 /// Where `pass-cli` keeps the key its local session store is encrypted with.
 ///
@@ -1962,7 +2039,7 @@ impl ProtonStore {
         Ok(dir)
     }
 
-    /// Put the three things every child of this adapter needs on one command.
+    /// Put the things every child of this adapter needs on one command.
     ///
     /// Written once and called from all four builders, because the set is not
     /// obviously complete and a builder that quietly lacked one of them would
@@ -1978,6 +2055,10 @@ impl ProtonStore {
     ///   enough to make this adapter destroy its own login.
     /// - **The reason** is required by the vendor and is what the remote audit
     ///   entry is filed under.
+    /// - **The two vendor switch-offs**, so a `run`, a listing or a view
+    ///   writes no telemetry row, and asks about no update even if a later
+    ///   release stops skipping that check for a child whose stderr is a
+    ///   pipe. See [`set_vendor_switch_offs`].
     ///
     /// Deliberately NOT `env_clear` followed by a rebuild: `pass-cli` may
     /// rewrite its session store on any invocation and must never be handed an
@@ -2005,6 +2086,7 @@ impl ProtonStore {
             command.env(variable, secret.expose());
         }
         command.env(REASON_VAR, reason);
+        set_vendor_switch_offs(command);
     }
 
     /// The daemon's login, resolved for one lookup, or nothing on a session.
@@ -2724,8 +2806,8 @@ fn is_executable(path: &Path) -> bool {
 mod tests {
     use super::{
         Address, ItemAddress, ItemListing, ItemRecord, ItemView, PROBE_VAR, ProtonStore,
-        REASON_MAX, REASON_VAR, Reason, SESSION_DIR_VAR, TempEnvFile, looks_concealed,
-        resolve_executable,
+        REASON_MAX, REASON_VAR, Reason, SESSION_DIR_VAR, TempEnvFile, assert_vendor_switch_offs,
+        env_value, looks_concealed, resolve_executable,
     };
     use crate::config::Config;
     use crate::store::Store;
@@ -2954,8 +3036,8 @@ mod tests {
         )
     }
 
-    fn argv(store: &ProtonStore, name: &str) -> Vec<String> {
-        let command = command_for(store, name);
+    /// The program and its arguments, in the order a shell would show them.
+    fn argv_of(command: &std::process::Command) -> Vec<String> {
         std::iter::once(command.get_program())
             .chain(command.get_args())
             .map(OsStr::to_string_lossy)
@@ -2963,28 +3045,39 @@ mod tests {
             .collect()
     }
 
+    fn argv(store: &ProtonStore, name: &str) -> Vec<String> {
+        argv_of(&command_for(store, name))
+    }
+
     /// The value the child would see for `key`, as the adapter set it.
     fn child_env(store: &ProtonStore, name: &str, key: &str) -> Option<String> {
-        command_for(store, name)
-            .get_envs()
-            .find(|(k, _)| *k == OsStr::new(key))
-            .and_then(|(_, value)| value)
-            .map(|value| value.to_string_lossy().into_owned())
+        env_value(&command_for(store, name), key)
     }
 
     #[test]
     fn the_invocation_uses_run_and_never_the_verb_that_prints_a_value() {
         // `pass-cli item view --field` writes plaintext to stdout. Same rule as
         // Infisical's denied verbs: this adapter must not become the way there.
+        //
+        // The exact argv, rather than a check per forbidden word: a full match
+        // implies every one of them is absent, and it is the same command this
+        // adapter has always built — see `set_vendor_switch_offs`, asserted
+        // below on the same built command rather than a second one.
         let store = store_from(r#"{"secrets":{"X":{"reference":"pass://V/I/F"}}}"#);
-        let argv = argv(&store, "X");
-        assert_eq!(argv.get(1).map(String::as_str), Some("run"));
-        for forbidden in ["item", "view", "--field", "show", "get"] {
-            assert!(
-                !argv.iter().any(|arg| arg == forbidden),
-                "`{forbidden}` appeared in {argv:?}"
-            );
-        }
+        let command = command_for(&store, "X");
+        assert_eq!(
+            argv_of(&command),
+            vec![
+                "pass-cli",
+                "run",
+                "--env-file=/tmp/probe.env",
+                "--no-masking",
+                "--",
+                "/usr/bin/printenv",
+                "KEYLESS_PROBE",
+            ]
+        );
+        assert_vendor_switch_offs(&command);
     }
 
     #[test]
@@ -3284,12 +3377,7 @@ mod tests {
     // -----------------------------------------------------------------------
 
     fn list_argv(store: &ProtonStore, vault: &str) -> Vec<String> {
-        let command = store.list_command(Path::new(SCOPED), vault, "X", &[], ambient());
-        std::iter::once(command.get_program())
-            .chain(command.get_args())
-            .map(OsStr::to_string_lossy)
-            .map(std::borrow::Cow::into_owned)
-            .collect()
+        argv_of(&store.list_command(Path::new(SCOPED), vault, "X", &[], ambient()))
     }
 
     #[test]
@@ -3298,30 +3386,30 @@ mod tests {
         // It is refused for agent sessions, and it is never passed here either
         // way: this adapter reads coordinates, and the value comes back through
         // `run` where it never touches stdout.
-        let store = store_from("{}");
-        let argv = list_argv(&store, "personal");
-        assert_eq!(argv.get(1).map(String::as_str), Some("item"));
-        assert_eq!(argv.get(2).map(String::as_str), Some("list"));
-        assert!(argv.iter().any(|arg| arg == "--output"));
-        assert!(argv.iter().any(|arg| arg == "json"));
+        //
+        // The exact argv, rather than a check per forbidden flag: a full match
+        // implies every one of them is absent, and it is the same command
+        // `assert_vendor_switch_offs` checks below rather than a second one
+        // built just for that.
+        //
         // Named AND joined. Naming the flag stops the vault being taken as a
         // positional; joining it with `=` stops a vault whose name starts with
         // `-` being read as a short-flag cluster. Two separate arguments do only
         // the first, and the vendor refuses that outright.
-        assert!(
-            argv.iter().any(|arg| arg == "--vault-name=personal"),
-            "{argv:?}"
+        let store = store_from("{}");
+        let command = store.list_command(Path::new(SCOPED), "personal", "X", &[], ambient());
+        assert_eq!(
+            argv_of(&command),
+            vec![
+                "pass-cli",
+                "item",
+                "list",
+                "--vault-name=personal",
+                "--output",
+                "json",
+            ]
         );
-        assert!(
-            !argv.iter().any(|arg| arg == "--vault-name"),
-            "the flag and its value were passed as two arguments: {argv:?}"
-        );
-        for forbidden in ["--show-secrets", "view", "--field", "run"] {
-            assert!(
-                !argv.iter().any(|arg| arg == forbidden),
-                "`{forbidden}` appeared in {argv:?}"
-            );
-        }
+        assert_vendor_switch_offs(&command);
     }
 
     #[test]
@@ -3374,17 +3462,26 @@ mod tests {
         assert!(!removed.contains(&"PLAIN".to_owned()), "{removed:?}");
     }
 
+    /// An ordinary, active item — a base for a test whose own point lies
+    /// elsewhere to override with `..record()`.
+    fn record() -> ItemRecord {
+        ItemRecord {
+            id: "id".to_owned(),
+            share_id: "share".to_owned(),
+            state: "Active".to_owned(),
+            title: "keyless-decoy-alpha".to_owned(),
+            item_type: "login".to_owned(),
+        }
+    }
+
     #[test]
     fn a_trashed_item_is_not_active_and_an_unknown_state_is_not_either() {
         // An allowlist, not a denylist: a state this build has never seen must
         // fail closed, because the alternative is injecting a value whose owner
         // believes it is gone.
         let record = |state: &str| ItemRecord {
-            id: "id".to_owned(),
-            share_id: "share".to_owned(),
             state: state.to_owned(),
-            title: "keyless-decoy-alpha".to_owned(),
-            item_type: "login".to_owned(),
+            ..record()
         };
         assert!(record("Active").is_active());
         assert!(record("active").is_active());
@@ -3444,6 +3541,34 @@ mod tests {
         assert_eq!(listing.items[0].id, "ITEM1");
         assert_eq!(listing.items[0].share_id, "SHARE1");
         assert!(listing.items[0].is_active());
+    }
+
+    // -----------------------------------------------------------------------
+    // `vault list`: every vault this identity can see. No item content of any
+    // kind, so this is the one builder above with no `name` to carry a reason.
+    // `vault_list_command` has exactly the two tests below, so neither builds
+    // a shared `vault_list_argv` helper: one caller each is inlined.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn vault_list_asks_for_json_and_carries_no_show_secrets() {
+        let store = store_from("{}");
+        let argv = argv_of(&store.vault_list_command(Path::new(SCOPED), &[], ambient()));
+        assert_eq!(
+            argv,
+            vec!["pass-cli", "vault", "list", "--output", "json"],
+            "{argv:?}"
+        );
+    }
+
+    #[test]
+    fn vault_list_switches_off_the_vendors_telemetry_and_update_check() {
+        // `vault_list_command` had no test at all before the two variables
+        // below were added, so this stays its own test rather than folding
+        // into the one above: there is no pre-existing construction to share.
+        let store = store_from("{}");
+        let command = store.vault_list_command(Path::new(SCOPED), &[], ambient());
+        assert_vendor_switch_offs(&command);
     }
 
     // -----------------------------------------------------------------------
@@ -3661,37 +3786,34 @@ mod tests {
     #[test]
     fn the_view_invocation_addresses_one_item_by_id_and_asks_for_json() {
         let store = store_from("{}");
-        let record = ItemRecord {
+        let item = ItemRecord {
             id: "ITEM1".to_owned(),
             share_id: "SHARE1".to_owned(),
-            state: "Active".to_owned(),
             title: "demo api key".to_owned(),
             item_type: "custom".to_owned(),
+            ..record()
         };
-        let command = store.view_command(Path::new(SCOPED), &record, &[], ambient());
-        let argv: Vec<String> = std::iter::once(command.get_program())
-            .chain(command.get_args())
-            .map(OsStr::to_string_lossy)
-            .map(std::borrow::Cow::into_owned)
-            .collect();
+        let command = store.view_command(Path::new(SCOPED), &item, &[], ambient());
 
-        assert_eq!(argv.get(1).map(String::as_str), Some("item"));
-        assert_eq!(argv.get(2).map(String::as_str), Some("view"));
-        // By id, not by title: the id came from a listing this adapter just read,
-        // so `fields` and `run` are looking at the same item even if two share a
-        // title. Joined to its flag, because an id may begin with `-`.
-        assert!(argv.iter().any(|arg| arg == "--item-id=ITEM1"), "{argv:?}");
-        assert!(
-            argv.iter().any(|arg| arg == "--share-id=SHARE1"),
-            "{argv:?}"
+        // By id, not by title: the id came from a listing this adapter just
+        // read, so `fields` and `run` are looking at the same item even if two
+        // share a title. Joined to its flag, because an id may begin with `-`.
+        // The exact argv implies that on its own, and it is read off the same
+        // command `assert_vendor_switch_offs` checks below rather than a
+        // second one built just for that.
+        assert_eq!(
+            argv_of(&command),
+            vec![
+                "pass-cli",
+                "item",
+                "view",
+                "--share-id=SHARE1",
+                "--item-id=ITEM1",
+                "--output",
+                "json",
+            ]
         );
-        for split in ["--item-id", "--share-id"] {
-            assert!(
-                !argv.iter().any(|arg| arg == split),
-                "`{split}` and its value were passed as two arguments: {argv:?}"
-            );
-        }
-        assert!(argv.iter().any(|arg| arg == "json"));
+        assert_vendor_switch_offs(&command);
 
         // Same two variables as every other Proton call.
         let env: Vec<(String, Option<String>)> = command
@@ -3761,19 +3883,15 @@ mod tests {
         );
         no_cluster(&listing, "`item list`");
 
-        let record = ItemRecord {
+        let item = ItemRecord {
             id: "-Kx7Qm2Za".to_owned(),
             share_id: "-Sh4r3".to_owned(),
-            state: "Active".to_owned(),
             title: "demo.service".to_owned(),
             item_type: "custom".to_owned(),
+            ..record()
         };
-        let command = store.view_command(Path::new(SCOPED), &record, &[], ambient());
-        let view: Vec<String> = std::iter::once(command.get_program())
-            .chain(command.get_args())
-            .map(OsStr::to_string_lossy)
-            .map(std::borrow::Cow::into_owned)
-            .collect();
+        let command = store.view_command(Path::new(SCOPED), &item, &[], ambient());
+        let view = argv_of(&command);
         assert!(
             view.iter().any(|arg| arg == "--item-id=-Kx7Qm2Za"),
             "{view:?}"

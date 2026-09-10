@@ -6,6 +6,11 @@
 //! one the user already recognises. The cost is one process spawn per lookup,
 //! which is irrelevant next to the process we are about to spawn anyway.
 //!
+//! Nothing is switched off on that child: `security` is Apple's own tool,
+//! ships with the system, and offers neither a telemetry flag nor an update
+//! check. Stated rather than left silent, because `store/mod.rs` says every
+//! adapter that spawns a vendor answers this question in its own module doc.
+//!
 //! # The value's path through memory
 //!
 //! `security -w` writes the plaintext to its stdout. That buffer is read into a

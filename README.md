@@ -907,7 +907,7 @@ Remove exactly the variables that cause a problem and leave the rest alone.
 The share id moving is the reason references are written against the session
 that will resolve them, and never copied from another session or another day.
 
-Two details of the contract shape the adapter:
+Three details of the contract shape the adapter:
 
 - **`--no-masking` is passed on the probe.** Proton's own output masking is on by
   default and substitutes `<concealed by Proton Pass>`. The probe reads the
@@ -929,6 +929,13 @@ Two details of the contract shape the adapter:
   is then sent to a vendor and kept. Putting argv in it would take the exact
   leak this tool exists to prevent and forward it to a third party under a field
   labelled "reason".
+- **Every child is told to keep quiet.** `pass-cli` writes a row into its own
+  local telemetry database on every command and, by Proton's FAQ, sends them
+  unless `PROTON_PASS_DISABLE_TELEMETRY` is set; `PROTON_PASS_NO_UPDATE_CHECK`
+  keeps the same child from asking a manifest endpoint whether a newer version
+  exists. `keyless` sets both on every `pass-cli` it spawns — the daemon's own
+  `login`, `info` and `logout` included — and on none of the command lines it
+  prints for you to paste, which carry the session directory alone.
 
 ### 1Password — one vault, named once
 
@@ -2059,15 +2066,24 @@ an endpoint or a known analytics vendor's name appears in it.
 
 **The promise extends through the subprocesses it spawns.** A network-backed
 store reaches the network — that is what you asked it for — but nothing else
-leaves with it. The Infisical CLI's own telemetry defaults to **on**, so
-`keyless` passes `--telemetry=false` on every invocation it makes. Without that,
-`keyless` would be the reason a report left your machine while this section
-claimed otherwise.
+leaves with it. Two vendors carry something to switch off, and both are
+switched off on every invocation `keyless` makes, the daemon's own included:
 
-The binary test allows exactly one `telemetry` string — `--telemetry=false` — and
-fails both if any other appears and if that one ever goes missing.
+| Vendor | What is switched off |
+|---|---|
+| Infisical | telemetry defaults to **on**, so `--telemetry=false` goes on every invocation |
+| Proton Pass | `PROTON_PASS_DISABLE_TELEMETRY` stops the row `pass-cli` writes per command and the sending of the ones already saved; `PROTON_PASS_NO_UPDATE_CHECK` stops its update check |
 
-This says nothing about the `infisical` runs you make yourself.
+Without those, `keyless` would be the reason a report left your machine while
+this section claimed otherwise.
+
+The binary test allows exactly two `telemetry` strings — `--telemetry=false`
+and `PROTON_PASS_DISABLE_TELEMETRY` — and fails if any other appears, if either
+goes missing, or if `PROTON_PASS_NO_UPDATE_CHECK` goes missing.
+
+This says nothing about the `infisical` or `pass-cli` runs you make yourself. A
+line you paste carries what you type, and the lines `keyless` prints for you to
+paste carry the session directory alone.
 
 ---
 
