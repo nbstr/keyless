@@ -497,30 +497,6 @@ const KEY_LOST: &str = "local encryption key not found";
 /// The vendor's own noun for a token it will not take.
 const REFUSED: &str = "personal access token";
 
-/// Words that mean the request never reached the vendor's service, or lost it
-/// before an answer came back.
-///
-/// The first two are `pass-cli`'s own, observed verbatim in the daemon's log on
-/// 2026-09-09 during a network outage: `failed to connect to host: error
-/// resolving destination: unknown error errno=None`. The rest are this
-/// platform's `strerror` text, read from libc rather than recalled, for
-/// `ECONNREFUSED`, `ENETUNREACH`, `EHOSTUNREACH`, `ECONNRESET`, `ETIMEDOUT` and
-/// `ECONNABORTED` — which the vendor passes through as `std` renders an
-/// `io::Error`, `<strerror> (os error <n>)`.
-///
-/// A connection lost mid-login belongs here too. It is not a verdict on the
-/// token for the same reason a connection never made is not: nothing came back.
-const UNREACHABLE: &[&str] = &[
-    "failed to connect to host",
-    "error resolving destination",
-    "connection refused",
-    "network is unreachable",
-    "no route to host",
-    "connection reset by peer",
-    "operation timed out",
-    "software caused connection abort",
-];
-
 /// Read the vendor's answer.
 ///
 /// # Why the TEXT decides before the exit code does
@@ -554,7 +530,7 @@ pub fn classify(status: ExitStatus, said: &str) -> Outcome {
     if status.success() {
         return Outcome::LoggedIn;
     }
-    if UNREACHABLE.iter().any(|words| lowered.contains(words)) {
+    if proton::reached_no_service(&lowered) {
         return Outcome::Unreachable(said.trim().to_owned());
     }
     if lowered.contains(REFUSED) {

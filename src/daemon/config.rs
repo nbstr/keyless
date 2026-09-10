@@ -26,6 +26,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -50,7 +51,7 @@ use crate::store::onepassword::{
 };
 use crate::store::proton::{
     AgentToken, ENCRYPTION_KEY_VAR as PROTON_ENCRYPTION_KEY, KeyProvider, ProtonStore,
-    Reason as ProtonReason, Routing as ProtonRouting, TOKEN_VAR as PROTON_TOKEN,
+    Reason as ProtonReason, Routing as ProtonRouting, SessionGate, TOKEN_VAR as PROTON_TOKEN,
 };
 use crate::store::{Registry, Store};
 
@@ -796,8 +797,22 @@ fn default_probe_binary() -> ConfigPath {
     crate::config::default_probe_binary()
 }
 
+/// Thirty seconds per vendor call on this side, where the session allows ten.
+///
+/// The two sides wait for different things. A session's call has a person in
+/// front of it, and ten seconds is already longer than anyone wants to watch.
+/// A daemon's call has a heartbeat in front of it — the client's deadline is a
+/// silence deadline under a 120 s ceiling (`crate::ipc::client`) — so a late
+/// value still arrives, while a call abandoned at ten seconds is a degraded run
+/// that no amount of waiting recovers.
+///
+/// Ten was what a vendor process needed on an idle machine. Under memory
+/// pressure the same process spends the same hundredths of a second of CPU
+/// against ten seconds of wall time, and every call that was killed at the
+/// ceiling had reached the vendor and was waiting on the scheduler. Thirty is
+/// past that, and well under the ceiling.
 const fn default_timeout_ms() -> u64 {
-    crate::config::DEFAULT_TIMEOUT_MS
+    30_000
 }
 
 impl DaemonConfig {
@@ -1033,8 +1048,11 @@ impl DaemonConfig {
     /// is the side that knows what its stores hold. A session cannot settle it:
     /// [`crate::store::build`] drops every per-name pin when the daemon is
     /// enabled, precisely so a client cannot steer which vault answers.
+    /// `gate` is the [`SessionGate`] the renewal loop closes while it replaces
+    /// the session, or `None` for a registry nothing replaces underneath — a
+    /// `keylessd check`, which resolves in its own process and renews nothing.
     #[must_use]
-    pub fn registry(&self) -> Registry {
+    pub fn registry(&self, gate: Option<&Arc<SessionGate>>) -> Registry {
         let mut stores: Vec<Box<dyn Store>> = Vec::new();
         if self.stores.file.enabled {
             stores.push(Box::new(FileStore::new(
@@ -1134,6 +1152,7 @@ impl DaemonConfig {
                 )
                 .with_timeout(settings.timeout_ms)
                 .with_listing_ttl(settings.listing_ttl_ms)
+                .with_session_gate(gate.map(Arc::clone))
                 .with_agent_token(self.agent_token()),
             ));
         }
@@ -1477,7 +1496,7 @@ impl DaemonConfig {
         // rather than from a second list of names kept in step with it. A
         // hand-written list is how a store gets renamed and its warning quietly
         // stops firing.
-        let registry = self.registry();
+        let registry = self.registry(None);
         let configured: Vec<&str> = registry.stores().iter().map(|store| store.id()).collect();
 
         // Silent until the first request otherwise: every unpinned name comes
@@ -1697,7 +1716,7 @@ mod tests {
         let policy = config.policy().expect("valid");
         assert!(!policy.is_empty());
         assert_eq!(policy.image_count(), 1);
-        assert_eq!(config.registry().stores().len(), 1);
+        assert_eq!(config.registry(None).stores().len(), 1);
         assert!(config.warnings().is_empty());
     }
 
@@ -1752,7 +1771,7 @@ mod tests {
                           "default":"keychain"},
                 "secrets":{"DATABASE_URL":{"store":"file"}}}"#,
         );
-        let registry = config.registry();
+        let registry = config.registry(None);
         assert_eq!(registry.stores().len(), 2);
         // The file store's path does not exist, so this cannot be a value; the
         // question is only WHICH store was asked, and a route to a store that
@@ -1864,7 +1883,7 @@ mod tests {
                                        "binary":"/nonexistent/keyless-test/infisical"}},
                 "secrets":{"DATABASE_URL":{"env":"staging"}}}"#,
         );
-        let registry = config.registry();
+        let registry = config.registry(None);
         let ids: Vec<&str> = registry.stores().iter().map(|store| store.id()).collect();
         assert_eq!(ids, ["infisical"]);
 
@@ -1872,7 +1891,7 @@ mod tests {
         // and an empty registry answers `not found in any store` — which reads
         // as a working lookup that came back empty rather than as an absent
         // adapter. Asking for the store id is what tells them apart.
-        assert_eq!(parse("{}").registry().stores().len(), 0);
+        assert_eq!(parse("{}").registry(None).stores().len(), 0);
     }
 
     #[test]
@@ -1887,7 +1906,7 @@ mod tests {
                                        "binary":"/nonexistent/keyless-test/infisical"}},
                 "secrets":{"DECLARED":{"env":"staging"}}}"#,
         );
-        let registry = config.registry();
+        let registry = config.registry(None);
 
         let invented = registry.resolve("A_NAME_NOBODY_EVER_DECLARED").reason();
         assert!(invented.contains("was not asked"), "{invented}");
@@ -2009,7 +2028,7 @@ mod tests {
     fn a_well_formed_onepassword_config_registers_the_store_and_warns_about_nothing() {
         let config = parse(ONEPASSWORD_WELL_FORMED);
         let ids: Vec<String> = config
-            .registry()
+            .registry(None)
             .stores()
             .iter()
             .map(|store| store.id().to_owned())

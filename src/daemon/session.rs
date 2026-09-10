@@ -67,6 +67,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use crate::NAME;
+use crate::store::proton::SessionGate;
 
 use super::config::{DaemonConfig, SessionRenewal};
 use super::login::{self, Coordinates, Owner};
@@ -155,7 +156,7 @@ impl Drop for Keeper {
 /// rather than warned about: an operator who wrote `auto_login: true` has said
 /// the session matters, and starting anyway would leave them with the exact
 /// silent outage this module exists to end.
-pub fn spawn(config: &DaemonConfig) -> Result<Option<Keeper>, String> {
+pub fn spawn(config: &DaemonConfig, gate: &Arc<SessionGate>) -> Result<Option<Keeper>, String> {
     let settings = config.stores.proton.session;
     if !config.stores.proton.enabled || !settings.auto_login {
         return Ok(None);
@@ -168,6 +169,7 @@ pub fn spawn(config: &DaemonConfig) -> Result<Option<Keeper>, String> {
 
     let stop = Arc::new(AtomicBool::new(false));
     let flag = Arc::clone(&stop);
+    let gate = Arc::clone(gate);
     let (alive, done) = std::sync::mpsc::channel::<Never>();
     let handle = thread::Builder::new()
         .name(format!("{NAME}d-session"))
@@ -175,7 +177,7 @@ pub fn spawn(config: &DaemonConfig) -> Result<Option<Keeper>, String> {
             // Moved in so it is dropped when this thread returns, however it
             // returns. That drop is what shutdown waits on.
             let _alive = alive;
-            run(&coordinates, owner, settings, &flag);
+            run(&coordinates, owner, settings, &gate, &flag);
         })
         .map_err(|error| format!("cannot start the Proton session loop: {error}"))?;
 
@@ -204,7 +206,13 @@ pub fn spawn(config: &DaemonConfig) -> Result<Option<Keeper>, String> {
 /// though it were new is the one reading that produces an outage, so an unknown
 /// age is treated as old and replaced. `--replace` makes that safe against all
 /// three states.
-fn run(coordinates: &Coordinates, owner: Owner, settings: SessionRenewal, stop: &AtomicBool) {
+fn run(
+    coordinates: &Coordinates,
+    owner: Owner,
+    settings: SessionRenewal,
+    gate: &SessionGate,
+    stop: &AtomicBool,
+) {
     let interval = Duration::from_secs(settings.probe_interval_seconds).max(MIN_INTERVAL);
     let lifetime = Duration::from_secs(settings.login_after_minutes.saturating_mul(60));
     let min_backoff = Duration::from_secs(settings.min_backoff_seconds).max(MIN_INTERVAL);
@@ -222,7 +230,7 @@ fn run(coordinates: &Coordinates, owner: Owner, settings: SessionRenewal, stop: 
         let due =
             established.is_none_or(|at| at.elapsed() >= lifetime) || !alive(coordinates, owner);
         if due {
-            match attempt(coordinates, owner) {
+            match attempt(coordinates, owner, gate) {
                 Ok(()) => {
                     established = Some(Instant::now());
                     if failures > 0 {
@@ -304,7 +312,7 @@ fn alive(coordinates: &Coordinates, owner: Owner) -> bool {
 /// captured once at startup. That is what makes a rotation take effect without
 /// a restart — `keylessd credential` writes the file, and the next tick logs in
 /// with what it now says.
-fn attempt(coordinates: &Coordinates, owner: Owner) -> Result<(), String> {
+fn attempt(coordinates: &Coordinates, owner: Owner, gate: &SessionGate) -> Result<(), String> {
     use crate::store::Store;
 
     // The directory before the login that writes into it.
@@ -371,6 +379,13 @@ fn attempt(coordinates: &Coordinates, owner: Owner) -> Result<(), String> {
     // exists for. `--replace` logs out first and treats "already logged out"
     // as success, which makes it right against a live session, a dead one and
     // an empty directory alike.
+    //
+    // Held closed across both halves: between the logout and the login the
+    // directory holds no session, and a read landing in there gets the
+    // vendor's "not authenticated" — a sentence about this daemon's own login
+    // that a caller cannot tell from a revoked token. The gate reopens when
+    // this guard drops, a failed login and a panic included.
+    let _replacing = gate.replace();
     login::establish(coordinates, owner, true, &token, extra, &mut io::sink())
 }
 

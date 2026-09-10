@@ -1082,6 +1082,15 @@ environment. The never-block rule has no exception for a slow network.
 Ten names against an unreachable store is ten timeouts, so the wait is per
 lookup, not per run. `doctor` is where you find out why.
 
+**The daemon allows itself 30 seconds instead**, and the difference is who is
+waiting. A session's lookup has a person in front of it, and ten seconds is
+already longer than anyone wants to watch a terminal. A daemon's lookup has a
+heartbeat in front of it, so a late value still arrives — while one abandoned
+at ten seconds is a degraded run that no amount of waiting recovers. Under
+memory pressure a vendor process spends hundredths of a second of CPU against
+ten seconds of wall time, and every call killed at that ceiling had reached the
+vendor and was waiting on the machine.
+
 ---
 
 ## Finding what to put in the config
@@ -1783,6 +1792,23 @@ window may be configured past **15 minutes**, and `cache_ttl_seconds: 0` turns
 both off. So a vendor CLI that has gone slow costs a lookup a second rather than
 its whole latency, while a vendor that has revoked a credential still stops that
 credential dead on the first refresh that reaches it.
+
+**Which of those two a failure is, the vendor's own words decide.** A failure
+naming a transport fault — the connection refused, the host unresolved, the
+socket reset — reached nobody, so it decides nothing about the item and the
+value stands. Every other sentence is the account answering about this name, so
+it evicts. The recognised set is a list of measured phrases and nothing else,
+because the two mistakes are not the same size: a verdict read as transport
+serves a disowned credential for the rest of the window, while transport read
+as a verdict costs one eviction and a fresh lookup.
+
+**A read never lands in the middle of a session renewal.** The daemon replaces
+its own Proton session on a clock — a logout, then a login — and between them
+the session directory holds nothing. A lookup arriving in that gap waits for
+the new session instead of reading the vendor's "not authenticated", which is a
+sentence about the daemon's login that nothing downstream could tell from a
+revoked token. A lookup that waits out its whole ceiling there reports the
+store unavailable, so its cached value is kept rather than thrown away.
 
 **And there is no local fallback.** Enabling the daemon *disables* every local
 backend — keychain, Infisical, 1Password and Proton Pass alike — whatever each
