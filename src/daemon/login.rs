@@ -241,11 +241,14 @@ pub fn coordinates(config: &super::config::DaemonConfig) -> Result<Coordinates, 
         ));
     }
 
+    // `credential_entries`, not `credentials`: under `env` the local key's own
+    // entry is one this daemon names when the operator did not, and every
+    // reader of that map has to agree about the name — the generator writes
+    // the value under it, and this is where the same name is read back.
     let extra = settings
-        .credentials
-        .iter()
+        .credential_entries()
+        .into_iter()
         .filter(|(variable, _)| variable.as_str() != proton::TOKEN_VAR)
-        .map(|(variable, entry)| (variable.clone(), entry.clone()))
         .collect();
 
     Ok(Coordinates {

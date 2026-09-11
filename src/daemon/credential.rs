@@ -49,6 +49,7 @@ use std::fs;
 use std::io;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use zeroize::Zeroize;
 
@@ -738,8 +739,28 @@ pub enum GeneratedEntry {
 /// Whatever [`store_entry`] could not do, a malformed existing file, or a
 /// generator failure ([`crate::random::generate`]'s own `/dev/urandom` read).
 pub fn ensure_generated_entry(path: &Path, name: &str) -> Result<GeneratedEntry, CredentialError> {
-    let (entries, _owner) = read_existing(path)?;
-    if entries.get(name).is_some_and(|value| !value.is_empty()) {
+    // The read and the write are ONE act, and two processes reach it: the
+    // daemon's own start, and the `login` verb an operator runs beside it —
+    // which the installer's documented sequence puts back to back. Left
+    // unserialised, both find the entry absent, both generate, and the loser's
+    // value lands on top of a key the winner has already established a session
+    // under. The file then holds a key that opens nothing, which is this
+    // slice's own failure mode moved one file over. The claim `KeyProvider`
+    // makes — exactly one writer of the key — is true of two processes only
+    // because of this claim.
+    let _guard = Guard::take(path)?;
+
+    let (mut entries, _owner) = read_existing(path)?;
+    let present = entries.get(name).is_some_and(|value| !value.is_empty());
+    // `read_existing` hands back every credential in the file in plaintext —
+    // this entry, and the agent token beside it. That obligation travels with
+    // the map rather than being enforced by it (`crate::store::file::Contents`
+    // says so in its own doc), and this function is where the map lives
+    // longest, so it is scrubbed here on both arms rather than on one.
+    for value in entries.values_mut() {
+        value.zeroize();
+    }
+    if present {
         return Ok(GeneratedEntry::AlreadyPresent);
     }
 
@@ -749,19 +770,133 @@ pub fn ensure_generated_entry(path: &Path, name: &str) -> Result<GeneratedEntry,
     Ok(GeneratedEntry::Generated)
 }
 
+/// How long a claim may be held before the next writer takes it over.
+///
+/// A holder that died — a daemon killed mid-start, an operator's `login` that
+/// hit Ctrl-C — leaves its claim behind, and a claim nobody can break wedges
+/// every later start permanently. Long enough that a live holder doing a read,
+/// a generate and an atomic write is never overtaken; short enough that a
+/// machine recovers on its own.
+const CLAIM_STALE: Duration = Duration::from_secs(30);
+
+/// How long a writer waits for a claim before reporting that it could not take
+/// one.
+const CLAIM_WAIT: Duration = Duration::from_secs(5);
+
+/// An exclusive claim on one credential file, held across a read-then-write.
+///
+/// `create_new` IS the mechanism: the kernel admits exactly one creator of a
+/// path, so the claim file's existence is the lock and nothing else has to
+/// agree about it. No `flock`, because that would be a dependency for a
+/// property one `open` flag already provides.
+struct Guard {
+    path: PathBuf,
+}
+
+impl Guard {
+    /// Claim `target`, waiting up to [`CLAIM_WAIT`] for a live holder and
+    /// taking over one older than [`CLAIM_STALE`].
+    fn take(target: &Path) -> Result<Self, CredentialError> {
+        let path = claim_path(target)?;
+        let deadline = Instant::now() + CLAIM_WAIT;
+        loop {
+            match fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(MODE)
+                .open(&path)
+            {
+                Ok(_) => return Ok(Self { path }),
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                    if claim_is_stale(&path) {
+                        // Not a race between the reader of the age and the
+                        // remover: whoever removes it still has to win the
+                        // `create_new` above to hold it.
+                        let _ = fs::remove_file(&path);
+                        continue;
+                    }
+                    if Instant::now() >= deadline {
+                        return Err(io_error(
+                            target,
+                            format!(
+                                "another `{}` is writing it and did not finish within {} \
+                                 seconds: {} is held",
+                                crate::DAEMON_NAME,
+                                CLAIM_WAIT.as_secs(),
+                                path.display()
+                            ),
+                        ));
+                    }
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                Err(error) => {
+                    return Err(io_error(
+                        target,
+                        format!("cannot be claimed for writing: {error}"),
+                    ));
+                }
+            }
+        }
+    }
+}
+
+impl Drop for Guard {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+/// Where one credential file's claim lives — beside it, so it inherits the
+/// directory's own mode and never lands somewhere world-writable.
+fn claim_path(target: &Path) -> Result<PathBuf, CredentialError> {
+    let parent = target
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .ok_or_else(|| io_error(target, "has no directory to write into"))?;
+    let name = target
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("credentials");
+    Ok(parent.join(format!(".{name}.claim")))
+}
+
+/// Whether a claim is old enough that its holder is presumed gone.
+///
+/// An unreadable claim reads as NOT stale: it is there, something made it, and
+/// breaking one this process cannot even stat is the move that turns a
+/// permission problem into two writers.
+fn claim_is_stale(path: &Path) -> bool {
+    fs::metadata(path)
+        .and_then(|meta| meta.modified())
+        .map(|at| at.elapsed().unwrap_or_default() > CLAIM_STALE)
+        .unwrap_or(false)
+}
+
 /// Give [`crate::store::proton::KeyProvider::Env`] a local key to read,
 /// generated once at the daemon's own first start.
 ///
-/// `Ok(None)` when there is nothing to generate: Proton is disabled, `fs` is
-/// still in force, or `stores.proton.credentials` names no entry for
-/// [`proton::ENCRYPTION_KEY_VAR`] — that last case is a misconfiguration
-/// [`super::config::DaemonConfig::warnings`] already reports; this function
-/// does not repeat it, and generates nothing to fill a name that was never
-/// declared.
+/// `Ok(None)` when there is nothing to generate: Proton is disabled, or `fs` is
+/// still in force and owns its own key file.
+///
+/// # Why a config naming no entry is not one of those cases
+///
+/// The entry name is a label for a value this daemon generates and nobody ever
+/// types, so an operator who has to supply one is being asked to invent a name
+/// for something they will never see — and the cost of forgetting is every
+/// Proton name degrading behind a warning nobody reads at boot.
+/// [`super::config::DaemonProtonConfig::credential_entries`] fills the name in,
+/// which is why this function no longer has an arm for its absence. systemd
+/// draws the same line for the same object: its credential host key is
+/// "automatically generated when needed", and its explicit `setup` verb exists
+/// because it is cheaper to call than to discover, never as a prerequisite.
 ///
 /// # Errors
 ///
-/// Whatever [`ensure_generated_entry`] could not do.
+/// Whatever [`ensure_generated_entry`] could not do, and a refusal where the
+/// credential file is the file the `file` store serves — the same refusal
+/// [`super::login::coordinates`] makes, for the same reason: everything in that
+/// file is a name any attested client can ask for, so a key minted into it is
+/// handed out on request.
 pub fn ensure_proton_local_key(
     config: &super::config::DaemonConfig,
 ) -> Result<Option<GeneratedEntry>, CredentialError> {
@@ -769,10 +904,20 @@ pub fn ensure_proton_local_key(
     if !settings.enabled || settings.key_provider != proton::KeyProvider::Env {
         return Ok(None);
     }
-    let Some(entry) = settings.credentials.get(proton::ENCRYPTION_KEY_VAR) else {
+    let credentials_file = settings.credentials_file.to_path_buf();
+    if config.stores.file.enabled && credentials_file == config.stores.file.path.to_path_buf() {
+        return Err(CredentialError::Refused(format!(
+            "{} is the file the `file` store serves, so a local key generated there is a name \
+             any attested client can ask for over the socket. Point \
+             `stores.proton.credentials_file` at a file of its own first",
+            credentials_file.display()
+        )));
+    }
+    let entries = settings.credential_entries();
+    let Some(entry) = entries.get(proton::ENCRYPTION_KEY_VAR) else {
         return Ok(None);
     };
-    ensure_generated_entry(&settings.credentials_file, entry).map(Some)
+    ensure_generated_entry(&credentials_file, entry).map(Some)
 }
 
 /// A file's owning uid and gid, kept together so a rewrite can hand them back.
@@ -819,12 +964,19 @@ fn read_existing(
 /// Rename a fresh `0600` file over the old one, keeping its owner.
 fn write_atomically(path: &Path, body: &[u8], owner: Option<Owner>) -> Result<(), CredentialError> {
     let parent = path.parent().filter(|p| !p.as_os_str().is_empty());
+    // The process id is in the name because two `keylessd` processes can write
+    // this file — the daemon's own start and an operator's `login` — and a
+    // SHARED temporary is one inode two writers truncate and fill at their own
+    // offsets, which leaves a splice of two JSON images that parses as neither.
+    // A claim serialises the generator; this is what keeps every other writer
+    // from colliding whether or not it took one.
     let temporary = match parent {
         Some(dir) => dir.join(format!(
-            ".{}.new",
+            ".{}.{}.new",
             path.file_name()
                 .and_then(|n| n.to_str())
-                .unwrap_or("credentials")
+                .unwrap_or("credentials"),
+            std::process::id()
         )),
         None => return Err(io_error(path, "has no directory to write into")),
     };
@@ -1257,16 +1409,144 @@ mod tests {
     }
 
     #[test]
-    fn ensure_proton_local_key_generates_nothing_when_no_entry_is_declared() {
-        // `DaemonConfig::warnings` already reports this misconfiguration;
-        // this function must not paper over it by inventing an entry name.
+    fn a_config_naming_no_entry_still_gets_a_key_under_the_daemons_own_name() {
+        // The state this removes: `env` in force, no entry named, so nothing
+        // was generated and every Proton name degraded behind one warning
+        // printed into a launchd log at boot. The entry labels a value nobody
+        // types, so naming it is the daemon's job.
         let dir = scratch("generate-undeclared");
         let config = proton_config_for_generation(&dir, "env", false);
+
         assert_eq!(
             ensure_proton_local_key(&config).expect("no error"),
-            None,
-            "a name was invented for an undeclared entry"
+            Some(GeneratedEntry::Generated),
+            "a config naming no entry generated nothing"
         );
+
+        let store = crate::store::file::FileStore::new(dir.join("proton.json"));
+        let under_default =
+            crate::store::Store::resolve(&store, super::super::config::DEFAULT_LOCAL_KEY_ENTRY)
+                .expect("resolve")
+                .expect("present")
+                .len();
+        assert_eq!(
+            under_default, 43,
+            "the generated value is not the expected length"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_declared_entry_name_is_used_instead_of_the_daemons_own() {
+        // The control for the case above: without it, that test passes on a
+        // generator that writes to `LOCAL_KEY` unconditionally, which would
+        // strand every machine whose config names an entry of its own.
+        let dir = scratch("generate-declared-name");
+        let config = proton_config_for_generation(&dir, "env", true);
+
+        assert_eq!(
+            ensure_proton_local_key(&config).expect("no error"),
+            Some(GeneratedEntry::Generated)
+        );
+
+        let store = crate::store::file::FileStore::new(dir.join("proton.json"));
+        assert!(
+            crate::store::Store::resolve(&store, "PROTON_LOCAL_KEY")
+                .expect("resolve")
+                .is_some(),
+            "the declared entry holds nothing"
+        );
+        assert!(
+            crate::store::Store::resolve(&store, super::super::config::DEFAULT_LOCAL_KEY_ENTRY)
+                .expect("resolve")
+                .is_none(),
+            "the daemon's own entry name was written beside the declared one"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn two_generators_racing_one_file_agree_on_one_value() {
+        // The interleaving the claim exists for, and the one the installer's
+        // own documented sequence produces: `keylessd run` starting while
+        // `keylessd login` runs beside it. Without the claim both find the
+        // entry absent, both generate, and the loser's value lands on top of a
+        // key the winner has already established a session under — a file
+        // holding a key that opens nothing.
+        let dir = scratch("generate-race");
+        let path = dir.join("proton.json");
+
+        let verdicts: Vec<_> = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..2)
+                .map(|_| {
+                    let path = path.clone();
+                    scope.spawn(move || ensure_generated_entry(&path, "PROTON_LOCAL_KEY"))
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().expect("the generator panicked"))
+                .collect()
+        });
+
+        let generated = verdicts
+            .iter()
+            .filter(|verdict| matches!(verdict, Ok(GeneratedEntry::Generated)))
+            .count();
+        let present = verdicts
+            .iter()
+            .filter(|verdict| matches!(verdict, Ok(GeneratedEntry::AlreadyPresent)))
+            .count();
+        assert_eq!(
+            (generated, present),
+            (1, 1),
+            "two racing generators did not agree on one value: {verdicts:?}"
+        );
+
+        let store = crate::store::file::FileStore::new(path);
+        assert_eq!(
+            crate::store::Store::resolve(&store, "PROTON_LOCAL_KEY")
+                .expect("resolve")
+                .expect("present")
+                .len(),
+            43,
+            "the surviving value is not one whole generated key"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_key_is_never_generated_into_the_file_the_file_store_serves() {
+        // The refusal `login::coordinates` already makes, made by the writer
+        // too: everything in that file is a name any attested client can ask
+        // for, so a key minted there is handed out on request.
+        let dir = scratch("generate-into-served-file");
+        let shared = dir.join("secrets.json");
+        let config: super::super::config::DaemonConfig = serde_json::from_str(&format!(
+            r#"{{"audit":"{dir}/audit.jsonl",
+                 "stores":{{"file":{{"enabled":true,"path":"{shared}"}},
+                            "proton":{{"enabled":true,
+                                       "session_dir":"{dir}/session",
+                                       "credentials_file":"{shared}",
+                                       "key_provider":"env",
+                                       "credentials":{{"PROTON_PASS_PERSONAL_ACCESS_TOKEN":"TOKEN"}}}}}}}}"#,
+            dir = dir.display(),
+            shared = shared.display(),
+        ))
+        .expect("a valid daemon config");
+
+        let said = ensure_proton_local_key(&config)
+            .expect_err("a key was generated into the file the `file` store serves")
+            .to_string();
+        assert!(
+            said.contains("file of its own"),
+            "the refusal does not name the fix: {said}"
+        );
+        assert!(!shared.exists(), "the refused write left a file behind");
+
         let _ = fs::remove_dir_all(&dir);
     }
 

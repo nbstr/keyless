@@ -208,11 +208,27 @@ fn stub_recording_key_provider(
 /// cases could observe a resolve at all.
 fn daemon_config_with_proton(dir: &Path, vendor: &Path) -> DaemonConfig {
     support::publish_generation(&session_dir(dir));
+    // A credential file with both entries written, because this fixture takes
+    // the crate's own `key_provider` default: under `env` a config declaring
+    // no key is one a real `pass-cli` refuses at provider construction, so a
+    // control running that way would be modelling an arrangement that cannot
+    // work anywhere but against a stand-in.
+    let credentials = dir.join("proton.json");
+    write_secrets(
+        &credentials,
+        &[
+            ("AGENT_TOKEN", TOKEN_DECOY),
+            ("LOCAL_KEY", ENCRYPTION_KEY_DECOY),
+        ],
+    );
     serde_json::from_str(&format!(
         r#"{{"socket":"{socket}","audit":"{audit}",
              "cache_ttl_seconds":0,"idle_timeout_seconds":5,
              "stores":{{"proton":{{"enabled":true,"binary":"{vendor}",
                                    "session_dir":"{session}",
+                                   "credentials_file":"{credentials}",
+                                   "credentials":{{"PROTON_PASS_PERSONAL_ACCESS_TOKEN":"AGENT_TOKEN",
+                                                   "PROTON_PASS_ENCRYPTION_KEY":"LOCAL_KEY"}},
                                    "timeout_ms":60000}}}},
              "secrets":{{"{DECLARED}":{{"store":"proton","vault":"{VAULT}",
                                         "item":"{ITEM}","field":"password"}},
@@ -220,6 +236,7 @@ fn daemon_config_with_proton(dir: &Path, vendor: &Path) -> DaemonConfig {
         socket = short_socket_path(dir).display(),
         audit = dir.join("audit.jsonl").display(),
         session = session_dir(dir).display(),
+        credentials = credentials.display(),
         vendor = vendor.display(),
     ))
     .expect("valid daemon config")
@@ -308,6 +325,10 @@ fn daemon_config_with_a_failing_renewal(dir: &Path, vendor: &Path) -> DaemonConf
     write_secrets(&secrets, &[(NEIGHBOUR, NEIGHBOUR_VALUE)]);
     let credentials = dir.join("proton.json");
     write_secrets(&credentials, &[("AGENT_TOKEN", TOKEN_DECOY)]);
+    // `key_provider: fs` pinned rather than inherited: these cases are about
+    // the TOKEN, and under `env` the daemon also names an entry for its own
+    // local key, so an unwritten credential file would report the key missing
+    // where the case is asking what happens to the token.
 
     serde_json::from_str(&format!(
         r#"{{"socket":"{socket}","audit":"{audit}",
@@ -317,6 +338,7 @@ fn daemon_config_with_a_failing_renewal(dir: &Path, vendor: &Path) -> DaemonConf
                "proton":{{"enabled":true,"binary":"{vendor}",
                           "session_dir":"{session}",
                           "timeout_ms":60000,
+                          "key_provider":"fs",
                           "credentials_file":"{credentials}",
                           "credentials":{{"PROTON_PASS_PERSONAL_ACCESS_TOKEN":"AGENT_TOKEN"}},
                           "session":{{"auto_login":true,"login_after_minutes":1,
@@ -666,12 +688,17 @@ fn daemon_config_with_token(dir: &Path, vendor: &Path) -> DaemonConfig {
     support::publish_generation(&session_dir(dir));
     let credentials = dir.join("proton-credentials.json");
     write_secrets(&credentials, &[(TOKEN_ENTRY, TOKEN_DECOY)]);
+    // `key_provider: fs` pinned rather than inherited: these cases are about
+    // the TOKEN, and under `env` the daemon also names an entry for its own
+    // local key, so an unwritten credential file would report the key missing
+    // where the case is asking what happens to the token.
     serde_json::from_str(&format!(
         r#"{{"socket":"{socket}","audit":"{audit}",
              "cache_ttl_seconds":0,"idle_timeout_seconds":5,
              "stores":{{"proton":{{"enabled":true,"binary":"{vendor}",
                                    "session_dir":"{session}",
                                    "timeout_ms":60000,
+                                   "key_provider":"fs",
                                    "credentials_file":"{credentials}",
                                    "credentials":{{"PROTON_PASS_PERSONAL_ACCESS_TOKEN":"{TOKEN_ENTRY}"}}}}}},
              "secrets":{{"{DECLARED}":{{"store":"proton","vault":"{VAULT}",
@@ -782,12 +809,17 @@ fn a_credential_variable_this_adapter_sets_itself_is_refused() {
     support::publish_generation(&session_dir(&dir));
     let credentials = dir.join("proton-credentials.json");
     write_secrets(&credentials, &[(TOKEN_ENTRY, TOKEN_DECOY)]);
+    // `key_provider: fs` pinned rather than inherited: these cases are about
+    // the TOKEN, and under `env` the daemon also names an entry for its own
+    // local key, so an unwritten credential file would report the key missing
+    // where the case is asking what happens to the token.
     let config: DaemonConfig = serde_json::from_str(&format!(
         r#"{{"socket":"{socket}","audit":"{audit}",
              "cache_ttl_seconds":0,"idle_timeout_seconds":5,
              "stores":{{"proton":{{"enabled":true,"binary":"{vendor}",
                                    "session_dir":"{session}",
                                    "timeout_ms":60000,
+                                   "key_provider":"fs",
                                    "credentials_file":"{credentials}",
                                    "credentials":{{"PROTON_PASS_SESSION_DIR":"{TOKEN_ENTRY}"}}}}}},
              "secrets":{{"{DECLARED}":{{"store":"proton","vault":"{VAULT}",

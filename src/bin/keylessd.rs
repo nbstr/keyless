@@ -469,6 +469,38 @@ mod daemon {
             ));
         }
 
+        // The other arrangement that makes writing worse than not writing:
+        // under `env` this daemon GENERATES the Proton local key and every
+        // published generation is encrypted under the value it generated. A
+        // typed value replacing it leaves each of those directories encrypted
+        // under a key nothing holds — the failure this provider exists to
+        // remove, arriving through the one door that is still open. Refused
+        // rather than warned about, because the damage is done by the time
+        // anything could report it.
+        {
+            use keyless::store::proton::{ENCRYPTION_KEY_VAR, KeyProvider, STORE_ID};
+
+            if store == STORE_ID
+                && config.stores.proton.key_provider == KeyProvider::Env
+                && config
+                    .stores
+                    .proton
+                    .credential_entries()
+                    .get(ENCRYPTION_KEY_VAR)
+                    .is_some_and(|entry| entry == &args.name)
+            {
+                return fail(&format!(
+                    "`{}` is where {} keeps the Proton local encryption key, which it generates \
+                     itself and every session directory it has published is encrypted under. \
+                     Writing a value there makes those directories unreadable. Nothing has to \
+                     be typed here: the key is written at first start and reused on every later \
+                     one",
+                    args.name,
+                    keyless::DAEMON_NAME
+                ));
+            }
+        }
+
         // Echo off, on the descriptor the terminal test asked about, and no
         // prompt at all when it cannot be switched off. See
         // `credential::prompt_for`, which both this verb and `login` read
