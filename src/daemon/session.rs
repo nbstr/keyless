@@ -69,7 +69,7 @@ use std::time::{Duration, Instant};
 use crate::NAME;
 use crate::store::proton_session::Generations;
 
-use super::config::{DaemonConfig, SessionRenewal};
+use super::config::DaemonConfig;
 use super::login::{self, Coordinates, Owner};
 
 /// The shortest wake interval the loop will accept.
@@ -172,6 +172,12 @@ pub fn spawn(
     }
 
     let coordinates = login::coordinates(config)?;
+    // Cloned into the loop so it can re-attempt the local key's generation on
+    // every tick that is about to log in. Boot-only generation leaves a daemon
+    // that lost one race — a restart killing the holder of the claim — with no
+    // key and no way back until a person restarts it, which is the state this
+    // machine reached on 2026-09-11.
+    let for_key = config.clone();
     let Some(owner) = super::credential::daemon_owner(&config.audit) else {
         return Err(login::no_daemon_uid(&config.audit));
     };
@@ -183,8 +189,6 @@ pub fn spawn(
         ));
     };
     let generations = Arc::clone(generations);
-    let timeout_ms = config.stores.proton.timeout_ms;
-    let grace = login::grace(timeout_ms);
 
     let stop = Arc::new(AtomicBool::new(false));
     let flag = Arc::clone(&stop);
@@ -195,15 +199,7 @@ pub fn spawn(
             // Moved in so it is dropped when this thread returns, however it
             // returns. That drop is what shutdown waits on.
             let _alive = alive;
-            run(
-                &coordinates,
-                owner,
-                settings,
-                &generations,
-                grace,
-                timeout_ms,
-                &flag,
-            );
+            run(&coordinates, &for_key, owner, &generations, &flag);
         })
         .map_err(|error| format!("cannot start the Proton session loop: {error}"))?;
 
@@ -212,6 +208,36 @@ pub fn spawn(
         done,
         handle: Some(handle),
     }))
+}
+
+/// Give the local key another chance, and say only what changed.
+///
+/// A generation that succeeds is worth a line every time — it happens once per
+/// machine. A failure that persists is worth one line and not one per tick:
+/// the login failure beside it already carries the same fact in the operator's
+/// own terms, and two copies of one outage per minute is how a log stops being
+/// read.
+fn report_key_generation(config: &DaemonConfig, said: &mut Option<String>) {
+    match super::credential::ensure_proton_local_key(config) {
+        Ok(Some(super::credential::GeneratedEntry::Generated)) => {
+            *said = None;
+            report(&format!(
+                "generated the Proton local encryption key at {}",
+                config.stores.proton.credentials_file.display()
+            ));
+        }
+        Ok(_) => *said = None,
+        Err(error) => {
+            let now = error.to_string();
+            if said.as_deref() != Some(now.as_str()) {
+                report(&format!(
+                    "the Proton local encryption key could not be generated, so the login \
+                     below cannot open a session: {now}"
+                ));
+                *said = Some(now);
+            }
+        }
+    }
 }
 
 /// The loop itself, with its clock and its two waits.
@@ -234,13 +260,18 @@ pub fn spawn(
 /// three states.
 fn run(
     coordinates: &Coordinates,
+    config: &DaemonConfig,
     owner: Owner,
-    settings: SessionRenewal,
     generations: &Generations,
-    grace: Duration,
-    timeout_ms: u64,
     stop: &AtomicBool,
 ) {
+    // Derived here rather than handed in: all three are the config's own, and
+    // a parameter list that carries a value its neighbour already holds is one
+    // a later change can make disagree with itself.
+    let settings = config.stores.proton.session;
+    let timeout_ms = config.stores.proton.timeout_ms;
+    let grace = login::grace(timeout_ms);
+
     let interval = Duration::from_secs(settings.probe_interval_seconds).max(MIN_INTERVAL);
     let lifetime = Duration::from_secs(settings.login_after_minutes.saturating_mul(60));
     let min_backoff = Duration::from_secs(settings.min_backoff_seconds).max(MIN_INTERVAL);
@@ -255,6 +286,9 @@ fn run(
     // tick has even run waits out one `min_backoff` like any other, instead
     // of firing the instant the thread starts.
     let mut last_attempt = Instant::now();
+    // The last thing the generator said, so a failure that persists is said
+    // once rather than on every tick beside the login failure it causes.
+    let mut key_said: Option<String> = None;
 
     // Once before the clock below ever runs, so a crash leftover — a
     // generation a previous process created and never published, or one it
@@ -285,6 +319,15 @@ fn run(
             || !alive(coordinates, owner, generations);
         if due {
             last_attempt = Instant::now();
+            // The key before the login that needs it. `serve` generates once at
+            // start, and a start that lost the race for the claim — a restart
+            // killing the holder mid-write is how that happens — would
+            // otherwise leave this daemon with no key and no way back but a
+            // person restarting it. Attempted here, where the value is about to
+            // be read, it converges on its own: every later tick is another
+            // chance, and a claim a dead holder left behind goes stale in
+            // seconds.
+            report_key_generation(config, &mut key_said);
             match attempt(coordinates, owner, generations) {
                 Ok(name) => {
                     established = Some(Instant::now());

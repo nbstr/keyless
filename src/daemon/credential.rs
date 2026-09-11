@@ -772,16 +772,27 @@ pub fn ensure_generated_entry(path: &Path, name: &str) -> Result<GeneratedEntry,
 
 /// How long a claim may be held before the next writer takes it over.
 ///
-/// A holder that died — a daemon killed mid-start, an operator's `login` that
-/// hit Ctrl-C — leaves its claim behind, and a claim nobody can break wedges
-/// every later start permanently. Long enough that a live holder doing a read,
-/// a generate and an atomic write is never overtaken; short enough that a
-/// machine recovers on its own.
-const CLAIM_STALE: Duration = Duration::from_secs(30);
+/// A holder that died leaves its claim behind — a daemon killed mid-start by
+/// the very restart that installed it, an operator's `login` that hit Ctrl-C —
+/// because a signal runs no destructor. So a claim has to be breakable on time
+/// alone. The work it covers is one small file read and one atomic write, so
+/// five seconds is already a thousand times what a live holder needs, and
+/// nothing is served by waiting longer: the cost of breaking a claim too early
+/// is two writers, which the file's own read-before-write then resolves into
+/// one value, while the cost of breaking it too late is a daemon with no key.
+const CLAIM_STALE: Duration = Duration::from_secs(5);
 
 /// How long a writer waits for a claim before reporting that it could not take
 /// one.
-const CLAIM_WAIT: Duration = Duration::from_secs(5);
+///
+/// **Longer than [`CLAIM_STALE`], and that relation is the point.** Shorter, a
+/// waiter gives up before the claim it is waiting on can ever be declared
+/// abandoned — so one killed holder wedges every later writer until something
+/// else restarts them. Measured in production on 2026-09-11 with a five-second
+/// wait against a thirty-second staleness: the daemon's first start took the
+/// claim, the deploy's restart killed it mid-generation, and every later start
+/// refused to generate a key that nothing else was going to write.
+const CLAIM_WAIT: Duration = Duration::from_secs(15);
 
 /// An exclusive claim on one credential file, held across a read-then-write.
 ///
@@ -797,8 +808,21 @@ impl Guard {
     /// Claim `target`, waiting up to [`CLAIM_WAIT`] for a live holder and
     /// taking over one older than [`CLAIM_STALE`].
     fn take(target: &Path) -> Result<Self, CredentialError> {
+        Self::take_within(target, CLAIM_STALE, CLAIM_WAIT)
+    }
+
+    /// The same, with both durations named by the caller.
+    ///
+    /// Exists so a test can prove the takeover happens at all: written against
+    /// the constants, the only test available is one that sleeps out a real
+    /// five seconds, and a suite that sleeps is a suite people stop running.
+    fn take_within(
+        target: &Path,
+        stale: Duration,
+        wait: Duration,
+    ) -> Result<Self, CredentialError> {
         let path = claim_path(target)?;
-        let deadline = Instant::now() + CLAIM_WAIT;
+        let deadline = Instant::now() + wait;
         loop {
             match fs::OpenOptions::new()
                 .write(true)
@@ -808,24 +832,40 @@ impl Guard {
             {
                 Ok(_) => return Ok(Self { path }),
                 Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-                    if claim_is_stale(&path) {
+                    // Two ways to break it, and the second is what keeps a
+                    // claim from outliving everything. The first is its age.
+                    // The second is the deadline: a claim still standing after
+                    // the whole wait is broken WHATEVER its age reads as,
+                    // because every way of reading that age can fail — a file
+                    // a privileged run left owned by root, a clock that moved,
+                    // a filesystem that lies about mtime — and each failure
+                    // reads as "held by someone live" under any rule that only
+                    // consults the age.
+                    //
+                    // Breaking one too early costs two writers, which the
+                    // read-before-write below resolves into one value. Never
+                    // breaking one costs a daemon that serves nothing until a
+                    // person notices — measured on 2026-09-11, where a claim
+                    // whose age could not be read wedged every start for half
+                    // an hour.
+                    if claim_is_stale(&path, stale) || Instant::now() >= deadline {
                         // Not a race between the reader of the age and the
                         // remover: whoever removes it still has to win the
                         // `create_new` above to hold it.
-                        let _ = fs::remove_file(&path);
+                        if let Err(error) = fs::remove_file(&path)
+                            && error.kind() != io::ErrorKind::NotFound
+                        {
+                            return Err(io_error(
+                                target,
+                                format!(
+                                    "another `{}` claimed it and this one cannot break that \
+                                     claim: {} cannot be removed: {error}",
+                                    crate::DAEMON_NAME,
+                                    path.display()
+                                ),
+                            ));
+                        }
                         continue;
-                    }
-                    if Instant::now() >= deadline {
-                        return Err(io_error(
-                            target,
-                            format!(
-                                "another `{}` is writing it and did not finish within {} \
-                                 seconds: {} is held",
-                                crate::DAEMON_NAME,
-                                CLAIM_WAIT.as_secs(),
-                                path.display()
-                            ),
-                        ));
                     }
                     std::thread::sleep(Duration::from_millis(50));
                 }
@@ -865,10 +905,10 @@ fn claim_path(target: &Path) -> Result<PathBuf, CredentialError> {
 /// An unreadable claim reads as NOT stale: it is there, something made it, and
 /// breaking one this process cannot even stat is the move that turns a
 /// permission problem into two writers.
-fn claim_is_stale(path: &Path) -> bool {
+fn claim_is_stale(path: &Path, stale: Duration) -> bool {
     fs::metadata(path)
         .and_then(|meta| meta.modified())
-        .map(|at| at.elapsed().unwrap_or_default() > CLAIM_STALE)
+        .map(|at| at.elapsed().unwrap_or_default() > stale)
         .unwrap_or(false)
 }
 
@@ -1516,6 +1556,68 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_claim_is_always_taken_in_the_end_and_the_wait_is_what_a_live_holder_gets() {
+        // The outage of 2026-09-11 in one case. A deploy restarted the daemon
+        // while its first start held the claim; a signal runs no destructor,
+        // so the claim outlived the process. Every later start then read that
+        // claim as live — for half an hour — and served no Proton name.
+        //
+        // What is pinned here is the pair of guarantees that state cannot
+        // recur under: a claim is taken in the end WHATEVER its age reads as,
+        // and the wait is spent before taking it, so a holder that really is
+        // alive finishes first.
+        let dir = scratch("claim-abandoned");
+        let path = dir.join("proton.json");
+        let claim = claim_path(&path).expect("a claim path");
+        fs::create_dir_all(&dir).expect("scratch");
+
+        // Age unreadable as stale — an hour's staleness on a claim made now —
+        // so only the deadline can break it, and it does.
+        fs::write(&claim, b"").expect("plant a claim nobody will release");
+        let waited = Instant::now();
+        let broken =
+            Guard::take_within(&path, Duration::from_secs(3600), Duration::from_millis(150))
+                .expect("a claim still standing at the deadline must be broken");
+        let spent = waited.elapsed();
+        drop(broken);
+        assert!(
+            spent >= Duration::from_millis(150),
+            "the claim was broken without spending the wait a live holder is owed: {spent:?}"
+        );
+        assert!(
+            !claim.exists(),
+            "the claim outlived the guard that broke it"
+        );
+
+        // And an aged claim is broken on its age, without waiting out a wait
+        // measured in hours — the path that matters when the constants are the
+        // real ones.
+        fs::write(&claim, b"").expect("plant a second claim");
+        let unwaited = Instant::now();
+        let taken = Guard::take_within(&path, Duration::ZERO, Duration::from_secs(3600))
+            .expect("an abandoned claim must be taken over");
+        let quick = unwaited.elapsed();
+        drop(taken);
+        assert!(
+            quick < Duration::from_secs(1),
+            "an abandoned claim was waited on rather than broken on its age: {quick:?}"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_wait_for_a_claim_outlasts_the_age_at_which_one_is_abandoned() {
+        // The relation, not the numbers. Either may move; a wait shorter than
+        // the staleness cannot break the claim it is waiting on, which is the
+        // shape that wedged a live machine.
+        assert!(
+            CLAIM_WAIT > CLAIM_STALE,
+            "a writer gives up at {CLAIM_WAIT:?}, before a claim is abandoned at {CLAIM_STALE:?}"
+        );
     }
 
     #[test]
