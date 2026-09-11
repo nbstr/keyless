@@ -424,11 +424,19 @@ fn undirectable(coordinates: &Coordinates, owner: Owner, detail: &str) -> String
 /// A [`crate::store::proton_session::CurrentFault`] — no generation published
 /// yet, a pointer nothing can validate — reads the same as a dead session:
 /// `false`, which sends the loop straight to [`attempt`].
+///
+/// Resolves [`login::extra_credentials`] itself rather than taking it as a
+/// parameter — this runs on the loop's own thread, once a tick, so the small
+/// extra file read costs nothing a tick interval does not already dwarf, and
+/// a failure to resolve it reads the same way a dead session does: `false`,
+/// never a reason to skip the probe and read the session as healthy under
+/// [`crate::store::proton::KeyProvider::Env`] with nothing to open it with.
 fn alive(coordinates: &Coordinates, owner: Owner, generations: &Generations) -> bool {
     let Ok(pass) = generations.enter() else {
         return false;
     };
-    login::run(login::info_command(coordinates, pass.dir(), owner))
+    let login = login::extra_credentials(coordinates).unwrap_or_default();
+    login::run(login::info_command(coordinates, pass.dir(), &login, owner))
         .map(|(status, _)| status.success())
         .unwrap_or(false)
 }
@@ -598,6 +606,8 @@ fn report(line: &str) {
 mod tests {
     use super::*;
     use crate::store::proton_session::GenerationName;
+    use std::fs;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
     #[test]
     fn backoff_starts_at_the_minimum() {
@@ -771,5 +781,96 @@ mod tests {
             start.elapsed() >= Duration::from_millis(250),
             "the sleep ended early with no fault ever reported"
         );
+    }
+
+    /// A decoy shaped like a base64url local key, never a real one. Only its
+    /// LENGTH is ever compared against anything.
+    const KEY_DECOY: &str = "decoy0Lk4l0never0real0Bb2-ZGVjb3ktbG9vcC0wOTEx";
+
+    /// The entry name this fixture's credential file holds the key under —
+    /// what a real config writes in `stores.proton.credentials`.
+    const KEY_ENTRY: &str = "LOCAL_KEY";
+
+    #[test]
+    fn the_liveness_check_carries_the_local_key_the_session_was_encrypted_under() {
+        // CONTROL for a defect that shipped in every sibling of this call and
+        // was found here only by the compiler: `alive` built `info_command`
+        // with no credentials at all. Under `KeyProvider::Env` the vendor then
+        // fails at `EnvLocalKeyProvider::new()` — before it ever opens the
+        // session directory — so `alive` answers `false` on a perfectly
+        // healthy session, every tick, and the loop replaces a session that
+        // never needed replacing. Reverting this function's
+        // `extra_credentials` resolve back to `&[]` turns the length
+        // assertion below red while leaving the `answered` one green, because
+        // the stand-in exits 0 whatever it was handed.
+        let dir = scratch_generations_root("alive-carries-the-key");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("scratch");
+
+        let record = dir.join("key.seen");
+        let stub = dir.join("pass-cli-stub");
+        fs::write(
+            &stub,
+            format!(
+                "#!/bin/sh\n\
+                 if [ -n \"${{PROTON_PASS_ENCRYPTION_KEY+x}}\" ]; then\n\
+                 \x20 printf '%s' \"${{#PROTON_PASS_ENCRYPTION_KEY}}\" > '{record}'\n\
+                 else\n\
+                 \x20 printf absent > '{record}'\n\
+                 fi\n\
+                 exit 0\n",
+                record = record.display()
+            ),
+        )
+        .expect("write the stand-in");
+        fs::set_permissions(&stub, fs::Permissions::from_mode(0o700)).expect("chmod");
+
+        let credentials = dir.join("proton.json");
+        super::super::credential::store_entry(
+            &credentials,
+            KEY_ENTRY,
+            &crate::secret::Secret::new(KEY_DECOY.to_owned()),
+        )
+        .expect("write the local key the daemon generated");
+
+        let root = dir.join("session");
+        fs::create_dir_all(&root).expect("session root");
+        let generations = Generations::at(root.clone());
+        let meta = fs::metadata(&dir).expect("stat");
+        let owner = Owner {
+            uid: meta.uid(),
+            gid: meta.gid(),
+        };
+        let (name, _created) = generations
+            .create(Some((owner.uid, owner.gid)))
+            .expect("create");
+        generations
+            .publish(&name, Some((owner.uid, owner.gid)))
+            .expect("publish");
+
+        let coordinates = Coordinates {
+            binary: stub,
+            session_dir: root,
+            key_provider: crate::store::proton::KeyProvider::Env,
+            credentials_file: credentials,
+            token_entry: "AGENT_TOKEN".to_owned(),
+            extra: std::collections::BTreeMap::from([(
+                crate::store::proton::ENCRYPTION_KEY_VAR.to_owned(),
+                KEY_ENTRY.to_owned(),
+            )]),
+        };
+
+        let answered = alive(&coordinates, owner, &generations);
+        assert!(answered, "the stand-in exits 0, so the probe must have run");
+
+        let seen = fs::read_to_string(&record).expect("the stand-in recorded nothing");
+        assert_eq!(
+            seen,
+            KEY_DECOY.len().to_string(),
+            "the liveness check did not carry the local key — the length, never the value: \
+             saw {seen:?}"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }

@@ -547,6 +547,49 @@ pub struct DaemonProtonConfig {
     pub session: SessionRenewal,
 }
 
+/// The entry [`DaemonProtonConfig::credential_entries`] writes the generated
+/// local key under when the config names none.
+///
+/// Named rather than derived from the variable, because it is a label in a
+/// credential file and reads beside `AGENT_TOKEN` rather than beside
+/// `PROTON_PASS_*`.
+pub const DEFAULT_LOCAL_KEY_ENTRY: &str = "LOCAL_KEY";
+
+impl DaemonProtonConfig {
+    /// The credential entries this store reads: the operator's own, plus the
+    /// local key's entry filled in when [`KeyProvider::Env`] is in force and
+    /// the config named none.
+    ///
+    /// # Why the default is here rather than a refusal somewhere else
+    ///
+    /// Every other entry in this map is a label for a value a person typed and
+    /// holds elsewhere; this one labels a value the daemon GENERATES and nobody
+    /// ever sees. Asking an operator to name it buys nothing and costs every
+    /// Proton name on the machine the day they forget, behind a warning printed
+    /// once into a launchd log.
+    ///
+    /// One function rather than three defaults: the generator, the spawn's
+    /// credential resolution and any check that asks what this store reads all
+    /// have to agree about the name, and a fact three readers derive
+    /// separately is a fact that drifts.
+    /// A config naming NO credential at all gets nothing filled in: it has no
+    /// token either, so it cannot establish a session whatever key it holds,
+    /// and inventing an entry there would send a reader at a credential file
+    /// the operator never pointed at. The gap this closes is the config that
+    /// names a token and forgets the key, which is the shape an upgrade
+    /// produces.
+    #[must_use]
+    pub fn credential_entries(&self) -> BTreeMap<String, String> {
+        let mut entries = self.credentials.clone();
+        if self.key_provider == KeyProvider::Env && !entries.is_empty() {
+            entries
+                .entry(PROTON_ENCRYPTION_KEY.to_owned())
+                .or_insert_with(|| DEFAULT_LOCAL_KEY_ENTRY.to_owned());
+        }
+        entries
+    }
+}
+
 /// The renewal loop's settings — how the daemon puts its own session back
 /// before the vendor takes it away.
 ///
@@ -1005,12 +1048,17 @@ impl DaemonConfig {
     /// stops, with nobody there to log it back in.
     fn agent_token(&self) -> Option<AgentToken> {
         let settings = &self.stores.proton;
-        if settings.credentials.is_empty() {
+        // `credential_entries`, so a store-side spawn carries the local key on
+        // the same terms the login-side ones do. Under `env` that map is never
+        // empty, which is the point: a config declaring only a token still has
+        // a key to hand the vendor, and it is the one this daemon generated.
+        let entries = settings.credential_entries();
+        if entries.is_empty() {
             return None;
         }
         Some(AgentToken::new(
             Box::new(FileStore::new(settings.credentials_file.to_path_buf())),
-            settings.credentials.clone(),
+            entries,
         ))
     }
 
@@ -1297,24 +1345,6 @@ impl DaemonConfig {
                  Name `{PROTON_TOKEN}` under `stores.proton.credentials` and write it with \
                  `{} credential --store proton`",
                 crate::DAEMON_NAME
-            ));
-        }
-        if self.stores.proton.enabled
-            && self.stores.proton.key_provider == KeyProvider::Env
-            && !self
-                .stores
-                .proton
-                .credentials
-                .contains_key(PROTON_ENCRYPTION_KEY)
-        {
-            // The one arrangement that is a misconfiguration rather than a
-            // risk: `env` says the local key arrives in a variable, and no
-            // credential names that variable, so it arrives in nothing.
-            warnings.push(format!(
-                "`stores.proton.key_provider` is `env`, which takes the local encryption key \
-                 from `{PROTON_ENCRYPTION_KEY}`, and no credential names it — so `pass-cli` \
-                 will find no local key beside an existing session and reinitialise it. \
-                 Name it under `stores.proton.credentials`, or use `fs`"
             ));
         }
         let refused = AgentToken::refused(&self.stores.proton.credentials);
@@ -2355,9 +2385,10 @@ mod tests {
             assert_eq!(config.stores.proton.key_provider.as_str(), word);
         }
 
-        // And the default is the safe one, so a config that says nothing is
-        // not silently the vendor's default.
-        assert_eq!(parse("{}").stores.proton.key_provider.as_str(), "fs");
+        // And the default is `env`, so a config that says nothing is not
+        // silently the vendor's `keyring` default — see `KeyProvider`'s own
+        // doc for why `env` rather than `fs` is that default now.
+        assert_eq!(parse("{}").stores.proton.key_provider.as_str(), "env");
     }
 
     #[test]

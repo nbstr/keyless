@@ -222,6 +222,31 @@ mod daemon {
             let _ = writeln!(io::stderr(), "keylessd: warning: {warning}");
         }
 
+        // Before anything spawns the vendor: under `KeyProvider::Env` every
+        // registry lookup needs a value in this entry, and generating it here
+        // — once, reused on every later start — is what makes "the daemon
+        // generates its key" true of the actual boot path rather than of a
+        // step an operator has to remember. A failure here does not stop the
+        // other four stores from serving; it is reported the same way a
+        // config warning is.
+        match credential::ensure_proton_local_key(&config) {
+            Ok(Some(credential::GeneratedEntry::Generated)) => {
+                let _ = writeln!(
+                    io::stderr(),
+                    "keylessd: generated the Proton local encryption key at {}",
+                    config.stores.proton.credentials_file.display()
+                );
+            }
+            Ok(Some(credential::GeneratedEntry::AlreadyPresent) | None) => {}
+            Err(error) => {
+                let _ = writeln!(
+                    io::stderr(),
+                    "keylessd: warning: could not generate the Proton local encryption key: \
+                     {error}"
+                );
+            }
+        }
+
         // Block the shutdown signals on this thread BEFORE anything else is
         // spawned. A thread inherits the mask in force when it is created, so
         // blocking first is what stops a stray SIGTERM being delivered to the
@@ -444,6 +469,38 @@ mod daemon {
             ));
         }
 
+        // The other arrangement that makes writing worse than not writing:
+        // under `env` this daemon GENERATES the Proton local key and every
+        // published generation is encrypted under the value it generated. A
+        // typed value replacing it leaves each of those directories encrypted
+        // under a key nothing holds — the failure this provider exists to
+        // remove, arriving through the one door that is still open. Refused
+        // rather than warned about, because the damage is done by the time
+        // anything could report it.
+        {
+            use keyless::store::proton::{ENCRYPTION_KEY_VAR, KeyProvider, STORE_ID};
+
+            if store == STORE_ID
+                && config.stores.proton.key_provider == KeyProvider::Env
+                && config
+                    .stores
+                    .proton
+                    .credential_entries()
+                    .get(ENCRYPTION_KEY_VAR)
+                    .is_some_and(|entry| entry == &args.name)
+            {
+                return fail(&format!(
+                    "`{}` is where {} keeps the Proton local encryption key, which it generates \
+                     itself and every session directory it has published is encrypted under. \
+                     Writing a value there makes those directories unreadable. Nothing has to \
+                     be typed here: the key is written at first start and reused on every later \
+                     one",
+                    args.name,
+                    keyless::DAEMON_NAME
+                ));
+            }
+        }
+
         // Echo off, on the descriptor the terminal test asked about, and no
         // prompt at all when it cannot be switched off. See
         // `credential::prompt_for`, which both this verb and `login` read
@@ -537,6 +594,25 @@ mod daemon {
                 }
             }
             Err(detail) => return fail(&detail),
+        }
+
+        // Before `extra_credentials` reads it: a fresh machine can reach this
+        // verb before the running daemon has ever been restarted onto a
+        // config that names Proton, so `serve`'s own generation may not have
+        // run yet. Generating here too is what keeps `sudo keylessd login
+        // --store proton` — the installer's own documented next step — from
+        // answering "write it first" about a value this crate is supposed to
+        // write itself.
+        match credential::ensure_proton_local_key(&config) {
+            Ok(Some(credential::GeneratedEntry::Generated)) => {
+                let _ = writeln!(
+                    io::stdout(),
+                    "key\tgenerated\t{}",
+                    coordinates.credentials_file.display()
+                );
+            }
+            Ok(Some(credential::GeneratedEntry::AlreadyPresent) | None) => {}
+            Err(detail) => return fail(&detail.to_string()),
         }
 
         let extra = match login::extra_credentials(&coordinates) {

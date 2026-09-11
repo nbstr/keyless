@@ -241,11 +241,14 @@ pub fn coordinates(config: &super::config::DaemonConfig) -> Result<Coordinates, 
         ));
     }
 
+    // `credential_entries`, not `credentials`: under `env` the local key's own
+    // entry is one this daemon names when the operator did not, and every
+    // reader of that map has to agree about the name — the generator writes
+    // the value under it, and this is where the same name is read back.
     let extra = settings
-        .credentials
-        .iter()
+        .credential_entries()
+        .into_iter()
         .filter(|(variable, _)| variable.as_str() != proton::TOKEN_VAR)
-        .map(|(variable, entry)| (variable.clone(), entry.clone()))
         .collect();
 
     Ok(Coordinates {
@@ -421,10 +424,23 @@ pub fn login_command(
 /// there?
 ///
 /// The liveness half of the loop Proton publishes: `pass-cli info 2>/dev/null
-/// || … pass-cli login`. It carries no credential, because the question is
-/// about the session store rather than about the token: a directory with a live
+/// || … pass-cli login`. It carries no TOKEN, because the question is about
+/// the session store rather than about the account: a directory with a live
 /// identity answers, and one whose identity has gone answers `This operation
 /// requires an authenticated client`.
+///
+/// # Why `login` is a parameter here too
+///
+/// `info`, like every verb here, builds a client before it does anything
+/// else — and under [`KeyProvider::Env`] building a client means
+/// `EnvLocalKeyProvider::new()` reads [`proton::ENCRYPTION_KEY_VAR`] out of
+/// the environment BEFORE the vendor ever looks at the session directory. A
+/// caller that named the `env` provider and passed no key would fail on
+/// every call for that reason alone — not because the session died, but
+/// because nothing here gave the vendor anything to decrypt it with. So
+/// `login` carries [`extra_credentials`]' output: never the token (this verb
+/// asks nothing that needs one), and under `fs` an empty slice, matching the
+/// vendor's own file-backed key which needs no variable at all.
 ///
 /// Scoped exactly as the two verbs beside it. `info` is on
 /// [`crate::store::proton::SESSION_SCOPED_VERBS`], so run without
@@ -432,10 +448,15 @@ pub fn login_command(
 /// identity, usually a healthy one, which is the answer that makes a dead
 /// daemon session read as fine.
 #[must_use]
-pub fn info_command(coordinates: &Coordinates, dir: &Path, owner: Owner) -> Command {
+pub fn info_command(
+    coordinates: &Coordinates,
+    dir: &Path,
+    login: &[(String, Secret)],
+    owner: Owner,
+) -> Command {
     let mut command = Command::new(&coordinates.binary);
     command.arg("info");
-    scope(&mut command, coordinates, dir, &[], owner);
+    scope(&mut command, coordinates, dir, login, owner);
     command
 }
 
@@ -454,14 +475,32 @@ pub fn info_command(coordinates: &Coordinates, dir: &Path, owner: Owner) -> Comm
 /// fails" and claims nothing about what happens on disk. See [`retire`], the
 /// only caller that ever passes `true`, and only after a plain logout has
 /// already failed.
+///
+/// `login` is [`info_command`]'s own parameter, for the same reason: a PLAIN
+/// logout (`force: false`) builds a client exactly like `info` does, so it
+/// needs the same key under [`KeyProvider::Env`] to reach the vendor at all.
+/// `pass-cli logout --force` is the one exception — `main.rs`'s own dispatch
+/// answers `is_force_logout()` before any client is built, so a forced logout
+/// never constructs a key provider and never fails on a missing one. `login`
+/// is threaded through unconditionally even there: a builder that carries it
+/// only sometimes is a builder a later change forgets to carry it through in
+/// the case that still needs it, which is exactly how this bug shipped once
+/// already — see [`scope`]'s own doc on the five daemon-side builders in
+/// [`crate::store::proton::ProtonStore`] for the sibling argument.
 #[must_use]
-pub fn logout_command(coordinates: &Coordinates, dir: &Path, force: bool, owner: Owner) -> Command {
+pub fn logout_command(
+    coordinates: &Coordinates,
+    dir: &Path,
+    force: bool,
+    login: &[(String, Secret)],
+    owner: Owner,
+) -> Command {
     let mut command = Command::new(&coordinates.binary);
     command.arg("logout");
     if force {
         command.arg("--force");
     }
-    scope(&mut command, coordinates, dir, &[], owner);
+    scope(&mut command, coordinates, dir, login, owner);
     command
 }
 
@@ -860,7 +899,7 @@ pub fn establish(
     generations: &Generations,
     out: &mut dyn std::io::Write,
 ) -> Result<GenerationName, String> {
-    if !replace && already_authenticated_now(coordinates, owner, generations) {
+    if !replace && already_authenticated_now(coordinates, owner, generations, &extra) {
         let current = generations
             .current()
             .expect("already_authenticated_now only answers true when current() is Ok");
@@ -883,17 +922,31 @@ pub fn establish(
 
     let mut login = extra;
     // A second [`Secret`] rather than a borrow of the caller's, so the token is
-    // still here to be written once the vendor has taken it. It is zeroized
-    // with the vector, on the line below the spawn.
+    // still here to be written once the vendor has taken it.
+    //
+    // Pushed LAST and popped on the line after the spawn returns, which is the
+    // last moment anything here needs it: the pop drops that `Secret`, and
+    // [`Secret`]'s own `Drop` zeroizes it. Popping rather than slicing is what
+    // keeps this function from carrying a live copy of the token through the
+    // `info` call, the publish and their three failure paths, all of which
+    // spawn children of their own. What is left in `login` afterwards is
+    // exactly the extra credentials this function was handed — which is what
+    // those later spawns carry, `info` taking no token by design (see its own
+    // doc) — reused rather than resolved a second time, so the local key never
+    // exists twice in this process either.
     login.push((
         proton::TOKEN_VAR.to_owned(),
         Secret::new(token.expose().to_owned()),
     ));
-    let (status, said) = run(login_command(coordinates, &dir, &login, owner)).map_err(|error| {
+
+    let spawned = run(login_command(coordinates, &dir, &login, owner));
+    drop(login.pop());
+    let extra_only = &login;
+
+    let (status, said) = spawned.map_err(|error| {
         let _ = fs::remove_dir_all(&dir);
         cannot_spawn(coordinates, owner, &error)
     })?;
-    drop(login);
 
     let outcome = classify(status, &said);
     if outcome != Outcome::LoggedIn {
@@ -915,12 +968,13 @@ pub fn establish(
     writeln!(out, "login\t{STORE}\t{}", dir.display())
         .map_err(|error| format!("the report could not be written: {error}"))?;
 
-    let (status, said) = run(info_command(coordinates, &dir, owner)).map_err(|error| {
-        discard_unpublished(coordinates, &dir, owner);
-        cannot_spawn(coordinates, owner, &error)
-    })?;
+    let (status, said) =
+        run(info_command(coordinates, &dir, extra_only, owner)).map_err(|error| {
+            discard_unpublished(coordinates, &dir, extra_only, owner);
+            cannot_spawn(coordinates, owner, &error)
+        })?;
     if !status.success() {
-        discard_unpublished(coordinates, &dir, owner);
+        discard_unpublished(coordinates, &dir, extra_only, owner);
         return Err(format!(
             "the login into {} succeeded but the session did not answer `info`, so nothing was \
              made current: {}",
@@ -932,7 +986,7 @@ pub fn establish(
     generations
         .publish(&name, Some((owner.uid, owner.gid)))
         .map_err(|error| {
-            discard_unpublished(coordinates, &dir, owner);
+            discard_unpublished(coordinates, &dir, extra_only, owner);
             format!(
                 "{} logged in but could not be made current: {error}",
                 dir.display()
@@ -951,15 +1005,22 @@ pub fn establish(
 /// the module header. `false` covers both "no" and "could not be asked",
 /// because either one means [`establish`] should proceed to create a fresh
 /// generation rather than refuse.
+///
+/// `login` is the same extra-credentials slice [`establish`] was handed —
+/// under [`KeyProvider::Env`] this probe needs the local key exactly as
+/// every other `info` call does, or it reads as "could not be asked" on
+/// every attempt and `establish` always proceeds to create a fresh
+/// generation, never refusing a genuine double-run.
 fn already_authenticated_now(
     coordinates: &Coordinates,
     owner: Owner,
     generations: &Generations,
+    login: &[(String, Secret)],
 ) -> bool {
     let Ok(pass) = generations.enter() else {
         return false;
     };
-    run(info_command(coordinates, pass.dir(), owner))
+    run(info_command(coordinates, pass.dir(), login, owner))
         .map(|(status, _)| status.success())
         .unwrap_or(false)
 }
@@ -973,8 +1034,18 @@ fn already_authenticated_now(
 /// drain — there is no reader left to wait for. The logout is attempted
 /// unconditionally; whether the account had anything to end is the vendor's
 /// business, and its answer is not decisive here.
-fn discard_unpublished(coordinates: &Coordinates, dir: &Path, owner: Owner) {
-    let _ = run(logout_command(coordinates, dir, false, owner));
+///
+/// `login` carries the same extra credentials [`establish`] holds — a plain
+/// logout builds a client exactly like `info` does, so under
+/// [`KeyProvider::Env`] it needs the same key to even ATTEMPT the account-side
+/// end before this falls back to discarding the directory.
+fn discard_unpublished(
+    coordinates: &Coordinates,
+    dir: &Path,
+    login: &[(String, Secret)],
+    owner: Owner,
+) {
+    let _ = run(logout_command(coordinates, dir, false, login, owner));
     let _ = fs::remove_dir_all(dir);
 }
 
@@ -1184,9 +1255,18 @@ pub fn retire(
         ));
     }
 
+    // Resolved once, per candidate, the same way every other lookup in this
+    // crate reads its login — not held across retirements. A failure here
+    // (an entry named in the config but not yet written) is read the same
+    // way a spawn failure below is: `unwrap_or_default` falls through to the
+    // plain logout failing for that reason, then to step 3, never to this
+    // function refusing outright — a scheduled sweep running unattended must
+    // not wedge over one entry's own misconfiguration.
+    let login = extra_credentials(coordinates).unwrap_or_default();
+
     let timeout = bounded_timeout(timeout_ms);
     let already_gone = match exec::capture(
-        logout_command(coordinates, candidate.scope(), false, owner),
+        logout_command(coordinates, candidate.scope(), false, &login, owner),
         timeout,
     ) {
         Ok(captured) => {
@@ -1202,9 +1282,11 @@ pub fn retire(
     };
     if !already_gone {
         // Outcome deliberately not decisive here — see this function's own
-        // doc. `remove` below is what actually clears the directory.
+        // doc. `remove` below is what actually clears the directory. `--force`
+        // never needs `login` — see `logout_command`'s own doc — and carries
+        // it anyway, for the same reason that doc gives.
         let _ = exec::capture(
-            logout_command(coordinates, candidate.scope(), true, owner),
+            logout_command(coordinates, candidate.scope(), true, &login, owner),
             timeout,
         );
     }
@@ -1358,22 +1440,32 @@ mod tests {
     }
 
     /// The probe carries no token — it is not a place a credential belongs,
-    /// and one here would be a token in a child spawned every tick.
+    /// and one here would be a token in a child spawned every tick — but
+    /// DOES carry the local key it was handed, which under
+    /// [`KeyProvider::Env`] is what lets the vendor open the session at all.
+    ///
+    /// CONTROL for the bug this pins: `info_command` used to be built with
+    /// `&[]` unconditionally, the same defect review had already caught once
+    /// in `ProtonStore::info_probe_command`. Reverting the `login` parameter
+    /// back to `&[]` at this call site turns the key assertion below red
+    /// while leaving the token assertion green — which is why both are
+    /// checked, rather than only the invariant that never moved.
     ///
     /// Which directory the probe names is `every_login_verb_is_scoped_at_the_
     /// directory_it_is_given_and_never_at_the_root`'s claim, not this one's.
     #[test]
-    fn the_liveness_probe_names_the_session_it_is_asking_about_and_carries_no_token() {
+    fn the_liveness_probe_names_the_session_it_is_asking_about_carries_the_key_and_no_token() {
         let coordinates = Coordinates {
             binary: PathBuf::from("/nonexistent/pass-cli"),
             session_dir: PathBuf::from("/var/lib/keyless/proton-session"),
-            key_provider: KeyProvider::Fs,
+            key_provider: KeyProvider::Env,
             credentials_file: PathBuf::from("/var/lib/keyless/proton.json"),
             token_entry: "AGENT_TOKEN".to_owned(),
             extra: BTreeMap::new(),
         };
         let generation = coordinates.session_dir.join("gen-1789012345678-4242");
-        let command = info_command(&coordinates, &generation, Owner { uid: 1, gid: 1 });
+        let login = key_vector();
+        let command = info_command(&coordinates, &generation, &login, Owner { uid: 1, gid: 1 });
 
         let environment: Vec<_> = command
             .get_envs()
@@ -1390,6 +1482,14 @@ mod tests {
                 .any(|(key, _)| key == proton::KEY_PROVIDER_VAR),
             "the probe does not name the key provider: {environment:?}"
         );
+        assert_eq!(
+            environment
+                .iter()
+                .find(|(key, _)| key == proton::ENCRYPTION_KEY_VAR)
+                .and_then(|(_, value)| value.as_deref()),
+            Some(KEY_DECOY),
+            "the probe does not carry the local key it was handed: {environment:?}"
+        );
         assert!(
             !environment.iter().any(|(key, _)| key == proton::TOKEN_VAR),
             "the probe carries the token: {environment:?}"
@@ -1400,6 +1500,75 @@ mod tests {
             .map(|arg| arg.to_string_lossy().into_owned())
             .collect();
         assert_eq!(argv, vec!["info".to_owned()]);
+    }
+
+    /// The one caller of [`info_command`] `establish`'s own doc does not
+    /// cover: the double-run guard, reachable only from `keylessd login`
+    /// WITHOUT `--replace` — the renewal loop always passes `replace: true`
+    /// and never reaches this probe at all (see `session.rs::spawn`'s own
+    /// `!replace && …` short circuit having no analogue here — this guard
+    /// IS that check, on the operator verb's side).
+    ///
+    /// CONTROL — the change that makes this fail: `already_authenticated_now`
+    /// spawning `info_command` with `&[]` again. Under `KeyProvider::Env` the
+    /// stand-in then reports `absent` on every call, so this assertion is
+    /// exactly what turns red; the `assert!(answered, …)` line above it does
+    /// not, because the stand-in answers success regardless of what it saw.
+    #[test]
+    fn the_double_run_guard_probes_the_current_generation_with_the_key_it_needs_to_open_it() {
+        let dir = scratch("already-authenticated");
+        let stub = dir.join("pass-cli-stub");
+        let record = dir.join("key.seen");
+        std::fs::write(
+            &stub,
+            format!(
+                "#!/bin/sh\n\
+                 if [ -n \"${{PROTON_PASS_ENCRYPTION_KEY+x}}\" ]; then\n\
+                 \x20 printf '%s' \"${{#PROTON_PASS_ENCRYPTION_KEY}}\" > '{record}'\n\
+                 else\n\
+                 \x20 printf absent > '{record}'\n\
+                 fi\n\
+                 exit 0\n",
+                record = record.display()
+            ),
+        )
+        .expect("write stub");
+        fs::set_permissions(&stub, fs::Permissions::from_mode(0o700)).expect("chmod");
+
+        let root = dir.join("session");
+        fs::create_dir_all(&root).expect("root");
+        let generations = Generations::at(root.clone());
+        let owner = own(&dir);
+        let (name, _generation_dir) = generations
+            .create(Some((owner.uid, owner.gid)))
+            .expect("create");
+        generations
+            .publish(&name, Some((owner.uid, owner.gid)))
+            .expect("publish");
+
+        let coordinates = Coordinates {
+            binary: stub,
+            session_dir: root,
+            key_provider: KeyProvider::Env,
+            credentials_file: dir.join("proton.json"),
+            token_entry: "AGENT_TOKEN".to_owned(),
+            extra: BTreeMap::new(),
+        };
+
+        let answered = already_authenticated_now(&coordinates, owner, &generations, &key_vector());
+        assert!(
+            answered,
+            "the stand-in always exits 0; the probe must have run"
+        );
+
+        let seen = fs::read_to_string(&record).expect("the stub must have run and recorded");
+        assert_eq!(
+            seen,
+            KEY_DECOY.len().to_string(),
+            "the double-run guard did not carry the local key it was handed: saw {seen:?}"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1417,9 +1586,12 @@ mod tests {
                 login_command(&coordinates, &generation, &login, owner),
                 &["login"],
             ),
-            (info_command(&coordinates, &generation, owner), &["info"]),
             (
-                logout_command(&coordinates, &generation, false, owner),
+                info_command(&coordinates, &generation, &[], owner),
+                &["info"],
+            ),
+            (
+                logout_command(&coordinates, &generation, false, &[], owner),
                 &["logout"],
             ),
         ];
@@ -1456,9 +1628,9 @@ mod tests {
 
         let commands = [
             login_command(&coordinates, &generation, &login_vector(), owner),
-            info_command(&coordinates, &generation, owner),
-            logout_command(&coordinates, &generation, false, owner),
-            logout_command(&coordinates, &generation, true, owner),
+            info_command(&coordinates, &generation, &key_vector(), owner),
+            logout_command(&coordinates, &generation, false, &key_vector(), owner),
+            logout_command(&coordinates, &generation, true, &key_vector(), owner),
         ];
 
         for command in &commands {
@@ -1490,11 +1662,17 @@ mod tests {
         };
 
         assert_eq!(
-            argv_of(&logout_command(&coordinates, &generation, false, owner)),
+            argv_of(&logout_command(
+                &coordinates,
+                &generation,
+                false,
+                &[],
+                owner
+            )),
             vec!["logout".to_owned()]
         );
         assert_eq!(
-            argv_of(&logout_command(&coordinates, &generation, true, owner)),
+            argv_of(&logout_command(&coordinates, &generation, true, &[], owner)),
             vec!["logout".to_owned(), "--force".to_owned()]
         );
     }
@@ -1548,6 +1726,20 @@ mod tests {
         vec![(
             proton::TOKEN_VAR.to_owned(),
             Secret::new(TOKEN_DECOY.to_owned()),
+        )]
+    }
+
+    /// A decoy shaped like a base64url local key. Distinct from
+    /// [`TOKEN_DECOY`], and long enough that a grep for it in any output
+    /// would mean a real leak.
+    const KEY_DECOY: &str = "decoy0Lk4l0never0real0Aa1-ZGVjb3kta2V5LTA5MTE";
+
+    /// The extra-credentials `login` slice under [`KeyProvider::Env`] —
+    /// [`ENCRYPTION_KEY_VAR`](proton::ENCRYPTION_KEY_VAR), never the token.
+    fn key_vector() -> Vec<(String, Secret)> {
+        vec![(
+            proton::ENCRYPTION_KEY_VAR.to_owned(),
+            Secret::new(KEY_DECOY.to_owned()),
         )]
     }
 
