@@ -64,7 +64,7 @@ use crate::audit::{AuditLog, Event, Peer};
 use crate::ipc::protocol::{Op, Reply, Request, read_frame, write_frame};
 use crate::mask::Masker;
 use crate::secret::Secret;
-use crate::store::proton::SessionGate;
+use crate::store::proton_session::Generations;
 use crate::{NAME, State};
 
 use self::config::DaemonConfig;
@@ -122,10 +122,11 @@ pub struct Daemon {
     names: Arc<Vec<String>>,
     idle: Duration,
     live: Arc<AtomicUsize>,
-    /// Shared with the stores this daemon resolves through, so the renewal loop
-    /// can hold vendor reads out of the session directory while it replaces
-    /// what is in it. See [`Running::spawn`].
-    session_gate: Arc<SessionGate>,
+    /// Shared with the stores this daemon resolves through, and with the
+    /// renewal loop that creates and retires generations under it. `None`
+    /// when Proton is disabled or names no `session_dir` — see
+    /// [`DaemonConfig::generations`]. See [`Running::spawn`].
+    generations: Option<Arc<Generations>>,
 }
 
 impl Daemon {
@@ -151,17 +152,17 @@ impl Daemon {
         listener.set_nonblocking(true)?;
 
         // Built here because both sides of it are this daemon's: the stores
-        // that read the session directory, and the renewal loop that replaces
-        // what is in it. The adapter owns the type and knows nothing of the
-        // loop; the loop knows nothing of the stores.
-        let session_gate = Arc::new(SessionGate::default());
+        // that read through it, and the renewal loop that creates and retires
+        // generations under it. The adapter owns the type and knows nothing of
+        // the loop; the loop knows nothing of the stores.
+        let generations = config.generations();
 
         Ok(Daemon {
             listener,
             socket: config.socket.to_path_buf(),
             policy: Arc::new(policy),
             resolver: Arc::new(
-                Resolver::new(config.registry(Some(&session_gate)), config.ttl())
+                Resolver::new(config.registry(generations.as_ref()), config.ttl())
                     .with_stale_window(config.stale()),
             ),
             audit: Arc::new(
@@ -171,7 +172,7 @@ impl Daemon {
             names: Arc::new(config.names.clone()),
             idle: config.idle_timeout(),
             live: Arc::new(AtomicUsize::new(0)),
-            session_gate,
+            generations,
         })
     }
 
@@ -573,9 +574,10 @@ impl Running {
     /// has said the session matters and starting without it is the silent
     /// outage that loop exists to end.
     pub fn spawn(daemon: Daemon, config: &DaemonConfig) -> io::Result<Self> {
-        // The same gate the daemon's Proton store holds: the loop closes it
-        // around its logout-then-login, and no vendor read starts in between.
-        let session = self::session::spawn(config, &daemon.session_gate)
+        // The same `Generations` the daemon's Proton store reads through: the
+        // loop creates and publishes into it, and every store sees a fresh
+        // generation the moment this loop makes one current.
+        let session = self::session::spawn(config, daemon.generations.as_ref())
             .map_err(|detail| io::Error::new(io::ErrorKind::InvalidInput, detail))?;
         let stop = Arc::new(AtomicBool::new(false));
         let socket = daemon.socket.clone();

@@ -139,6 +139,13 @@ use support::within;
 /// A number with no row turns this test red with the file that introduced it.
 const CLASSIFIED: &[(u64, &str)] = &[
     (
+        3_000,
+        "tests/daemon_proton.rs — the deadline IS the subject: the generations \
+         fixtures derive the retirement grace from it (`2 × timeout_ms + REAP_GRACE \
+         + 1s` = 9s), and the tests wait on THAT arithmetic, not on a vendor CLI \
+         that might be slow.",
+    ),
+    (
         200,
         "tests/daemon_degraded.rs — the deadline IS the subject: the test asserts \
          the message a client prints when a daemon does not answer.",

@@ -324,7 +324,7 @@ fn persisting<T>(
 /// still take a moment is the read side draining: a grandchild that inherited
 /// the pipe keeps it open until it exits too. Waiting a little avoids leaving a
 /// zombie; not waiting forever is the whole point of being here.
-const REAP_GRACE: Duration = Duration::from_secs(2);
+pub(crate) const REAP_GRACE: Duration = Duration::from_secs(2);
 
 /// What a backend process produced.
 pub struct Captured {

@@ -169,7 +169,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use serde::Deserialize;
@@ -181,6 +181,7 @@ use crate::secret::Secret;
 use crate::store::Store;
 use crate::store::discover::{Discover, FieldKind, FieldSummary, ItemSummary};
 use crate::store::exec::{self, CaptureError, capture, strip_one_newline, summarise};
+use crate::store::proton_session::{self, GenerationName, Generations};
 
 /// This adapter's id, as a config route and an error message spell it.
 pub const STORE_ID: &str = "proton";
@@ -700,7 +701,7 @@ pub(crate) fn relative_session_dir(field: &str, dir: &Path) -> String {
 /// Under `PROTON_PASS_SESSION_DIR`, not beside it: measured 2026-08-11, a
 /// directory this crate handed the vendor came back holding
 /// `<dir>/.session/{pass-cli.db,pat_key,session.json}`.
-const SESSION_SUBDIR: &str = ".session";
+pub(crate) const SESSION_SUBDIR: &str = ".session";
 
 /// The prefix on the file `pass-cli` writes a session into before renaming it.
 ///
@@ -1829,134 +1830,6 @@ pub fn reached_no_service(said: &str) -> bool {
     UNREACHABLE.iter().any(|words| lowered.contains(words))
 }
 
-/// Holds vendor reads out of the session directory while the session in it is
-/// being replaced.
-///
-/// # The gap this closes
-///
-/// A renewal is a logout followed by a login (`crate::daemon::session`), and
-/// between them the directory holds no session at all. A read landing in that
-/// gap gets the vendor's own "not authenticated" — a sentence about the
-/// DAEMON's login that says nothing about the item, and that a caller cannot
-/// tell from an account that has revoked its token.
-///
-/// # Why a hand-rolled gate rather than an `RwLock`
-///
-/// The shape is exactly a reader-writer lock, and `std`'s is the wrong one for
-/// two reasons. A read has to be able to give up — it waits at most its own
-/// per-call ceiling and then reports the store unavailable — and `std` offers
-/// no timed acquire. And a stream of reads must not starve the replace, which
-/// `std::sync::RwLock` does not promise: this gate closes first and drains
-/// second, so a read arriving after `replace` waits behind it.
-///
-/// The drain needs no bound of its own. A pass spans one vendor child and the
-/// capture around it is bounded by `timeout_ms`, so the longest a replace waits
-/// is one ceiling — a number the operator already set, rather than a second one
-/// invented here.
-#[derive(Default)]
-pub struct SessionGate {
-    state: Mutex<GateState>,
-    changed: Condvar,
-}
-
-#[derive(Default)]
-struct GateState {
-    /// A replace is holding the gate closed.
-    closed: bool,
-    /// Vendor children that entered before it closed and have not finished.
-    passes: usize,
-}
-
-/// One vendor child's permission to read the session directory.
-///
-/// Dropping it releases the pass, on the ordinary path and on an unwinding
-/// panic alike — which is what stops a replace waiting for a child that has
-/// already gone.
-pub struct Pass<'gate> {
-    gate: &'gate SessionGate,
-}
-
-impl Drop for Pass<'_> {
-    fn drop(&mut self) {
-        let mut state = self.gate.lock();
-        state.passes = state.passes.saturating_sub(1);
-        drop(state);
-        self.gate.changed.notify_all();
-    }
-}
-
-/// A replace in progress. Dropping it reopens the gate.
-pub struct Replacing<'gate> {
-    gate: &'gate SessionGate,
-}
-
-impl Drop for Replacing<'_> {
-    fn drop(&mut self) {
-        let mut state = self.gate.lock();
-        state.closed = false;
-        drop(state);
-        self.gate.changed.notify_all();
-    }
-}
-
-/// The gate was still closed when a read ran out of patience.
-#[derive(Debug)]
-pub struct GateClosed;
-
-impl SessionGate {
-    /// Wait for the gate, for at most `deadline`.
-    ///
-    /// # Errors
-    ///
-    /// A replace still holds the gate when `deadline` passes.
-    pub fn enter(&self, deadline: Duration) -> Result<Pass<'_>, GateClosed> {
-        let until = Instant::now() + deadline;
-        let mut state = self.lock();
-        while state.closed {
-            let Some(left) = until.checked_duration_since(Instant::now()) else {
-                return Err(GateClosed);
-            };
-            let (guard, timeout) = self
-                .changed
-                .wait_timeout(state, left)
-                .unwrap_or_else(PoisonError::into_inner);
-            state = guard;
-            if timeout.timed_out() && state.closed {
-                return Err(GateClosed);
-            }
-        }
-        state.passes += 1;
-        Ok(Pass { gate: self })
-    }
-
-    /// Close the gate and wait for the reads already running to finish.
-    ///
-    /// Reopens when the returned guard drops — after a failed replace and after
-    /// a panic, because a gate left closed by a failure would turn one bad
-    /// login into an outage on every name.
-    #[must_use]
-    pub fn replace(&self) -> Replacing<'_> {
-        let mut state = self.lock();
-        state.closed = true;
-        while state.passes > 0 {
-            state = self
-                .changed
-                .wait(state)
-                .unwrap_or_else(PoisonError::into_inner);
-        }
-        drop(state);
-        Replacing { gate: self }
-    }
-
-    /// A poisoned gate is recovered rather than propagated, for the reason the
-    /// listing cache is: the state behind it is two counters with no invariant
-    /// a panic could break, and refusing to serve after an unrelated panic
-    /// would degrade every name for no gain.
-    fn lock(&self) -> std::sync::MutexGuard<'_, GateState> {
-        self.state.lock().unwrap_or_else(PoisonError::into_inner)
-    }
-}
-
 /// Reads one Proton Pass item at a time through `pass-cli run`.
 pub struct ProtonStore {
     binary: PathBuf,
@@ -1978,10 +1851,11 @@ pub struct ProtonStore {
     routing: Routing,
     /// How long a listing may be reused. See [`ProtonStore::cached_items`].
     listing_ttl: Duration,
-    /// Held across each vendor child so a session replace does not land in the
-    /// middle of one. `None` wherever nothing replaces the session — a
-    /// `keyless` session inherits one and never touches it. See [`SessionGate`].
-    session_gate: Option<Arc<SessionGate>>,
+    /// The daemon's layout of generation directories, shared with the renewal
+    /// loop that creates and retires them. `None` wherever nothing replaces the
+    /// session — a `keyless` session inherits whatever is already logged in and
+    /// has no generations of its own. See [`ProtonStore::enter`].
+    generations: Option<Arc<Generations>>,
     /// vault name -> that vault's items, until they expire.
     ///
     /// In memory and nowhere else. A cache on disk that the client can read is
@@ -2006,6 +1880,16 @@ type VaultSlot = Arc<Mutex<Option<Listed>>>;
 struct Listed {
     items: Arc<Vec<ItemRecord>>,
     at: Instant,
+    /// The generation this listing was fetched under. `None` on the session
+    /// side, which has no generations and so nothing to compare against.
+    ///
+    /// A renewal replaces the identity a session directory serves without
+    /// changing its path, so the directory alone cannot tell a stale listing
+    /// from a fresh one — the generation is what changed. A slot filled under
+    /// one generation and read under the next is exactly as stale as one read
+    /// past its TTL, so it is refetched the same way rather than handed out as
+    /// though the vault behind it had not changed.
+    generation: Option<GenerationName>,
 }
 
 /// The longest a listing may be reused, whatever the config asks for.
@@ -2077,7 +1961,7 @@ impl ProtonStore {
             routing,
             listing_ttl: bounded_listing_ttl(crate::config::default_listing_ttl_ms()),
             listings: Mutex::new(BTreeMap::new()),
-            session_gate: None,
+            generations: None,
         }
     }
 
@@ -2168,33 +2052,43 @@ impl ProtonStore {
         self
     }
 
-    /// Share a [`SessionGate`] with whatever replaces this session.
+    /// Share a [`Generations`] with whatever renews this session.
     ///
-    /// The gate is the caller's to build and to hand to both sides, because the
-    /// side that replaces the session is the daemon and this adapter must not
-    /// depend on it.
+    /// The layout is the caller's to build and to hand to every side that
+    /// reads through it, because the side that creates and retires generations
+    /// is the daemon and this adapter must not depend on it.
     #[must_use]
-    pub fn with_session_gate(mut self, gate: Option<Arc<SessionGate>>) -> Self {
-        self.session_gate = gate;
+    pub fn with_generations(mut self, generations: Option<Arc<Generations>>) -> Self {
+        self.generations = generations;
         self
     }
 
-    /// Permission to run one vendor child, or the reason there is none.
+    /// Take a pass on the directory this store's next vendor child should be
+    /// scoped at, and say which directory that is.
     ///
-    /// A read that waits out its whole ceiling at a closed gate reports the
-    /// store UNAVAILABLE rather than failed: a replace is this daemon's own
-    /// business and says nothing about the item, so a cached value stands and
-    /// the next read gets the session that replace was establishing.
-    fn enter_session(&self) -> Result<Option<Pass<'_>>, StoreError> {
-        let Some(gate) = self.session_gate.as_ref() else {
-            return Ok(None);
-        };
-        gate.enter(self.timeout).map(Some).map_err(|GateClosed| {
-            self.unavailable(format!(
-                "the Proton session was still being replaced after {} ms",
-                self.timeout.as_millis()
-            ))
-        })
+    /// On the daemon side this reads `<root>/current` under
+    /// [`Generations::enter`], which never waits — there is no gate here to
+    /// close, so a renewal in progress never makes a read pause and never makes
+    /// it fail. What a fresh root without a published generation yet, or a
+    /// pointer a renewal has not caught up with, produces instead is
+    /// [`StoreError::Unavailable`] with the fault named — a degraded read the
+    /// cache keeps what it holds against, exactly as an unreachable backend
+    /// does.
+    ///
+    /// On the session side, which carries no [`Generations`] at all, this
+    /// returns a pass over [`ProtonStore::session_dir`] directly, holding no
+    /// count — there is nothing here for a renewal to race, because a session
+    /// has no renewal loop.
+    fn enter(&self) -> Result<proton_session::Pass<'_>, StoreError> {
+        match &self.generations {
+            Some(generations) => generations.enter().map_err(|fault| {
+                self.unavailable(format!("{fault} (root {})", generations.root().display()))
+            }),
+            None => {
+                let dir = self.session_dir()?.to_path_buf();
+                Ok(proton_session::Pass::without_generation(dir))
+            }
+        }
     }
 
     /// What a vendor child's failure says about the item.
@@ -2450,21 +2344,24 @@ impl ProtonStore {
     /// falling back to the stale answer it was sent to replace.
     fn cached_items(
         &self,
-        session_dir: &Path,
+        pass: &proton_session::Pass<'_>,
         vault: &str,
         name: &str,
     ) -> Result<Arc<Vec<ItemRecord>>, StoreError> {
+        let generation = pass.generation().cloned();
         let slot = Arc::clone(self.cache().entry(vault.to_owned()).or_default());
         let mut slot = slot.lock().unwrap_or_else(PoisonError::into_inner);
         if let Some(cached) = slot.as_ref()
             && cached.at.elapsed() < self.listing_ttl
+            && cached.generation == generation
         {
             return Ok(Arc::clone(&cached.items));
         }
-        let fetched = Arc::new(self.fetch_items(session_dir, vault, name)?);
+        let fetched = Arc::new(self.fetch_items(pass, vault, name)?);
         *slot = Some(Listed {
             items: Arc::clone(&fetched),
             at: Instant::now(),
+            generation,
         });
         Ok(fetched)
     }
@@ -2482,14 +2379,13 @@ impl ProtonStore {
     /// Run the listing and parse it.
     fn fetch_items(
         &self,
-        session_dir: &Path,
+        pass: &proton_session::Pass<'_>,
         vault: &str,
         name: &str,
     ) -> Result<Vec<ItemRecord>, StoreError> {
-        let pass = self.enter_session()?;
         let captured = capture(
             self.list_command(
-                session_dir,
+                pass.dir(),
                 vault,
                 name,
                 &self.vendor_login()?,
@@ -2498,7 +2394,6 @@ impl ProtonStore {
             self.timeout,
         )
         .map_err(|error| self.unreachable(&error))?;
-        drop(pass);
 
         if !captured.status.success() {
             // The vendor names the vault it could not find, which is a name
@@ -2525,11 +2420,11 @@ impl ProtonStore {
     /// cannot carry one.
     fn reference_for(
         &self,
-        session_dir: &Path,
+        pass: &proton_session::Pass<'_>,
         name: &str,
         address: &ItemAddress,
     ) -> Result<String, StoreError> {
-        let items = self.cached_items(session_dir, &address.vault, name)?;
+        let items = self.cached_items(pass, &address.vault, name)?;
 
         match match_title(&items, &address.item) {
             Matched::One(only) => Ok(format!(
@@ -2639,14 +2534,12 @@ impl ProtonStore {
     }
 
     /// Every vault this identity can see.
-    fn vaults(&self, session_dir: &Path) -> Result<Vec<String>, StoreError> {
-        let pass = self.enter_session()?;
+    fn vaults(&self, pass: &proton_session::Pass<'_>) -> Result<Vec<String>, StoreError> {
         let captured = capture(
-            self.vault_list_command(session_dir, &self.vendor_login()?, std::env::vars_os()),
+            self.vault_list_command(pass.dir(), &self.vendor_login()?, std::env::vars_os()),
             self.timeout,
         )
         .map_err(|error| self.unreachable(&error))?;
-        drop(pass);
 
         if !captured.status.success() {
             let said = summarise(&captured.stderr);
@@ -2683,12 +2576,6 @@ impl Store for ProtonStore {
     }
 
     fn resolve(&self, name: &str) -> Result<Option<Secret>, StoreError> {
-        // Checked before the name's own reference, and before anything is
-        // spawned or written. Without it there is no identity to read as, so
-        // every name fails for this one reason and the systemic fault is what
-        // the operator should see first.
-        let session_dir = self.session_dir()?;
-
         let Some(address) = self.routing.route(name) else {
             // Deliberately an error rather than `Ok(None)`. "I was asked for a
             // name I have no address for" is a config mistake with a specific
@@ -2707,10 +2594,16 @@ impl Store for ProtonStore {
             )));
         };
 
+        // One pass spans both children this lookup may spawn — the listing
+        // inside `reference_for` and the probe below — so a retirement waits
+        // for at most one reader's worth of vendor children rather than
+        // treating each spawn as its own pass.
+        let pass = self.enter()?;
+
         // Resolved every time, never stored: a share id belongs to one session.
         let reference = match address {
             Address::Reference(reference) => reference.clone(),
-            Address::Named(address) => self.reference_for(session_dir, name, address)?,
+            Address::Named(address) => self.reference_for(&pass, name, address)?,
             Address::Unusable(detail) => return Err(self.backend(detail.clone())),
         };
         let reference = reference.as_str();
@@ -2720,10 +2613,9 @@ impl Store for ProtonStore {
             self.unavailable(format!("cannot write a probe env file: {source}"))
         })?;
 
-        let pass = self.enter_session()?;
         let mut captured = capture(
             self.probe_command(
-                session_dir,
+                pass.dir(),
                 &env_file.path,
                 name,
                 &self.vendor_login()?,
@@ -2814,13 +2706,12 @@ impl Store for ProtonStore {
             )));
         }
 
-        let pass = self.enter_session()?;
+        let pass = self.enter()?;
         let captured = capture(
-            self.vault_list_command(session_dir, &self.vendor_login()?, std::env::vars_os()),
+            self.vault_list_command(pass.dir(), &self.vendor_login()?, std::env::vars_os()),
             self.timeout,
         )
         .map_err(|error| self.unreachable(&error))?;
-        drop(pass);
 
         if captured.status.success() {
             // Deliberately no forensics on the success path. An orphan temp file
@@ -2835,9 +2726,11 @@ impl Store for ProtonStore {
         let vendor = summarise(&captured.stderr);
 
         // Asked only once the round trip has already failed, so a working store
-        // never pays for it and a passing report never depends on it.
-        if let Some(write) = interrupted_write(session_dir) {
-            return Err(self.unavailable(interrupted_write_detail(session_dir, &write, &vendor)));
+        // never pays for it and a passing report never depends on it. Scoped at
+        // the directory this pass actually read — the generation on the daemon
+        // side, the configured directory itself on the session side.
+        if let Some(write) = interrupted_write(pass.dir()) {
+            return Err(self.unavailable(interrupted_write_detail(pass.dir(), &write, &vendor)));
         }
 
         // The one refusal that must not be reported as "the session is
@@ -2872,19 +2765,21 @@ impl Discover for ProtonStore {
     }
 
     fn items(&self, vault: Option<&str>) -> Result<Vec<ItemSummary>, StoreError> {
-        let session_dir = self.session_dir()?;
+        // One pass for the whole call, spanning every vendor child it may
+        // spawn — the vault listing below and one item listing per vault.
+        let pass = self.enter()?;
 
         // One named vault, or every vault this identity can see. Enumerating all
         // of them is one extra spawn plus one per vault, which is the honest cost
         // of not making the caller already know the answer.
         let vaults = match vault {
             Some(one) => vec![one.to_owned()],
-            None => self.vaults(session_dir)?,
+            None => self.vaults(&pass)?,
         };
 
         let mut summaries = Vec::new();
         for name in vaults {
-            let items = self.cached_items(session_dir, &name, &name)?;
+            let items = self.cached_items(&pass, &name, &name)?;
             summaries.extend(items.iter().map(|record| ItemSummary {
                 vault: name.clone(),
                 title: record.title.clone(),
@@ -2904,7 +2799,6 @@ impl Discover for ProtonStore {
     }
 
     fn fields(&self, vault: Option<&str>, item: &str) -> Result<Vec<FieldSummary>, StoreError> {
-        let session_dir = self.session_dir()?;
         // Required rather than searched for. Scanning every vault for a title
         // would read vaults nobody asked about, and each read is recorded
         // off-machine and permanently.
@@ -2916,7 +2810,9 @@ impl Discover for ProtonStore {
             ));
         };
 
-        let items = self.cached_items(session_dir, vault, item)?;
+        // One pass spans the listing below and the `item view` capture.
+        let pass = self.enter()?;
+        let items = self.cached_items(&pass, vault, item)?;
         let record = match match_title(&items, item) {
             Matched::One(only) => only,
             Matched::None => {
@@ -2950,10 +2846,9 @@ impl Discover for ProtonStore {
             }
         };
 
-        let pass = self.enter_session()?;
         let captured = capture(
             self.view_command(
-                session_dir,
+                pass.dir(),
                 record,
                 &self.vendor_login()?,
                 std::env::vars_os(),
@@ -3029,7 +2924,7 @@ fn is_executable(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        Address, ItemAddress, ItemListing, ItemRecord, ItemView, PROBE_VAR, ProtonStore,
+        Address, ItemAddress, ItemListing, ItemRecord, ItemView, Listed, PROBE_VAR, ProtonStore,
         REASON_MAX, REASON_VAR, Reason, SESSION_DIR_VAR, TempEnvFile, assert_vendor_switch_offs,
         env_value, looks_concealed, resolve_executable,
     };
@@ -3037,10 +2932,24 @@ mod tests {
     use crate::error::StoreError;
     use crate::store::Store;
     use crate::store::discover::Discover;
+    use crate::store::proton_session::Generations;
     use std::ffi::{OsStr, OsString};
     use std::path::Path;
     use std::sync::Arc;
-    use std::time::Duration;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::{Duration, Instant};
+
+    /// A fresh, empty directory for one gate test's `Generations` to live in.
+    fn scratch(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "keyless-proton-gate-{tag}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch");
+        dir
+    }
 
     /// The session directory these tests pretend was configured.
     ///
@@ -3752,6 +3661,52 @@ mod tests {
     }
 
     #[test]
+    fn a_listing_cached_under_one_generation_is_not_reused_under_the_next() {
+        // A renewal changes which identity a session DIRECTORY serves without
+        // changing its path, so the generation is the only signal that a
+        // listing has gone stale for the reason a renewal makes it stale — the
+        // trash rule this cache carries is only as good as knowing when to
+        // refetch.
+        let dir = scratch("listing-per-generation");
+        let generations = Arc::new(Generations::at(dir.clone()));
+        let (a, _) = generations.create(None).expect("create A");
+        generations.publish(&a, None).expect("publish A");
+
+        // `/nonexistent/pass-cli` — a cache HIT never spawns it, and a cache
+        // MISS fails loudly rather than silently, which is what tells the two
+        // states apart without a working vendor binary.
+        let store = parts_store()
+            .in_session_dir(Some(dir.clone()))
+            .with_generations(Some(Arc::clone(&generations)));
+
+        let vault = "company";
+        let slot = Arc::clone(store.cache().entry(vault.to_owned()).or_default());
+        *slot.lock().expect("lock the fresh slot") = Some(Listed {
+            items: Arc::new(Vec::new()),
+            at: Instant::now(),
+            generation: Some(a.clone()),
+        });
+
+        let pass_a = store.enter().expect("a pass over A");
+        assert!(
+            store.cached_items(&pass_a, vault, "X").is_ok(),
+            "a listing cached under the current generation was refetched anyway"
+        );
+        drop(pass_a);
+
+        let (b, _) = generations.create(None).expect("create B");
+        generations.publish(&b, None).expect("publish B");
+
+        let pass_b = store.enter().expect("a pass over B");
+        assert!(
+            store.cached_items(&pass_b, vault, "X").is_err(),
+            "a listing cached under A answered a read scoped at the next generation, B"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn a_listing_record_reads_the_item_id_from_id_and_not_from_item_id() {
         // Measured 2026-08-08: the record has `id`, `share_id`, `vault_id`,
         // `state`, `flags`, `create_time`, `modify_time`, `title`, `item_type`.
@@ -4283,94 +4238,154 @@ mod tests {
     }
 
     #[test]
-    fn a_store_with_no_gate_reads_without_waiting_for_one() {
-        // The session side has no renewal loop, so it has no gate — and a gate
-        // that is absent must not become a deadline every read pays.
-        let store = parts_store();
-        assert!(
-            store
-                .enter_session()
-                .expect("no gate is not a refusal")
-                .is_none(),
-            "a store with no gate handed out a pass"
+    fn a_store_with_no_generations_reads_its_configured_directory_directly() {
+        // The session side has no renewal loop, so it has no `Generations` —
+        // and `enter()` still has to answer with somewhere to read, which is
+        // the directory the config named, taken verbatim.
+        let store = parts_store().in_session_dir(Some(std::path::PathBuf::from(SCOPED)));
+        let pass = store.enter().expect("no generations is not a refusal");
+        assert_eq!(
+            pass.dir(),
+            Path::new(SCOPED),
+            "the session-side pass did not read the configured directory"
         );
     }
 
     #[test]
-    fn a_read_at_a_closed_gate_proceeds_once_the_replace_finishes() {
-        let gate = Arc::new(super::SessionGate::default());
-        let replacing = gate.replace();
+    fn a_read_is_never_made_to_wait_for_a_renewal() {
+        // The property `SessionGate` traded away: a renewal in progress must
+        // never make an ordinary read pause, let alone time out. Proven against
+        // a real `Generations` under real, continuous publishing pressure from
+        // another thread, rather than against a single replace.
+        let dir = scratch("read-never-waits");
+        let generations = Arc::new(Generations::at(dir.clone()));
+        let (first, _) = generations
+            .create(None)
+            .expect("create the first generation");
+        generations
+            .publish(&first, None)
+            .expect("publish the first generation");
 
-        let waiter = Arc::clone(&gate);
-        let read =
-            std::thread::spawn(move || waiter.enter(Duration::from_secs(5)).map(drop).is_ok());
+        let store = parts_store()
+            .in_session_dir(Some(dir.clone()))
+            .with_generations(Some(Arc::clone(&generations)));
 
-        // Long enough that the reader is certainly parked at the gate, and far
-        // short of its own five-second ceiling.
-        std::thread::sleep(Duration::from_millis(100));
-        assert!(!read.is_finished(), "a read started during a replace");
-
-        drop(replacing);
-        assert!(
-            read.join().expect("the reader thread panicked"),
-            "a read did not proceed after the replace finished"
-        );
-    }
-
-    #[test]
-    fn a_read_that_waits_out_its_ceiling_says_the_session_is_being_replaced() {
-        let store = parts_store().with_timeout(50);
-        let gate = Arc::new(super::SessionGate::default());
-        let store = store.with_session_gate(Some(Arc::clone(&gate)));
-        let _replacing = gate.replace();
-
-        let Err(error) = store.enter_session() else {
-            panic!("a closed gate must refuse a read that waits it out");
+        let stop = Arc::new(AtomicBool::new(false));
+        let publisher = {
+            let generations = Arc::clone(&generations);
+            let stop = Arc::clone(&stop);
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    if let Ok((name, _)) = generations.create(None) {
+                        let _ = generations.publish(&name, None);
+                    }
+                }
+            })
         };
+
+        // A read that ever waited on the publisher would show up here: a
+        // single `enter()` has nothing to do but read one small file, so any
+        // one of two hundred calls taking anywhere near a network-sized delay
+        // means a read was made to wait.
+        for _ in 0..200 {
+            let started = Instant::now();
+            let pass = store
+                .enter()
+                .expect("a read must never be refused by a renewal");
+            drop(pass);
+            assert!(
+                started.elapsed() < Duration::from_millis(50),
+                "a read waited on a renewal in progress"
+            );
+        }
+
+        stop.store(true, Ordering::Relaxed);
+        publisher.join().expect("the publishing thread panicked");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_read_with_no_current_generation_degrades_at_once_and_says_no_session_is_established() {
+        let dir = scratch("read-no-current");
+        let generations = Arc::new(Generations::at(dir.clone()));
+        let store = parts_store()
+            .in_session_dir(Some(dir.clone()))
+            .with_generations(Some(Arc::clone(&generations)))
+            .with_timeout(60_000);
+
+        let started = Instant::now();
+        let error = store
+            .enter()
+            .expect_err("a root with no published generation must degrade");
+        let took = started.elapsed();
+
         assert!(
             matches!(error, StoreError::Unavailable { .. }),
-            "a replace was reported as a verdict on the item: {error}"
+            "an unestablished session was reported as a verdict on the item: {error}"
         );
         assert!(
-            error.to_string().contains("being replaced"),
-            "the refusal does not name the replace: {error}"
+            error.to_string().contains("established"),
+            "the refusal does not say no session has been established: {error}"
         );
+        assert!(
+            took < Duration::from_secs(1),
+            "a fresh root made a read wait out something instead of degrading at once: {took:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn a_replace_waits_for_a_read_already_running() {
-        let gate = Arc::new(super::SessionGate::default());
-        let pass = gate.enter(Duration::from_secs(5)).expect("an open gate");
+    fn a_retirement_waits_for_the_readers_of_that_generation_alone() {
+        // The `ProtonStore::enter` + `Generations::drain` seam, in place of
+        // `SessionGate::replace`'s whole-session close: a retirement of one
+        // generation must wait for readers of THAT generation, and must not
+        // touch readers of the one that replaced it.
+        let dir = scratch("retire-waits-for-readers");
+        let generations = Arc::new(Generations::at(dir.clone()));
+        let (old, _) = generations.create(None).expect("create the old generation");
+        generations
+            .publish(&old, None)
+            .expect("publish the old generation");
 
-        let closer = Arc::clone(&gate);
-        let replace = std::thread::spawn(move || drop(closer.replace()));
+        let store = parts_store()
+            .in_session_dir(Some(dir.clone()))
+            .with_generations(Some(Arc::clone(&generations)));
+
+        let held = store.enter().expect("a pass over the old generation");
+        assert_eq!(held.dir(), dir.join(old.as_str()));
+
+        let (new, _) = generations.create(None).expect("create the new generation");
+        generations
+            .publish(&new, None)
+            .expect("publish the new generation");
+
+        // A fresh read now goes to the NEW generation, and is never blocked by
+        // the pass still held on the old one.
+        let fresh = store.enter().expect("a read must not wait on a retirement");
+        assert_eq!(fresh.dir(), dir.join(new.as_str()));
+        drop(fresh);
+
+        let waiting = Arc::clone(&generations);
+        let old_for_thread = old.clone();
+        let drain = std::thread::spawn(move || {
+            waiting
+                .drain(&old_for_thread, Duration::from_secs(5))
+                .is_ok()
+        });
 
         std::thread::sleep(Duration::from_millis(100));
         assert!(
-            !replace.is_finished(),
-            "a replace started while a vendor child was still reading the session"
+            !drain.is_finished(),
+            "the retirement did not wait for the old generation's own reader"
         );
 
-        drop(pass);
-        replace.join().expect("the replace thread panicked");
-    }
-
-    #[test]
-    fn a_panicking_replace_still_reopens_the_gate() {
-        // A gate left closed by a failed login would turn one bad renewal into
-        // an outage on every name, so the reopen is a `Drop` rather than a line
-        // at the end of the happy path.
-        let gate = Arc::new(super::SessionGate::default());
-        let closer = Arc::clone(&gate);
-        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _replacing = closer.replace();
-            panic!("the login blew up");
-        }));
-        assert!(panicked.is_err(), "the test's own panic did not happen");
-
+        drop(held);
         assert!(
-            gate.enter(Duration::from_millis(50)).is_ok(),
-            "the gate stayed closed after the replace panicked"
+            drain.join().expect("the drain thread panicked"),
+            "the retirement never noticed the reader had gone"
         );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

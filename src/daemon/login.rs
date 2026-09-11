@@ -53,19 +53,28 @@
 //! that nothing here can repair. See
 //! [`crate::store::proton`]'s note on interrupted writes.
 //!
-//! **Any judgement about whether a session already exists.** The vendor answers
-//! that, in its own words, and it is the only thing on the machine that knows —
-//! see [`Outcome::AlreadyAuthenticated`], which is what makes a second run safe
-//! rather than merely unlikely to be harmful.
+//! **Any judgement about whether a session already exists, made without
+//! asking.** The vendor no longer gets to answer that for a generation this
+//! crate is about to create — a fresh generation is never refused, so a
+//! `pass-cli login` reporting `LoggedIn` there proves nothing about whether an
+//! identity was already live. What makes a second run of `keylessd login`
+//! safe now is this crate's own `info` probe of the CURRENT generation, run
+//! before anything is created — see [`establish`] — which supplies the
+//! refusal the vendor's own `Client is already authenticated` used to.
 
 use std::collections::BTreeMap;
 use std::fs;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
+use crate::config::bounded_timeout;
 use crate::secret::Secret;
+use crate::store::exec::REAP_GRACE;
 use crate::store::proton::{self, KeyProvider};
+use crate::store::proton_session::{Candidate, GenerationName, Generations};
 
 /// The only mode the session directory may have.
 ///
@@ -104,7 +113,11 @@ pub struct Owner {
 pub struct Coordinates {
     /// The vendor binary to spawn.
     pub binary: PathBuf,
-    /// Which logged-in identity the login establishes.
+    /// The ROOT of the daemon's generations — `<root>/current` names which
+    /// one is live, and `<root>/gen-<millis>-<pid>/` is what a login actually
+    /// scopes a vendor child at. Never handed to a vendor child directly: see
+    /// [`establish`], which always spawns against a specific generation
+    /// directory, never against this path.
     pub session_dir: PathBuf,
     /// Where the key encrypting that identity is kept.
     pub key_provider: KeyProvider,
@@ -370,26 +383,33 @@ fn reown(path: &Path, owner: Owner, changed: &mut usize) -> Result<(), String> {
     Ok(())
 }
 
-/// One `pass-cli login` invocation, built and not yet spawned.
+/// One `pass-cli login` invocation, scoped at `dir` and not yet spawned.
 ///
 /// Split out so a test can read the argument vector and the environment from
 /// the outside. The property being defended is not that the login works — it is
 /// that the TOKEN is in the environment and the argument vector is the two
 /// words `pass-cli login`, and an assertion on the returned status could not
 /// tell those apart.
+///
+/// `dir` is a specific GENERATION directory, never
+/// [`Coordinates::session_dir`] — see that field's own doc. Every builder in
+/// this file takes the directory explicitly for the same reason: a generation
+/// changes on every attempt, so nothing here may read it off `coordinates`.
 #[must_use]
 pub fn login_command(
     coordinates: &Coordinates,
+    dir: &Path,
     login: &[(String, Secret)],
     owner: Owner,
 ) -> Command {
     let mut command = Command::new(&coordinates.binary);
     command.arg("login");
-    scope(&mut command, coordinates, login, owner);
+    scope(&mut command, coordinates, dir, login, owner);
     command
 }
 
-/// One `pass-cli info` invocation — does a session answer in this directory?
+/// One `pass-cli info` invocation, scoped at `dir` — does a session answer
+/// there?
 ///
 /// The liveness half of the loop Proton publishes: `pass-cli info 2>/dev/null
 /// || … pass-cli login`. It carries no credential, because the question is
@@ -403,19 +423,29 @@ pub fn login_command(
 /// identity, usually a healthy one, which is the answer that makes a dead
 /// daemon session read as fine.
 #[must_use]
-pub fn info_command(coordinates: &Coordinates, owner: Owner) -> Command {
+pub fn info_command(coordinates: &Coordinates, dir: &Path, owner: Owner) -> Command {
     let mut command = Command::new(&coordinates.binary);
     command.arg("info");
-    scope(&mut command, coordinates, &[], owner);
+    scope(&mut command, coordinates, dir, &[], owner);
     command
 }
 
-/// One `pass-cli logout` invocation, for the rotation path only.
+/// One `pass-cli logout` invocation, scoped at `dir`, for the retirement path
+/// only — never against the directory [`Coordinates::session_dir`]'s root
+/// names as current.
+///
+/// `force` appends `--force`, which the vendor's own words describe as
+/// deleting the directory's contents rather than ending the session at the
+/// account — see [`retire`], the only caller that ever passes `true`, and only
+/// after a plain logout has already failed.
 #[must_use]
-pub fn logout_command(coordinates: &Coordinates, owner: Owner) -> Command {
+pub fn logout_command(coordinates: &Coordinates, dir: &Path, force: bool, owner: Owner) -> Command {
     let mut command = Command::new(&coordinates.binary);
     command.arg("logout");
-    scope(&mut command, coordinates, &[], owner);
+    if force {
+        command.arg("--force");
+    }
+    scope(&mut command, coordinates, dir, &[], owner);
     command
 }
 
@@ -427,12 +457,13 @@ pub fn logout_command(coordinates: &Coordinates, owner: Owner) -> Command {
 fn scope(
     command: &mut Command,
     coordinates: &Coordinates,
+    dir: &Path,
     login: &[(String, Secret)],
     owner: Owner,
 ) {
     use std::os::unix::process::CommandExt;
 
-    command.env(proton::SESSION_DIR_VAR, &coordinates.session_dir);
+    command.env(proton::SESSION_DIR_VAR, dir);
     command.env(proton::KEY_PROVIDER_VAR, coordinates.key_provider.as_str());
     for (variable, secret) in login {
         command.env(variable, secret.expose());
@@ -734,16 +765,23 @@ pub fn perform(
     replace: bool,
     token: &Secret,
     extra: Vec<(String, Secret)>,
+    generations: &Generations,
     out: &mut dyn std::io::Write,
 ) -> Result<(), String> {
-    establish(coordinates, owner, replace, token, extra, out)?;
+    let name = establish(coordinates, owner, replace, token, extra, generations, out)?;
 
     super::credential::store_entry(
         &coordinates.credentials_file,
         &coordinates.token_entry,
         token,
     )
-    .map_err(|error| logged_in_but_unwritten(coordinates, &error.to_string()))?;
+    .map_err(|error| {
+        logged_in_but_unwritten(
+            coordinates,
+            &generations.root().join(name.as_str()),
+            &error.to_string(),
+        )
+    })?;
 
     writeln!(
         out,
@@ -754,16 +792,40 @@ pub fn perform(
     .map_err(|error| format!("the report could not be written: {error}"))
 }
 
-/// Establish the session, and record nothing.
+/// Establish a session in a FRESH generation directory, and record nothing.
 ///
 /// The half of [`perform`] that talks to the vendor, split out so the renewal
 /// loop in [`super::session`] can reuse it without rewriting a token the file
 /// already holds.
 ///
+/// # The flow, and why each step is safe
+///
+/// 1. Unless `replace` is set, probe the CURRENT generation with `info`; if
+///    one answers, refuse with [`already_authenticated`] — this crate's own
+///    refusal, since a fresh generation is never refused by the vendor and so
+///    cannot supply one on its own (see the module header).
+/// 2. [`Generations::create`] a fresh, empty, `0700` directory. Nothing reads
+///    it yet.
+/// 3. `pass-cli login`, scoped at that directory alone. Anything but
+///    [`Outcome::LoggedIn`] discards the directory directly — no grace, no
+///    sweep, because its only possible reader is this call and
+///    `Command::output()` has already returned.
+/// 4. Verify with `pass-cli info` at the same directory. A non-zero answer
+///    means the vendor reported success and then could not be asked anything
+///    — discarded the same way as step 3, after a plain logout first, since
+///    the account-side session this time genuinely exists.
+/// 5. [`Generations::publish`]. From this instant every new pass reads the
+///    new generation. A failure here discards the same way as step 4 — the
+///    directory is fully logged in and unpublished, which is exactly the
+///    state step 4's discard already handles.
+///
+/// The OLD generation, if any, is never opened, mutated or deleted by this
+/// function. Retiring it is [`sweep`]'s job, on its own grace.
+///
 /// # Why the renewal must NOT write the token back
 ///
 /// It is the same value, so the write looks free — and it is the one step in
-/// this verb that can fail on a healthy renewal. A full disk, a read-only
+/// [`perform`] that can fail on a healthy renewal. A full disk, a read-only
 /// filesystem or a credential file an operator has just chmod'd turns a
 /// successful login into [`logged_in_but_unwritten`], which backs the loop off
 /// and eventually notifies, over a session that is in fact alive. Writing the
@@ -772,41 +834,36 @@ pub fn perform(
 ///
 /// # Errors
 ///
-/// The sentence to print. `Ok` means the vendor has taken the token.
+/// The sentence to print. `Ok` carries the generation that is now current.
 pub fn establish(
     coordinates: &Coordinates,
     owner: Owner,
     replace: bool,
     token: &Secret,
     extra: Vec<(String, Secret)>,
+    generations: &Generations,
     out: &mut dyn std::io::Write,
-) -> Result<(), String> {
-    if replace {
-        let (status, said) = run(logout_command(coordinates, owner))
-            .map_err(|error| cannot_spawn(coordinates, owner, &error))?;
-        // `There was not an active session, you are already logged out` is a
-        // success for this verb's purposes: the directory is empty, which is
-        // the state the login below needs.
-        if !status.success() && !said.to_ascii_lowercase().contains("already logged out") {
-            return Err(format!(
-                "the existing session at {} could not be logged out, so nothing was replaced \
-                 and the session is as it was: {}\n\nThe vendor's own next step DELETES that \
-                 directory's contents rather than ending the session at the account, so it is \
-                 not a step this verb takes for anybody. Run it deliberately, as the daemon: \
-                 `sudo -u '#{}' env {}` — or take the directory away and log in fresh",
-                coordinates.session_dir.display(),
-                said.trim(),
-                owner.uid,
-                proton::scoped_command(&coordinates.session_dir, "logout --force")
-            ));
-        }
-        writeln!(
-            out,
-            "logout\t{STORE}\t{}",
-            coordinates.session_dir.display()
-        )
-        .map_err(|error| format!("the report could not be written: {error}"))?;
+) -> Result<GenerationName, String> {
+    if !replace && already_authenticated_now(coordinates, owner, generations) {
+        let current = generations
+            .current()
+            .expect("already_authenticated_now only answers true when current() is Ok");
+        return Err(already_authenticated(
+            &generations.root().join(current.as_str()),
+            "the vendor's own liveness probe answered there, which is this crate's own check \
+             standing in for the vendor's login refusal — a freshly created generation is \
+             never refused",
+        ));
     }
+
+    let (name, dir) = generations
+        .create(Some((owner.uid, owner.gid)))
+        .map_err(|error| {
+            format!(
+                "a fresh Proton session directory could not be created under {}: {error}",
+                generations.root().display()
+            )
+        })?;
 
     let mut login = extra;
     // A second [`Secret`] rather than a borrow of the caller's, so the token is
@@ -816,30 +873,93 @@ pub fn establish(
         proton::TOKEN_VAR.to_owned(),
         Secret::new(token.expose().to_owned()),
     ));
-    let (status, said) = run(login_command(coordinates, &login, owner))
-        .map_err(|error| cannot_spawn(coordinates, owner, &error))?;
+    let (status, said) = run(login_command(coordinates, &dir, &login, owner)).map_err(|error| {
+        let _ = fs::remove_dir_all(&dir);
+        cannot_spawn(coordinates, owner, &error)
+    })?;
     drop(login);
 
-    match classify(status, &said) {
-        Outcome::LoggedIn => {}
-        Outcome::AlreadyAuthenticated => {
-            return Err(already_authenticated(&coordinates.session_dir, said.trim()));
-        }
-        Outcome::KeyLost(said) => return Err(key_lost(coordinates, &said)),
-        Outcome::TokenRefused(said) => return Err(token_refused(coordinates, &said)),
-        Outcome::Unreachable(said) => return Err(unreachable(coordinates, &said)),
-        Outcome::Failed(said) => {
-            return Err(format!(
+    let outcome = classify(status, &said);
+    if outcome != Outcome::LoggedIn {
+        let _ = fs::remove_dir_all(&dir);
+        return Err(match outcome {
+            Outcome::AlreadyAuthenticated => already_authenticated(&dir, said.trim()),
+            Outcome::KeyLost(said) => key_lost(coordinates, &dir, &said),
+            Outcome::TokenRefused(said) => token_refused(coordinates, &said),
+            Outcome::Unreachable(said) => unreachable(coordinates, &said),
+            Outcome::Failed(said) => format!(
                 "the login into {} failed for a reason nothing here recognises, and nothing \
                  was written to {}: {said}",
-                coordinates.session_dir.display(),
+                dir.display(),
                 coordinates.credentials_file.display()
-            ));
-        }
+            ),
+            Outcome::LoggedIn => unreachable!("handled above"),
+        });
+    }
+    writeln!(out, "login\t{STORE}\t{}", dir.display())
+        .map_err(|error| format!("the report could not be written: {error}"))?;
+
+    let (status, said) = run(info_command(coordinates, &dir, owner)).map_err(|error| {
+        discard_unpublished(coordinates, &dir, owner);
+        cannot_spawn(coordinates, owner, &error)
+    })?;
+    if !status.success() {
+        discard_unpublished(coordinates, &dir, owner);
+        return Err(format!(
+            "the login into {} succeeded but the session did not answer `info`, so nothing was \
+             made current: {}",
+            dir.display(),
+            said.trim()
+        ));
     }
 
-    writeln!(out, "login\t{STORE}\t{}", coordinates.session_dir.display())
-        .map_err(|error| format!("the report could not be written: {error}"))
+    generations
+        .publish(&name, Some((owner.uid, owner.gid)))
+        .map_err(|error| {
+            discard_unpublished(coordinates, &dir, owner);
+            format!(
+                "{} logged in but could not be made current: {error}",
+                dir.display()
+            )
+        })?;
+
+    writeln!(out, "established generation {name}")
+        .map_err(|error| format!("the report could not be written: {error}"))?;
+    Ok(name)
+}
+
+/// Does a session already answer in the CURRENT generation?
+///
+/// This crate's own replacement for the vendor's `Client is already
+/// authenticated` refusal, which a fresh generation can never trigger — see
+/// the module header. `false` covers both "no" and "could not be asked",
+/// because either one means [`establish`] should proceed to create a fresh
+/// generation rather than refuse.
+fn already_authenticated_now(
+    coordinates: &Coordinates,
+    owner: Owner,
+    generations: &Generations,
+) -> bool {
+    let Ok(pass) = generations.enter() else {
+        return false;
+    };
+    run(info_command(coordinates, pass.dir(), owner))
+        .map(|(status, _)| status.success())
+        .unwrap_or(false)
+}
+
+/// Log out (best-effort) and delete a generation this call created but will
+/// never publish.
+///
+/// The one exception to the grace-and-drain retirement [`sweep`] performs: a
+/// generation nobody but THIS call could ever have read, whose
+/// `Command::output()` has already returned, needs neither a grace nor a
+/// drain — there is no reader left to wait for. The logout is attempted
+/// unconditionally; whether the account had anything to end is the vendor's
+/// business, and its answer is not decisive here.
+fn discard_unpublished(coordinates: &Coordinates, dir: &Path, owner: Owner) {
+    let _ = run(logout_command(coordinates, dir, false, owner));
+    let _ = fs::remove_dir_all(dir);
 }
 
 /// What to tell an operator whose child could not even be started.
@@ -868,39 +988,46 @@ fn cannot_spawn(coordinates: &Coordinates, owner: Owner, error: &std::io::Error)
     )
 }
 
-/// What to tell an operator whose session directory already holds an identity.
+/// What to tell an operator whose current generation already holds an
+/// identity.
+///
+/// `said` names WHY this call believes that — either the vendor's own refusal
+/// of a login into a directory that, in the ordinary case, was never fresh
+/// (`Outcome::AlreadyAuthenticated`, now reachable only if something else
+/// logged into a generation this call had just created), or this crate's own
+/// `info` probe of the current generation, which is the refusal
+/// [`establish`] actually relies on — see the module header.
 #[must_use]
-pub fn already_authenticated(session_dir: &Path, said: &str) -> String {
+pub fn already_authenticated(dir: &Path, said: &str) -> String {
     format!(
-        "{} already holds a logged-in identity, and `pass-cli` refuses to replace one: {said}\n\
+        "{} already holds a logged-in identity: {said}\n\
          \n\
          NOTHING was changed — not the session, not the credential file — and the token you \
          typed was discarded. If that identity is the one you want, there is nothing to do; run \
          `{daemon} check` to see whether the daemon accepts it. If you are ROTATING the token, \
-         re-run with `--replace`, which logs the existing session out first. That is deliberate \
-         and not the default: a logout followed by a login the vendor refuses leaves the \
-         directory with no identity at all, so it is a step somebody chooses.\n\
+         re-run with `--replace`, which establishes a fresh generation and makes it current \
+         without touching this one until it has proven itself.\n\
          \n\
          To record a token in the credential file WITHOUT touching the session: \
          `{daemon} credential --store {STORE} --name <entry>`",
-        session_dir.display(),
+        dir.display(),
         daemon = crate::DAEMON_NAME
     )
 }
 
-/// What to tell an operator whose store was just reinitialised.
+/// What to tell an operator whose fresh generation the vendor reinitialised.
 #[must_use]
-pub fn key_lost(coordinates: &Coordinates, said: &str) -> String {
+pub fn key_lost(coordinates: &Coordinates, dir: &Path, said: &str) -> String {
     format!(
         "`pass-cli` could not find the local key for {}, found a session store beside it, and \
          FORCED A LOGOUT to reinitialise the store: {said}\n\
          \n\
-         That directory now holds no identity. This daemon set `{}={}`, so the key was looked \
-         for in the directory itself — if the session in there was established under a \
-         different provider, this is what that mismatch does, and it is why `keyring` is not a \
-         value `keylessd.json` will accept. Nothing was written to {}. Log in again with this \
-         verb, which will find an empty directory and establish a fresh session",
-        coordinates.session_dir.display(),
+         That directory has been discarded — it was a fresh generation this attempt created and \
+         never published, so nothing was reading it. This daemon set `{}={}`, so the key was \
+         looked for in the directory itself; a key-provider mismatch is the ordinary way this \
+         happens. Nothing was written to {}. The next attempt establishes another fresh \
+         generation",
+        dir.display(),
         proton::KEY_PROVIDER_VAR,
         coordinates.key_provider.as_str(),
         coordinates.credentials_file.display()
@@ -949,21 +1076,140 @@ pub fn unreachable(coordinates: &Coordinates, said: &str) -> String {
 /// the session works, so every name resolves, and the row that is red is about
 /// a file nobody is looking at.
 #[must_use]
-pub fn logged_in_but_unwritten(coordinates: &Coordinates, detail: &str) -> String {
+pub fn logged_in_but_unwritten(coordinates: &Coordinates, dir: &Path, detail: &str) -> String {
     format!(
-        "the session at {} is established and every Proton name will resolve — but the token \
-         could not be recorded in {}: {detail}\n\
+        "the session at {} is established and current, and every Proton name will resolve — \
+         but the token could not be recorded in {}: {detail}\n\
          \n\
          So nothing can re-establish that session when the vendor drops it, which it does \
          without warning, and the failure would arrive at an hour nobody chose. `{} check` says \
          so in the `identity` row. Fix the file and run `{} credential --store {STORE} --name \
          {}` with the same token",
-        coordinates.session_dir.display(),
+        dir.display(),
         coordinates.credentials_file.display(),
         crate::DAEMON_NAME,
         crate::DAEMON_NAME,
         coordinates.token_entry
     )
+}
+
+/// The grace a retirement candidate must clear before [`sweep`] logs it out.
+///
+/// `2 × bounded_timeout(timeout_ms) + REAP_GRACE + 1s`. Two `capture`-bounded
+/// children can outlive one attempt's own `timeout_ms` — a `resolve` spawns
+/// the listing and the read as two children, each bounded separately — so the
+/// grace covers two full budgets rather than one. [`REAP_GRACE`] is the extra
+/// `capture` itself waits for a killed child's pipes to drain, and the final
+/// second covers the gap between a token being read and its child actually
+/// spawning. Never configurable, and never allowed below one `capture`
+/// timeout plus [`REAP_GRACE`] — see [`Generations::drain`]'s own contract,
+/// which this exists to satisfy: no other process's child can still be
+/// reading a candidate once its age clears this bound.
+#[must_use]
+pub fn grace(timeout_ms: u64) -> Duration {
+    2 * bounded_timeout(timeout_ms) + REAP_GRACE + Duration::from_secs(1)
+}
+
+/// Run the ordered retirement procedure against one candidate.
+///
+/// Never touches [`Generations::current`] — every step is guarded by
+/// [`Generations`] itself refusing to hand out or delete the current name, so
+/// this function's own logic never has to re-derive that guard.
+///
+/// 1. [`Generations::drain`] — wait for this process's own readers of the
+///    candidate to finish, for at most `bound`.
+/// 2. A plain `pass-cli logout`, scoped at the candidate. Success, or the
+///    vendor's own "already logged out", both mean the account-side session
+///    this candidate held is gone.
+/// 3. On any other outcome, `pass-cli logout --force` — the vendor's own
+///    words describe this as deleting the directory's contents rather than
+///    ending the session at the account, which is exactly what step 4 is
+///    about to do anyway, so nothing here relies on it reaching the account.
+/// 4. [`Generations::remove`] — `remove_dir_all`, refused if `current` has,
+///    in the meantime, come to name this candidate.
+///
+/// # Errors
+///
+/// The sentence to print, naming which step failed. The candidate is left in
+/// place either way, for [`sweep`] to retry on its next pass.
+pub fn retire(
+    coordinates: &Coordinates,
+    owner: Owner,
+    generations: &Generations,
+    candidate: &Candidate,
+    bound: Duration,
+    out: &mut dyn std::io::Write,
+) -> Result<(), String> {
+    if let Some(name) = candidate.name()
+        && generations.drain(name, bound).is_err()
+    {
+        return Err(format!(
+            "{name} is still being read by this process; retried next sweep"
+        ));
+    }
+
+    let (status, said) = run(logout_command(coordinates, candidate.scope(), false, owner))
+        .map_err(|error| cannot_spawn(coordinates, owner, &error))?;
+    let already_gone = status.success() || said.to_ascii_lowercase().contains("already logged out");
+    if !already_gone {
+        // Outcome deliberately not decisive here — see this function's own
+        // doc. `remove` below is what actually clears the directory.
+        let _ = run(logout_command(coordinates, candidate.scope(), true, owner));
+    }
+
+    generations
+        .remove(candidate)
+        .map_err(|error| format!("{} could not be removed: {error}", candidate.label()))?;
+
+    writeln!(out, "retired\tproton\t{}", candidate.label())
+        .map_err(|error| format!("the report could not be written: {error}"))
+}
+
+/// Retire every eligible candidate, oldest first, honouring `stop` between
+/// candidates.
+///
+/// Called on the renewal loop's own thread at every tick — after the due
+/// check, and once more before the first attempt — and by `keylessd login`
+/// once, after a successful publish. Never drains on the operator verb's
+/// behalf: a candidate whose readers have not finished by the time `keylessd
+/// login` gets to it is left for the loop's own next tick, or for the next
+/// invocation of this verb.
+///
+/// A failure retiring one candidate does not stop the sweep — every other
+/// eligible candidate still gets its turn — and is reported through `out` at
+/// most once per candidate per process, via
+/// [`Generations::mark_failure_reported`].
+///
+/// # Returns
+///
+/// How many candidates this call retired.
+pub fn sweep(
+    coordinates: &Coordinates,
+    owner: Owner,
+    generations: &Generations,
+    grace: Duration,
+    stop: Option<&AtomicBool>,
+    out: &mut dyn std::io::Write,
+) -> usize {
+    let mut retired = 0;
+    for candidate in generations.candidates(std::time::SystemTime::now(), grace) {
+        if stop.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+            break;
+        }
+        match retire(coordinates, owner, generations, &candidate, grace, out) {
+            Ok(()) => retired += 1,
+            Err(detail) => {
+                if generations.mark_failure_reported(&candidate) {
+                    let _ = writeln!(
+                        out,
+                        "retire-failed\tproton\t{}\t{detail}",
+                        candidate.label()
+                    );
+                }
+            }
+        }
+    }
+    retired
 }
 
 #[cfg(test)]
@@ -1027,12 +1273,11 @@ mod tests {
         );
     }
 
-    /// The probe asks about the DAEMON's session, never the ambient one.
+    /// The probe carries no token — it is not a place a credential belongs,
+    /// and one here would be a token in a child spawned every tick.
     ///
-    /// `info` is session-scoped, so run without `PROTON_PASS_SESSION_DIR` it
-    /// reports on the caller's default session — usually healthy — and a dead
-    /// daemon session reads as fine. That is a probe that can only ever say
-    /// yes.
+    /// Which directory the probe names is `every_login_verb_is_scoped_at_the_
+    /// directory_it_is_given_and_never_at_the_root`'s claim, not this one's.
     #[test]
     fn the_liveness_probe_names_the_session_it_is_asking_about_and_carries_no_token() {
         let coordinates = Coordinates {
@@ -1043,7 +1288,8 @@ mod tests {
             token_entry: "AGENT_TOKEN".to_owned(),
             extra: BTreeMap::new(),
         };
-        let command = info_command(&coordinates, Owner { uid: 1, gid: 1 });
+        let generation = coordinates.session_dir.join("gen-1789012345678-4242");
+        let command = info_command(&coordinates, &generation, Owner { uid: 1, gid: 1 });
 
         let environment: Vec<_> = command
             .get_envs()
@@ -1057,18 +1303,9 @@ mod tests {
         assert!(
             environment
                 .iter()
-                .any(|(key, value)| key == proton::SESSION_DIR_VAR
-                    && value.as_deref() == Some("/var/lib/keyless/proton-session")),
-            "the probe does not name the session directory: {environment:?}"
-        );
-        assert!(
-            environment
-                .iter()
                 .any(|(key, _)| key == proton::KEY_PROVIDER_VAR),
             "the probe does not name the key provider: {environment:?}"
         );
-        // It asks whether a session answers; it is not a place a credential
-        // belongs, and one here would be a token in a child spawned every tick.
         assert!(
             !environment.iter().any(|(key, _)| key == proton::TOKEN_VAR),
             "the probe carries the token: {environment:?}"
@@ -1086,14 +1323,21 @@ mod tests {
         let coordinates = coordinates_at(Path::new("/nonexistent/keyless-login-switch-off"));
         let owner = Owner { uid: 1, gid: 1 };
         let login = login_vector();
+        let generation = coordinates.session_dir.join("gen-1-1");
 
         // Every verb's own argv, alongside the switch-off check below: setting
         // an environment variable cannot append an argument, so this is the
         // same argv each verb has always produced.
         let cases: [(Command, &[&str]); 3] = [
-            (login_command(&coordinates, &login, owner), &["login"]),
-            (info_command(&coordinates, owner), &["info"]),
-            (logout_command(&coordinates, owner), &["logout"]),
+            (
+                login_command(&coordinates, &generation, &login, owner),
+                &["login"],
+            ),
+            (info_command(&coordinates, &generation, owner), &["info"]),
+            (
+                logout_command(&coordinates, &generation, false, owner),
+                &["logout"],
+            ),
         ];
 
         for (command, expected_argv) in cases {
@@ -1106,6 +1350,64 @@ mod tests {
         }
     }
 
+    #[test]
+    fn every_login_verb_is_scoped_at_the_directory_it_is_given_and_never_at_the_root() {
+        // The property generations exist for: whichever directory a caller
+        // names is the one the vendor sees, and `Coordinates::session_dir` —
+        // the ROOT of every generation — is never that directory on its own.
+        let coordinates = coordinates_at(Path::new("/nonexistent/keyless-login-scoped"));
+        let owner = Owner { uid: 1, gid: 1 };
+        let generation = coordinates.session_dir.join("gen-1-1");
+        assert_ne!(
+            generation, coordinates.session_dir,
+            "the fixture's own generation must differ from the root"
+        );
+
+        let commands = [
+            login_command(&coordinates, &generation, &login_vector(), owner),
+            info_command(&coordinates, &generation, owner),
+            logout_command(&coordinates, &generation, false, owner),
+            logout_command(&coordinates, &generation, true, owner),
+        ];
+
+        for command in &commands {
+            let scoped = env_value(command, proton::SESSION_DIR_VAR);
+            assert_eq!(
+                scoped.as_deref(),
+                Some(generation.display().to_string().as_str()),
+                "scoped at {scoped:?}, not the generation it was given: {command:?}"
+            );
+            assert_ne!(
+                scoped.as_deref(),
+                Some(coordinates.session_dir.display().to_string().as_str()),
+                "a login verb was scoped at the root of generations"
+            );
+        }
+    }
+
+    #[test]
+    fn a_retirement_logout_carries_force_only_when_asked() {
+        let coordinates = coordinates_at(Path::new("/nonexistent/keyless-login-force"));
+        let owner = Owner { uid: 1, gid: 1 };
+        let generation = coordinates.session_dir.join("gen-1-1");
+
+        let argv_of = |command: &Command| -> Vec<String> {
+            command
+                .get_args()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect()
+        };
+
+        assert_eq!(
+            argv_of(&logout_command(&coordinates, &generation, false, owner)),
+            vec!["logout".to_owned()]
+        );
+        assert_eq!(
+            argv_of(&logout_command(&coordinates, &generation, true, owner)),
+            vec!["logout".to_owned(), "--force".to_owned()]
+        );
+    }
+
     fn scratch(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
             "keyless-login-{tag}-{}-{:?}",
@@ -1115,6 +1417,16 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).expect("scratch");
         dir
+    }
+
+    /// The value a built [`Command`] would export for `key`, read off it
+    /// directly rather than off the process's own environment.
+    fn env_value(command: &Command, key: &str) -> Option<String> {
+        command
+            .get_envs()
+            .find(|(k, _)| *k == std::ffi::OsStr::new(key))
+            .and_then(|(_, value)| value)
+            .map(|value| value.to_string_lossy().into_owned())
     }
 
     fn own(dir: &Path) -> Owner {
@@ -1156,7 +1468,8 @@ mod tests {
         let dir = scratch("argv");
         let coordinates = coordinates_at(&dir);
         let login = login_vector();
-        let command = login_command(&coordinates, &login, own(&dir));
+        let generation = coordinates.session_dir.join("gen-1-1");
+        let command = login_command(&coordinates, &generation, &login, own(&dir));
 
         let argv: Vec<String> = command
             .get_args()
@@ -1193,8 +1506,8 @@ mod tests {
         );
         assert_eq!(
             environment.get(proton::SESSION_DIR_VAR).map(String::as_str),
-            Some(coordinates.session_dir.display().to_string().as_str()),
-            "the session directory was not set"
+            Some(generation.display().to_string().as_str()),
+            "the generation directory was not set"
         );
 
         let _ = fs::remove_dir_all(&dir);

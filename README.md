@@ -1330,7 +1330,8 @@ can find. So they exit non-zero and say what is missing:
 `stores.proton.session_dir` is the **reader**: a viewer-role agent token, the
 default, and the only identity `run`, `ls`, `items` and `fields` can reach. It
 cannot create, move or trash anything, which is what you want every session on
-the machine to hold.
+the machine to hold. On a session this is a plain directory; on the daemon the
+same key names the ROOT of a set of generation directories it renews into.
 
 `stores.proton.manager.session_dir` is a **second** token with the editor role,
 used by `new` and `put` and by nothing else:

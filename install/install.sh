@@ -437,11 +437,14 @@ place_state_file 0600 "$LIB_DIR/infisical.json"
 place_state_file 0600 "$LIB_DIR/onepassword.json"
 place_state_file 0600 "$LIB_DIR/proton.json"
 
-note "Proton Pass keeps its logged-in identity in a DIRECTORY, not a file, and
-# it writes to that directory on invocations that only read. 0700 under the
-# daemon: the session store and the local key that decrypts it both live in
-# here, and the key is the whole of what stands between anyone on this machine
-# and the vault. Nothing is logged in yet -- see the Proton step at the end."
+note "This holds one GENERATION directory per login and a 'current' pointer
+# naming which one is live -- never a session store directly. Proton Pass
+# writes to whichever generation it is pointed at on invocations that only
+# read, so a renewal creates a fresh one beside the old rather than touching
+# it. 0700 under the daemon: the key that decrypts a generation's store lives
+# inside it, and the key is the whole of what stands between anyone on this
+# machine and the vault. Nothing is logged in yet -- see the Proton step at
+# the end."
 step install -d -m 0700 -o "$DAEMON_USER" -g "$ACCESS_GROUP" "$LIB_DIR/proton-session"
 
 # --- the policy ------------------------------------------------------------
@@ -696,23 +699,26 @@ cat <<'NEXT'
 #
 # Proton keeps ONE logged-in identity per session DIRECTORY, chosen by
 # PROTON_PASS_SESSION_DIR. A session inherits whichever identity the person at
-# the keyboard logged in; the daemon is given one of its own, at
-# $LIB_DIR/proton-session, created above and readable by nobody else.
+# the keyboard logged in; the daemon is given a ROOT of its own, at
+# $LIB_DIR/proton-session, created above and readable by nobody else. Each
+# login lands in a fresh GENERATION under that root -- never in the root
+# itself -- and a one-line pointer there names which one is current, so a
+# renewal never opens, rewrites or deletes the directory reads are using.
 #
-# Two things about that directory decide whether any of this works.
+# Two things about that root decide whether any of this works.
 #
-# It must be WRITABLE by the daemon. `pass-cli` rewrites its session store on
-# invocations that only read, so a read-only directory is not a safer version
-# of this arrangement -- it is a broken one.
+# It must be WRITABLE by the daemon. `pass-cli` rewrites a generation's own
+# store on invocations that only read, so a read-only root is not a safer
+# version of this arrangement -- it is a broken one.
 #
-# And the daemon must be able to find the LOCAL KEY that directory is
+# And the daemon must be able to find the LOCAL KEY each generation is
 # encrypted with. By default that key lives in a login keyring, and a keyring
 # belongs to the uid that unlocked it: a daemon uid has none. Asked for a key
 # it cannot find beside a session store that exists, `pass-cli` FORCES A LOGOUT
 # and reinitialises the store. So the daemon always sets a key provider, and
 # `keyring` is not a value keylessd.json will accept -- it refuses to start
-# rather than run that way. `fs` keeps the key in the session directory beside
-# the store, at the same 0600 under the same uid.
+# rather than run that way. `fs` keeps the key inside the generation directory
+# beside its store, at the same 0600 under the same uid.
 #
 # a. Create a VIEWER-role agent token at the vendor, scoped to exactly the one
 #    vault the daemon may read. `agent create` prints it once:
@@ -772,18 +778,21 @@ cat <<'NEXT'
 #    step comes first and why there is no --session-dir flag here: one that
 #    disagreed with the config would log a session into a directory the daemon
 #    never opens, and that fails in a way that reads exactly like a wrong
-#    token. The verb creates the session directory 0700 under the daemon --
-#    or repairs one that is not, including files a hand-run login left owned
-#    by root -- runs the login AS the daemon's uid, sets the key provider,
-#    puts the token in the child's ENVIRONMENT and never in an argument, and
-#    records it in proton.json only once the account has accepted it. A token
-#    written before that would sit in a 0600 file that `check` calls sound and
-#    unlock nothing.
+#    token. The verb creates the ROOT 0700 under the daemon -- or repairs one
+#    that is not, including files a hand-run login left owned by root -- logs
+#    into a FRESH GENERATION under it AS the daemon's uid, sets the key
+#    provider, puts the token in the child's ENVIRONMENT and never in an
+#    argument, and records it in proton.json only once the account has
+#    accepted it. A token written before that would sit in a 0600 file that
+#    `check` calls sound and unlock nothing.
 #
-#    Safe to run twice: `pass-cli` refuses to replace a session it already
-#    holds, so a second run touches neither the session nor the file and says
-#    so. To ROTATE the token, add --replace, which logs the old session out
-#    first.
+#    Safe to run twice: this verb, not the vendor, refuses a plain re-run when
+#    a session already answers in the current generation -- a fresh
+#    generation is never refused by `pass-cli` itself, so a second run touches
+#    neither the existing generation nor the credential file, and says so. To
+#    ROTATE the token, add --replace, which establishes a new generation and
+#    makes it current without touching the old one; the daemon's own sweep, or
+#    the next login, retires it once its readers have drained.
 #
 # d. Check it. `identity` reports the file, the two `token` rows report what is
 #    IN it and when it stops, and `store proton` is the vendor accepting it:
