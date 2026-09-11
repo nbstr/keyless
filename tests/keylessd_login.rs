@@ -34,7 +34,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
-use support::install_executable;
+use support::{current_generation, install_executable, publish_generation};
 
 /// A decoy shaped the way a real agent token is: `pst_<token>::<key>`, with a
 /// base64url key. Invented, and distinctive enough that finding it in an
@@ -215,12 +215,26 @@ fn the_token_reaches_the_vendor_in_the_environment_and_never_in_its_argument_vec
     let rendered = said(&output);
     assert!(output.status.success(), "{rendered}");
 
-    let argv = read(&dir.join("pass-cli.argv"));
-    assert_eq!(argv.trim(), "login", "argv: {argv}");
-    assert!(
-        !argv.contains("pst_"),
-        "the token reached the argument vector: {argv}"
+    // `login`, then this crate's own verification of the fresh generation —
+    // see `establish`. `session` is now the ROOT of generations, so the
+    // directory actually scoped is `<session>/<current>`, read back rather
+    // than assumed.
+    let argv: Vec<String> = read(&dir.join("pass-cli.argv"))
+        .lines()
+        .map(str::to_owned)
+        .collect();
+    assert_eq!(
+        argv,
+        vec!["login".to_owned(), "info".to_owned()],
+        "argv: {argv:?}"
     );
+    assert!(
+        !argv.iter().any(|arg| arg.contains("pst_")),
+        "the token reached the argument vector: {argv:?}"
+    );
+
+    let generation = current_generation(&session).expect("the login must publish a generation");
+    let scoped = session.join(&generation).display().to_string();
 
     let environment = read(&dir.join("pass-cli.env"));
     assert!(
@@ -230,12 +244,13 @@ fn the_token_reaches_the_vendor_in_the_environment_and_never_in_its_argument_vec
         "the token did not reach the environment: {environment}"
     );
     // Both of the other two, read whole rather than as substrings. A key
-    // provider left unset is what reinitialises a session store, and a session
-    // directory left unset logs in whichever identity the caller's home holds.
+    // provider left unset is what reinitialises a session store, and a
+    // generation directory left unset logs in whichever identity the caller's
+    // home holds.
     assert!(
         environment
             .lines()
-            .any(|line| line == format!("PROTON_PASS_SESSION_DIR={}", session.display())),
+            .any(|line| line == format!("PROTON_PASS_SESSION_DIR={scoped}")),
         "environment: {environment}"
     );
     assert!(
@@ -458,38 +473,77 @@ fn a_token_the_account_refuses_is_not_left_on_disk() {
 }
 
 #[test]
-fn replace_logs_the_existing_session_out_first_and_the_default_does_not() {
+fn the_default_refuses_a_live_session_by_asking_and_replace_never_asks_at_all() {
     // The control for the case above and the rotation path itself: the same
-    // fixture, differing only in the flag, must reach the vendor with two verbs
-    // rather than one.
+    // fixture, differing only in the flag, must reach the vendor differently.
+    //
+    // Under generations a fresh directory is never refused by the vendor — see
+    // `establish`'s own doc — so the property this used to prove (`--replace`
+    // logs the old session out first, the default does not) is now proven the
+    // other way round: the DEFAULT asks this crate's own question (`info`
+    // against the current generation) and refuses without ever calling
+    // `login` when it answers; `--replace` skips that question entirely and
+    // goes straight to a fresh generation, never touching the old one.
     let dir = scratch("replace");
     let session = dir.join("session");
     let vendor = stub_vendor(&dir, &Vendor::Accepts);
     let config = config_at(&dir, &vendor, &session, "");
+    let existing = publish_generation(&session);
+    let existing_name = existing
+        .file_name()
+        .and_then(|name| name.to_str())
+        .expect("a generation name")
+        .to_owned();
 
-    let output = login(&config, TOKEN_DECOY, &["--replace"]);
+    // The default: `Vendor::Accepts` answers ANY verb with exit 0, so the
+    // `info` probe reads as a live session and the verb refuses without
+    // creating anything.
+    let output = login(&config, TOKEN_DECOY, &[]);
     let rendered = said(&output);
-    assert!(output.status.success(), "{rendered}");
-
+    assert!(
+        !output.status.success(),
+        "a live session was not refused: {rendered}"
+    );
     let argv: Vec<String> = read(&dir.join("pass-cli.argv"))
         .lines()
         .map(str::to_owned)
         .collect();
     assert_eq!(
         argv,
-        vec!["logout".to_owned(), "login".to_owned()],
-        "argv: {argv:?}"
+        vec!["info".to_owned()],
+        "the default asked something other than this crate's own liveness check: {argv:?}"
     );
-    // The logout must carry the session directory too. One that did not would
-    // end whichever session the caller's home names.
-    let environment = read(&dir.join("pass-cli.env"));
     assert_eq!(
-        environment
-            .lines()
-            .filter(|line| *line == format!("PROTON_PASS_SESSION_DIR={}", session.display()))
-            .count(),
-        2,
-        "environment: {environment}"
+        current_generation(&session).as_deref(),
+        Some(existing_name.as_str()),
+        "current changed even though the default never logs in"
+    );
+
+    // `--replace`: no question is asked, a fresh generation is created,
+    // logged into and verified — and the OLD one is never touched, because
+    // retirement runs on its own grace and this run is far too quick for it.
+    std::fs::remove_file(dir.join("pass-cli.argv")).expect("clear the argv log");
+    let output = login(&config, TOKEN_DECOY, &["--replace"]);
+    let rendered = said(&output);
+    assert!(output.status.success(), "{rendered}");
+    let argv: Vec<String> = read(&dir.join("pass-cli.argv"))
+        .lines()
+        .map(str::to_owned)
+        .collect();
+    assert_eq!(
+        argv,
+        vec!["login".to_owned(), "info".to_owned()],
+        "`--replace` asked the already-authenticated question or skipped its own \
+         verification: {argv:?}"
+    );
+    let replaced_name = current_generation(&session).expect("a generation is current");
+    assert_ne!(
+        replaced_name, existing_name,
+        "`--replace` republished the same generation rather than a fresh one"
+    );
+    assert!(
+        session.join(&existing_name).is_dir(),
+        "the superseded generation was deleted immediately, with no grace"
     );
 
     let _ = std::fs::remove_dir_all(&dir);

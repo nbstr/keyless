@@ -66,6 +66,7 @@ pub mod manage;
 pub mod onepassword;
 pub mod proton;
 pub mod proton_manager;
+pub mod proton_session;
 
 use std::collections::{BTreeMap, BTreeSet};
 

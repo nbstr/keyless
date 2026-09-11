@@ -411,9 +411,12 @@ Optional, and independent of everything above.
 
 Proton keeps **one logged-in identity per session directory**, chosen by
 `PROTON_PASS_SESSION_DIR`. A session inherits whichever identity the person at
-the keyboard logged in — usually the whole account. The daemon gets one of its
-own instead, at `/usr/local/var/lib/keyless/proton-session`, created by the
-installer at `0700` and readable by nobody else.
+the keyboard logged in — usually the whole account. The daemon is given a
+**root** of its own instead, at `/usr/local/var/lib/keyless/proton-session`,
+created by the installer at `0700` and readable by nobody else. Each login
+lands in a fresh **generation** directory under that root — never in the root
+itself — and a one-line pointer there names which one is current, so a
+renewal never opens, rewrites or deletes the directory reads are using.
 
 Two facts about that directory decide whether any of this works, and the second
 one is the reason this adapter took a day to move behind the daemon.
@@ -572,12 +575,16 @@ What it does, and why each part of it is not optional:
   credential `check` reports as sound — its `token` row judges shape — sitting
   in a `0600` file and unlocking nothing.
 
-**Run it twice and nothing breaks.** `pass-cli` refuses to replace a session it
-already holds (`Client is already authenticated`), so the second run touches
-neither the session nor `proton.json` and says so. To ROTATE the token, add
-`--replace`, which logs the old session out first — deliberately a flag, because
-a logout followed by a token the account refuses leaves the directory with no
-identity at all.
+**Run it twice and nothing breaks.** This verb, not the vendor, refuses a
+plain re-run when a session already answers in the current generation — a
+fresh generation is never refused by `pass-cli` itself, so the refusal is
+this crate's own liveness probe of whichever generation `current` names. The
+second run therefore touches neither the existing generation nor
+`proton.json`, and says so. To ROTATE the token, add `--replace`, which
+establishes a NEW generation and makes it current without touching the old
+one — deliberately a flag, because it is the rotation path and not the
+default. The daemon's own sweep, or the next plain login, retires the old
+generation once its readers have drained.
 
 `keylessd credential --store proton --name <entry>` still writes that file on
 its own, without touching the session. That is the verb for a `key_provider` of
@@ -643,12 +650,15 @@ the session back.
   without warning, and age alone would sit out the whole lifetime over one that
   had already gone. The probe is Proton's own published loop; the age check is
   what stops it from only ever acting after an outage has started.
-- **The renewal is a logout followed by a login**, because `pass-cli` answers a
-  login over a live session with `Client is already authenticated` and changes
-  nothing. So there is a window of roughly a second, once every 90 minutes, in
-  which a lookup degrades. That is the cost of the vendor having no renewal
-  verb, and it is stated rather than hidden: one second in 5400, against a
-  guaranteed outage every two hours.
+- **The renewal never logs the old session out first.** It establishes a
+  fresh generation beside the one already serving, verifies it, and swaps a
+  one-line pointer to make it current — the generation a lookup was already
+  reading keeps answering, unmodified, for the whole replacement. A lookup is
+  never made to wait for a renewal: it reads whichever generation was current
+  the instant it started, and the old one is only logged out and removed once
+  every reader this process handed it to has finished. That is the cost of
+  the vendor having no renewal verb, paid in a directory kept around for a
+  grace window rather than in a lookup's own latency.
 - **A failing login never stops the daemon.** Vault Agent's `auto_auth` carries
   `exit_on_err` and there is deliberately no counterpart here: Vault Agent
   brokers one identity, while this daemon serves several stores, and a Proton
@@ -657,9 +667,11 @@ the session back.
 - **The token is re-read on every attempt**, so `keylessd credential` is enough
   to rotate it — the next tick logs in with what the file now says, and nothing
   restarts.
-- **Off by default**, because the loop logs a session out before it logs one in,
-  and a patch release should not start doing that to a session directory an
-  operator manages by hand.
+- **Off by default**, because the loop still ends every generation it
+  replaces with a real, account-level logout — later, and never on a
+  lookup's own time, but still a change to a session directory an operator
+  may be managing by hand. A patch release should not start rotating and
+  logging out sessions on an existing install without being asked.
 
 Startup says so when it is on:
 

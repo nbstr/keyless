@@ -67,7 +67,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use crate::NAME;
-use crate::store::proton::SessionGate;
+use crate::store::proton_session::Generations;
 
 use super::config::{DaemonConfig, SessionRenewal};
 use super::login::{self, Coordinates, Owner};
@@ -156,7 +156,16 @@ impl Drop for Keeper {
 /// rather than warned about: an operator who wrote `auto_login: true` has said
 /// the session matters, and starting anyway would leave them with the exact
 /// silent outage this module exists to end.
-pub fn spawn(config: &DaemonConfig, gate: &Arc<SessionGate>) -> Result<Option<Keeper>, String> {
+///
+/// `generations` being `None` here while the loop was asked for is a wiring
+/// bug rather than a config problem — [`login::coordinates`] above already
+/// requires `session_dir`, and [`super::config::DaemonConfig::generations`]
+/// builds `Some` from the identical precondition, so the two disagreeing means
+/// whoever called this built `generations` from a different config.
+pub fn spawn(
+    config: &DaemonConfig,
+    generations: Option<&Arc<Generations>>,
+) -> Result<Option<Keeper>, String> {
     let settings = config.stores.proton.session;
     if !config.stores.proton.enabled || !settings.auto_login {
         return Ok(None);
@@ -166,10 +175,19 @@ pub fn spawn(config: &DaemonConfig, gate: &Arc<SessionGate>) -> Result<Option<Ke
     let Some(owner) = super::credential::daemon_owner(&config.audit) else {
         return Err(login::no_daemon_uid(&config.audit));
     };
+    let Some(generations) = generations else {
+        return Err(format!(
+            "`stores.{}.session_dir` names a directory to renew, but no `Generations` was \
+             built for it",
+            login::STORE
+        ));
+    };
+    let generations = Arc::clone(generations);
+    let timeout_ms = config.stores.proton.timeout_ms;
+    let grace = login::grace(timeout_ms);
 
     let stop = Arc::new(AtomicBool::new(false));
     let flag = Arc::clone(&stop);
-    let gate = Arc::clone(gate);
     let (alive, done) = std::sync::mpsc::channel::<Never>();
     let handle = thread::Builder::new()
         .name(format!("{NAME}d-session"))
@@ -177,7 +195,15 @@ pub fn spawn(config: &DaemonConfig, gate: &Arc<SessionGate>) -> Result<Option<Ke
             // Moved in so it is dropped when this thread returns, however it
             // returns. That drop is what shutdown waits on.
             let _alive = alive;
-            run(&coordinates, owner, settings, &gate, &flag);
+            run(
+                &coordinates,
+                owner,
+                settings,
+                &generations,
+                grace,
+                timeout_ms,
+                &flag,
+            );
         })
         .map_err(|error| format!("cannot start the Proton session loop: {error}"))?;
 
@@ -210,7 +236,9 @@ fn run(
     coordinates: &Coordinates,
     owner: Owner,
     settings: SessionRenewal,
-    gate: &SessionGate,
+    generations: &Generations,
+    grace: Duration,
+    timeout_ms: u64,
     stop: &AtomicBool,
 ) {
     let interval = Duration::from_secs(settings.probe_interval_seconds).max(MIN_INTERVAL);
@@ -221,23 +249,32 @@ fn run(
     let mut established: Option<Instant> = None;
     let mut failures: u32 = 0;
 
+    // Once before the clock below ever runs, so a crash leftover — a
+    // generation a previous process created and never published, or one it
+    // published and never got to retire — is swept before this process's
+    // first attempt rather than waiting out a whole interval for it.
+    report_sweep(coordinates, owner, generations, grace, timeout_ms, stop);
+
     while !stop.load(Ordering::Relaxed) {
         // Two triggers, and the second is not redundant. Age alone would sit
         // for the whole lifetime over a session the vendor had already taken
         // away — and it does take them away without warning, ahead of the cap.
         // So each tick asks the vendor whether one still answers, which is the
         // `pass-cli info || login` Proton publishes.
-        let due =
-            established.is_none_or(|at| at.elapsed() >= lifetime) || !alive(coordinates, owner);
+        let due = established.is_none_or(|at| at.elapsed() >= lifetime)
+            || !alive(coordinates, owner, generations);
         if due {
-            match attempt(coordinates, owner, gate) {
-                Ok(()) => {
+            match attempt(coordinates, owner, generations) {
+                Ok(name) => {
                     established = Some(Instant::now());
                     if failures > 0 {
                         report(&format!(
-                            "Proton session re-established after {failures} failed attempt(s)"
+                            "established generation {name}, recovered after {failures} failed \
+                             attempt(s)"
                         ));
                         failures = 0;
+                    } else {
+                        report(&format!("established generation {name}"));
                     }
                 }
                 Err(detail) => {
@@ -254,12 +291,67 @@ fn run(
             }
         }
 
+        // After the due-check, on every tick regardless of whether one was
+        // due: retirement runs on its own clock (the grace), never the
+        // renewal's, so a generation superseded three ticks ago is retired
+        // the moment it clears its grace rather than waiting for the next
+        // renewal to notice it.
+        report_sweep(coordinates, owner, generations, grace, timeout_ms, stop);
+
         let wait = if failures == 0 {
             interval
         } else {
             backoff(min_backoff, max_backoff, failures)
         };
         sleep_until_stopped(wait, stop);
+    }
+}
+
+/// Run [`login::sweep`] and translate its tab-separated rows into the plain
+/// stderr sentences this loop's other lines already use.
+///
+/// `sweep` itself writes the operator-verb's own row shape
+/// (`retired\tproton\t<label>`) because [`super::bin::keylessd`]'s `login`
+/// verb shares the same function for its own, much rarer call. Rewritten here
+/// rather than given a second `sweep` that speaks stderr directly: one
+/// retirement procedure, two renderings, is the same relationship
+/// `login::perform` and `login::establish` already have.
+fn report_sweep(
+    coordinates: &Coordinates,
+    owner: Owner,
+    generations: &Generations,
+    grace: Duration,
+    timeout_ms: u64,
+    stop: &AtomicBool,
+) {
+    let mut rows: Vec<u8> = Vec::new();
+    login::sweep(
+        coordinates,
+        owner,
+        generations,
+        grace,
+        timeout_ms,
+        Some(stop),
+        &mut rows,
+    );
+    for line in rows.split(|&byte| byte == b'\n') {
+        if line.is_empty() {
+            continue;
+        }
+        let text = String::from_utf8_lossy(line);
+        let mut fields = text.split('\t');
+        match (fields.next(), fields.next(), fields.next(), fields.next()) {
+            (Some("retired"), Some("proton"), Some("legacy"), None) => {
+                report("retired the legacy session directory");
+            }
+            (Some("retired"), Some("proton"), Some(label), None) => {
+                report(&format!("retired {label}"));
+            }
+            (Some("retire-failed"), Some("proton"), Some(label), Some(why)) => {
+                report(&format!("could not retire {label}: {why}"));
+            }
+            _ => {}
+        }
     }
 }
 
@@ -300,8 +392,15 @@ fn undirectable(coordinates: &Coordinates, owner: Owner, detail: &str) -> String
 ///
 /// The alternative — treating an unanswerable probe as healthy — is the reading
 /// that produces silence over an outage.
-fn alive(coordinates: &Coordinates, owner: Owner) -> bool {
-    login::run(login::info_command(coordinates, owner))
+///
+/// A [`crate::store::proton_session::CurrentFault`] — no generation published
+/// yet, a pointer nothing can validate — reads the same as a dead session:
+/// `false`, which sends the loop straight to [`attempt`].
+fn alive(coordinates: &Coordinates, owner: Owner, generations: &Generations) -> bool {
+    let Ok(pass) = generations.enter() else {
+        return false;
+    };
+    login::run(login::info_command(coordinates, pass.dir(), owner))
         .map(|(status, _)| status.success())
         .unwrap_or(false)
 }
@@ -312,7 +411,11 @@ fn alive(coordinates: &Coordinates, owner: Owner) -> bool {
 /// captured once at startup. That is what makes a rotation take effect without
 /// a restart — `keylessd credential` writes the file, and the next tick logs in
 /// with what it now says.
-fn attempt(coordinates: &Coordinates, owner: Owner, gate: &SessionGate) -> Result<(), String> {
+fn attempt(
+    coordinates: &Coordinates,
+    owner: Owner,
+    generations: &Generations,
+) -> Result<crate::store::proton_session::GenerationName, String> {
     use crate::store::Store;
 
     // The directory before the login that writes into it.
@@ -372,21 +475,24 @@ fn attempt(coordinates: &Coordinates, owner: Owner, gate: &SessionGate) -> Resul
     };
     let extra = login::extra_credentials(coordinates)?;
 
-    // `--replace` rather than a plain login, unconditionally. A session the
-    // vendor has dropped leaves the local store populated and invalid, and
-    // `pass-cli` answers a login over it with `Client is already
-    // authenticated` — so a plain login fails in exactly the case this loop
-    // exists for. `--replace` logs out first and treats "already logged out"
-    // as success, which makes it right against a live session, a dead one and
-    // an empty directory alike.
-    //
-    // Held closed across both halves: between the logout and the login the
-    // directory holds no session, and a read landing in there gets the
-    // vendor's "not authenticated" — a sentence about this daemon's own login
-    // that a caller cannot tell from a revoked token. The gate reopens when
-    // this guard drops, a failed login and a panic included.
-    let _replacing = gate.replace();
-    login::establish(coordinates, owner, true, &token, extra, &mut io::sink())
+    // `replace = true` unconditionally. An unknown-age generation at startup,
+    // a live one past its `login_after_minutes`, and one the vendor already
+    // dropped are three different states this loop cannot tell apart from
+    // outside — see this function's own doc — and `establish` treats all
+    // three the same way under `replace`: build a fresh generation, verify it,
+    // publish it, and never open, mutate or delete whatever `current` names
+    // right now. There is no gap here for a read to land in: the OLD
+    // generation keeps serving, unmodified, for the whole time this call is
+    // spawning children against a directory nothing else knows about yet.
+    login::establish(
+        coordinates,
+        owner,
+        true,
+        &token,
+        extra,
+        generations,
+        &mut io::sink(),
+    )
 }
 
 /// Exponential, from `min` to `max`, saturating rather than wrapping.

@@ -145,11 +145,17 @@ mod daemon {
         /// the other two are credentials and `credential` writes those.
         #[arg(long, value_name = "STORE")]
         store: String,
-        /// Log an EXISTING session out first, then log in.
+        /// Create a fresh generation and make it current, without first
+        /// asking whether the one already current still answers.
         ///
-        /// The token-rotation path, and deliberately not the default: without
-        /// it the vendor refuses to replace a session it already has, which is
-        /// what makes a second run safe.
+        /// The token-rotation path, and deliberately not the default:
+        /// without it, this crate's own liveness probe of the current
+        /// generation — not the vendor, which never refuses a login into a
+        /// fresh generation on its own — refuses a second run that would
+        /// otherwise create a needless generation over a session that is
+        /// still live. The generation this supersedes is never opened,
+        /// mutated or logged out by this flag itself; it is left for the
+        /// ordinary retirement sweep, on its own grace.
         #[arg(long)]
         replace: bool,
         /// Ask for a token even though this daemon already holds one.
@@ -157,8 +163,9 @@ mod daemon {
         /// The credential file answers first, so an ordinary login uses the
         /// token already written there and asks for nothing. This is the way
         /// to type a REPLACEMENT without running `credential` first — and
-        /// pairs with `--replace`, since a new token needs the old session
-        /// logged out.
+        /// pairs with `--replace`, because a live session refuses the login
+        /// before the freshly typed token is ever used unless `--replace` is
+        /// also given.
         #[arg(long)]
         prompt: bool,
         /// Config file. Every coordinate the login needs is read from it, and
@@ -611,6 +618,16 @@ mod daemon {
             ));
         }
 
+        // The generation layout for this login alone — private, exactly as
+        // `keylessd check` builds its own: this process resolves once and
+        // renews nothing, so there is no running loop to share it with.
+        let generations =
+            keyless::store::proton_session::Generations::at(coordinates.session_dir.clone());
+        // Read BEFORE the login below, so it names whatever this login is
+        // about to supersede — never the fresh generation the login itself
+        // just published.
+        let superseded = generations.current().ok();
+
         // A token that came OUT of the credential file is not written back
         // into it. The value is identical, so the write looks free — and it is
         // the one step here that can fail over a session that is in fact
@@ -623,6 +640,7 @@ mod daemon {
                 args.replace,
                 &token,
                 extra,
+                &generations,
                 &mut io::stdout(),
             )
         } else {
@@ -632,11 +650,37 @@ mod daemon {
                 args.replace,
                 &token,
                 extra,
+                &generations,
                 &mut io::stdout(),
             )
+            .map(drop)
         };
         if let Err(detail) = outcome {
             return fail(&detail);
+        }
+
+        // Sweep what can be retired now — the operator verb never drains, so
+        // a candidate whose readers have not finished is simply left for the
+        // next sweeper, a running daemon's own tick or the next invocation of
+        // this verb.
+        let grace = login::grace(config.stores.proton.timeout_ms);
+        let _ = login::sweep(
+            &coordinates,
+            owner,
+            &generations,
+            grace,
+            config.stores.proton.timeout_ms,
+            None,
+            &mut io::stdout(),
+        );
+        if let Some(superseded) = &superseded
+            && generations.root().join(superseded.as_str()).exists()
+        {
+            let _ = writeln!(
+                io::stderr(),
+                "keylessd: {superseded} is superseded and not yet retired; a running daemon's \
+                 own sweep retires it once its readers drain, or the next `keylessd login` does"
+            );
         }
 
         // Said afterwards rather than refused beforehand: a date is a thing an

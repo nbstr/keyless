@@ -51,8 +51,9 @@ use crate::store::onepassword::{
 };
 use crate::store::proton::{
     AgentToken, ENCRYPTION_KEY_VAR as PROTON_ENCRYPTION_KEY, KeyProvider, ProtonStore,
-    Reason as ProtonReason, Routing as ProtonRouting, SessionGate, TOKEN_VAR as PROTON_TOKEN,
+    Reason as ProtonReason, Routing as ProtonRouting, TOKEN_VAR as PROTON_TOKEN,
 };
+use crate::store::proton_session::Generations;
 use crate::store::{Registry, Store};
 
 /// The daemon's whole configuration.
@@ -461,7 +462,10 @@ pub struct DaemonProtonConfig {
     /// here, for the reason [`DaemonInfisicalConfig::binary`] gives.
     #[serde(default = "default_proton_binary")]
     pub binary: ConfigPath,
-    /// The session directory holding the daemon's own logged-in identity.
+    /// The ROOT of the daemon's generation directories — see
+    /// [`crate::store::proton_session::Generations`]. Each login creates
+    /// `<session_dir>/gen-<millis>-<pid>/`, which is what the vendor actually
+    /// sees; `<session_dir>/current` names which one is live.
     ///
     /// No default, and an absent one degrades every Proton name rather than
     /// falling back to a shared per-user location — see
@@ -563,11 +567,16 @@ pub struct DaemonProtonConfig {
 ///
 /// # Why it is opt-in
 ///
-/// The loop logs out before it logs in — see [`SessionRenewal::login_after_minutes`] —
-/// so switching it on changes what happens to a session directory an operator
-/// may be managing by hand, from outside this process. A default that started
-/// replacing sessions on upgrade would be a surprising thing for a patch
-/// release to do to a working install.
+/// The loop still ends every generation it replaces with a real,
+/// account-level `pass-cli logout` — see [`crate::daemon::login::retire`] —
+/// even though a read is never made to wait for the replacement itself (see
+/// [`SessionRenewal::login_after_minutes`]). Switching it on for the first
+/// time on an existing install therefore still changes what happens to a
+/// session directory an operator may be managing by hand, from outside this
+/// process — later, and never on a lookup's own time, but a real logout all
+/// the same. A default that started rotating and logging out sessions on
+/// upgrade would be a surprising thing for a patch release to do to a
+/// working install.
 ///
 /// # The shape is Vault Agent's, minus one field
 ///
@@ -593,13 +602,11 @@ pub struct SessionRenewal {
     /// failed attempt and a backoff, so a session is never renewed at the edge
     /// of the cliff it exists to stay off.
     ///
-    /// The replacement is a logout followed by a login, because `pass-cli`
-    /// answers a login over a live session with `Client is already
-    /// authenticated` and changes nothing. So there is a window of roughly a
-    /// second, once per interval, in which no session exists and a lookup
-    /// degrades. That is the cost of the vendor having no renewal verb, and it
-    /// is stated here rather than hidden: 1 second in 5400 is the trade against
-    /// a guaranteed outage every two hours.
+    /// The replacement establishes a fresh generation, verifies it, and swaps
+    /// the current pointer to it — see
+    /// [`crate::daemon::login::establish`] — so the generation the daemon was
+    /// already serving from keeps answering, unmodified, for the whole
+    /// duration of the replacement. A read is never made to wait for it.
     #[serde(default = "default_login_after_minutes")]
     pub login_after_minutes: u64,
     /// How often the loop wakes to check the session's age.
@@ -1034,6 +1041,39 @@ impl DaemonConfig {
             .collect()
     }
 
+    /// The generation layout this config names, or `None` when there is
+    /// nothing to build one over.
+    ///
+    /// `Some` exactly when Proton is enabled and `session_dir` is set — the
+    /// same precondition [`crate::store::proton::ProtonStore::session_dir`]
+    /// and [`super::login::coordinates`] already enforce, so a caller that
+    /// gets `Some` here knows every other Proton-reading call in this crate
+    /// will too. Fresh on every call rather than cached: this method builds
+    /// the type, and *which instance* is shared across the daemon is decided
+    /// once, by [`Daemon::bind`](super::Daemon::bind) — every other caller
+    /// that wants the SAME running layout takes it from there rather than
+    /// calling this again.
+    #[must_use]
+    pub fn generations(&self) -> Option<Arc<Generations>> {
+        if !self.stores.proton.enabled {
+            return None;
+        }
+        let root = self.stores.proton.session_dir.as_deref()?;
+        // The same guard `ProtonStore::session_dir` applies on the session
+        // side, restated here because a `Some` from this function is what
+        // makes `ProtonStore::enter`'s daemon-side arm skip that call
+        // entirely. Returning `None` for a relative root — rather than
+        // building a `Generations` over it — is what sends the daemon read
+        // path back through `session_dir()`'s own check and its
+        // named-config-line message, instead of degrading later as
+        // `CurrentFault::Absent`, a sentence that points an operator at "no
+        // session established" when the real fault is one config line.
+        if !root.is_absolute() {
+            return None;
+        }
+        Some(Arc::new(Generations::at(root.to_path_buf())))
+    }
+
     /// Build the store registry, with the routing that decides which store
     /// answers a name.
     ///
@@ -1048,11 +1088,16 @@ impl DaemonConfig {
     /// is the side that knows what its stores hold. A session cannot settle it:
     /// [`crate::store::build`] drops every per-name pin when the daemon is
     /// enabled, precisely so a client cannot steer which vault answers.
-    /// `gate` is the [`SessionGate`] the renewal loop closes while it replaces
-    /// the session, or `None` for a registry nothing replaces underneath — a
-    /// `keylessd check`, which resolves in its own process and renews nothing.
+    ///
+    /// `shared` is the [`Generations`] the renewal loop creates and retires
+    /// generations through, when one is already built — the running daemon's
+    /// own case. `None` builds a fresh, PRIVATE `Generations` from this same
+    /// config instead of leaving the registry with none at all: `keylessd
+    /// check` resolves in its own process and renews nothing, but it still has
+    /// to read `<root>/current` to report on the store honestly.
     #[must_use]
-    pub fn registry(&self, gate: Option<&Arc<SessionGate>>) -> Registry {
+    pub fn registry(&self, shared: Option<&Arc<Generations>>) -> Registry {
+        let generations = shared.cloned().or_else(|| self.generations());
         let mut stores: Vec<Box<dyn Store>> = Vec::new();
         if self.stores.file.enabled {
             stores.push(Box::new(FileStore::new(
@@ -1152,7 +1197,7 @@ impl DaemonConfig {
                 )
                 .with_timeout(settings.timeout_ms)
                 .with_listing_ttl(settings.listing_ttl_ms)
-                .with_session_gate(gate.map(Arc::clone))
+                .with_generations(generations.clone())
                 .with_agent_token(self.agent_token()),
             ));
         }
@@ -1627,6 +1672,32 @@ mod tests {
         assert_eq!(session.probe_interval_seconds, 60);
         assert_eq!(session.min_backoff_seconds, 2);
         assert_eq!(session.max_backoff_seconds, 60);
+    }
+
+    #[test]
+    fn the_daemon_config_builds_generations_only_where_proton_names_a_root() {
+        assert!(
+            parse("{}").generations().is_none(),
+            "a config with no Proton store built a generation layout"
+        );
+        assert!(
+            parse(r#"{"stores":{"proton":{"enabled":true}}}"#)
+                .generations()
+                .is_none(),
+            "an enabled store with no session_dir built a generation layout"
+        );
+        assert!(
+            parse(r#"{"stores":{"proton":{"session_dir":"/tmp/kl-gen"}}}"#)
+                .generations()
+                .is_none(),
+            "a session_dir with the store not enabled built a generation layout"
+        );
+
+        let generations =
+            parse(r#"{"stores":{"proton":{"enabled":true,"session_dir":"/tmp/kl-gen-root"}}}"#)
+                .generations()
+                .expect("enabled and session_dir together must build one");
+        assert_eq!(generations.root(), Path::new("/tmp/kl-gen-root"));
     }
 
     /// Silence while the loop is off: none of these numbers does anything, so
