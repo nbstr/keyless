@@ -46,12 +46,21 @@
 //! failure above is reached. This module ADDS three variables and removes
 //! nothing.
 //!
-//! **A deadline.** `stores.proton.timeout_ms` bounds a LOOKUP, where a hung
-//! vendor would hold a session's command open with nobody watching. This runs
-//! with a person at a terminal who can stop it, and killing a login part way is
-//! how a session store ends up half-written — the one damage in this directory
-//! that nothing here can repair. See
-//! [`crate::store::proton`]'s note on interrupted writes.
+//! **A deadline on `login` and `info` — never on [`retire`]'s two logouts.**
+//! `stores.proton.timeout_ms` bounds a LOOKUP, where a hung vendor would hold
+//! a session's command open with nobody watching. `login` and `info` run
+//! either with a person at a terminal who can stop them — `keylessd login`
+//! typed by hand — or as the renewal loop's own probe of a generation
+//! nothing is reading yet, and killing either part way is how a session
+//! store ends up half-written — the one damage in this directory that
+//! nothing here can repair. See [`crate::store::proton`]'s note on
+//! interrupted writes. `retire`'s two logouts are the opposite shape: they
+//! run unattended, on the renewal loop's own thread, against a directory
+//! nothing is writing to any more, so a hung one is pure loss with no
+//! half-written store to protect — and a wedge on that thread is the same
+//! outage class this whole change exists to end, reached through a
+//! different door. `retire` bounds them with
+//! [`crate::store::exec::capture`] instead of this module's own `run`.
 //!
 //! **Any judgement about whether a session already exists, made without
 //! asking.** The vendor no longer gets to answer that for a generation this
@@ -72,7 +81,7 @@ use std::time::Duration;
 
 use crate::config::bounded_timeout;
 use crate::secret::Secret;
-use crate::store::exec::REAP_GRACE;
+use crate::store::exec::{self, REAP_GRACE};
 use crate::store::proton::{self, KeyProvider};
 use crate::store::proton_session::{Candidate, GenerationName, Generations};
 
@@ -431,13 +440,20 @@ pub fn info_command(coordinates: &Coordinates, dir: &Path, owner: Owner) -> Comm
 }
 
 /// One `pass-cli logout` invocation, scoped at `dir`, for the retirement path
-/// only — never against the directory [`Coordinates::session_dir`]'s root
-/// names as current.
+/// only — never against the directory an ordinary, generation-named
+/// [`Coordinates::session_dir`] names as current. The one deliberate
+/// exception is the legacy retirement candidate: it carries no name of its
+/// own (see [`crate::store::proton_session::Candidate::name`]), so `dir` IS
+/// `Coordinates::session_dir` there — the vendor appends its own `.session`
+/// subdirectory to whatever root it is given, which is exactly what that
+/// candidate needs.
 ///
-/// `force` appends `--force`, which the vendor's own words describe as
+/// `force` appends `--force`, measured against the real vendor binary as
 /// deleting the directory's contents rather than ending the session at the
-/// account — see [`retire`], the only caller that ever passes `true`, and only
-/// after a plain logout has already failed.
+/// account — its own `--help` says only "Force logout even if remote logout
+/// fails" and claims nothing about what happens on disk. See [`retire`], the
+/// only caller that ever passes `true`, and only after a plain logout has
+/// already failed.
 #[must_use]
 pub fn logout_command(coordinates: &Coordinates, dir: &Path, force: bool, owner: Owner) -> Command {
     let mut command = Command::new(&coordinates.binary);
@@ -1110,6 +1126,21 @@ pub fn grace(timeout_ms: u64) -> Duration {
     2 * bounded_timeout(timeout_ms) + REAP_GRACE + Duration::from_secs(1)
 }
 
+/// What a `pass-cli` child said, both streams joined the way [`run`]'s own
+/// return value joins them — stderr, a newline, then stdout.
+///
+/// [`exec::capture`] keeps the two streams separate; `retire`'s "already
+/// logged out" check needs them joined the same way `run`'s callers have
+/// always read it, so a stub answering on either stream (the standing
+/// `LogoutAnswer::AlreadyLoggedOut`/`Fails` fixtures write to both) is read
+/// identically whichever function produced it.
+fn captured_said(captured: &exec::Captured) -> String {
+    let mut said = String::from_utf8_lossy(&captured.stderr).into_owned();
+    said.push('\n');
+    said.push_str(&String::from_utf8_lossy(&captured.stdout));
+    said
+}
+
 /// Run the ordered retirement procedure against one candidate.
 ///
 /// Never touches [`Generations::current`] — every step is guarded by
@@ -1118,13 +1149,18 @@ pub fn grace(timeout_ms: u64) -> Duration {
 ///
 /// 1. [`Generations::drain`] — wait for this process's own readers of the
 ///    candidate to finish, for at most `bound`.
-/// 2. A plain `pass-cli logout`, scoped at the candidate. Success, or the
-///    vendor's own "already logged out", both mean the account-side session
-///    this candidate held is gone.
-/// 3. On any other outcome, `pass-cli logout --force` — the vendor's own
+/// 2. A plain `pass-cli logout`, scoped at the candidate and bounded by
+///    `timeout_ms` — [`exec::capture`], never [`run`], because this child
+///    runs unattended on the renewal loop's own thread; see the module
+///    header. Success, or the vendor's own "already logged out", both mean
+///    the account-side session this candidate held is gone.
+/// 3. On any other outcome — a refusal, a spawn failure, or a timeout alike
+///    — `pass-cli logout --force`, bounded the same way. The vendor's own
 ///    words describe this as deleting the directory's contents rather than
 ///    ending the session at the account, which is exactly what step 4 is
-///    about to do anyway, so nothing here relies on it reaching the account.
+///    about to do anyway, so nothing here relies on it reaching the
+///    account, and no outcome of step 2 skips this step: whatever went
+///    wrong there is read the same way as an ordinary refusal.
 /// 4. [`Generations::remove`] — `remove_dir_all`, refused if `current` has,
 ///    in the meantime, come to name this candidate.
 ///
@@ -1138,23 +1174,39 @@ pub fn retire(
     generations: &Generations,
     candidate: &Candidate,
     bound: Duration,
+    timeout_ms: u64,
     out: &mut dyn std::io::Write,
 ) -> Result<(), String> {
-    if let Some(name) = candidate.name()
-        && generations.drain(name, bound).is_err()
-    {
+    let drain_key = candidate.drain_key();
+    if generations.drain(&drain_key, bound).is_err() {
         return Err(format!(
-            "{name} is still being read by this process; retried next sweep"
+            "{drain_key} is still being read by this process; retried next sweep"
         ));
     }
 
-    let (status, said) = run(logout_command(coordinates, candidate.scope(), false, owner))
-        .map_err(|error| cannot_spawn(coordinates, owner, &error))?;
-    let already_gone = status.success() || said.to_ascii_lowercase().contains("already logged out");
+    let timeout = bounded_timeout(timeout_ms);
+    let already_gone = match exec::capture(
+        logout_command(coordinates, candidate.scope(), false, owner),
+        timeout,
+    ) {
+        Ok(captured) => {
+            let said = captured_said(&captured);
+            captured.status.success() || said.to_ascii_lowercase().contains("already logged out")
+        }
+        // A spawn failure or a timeout is read exactly like a refusal:
+        // step 3 runs whatever step 2 did or did not manage to say. See
+        // this function's own doc — dropping the vendor's own `?` here is
+        // what makes that ordering hold for every kind of failure, not
+        // only the ones with an exit status to read.
+        Err(_) => false,
+    };
     if !already_gone {
         // Outcome deliberately not decisive here — see this function's own
         // doc. `remove` below is what actually clears the directory.
-        let _ = run(logout_command(coordinates, candidate.scope(), true, owner));
+        let _ = exec::capture(
+            logout_command(coordinates, candidate.scope(), true, owner),
+            timeout,
+        );
     }
 
     generations
@@ -1180,26 +1232,58 @@ pub fn retire(
 /// most once per candidate per process, via
 /// [`Generations::mark_failure_reported`].
 ///
+/// `timeout_ms` bounds every vendor child [`retire`] spawns for each
+/// candidate — the same value the store's own reads are bounded by. Passed
+/// through rather than read off `coordinates`, which carries no timeout of
+/// its own: see [`retire`]'s doc for why this loop's two logouts need one at
+/// all.
+///
 /// # Returns
 ///
 /// How many candidates this call retired.
+/// The label [`Generations::legacy_layout_obstruction`] is reported under —
+/// distinct from [`Candidate::label`]'s `"legacy"`, so a root that once had a
+/// real legacy DIRECTORY fail to retire, and later has that directory
+/// replaced by a symlink, reports the new obstruction on its own rather than
+/// finding the label already spent.
+const LEGACY_OBSTRUCTION_LABEL: &str = "legacy-not-a-directory";
+
 pub fn sweep(
     coordinates: &Coordinates,
     owner: Owner,
     generations: &Generations,
     grace: Duration,
+    timeout_ms: u64,
     stop: Option<&AtomicBool>,
     out: &mut dyn std::io::Write,
 ) -> usize {
+    // Reported once per process, the same mechanism a stuck retirement uses
+    // below — a `.session` that is a symlink or a plain file is never a
+    // `Candidate` (`Generations::candidates` excludes it), so without this it
+    // would never surface anywhere and would be skipped in silence forever.
+    if let Some(detail) = generations.legacy_layout_obstruction()
+        && generations.mark_failure_reported(LEGACY_OBSTRUCTION_LABEL)
+    {
+        let _ = writeln!(out, "retire-failed\tproton\tlegacy\t{detail}");
+    }
+
     let mut retired = 0;
     for candidate in generations.candidates(std::time::SystemTime::now(), grace) {
         if stop.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
             break;
         }
-        match retire(coordinates, owner, generations, &candidate, grace, out) {
+        match retire(
+            coordinates,
+            owner,
+            generations,
+            &candidate,
+            grace,
+            timeout_ms,
+            out,
+        ) {
             Ok(()) => retired += 1,
             Err(detail) => {
-                if generations.mark_failure_reported(&candidate) {
+                if generations.mark_failure_reported(&candidate.label()) {
                     let _ = writeln!(
                         out,
                         "retire-failed\tproton\t{}\t{detail}",
@@ -1355,6 +1439,13 @@ mod tests {
         // The property generations exist for: whichever directory a caller
         // names is the one the vendor sees, and `Coordinates::session_dir` —
         // the ROOT of every generation — is never that directory on its own.
+        //
+        // The deliberate exception, NOT exercised here: the legacy
+        // retirement candidate has no generation name of its own, so
+        // `Generations::candidates` scopes it at the root directly (see
+        // `logout_command`'s own doc) — proved end to end, against a real
+        // daemon, by `a_legacy_session_directory_is_retired_and_never_served_from`
+        // in `tests/daemon_proton.rs`.
         let coordinates = coordinates_at(Path::new("/nonexistent/keyless-login-scoped"));
         let owner = Owner { uid: 1, gid: 1 };
         let generation = coordinates.session_dir.join("gen-1-1");

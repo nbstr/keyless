@@ -1577,6 +1577,7 @@ fn daemon_config_with_generations_loop(
 }
 
 /// One recorded line of `pass-cli.verbs`, parsed.
+#[derive(Debug)]
 struct VerbLine {
     verb: String,
     dir: String,
@@ -1608,6 +1609,11 @@ fn basename(path: &str) -> &str {
 
 #[test]
 fn the_renewal_loop_establishes_each_session_in_a_fresh_generation_and_makes_it_current() {
+    // CONTROL — the change that makes this fail: scope `establish`'s login
+    // at `coordinates.session_dir` (the root) instead of the fresh
+    // generation directory it just created. `info` still runs at the
+    // generation, so `followed_by_info` below breaks — the login and the
+    // info that verifies it are no longer at the same directory.
     let dir = scratch("daemon-proton-gen-establishes");
     let inner = stub_pass_cli_listing(
         &dir,
@@ -1674,6 +1680,21 @@ fn the_renewal_loop_establishes_each_session_in_a_fresh_generation_and_makes_it_
         "a read was scoped somewhere other than the published current generation"
     );
 
+    // The scope invariant over every line, not the single sample above: a
+    // real vault read (`run`, `item`, `vault`) is never scoped at the root —
+    // re-read fresh so the resolve just performed is included.
+    let verbs = std::fs::read_to_string(dir.join("pass-cli.verbs")).unwrap_or_default();
+    let root_str = root.display().to_string();
+    for line in parse_verbs(&verbs) {
+        if matches!(line.verb.as_str(), "run" | "item" | "vault") {
+            assert_ne!(
+                line.dir, root_str,
+                "a `{}` was scoped at the root instead of a generation",
+                line.verb
+            );
+        }
+    }
+
     drop(running);
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -1694,15 +1715,20 @@ fn a_renewal_never_logs_out_the_generation_current_names() {
         LogoutAnswer::AlreadyLoggedOut,
         None,
     );
-    // `60_000` — this case is not about the grace either: `login_after_minutes:
-    // 0` keeps every tick due, which keeps `current`'s own mtime too fresh for
-    // ANY candidate to ever clear it (see
-    // `a_generation_the_daemon_retires_is_logged_out_then_removed_and_current_survives`
-    // for the case that actually drives a candidate's grace to zero). So this
-    // case's own two claims — a logout never names `current`, and at least two
-    // distinct generations get logged into — hold whether or not a logout
-    // happens to run at all; it is not what a small ceiling here would buy.
-    let config = daemon_config_with_generations_loop(&dir, &vendor, 0, 1, 60_000);
+    // CONTROL — the change that makes this fail: `timeout_ms: 60_000`
+    // (grace 123s, past the 30s this test runs for), the shape this fixture
+    // carried before `Generations::candidates` was fixed to anchor a
+    // candidate at its own successor's minted time (F3) rather than at
+    // `current`'s mtime. `login_after_minutes: 0` keeps every tick due, so
+    // under the pre-fix anchor `current`'s mtime was refreshed to "now" on
+    // every renewal and no candidate ever cleared the grace — the `for` loop
+    // below would iterate an empty set and the `any(logout)` assertion
+    // would fail on a run that never logged anything out at all. `3_000`
+    // (grace 9s) against a 30s run with a fresh renewal every second is
+    // exactly the "sweep lands in the same tick as a publish" case F3
+    // fixes, so this is now a real proof of it: logouts DO happen, and none
+    // of them ever names the generation `current` held at that instant.
+    let config = daemon_config_with_generations_loop(&dir, &vendor, 0, 1, 3_000);
     let running = start_daemon(&config, policy_allowing_self());
 
     // Comfortably enough ticks (each at least MIN_INTERVAL apart) for the
@@ -1724,6 +1750,14 @@ fn a_renewal_never_logs_out_the_generation_current_names() {
         );
     }
 
+    // Without this, the loop above proves nothing whenever no candidate ever
+    // clears the grace — exactly the state the pre-F3 anchor left this test
+    // in, silently, forever.
+    assert!(
+        lines.iter().any(|line| line.verb == "logout"),
+        "no logout ran at all in 30s, so the loop above checked an empty set: {lines:?}"
+    );
+
     let distinct_logins: std::collections::BTreeSet<&str> = lines
         .iter()
         .filter(|line| line.verb == "login")
@@ -1740,16 +1774,24 @@ fn a_renewal_never_logs_out_the_generation_current_names() {
 
 #[test]
 fn a_generation_the_daemon_retires_is_logged_out_then_removed_and_current_survives() {
+    // CONTROL — the change that makes this fail: `retire` treating every
+    // candidate as already logged out and never spawning a logout at all.
+    // The directory still disappears (`remove` does not depend on the
+    // logout outcome), so only the `any(logout && …)` assertion below
+    // catches it: "the superseded generation disappeared with no logout
+    // line ahead of it."
+    //
     // `login_after_minutes: 0` forces the FIRST tick to renew (`established`
-    // starts `None`, which is always due) and every tick after that to renew
-    // AGAIN — which never lets `current`'s own mtime grow stale enough to
-    // clear the grace, because every renewal refreshes it right back to "now"
-    // in the same tick the sweep that would consult it also runs. So this
-    // case starts with a generation already published and a LARGE
-    // `login_after_minutes`: exactly one renewal happens (the forced first
-    // tick, because `established` starts `None`), `current`'s mtime is then
-    // left untouched, and the grace clears on an ordinary later tick that
-    // does nothing BUT sweep.
+    // starts `None`, which is always due); the LARGE `login_after_minutes`
+    // here keeps every tick after that one not-due, so exactly one renewal
+    // happens and the root's only candidate is the generation this fixture
+    // published up front. `Generations::candidates` anchors that candidate
+    // at its successor's own minted time — fixed the instant the forced
+    // renewal mints it, and untouched by anything published later — so the
+    // grace clears on an ordinary later tick that does nothing but sweep,
+    // whether or not a further renewal ever runs. A run where every tick
+    // renews is exercised on its own, against real retirements, by
+    // `a_renewal_never_logs_out_the_generation_current_names`.
     let dir = scratch("daemon-proton-gen-retires");
     let inner = stub_pass_cli_listing(
         &dir,
@@ -1819,6 +1861,11 @@ fn a_generation_the_daemon_retires_is_logged_out_then_removed_and_current_surviv
 
 #[test]
 fn a_login_that_succeeds_but_does_not_answer_info_is_discarded_and_current_is_unchanged() {
+    // CONTROL — the change that makes this fail: `establish` never
+    // discarding on a failed `info` (publishing every login regardless).
+    // `generation_dirs` grows past `[g0]` and never converges back, so the
+    // first polling loop below runs out its 30s deadline and panics naming
+    // every generation that piled up instead of being discarded.
     let dir = scratch("daemon-proton-gen-info-fails");
     let inner = stub_pass_cli_listing(
         &dir,
@@ -1840,6 +1887,34 @@ fn a_login_that_succeeds_but_does_not_answer_info_is_discarded_and_current_is_un
     // with no drain and no grace at all (see `discard_unpublished`).
     let config = daemon_config_with_generations_loop(&dir, &vendor, 0, 1, 60_000);
     let running = start_daemon(&config, policy_allowing_self());
+
+    // CONTROL — the change that makes this fail: dropping the first phase
+    // below and polling `generation_dirs(&root) == vec![g0]` alone, which
+    // is already true the INSTANT `publish_generation` writes it above,
+    // before the daemon has even started — the `dirs:?}"` message would
+    // never print because the loop breaks on its first iteration and the
+    // property "a login that could not answer `info` was discarded" would
+    // be unexercised. So this waits for evidence the loop actually
+    // attempted more than one login FIRST — the same two-phase shape
+    // `a_generation_the_daemon_retires_is_logged_out_then_removed_and_
+    // current_survives` uses for the identical hazard — and only then
+    // checks that nothing any of those attempts produced survived.
+    let attempted = Instant::now() + Duration::from_secs(30);
+    loop {
+        let verbs = std::fs::read_to_string(dir.join("pass-cli.verbs")).unwrap_or_default();
+        let logins = parse_verbs(&verbs)
+            .iter()
+            .filter(|line| line.verb == "login")
+            .count();
+        if logins >= 2 {
+            break;
+        }
+        assert!(
+            Instant::now() < attempted,
+            "the loop never attempted two logins, so nothing here is under test"
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
 
     // Polled rather than a single fixed sleep: a discard is a few subprocess
     // spawns this MACHINE'S load decides the speed of, and the property under
@@ -1870,6 +1945,11 @@ fn a_login_that_succeeds_but_does_not_answer_info_is_discarded_and_current_is_un
 #[test]
 fn a_renewal_whose_old_store_cannot_be_decrypted_still_establishes_a_new_generation_and_reads_succeed()
  {
+    // CONTROL — the change that makes this fail: `retire` treating every
+    // candidate as already logged out (never spawning the plain logout at
+    // all, so the force step it would otherwise trigger never runs either).
+    // The old generation is still removed either way, so only the
+    // `logout_then_force` pair assertion below catches the missing step.
     let dir = scratch("daemon-proton-gen-old-store-undecryptable");
     let inner = stub_pass_cli_listing(
         &dir,
@@ -1894,8 +1974,8 @@ fn a_renewal_whose_old_store_cannot_be_decrypted_still_establishes_a_new_generat
     // `login_after_minutes: 90` for the reason
     // `a_generation_the_daemon_retires_is_logged_out_then_removed_and_current_survives`
     // gives in full: the forced first tick (`established` starts `None`) is
-    // the only renewal this run performs, so `current`'s mtime is left alone
-    // long enough for the old generation's grace to clear on a later,
+    // the only renewal this run performs, so the old generation's one and
+    // only successor is minted once and its grace clears on a later,
     // sweep-only tick.
     let config = daemon_config_with_generations_loop(&dir, &vendor, 90, 1, 3_000);
     let running = start_daemon(&config, policy_allowing_self());
@@ -1952,6 +2032,13 @@ fn a_renewal_whose_old_store_cannot_be_decrypted_still_establishes_a_new_generat
 
 #[test]
 fn a_generation_published_by_another_process_is_served_at_the_daemons_next_read() {
+    // CONTROL — the change that makes this fail: `Generations::enter`
+    // memoizing the first successful read of `current` forever instead of
+    // re-reading it on every call. The daemon's OWN first read still
+    // resolves; the assertion that catches the staleness is the final one,
+    // comparing what the SECOND read (after the out-of-band publish) was
+    // actually scoped at against the new generation the other process just
+    // published.
     let dir = scratch("daemon-proton-gen-cross-process");
     let inner = stub_pass_cli_listing(
         &dir,
@@ -2027,16 +2114,19 @@ fn a_generation_published_by_another_process_is_served_at_the_daemons_next_read(
 
 #[test]
 fn a_legacy_session_directory_is_retired_and_never_served_from() {
-    // CONTROL — this fails two different ways under two different faults.
-    // Drop the `if fs::symlink_metadata(self.legacy_dir()).is_ok())` arm from
-    // `Generations::candidates`, or gate the legacy candidate behind an age
-    // check the way an ordinary generation is gated, and `.session` below
-    // never disappears before the 30s deadline. Make a read fall back to the
-    // legacy directory or to `session_dir` itself whenever no generation is
-    // current yet — the one fallback `ProtonStore::enter` still has on the
-    // SESSION side, see its own doc — and the final assertion below, which
-    // reads back the exact directory the read was scoped at, stops naming a
-    // real generation.
+    // CONTROL — this fails four different ways under four different faults.
+    // Drop the `is_dir` gate from `Generations::candidates`'s legacy branch,
+    // or gate the legacy candidate behind an age check the way an ordinary
+    // generation is gated, and `.session` below never disappears before the
+    // 30s deadline. Widen `ProtonStore::enter`'s own legacy fallback —
+    // narrowly gated on `CurrentFault::Absent` plus the legacy directory
+    // existing as a directory, see its own doc — to also answer once a
+    // generation is current, or on any other `CurrentFault`, and the final
+    // assertion below, which reads back the exact directory the read was
+    // scoped at, stops naming a real generation. And widen `candidates` to
+    // admit the legacy candidate before any generation has ever published —
+    // the ordering check near the end, over every `pass-cli.verbs` line,
+    // catches a `logout` scoped at the root ahead of the first `login`.
     let dir = scratch("daemon-proton-gen-legacy-retired");
     let inner = stub_pass_cli_listing(
         &dir,
@@ -2126,6 +2216,96 @@ fn a_legacy_session_directory_is_retired_and_never_served_from() {
         support::recorded(&dir.join("pass-cli.session")),
         root.join(&current).display().to_string(),
         "a read was scoped somewhere other than the published current generation"
+    );
+
+    // The scope invariant over every line this whole run produced, not the
+    // single last-read sample above, plus the ordering S9 names: no `run`
+    // or `item` line is ever scoped at the root, and no `logout` at the
+    // root — the legacy candidate's own scope — runs before the first
+    // `login`, which is what would prove the legacy candidate was retired
+    // before any generation existed to make it eligible.
+    let verbs = std::fs::read_to_string(dir.join("pass-cli.verbs")).unwrap_or_default();
+    let lines = parse_verbs(&verbs);
+    let root_str = root.display().to_string();
+    for line in &lines {
+        if matches!(line.verb.as_str(), "run" | "item" | "vault") {
+            assert_ne!(
+                line.dir, root_str,
+                "a `{}` was scoped at the root instead of a generation",
+                line.verb
+            );
+        }
+    }
+    let first_login = lines
+        .iter()
+        .position(|line| line.verb == "login")
+        .expect("the loop never logged in at all");
+    assert!(
+        lines[..first_login]
+            .iter()
+            .all(|line| !(line.verb == "logout" && line.dir == root_str)),
+        "a legacy logout at the root ran before the first login: {:?}",
+        &lines[..first_login]
+    );
+
+    drop(running);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_daemon_with_no_renewal_loop_and_only_the_legacy_layout_reads_from_it_instead_of_degrading() {
+    // Consumer F1: an install with `session.auto_login` off (the default)
+    // runs no renewal loop, so nothing ever writes `<root>/current` — and a
+    // pre-upgrade install's real, working session sits at `<root>/.session`,
+    // the layout this crate wrote before generations existed. Planted here
+    // and never touched by a loop, since this daemon's config carries no
+    // `session` block at all.
+    let dir = scratch("daemon-proton-legacy-only-no-loop");
+    let vendor = stub_pass_cli_listing(
+        &dir,
+        &Backend::Injects(PROTON_DECOY),
+        &Listing::Json(LISTING),
+    );
+    let root = session_dir(&dir);
+    let legacy = root.join(".session");
+    std::fs::create_dir_all(&legacy).expect("plant the pre-generation layout");
+    std::fs::write(legacy.join("session.json"), b"pre-upgrade session")
+        .expect("plant the legacy marker");
+
+    let config: DaemonConfig = serde_json::from_str(&format!(
+        r#"{{"socket":"{socket}","audit":"{audit}",
+             "cache_ttl_seconds":0,"idle_timeout_seconds":5,
+             "stores":{{"proton":{{"enabled":true,"binary":"{vendor}",
+                                   "session_dir":"{session}",
+                                   "timeout_ms":60000}}}},
+             "secrets":{{"{DECLARED}":{{"store":"proton","vault":"{VAULT}",
+                                        "item":"{ITEM}","field":"password"}}}}}}"#,
+        socket = short_socket_path(&dir).display(),
+        audit = dir.join("audit.jsonl").display(),
+        session = root.display(),
+        vendor = vendor.display(),
+    ))
+    .expect("valid daemon config");
+    let running = start_daemon(&config, policy_allowing_self());
+
+    let client = client_config(running.socket(), 3_000);
+    let registry = store::build(&client, &Invocation::default()).registry;
+
+    match registry.resolve(DECLARED) {
+        Resolution::Found { secret, .. } => assert_eq!(secret.expose(), PROTON_DECOY),
+        other => panic!(
+            "a legacy-only root with no renewal loop must still resolve: {}",
+            other.reason()
+        ),
+    }
+    assert_eq!(
+        support::recorded(&dir.join("pass-cli.session")),
+        root.display().to_string(),
+        "the read was not scoped at the root the legacy layout lives under"
+    );
+    assert!(
+        current_generation(&root).is_none(),
+        "no renewal loop ran, so `current` must still name nothing"
     );
 
     drop(running);

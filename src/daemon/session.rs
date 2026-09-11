@@ -183,7 +183,8 @@ pub fn spawn(
         ));
     };
     let generations = Arc::clone(generations);
-    let grace = login::grace(config.stores.proton.timeout_ms);
+    let timeout_ms = config.stores.proton.timeout_ms;
+    let grace = login::grace(timeout_ms);
 
     let stop = Arc::new(AtomicBool::new(false));
     let flag = Arc::clone(&stop);
@@ -194,7 +195,15 @@ pub fn spawn(
             // Moved in so it is dropped when this thread returns, however it
             // returns. That drop is what shutdown waits on.
             let _alive = alive;
-            run(&coordinates, owner, settings, &generations, grace, &flag);
+            run(
+                &coordinates,
+                owner,
+                settings,
+                &generations,
+                grace,
+                timeout_ms,
+                &flag,
+            );
         })
         .map_err(|error| format!("cannot start the Proton session loop: {error}"))?;
 
@@ -229,6 +238,7 @@ fn run(
     settings: SessionRenewal,
     generations: &Generations,
     grace: Duration,
+    timeout_ms: u64,
     stop: &AtomicBool,
 ) {
     let interval = Duration::from_secs(settings.probe_interval_seconds).max(MIN_INTERVAL);
@@ -243,7 +253,7 @@ fn run(
     // generation a previous process created and never published, or one it
     // published and never got to retire — is swept before this process's
     // first attempt rather than waiting out a whole interval for it.
-    report_sweep(coordinates, owner, generations, grace, stop);
+    report_sweep(coordinates, owner, generations, grace, timeout_ms, stop);
 
     while !stop.load(Ordering::Relaxed) {
         // Two triggers, and the second is not redundant. Age alone would sit
@@ -286,7 +296,7 @@ fn run(
         // renewal's, so a generation superseded three ticks ago is retired
         // the moment it clears its grace rather than waiting for the next
         // renewal to notice it.
-        report_sweep(coordinates, owner, generations, grace, stop);
+        report_sweep(coordinates, owner, generations, grace, timeout_ms, stop);
 
         let wait = if failures == 0 {
             interval
@@ -311,6 +321,7 @@ fn report_sweep(
     owner: Owner,
     generations: &Generations,
     grace: Duration,
+    timeout_ms: u64,
     stop: &AtomicBool,
 ) {
     let mut rows: Vec<u8> = Vec::new();
@@ -319,6 +330,7 @@ fn report_sweep(
         owner,
         generations,
         grace,
+        timeout_ms,
         Some(stop),
         &mut rows,
     );

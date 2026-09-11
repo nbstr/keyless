@@ -145,11 +145,17 @@ mod daemon {
         /// the other two are credentials and `credential` writes those.
         #[arg(long, value_name = "STORE")]
         store: String,
-        /// Log an EXISTING session out first, then log in.
+        /// Create a fresh generation and make it current, without first
+        /// asking whether the one already current still answers.
         ///
-        /// The token-rotation path, and deliberately not the default: without
-        /// it the vendor refuses to replace a session it already has, which is
-        /// what makes a second run safe.
+        /// The token-rotation path, and deliberately not the default:
+        /// without it, this crate's own liveness probe of the current
+        /// generation — not the vendor, which never refuses a login into a
+        /// fresh generation on its own — refuses a second run that would
+        /// otherwise create a needless generation over a session that is
+        /// still live. The generation this supersedes is never opened,
+        /// mutated or logged out by this flag itself; it is left for the
+        /// ordinary retirement sweep, on its own grace.
         #[arg(long)]
         replace: bool,
         /// Ask for a token even though this daemon already holds one.
@@ -157,8 +163,9 @@ mod daemon {
         /// The credential file answers first, so an ordinary login uses the
         /// token already written there and asks for nothing. This is the way
         /// to type a REPLACEMENT without running `credential` first — and
-        /// pairs with `--replace`, since a new token needs the old session
-        /// logged out.
+        /// pairs with `--replace`, because a live session refuses the login
+        /// before the freshly typed token is ever used unless `--replace` is
+        /// also given.
         #[arg(long)]
         prompt: bool,
         /// Config file. Every coordinate the login needs is read from it, and
@@ -662,6 +669,7 @@ mod daemon {
             owner,
             &generations,
             grace,
+            config.stores.proton.timeout_ms,
             None,
             &mut io::stdout(),
         );

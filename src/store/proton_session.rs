@@ -49,11 +49,17 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 /// The name of the pointer file inside `<root>`.
 const CURRENT_FILE: &str = "current";
 
-/// The temporary name [`Generations::publish`] renames over [`CURRENT_FILE`].
+/// The prefix [`Generations::publish`]'s temporary file carries, before its
+/// own process id is appended — `.current.new.<pid>`. Unique per writer, so
+/// two processes racing to publish never share one file to interleave writes
+/// into, and a leftover under this exact name can only be debris from an
+/// earlier run of the SAME pid, never a concurrent one — nothing else can be
+/// holding this process's own pid while this process is the one running
+/// under it.
 ///
-/// Excluded from [`Generations::candidates`] by the parse rule alone — it does
-/// not begin with [`GENERATION_PREFIX`], so nothing has to know its name to
-/// keep it out of the retirement set.
+/// Excluded from [`Generations::candidates`] by the parse rule alone, prefix
+/// or full name alike — it does not begin with [`GENERATION_PREFIX`], so
+/// nothing has to know its exact name to keep it out of the retirement set.
 const CURRENT_TEMP_FILE: &str = ".current.new";
 
 /// Every generation directory's name begins with this.
@@ -165,6 +171,20 @@ impl GenerationName {
         let millis: u64 = millis.parse().ok()?;
         UNIX_EPOCH.checked_add(Duration::from_millis(millis))
     }
+
+    /// The reserved key [`Generations`]'s pass table credits a vendor child
+    /// spawned through the legacy fallback against — see
+    /// [`Generations::enter_legacy`].
+    ///
+    /// Never produced by [`GenerationName::mint`], which always writes
+    /// [`GENERATION_PREFIX`] followed by digits, and never accepted by
+    /// [`GenerationName::parse`], which requires that exact prefix too — the
+    /// literal below carries no `-` at all, so it cannot even reach the
+    /// `strip_prefix` call. A name read off disk or minted for a real
+    /// generation can therefore never collide with this one.
+    fn legacy() -> Self {
+        GenerationName("legacy".to_owned())
+    }
 }
 
 impl std::fmt::Display for GenerationName {
@@ -259,6 +279,19 @@ impl Candidate {
             Some(name) => name.to_string(),
             None => "legacy".to_owned(),
         }
+    }
+
+    /// The key [`Generations::drain`] waits on for this candidate — its own
+    /// name, or [`GenerationName::legacy`] for the pre-generation layout.
+    ///
+    /// The legacy candidate now shares the same pass-counted machinery an
+    /// ordinary generation does: [`super::proton::ProtonStore::enter`]'s
+    /// fallback takes its pass through [`Generations::enter_legacy`], which
+    /// credits this exact key, so a vendor child that fallback spawned is
+    /// waited out here exactly like a reader of a real generation — closing
+    /// the race between that child and this candidate's own retirement.
+    pub(crate) fn drain_key(&self) -> GenerationName {
+        self.name.clone().unwrap_or_else(GenerationName::legacy)
     }
 }
 
@@ -522,26 +555,50 @@ impl Generations {
     /// here leaves the previous pointer exactly as it was.
     ///
     /// Runs under the pass-table lock so it is fully ordered against
-    /// [`Generations::enter`] and [`Generations::candidates`]: neither call
-    /// can observe a `current` that is mid-rename.
+    /// [`Generations::enter`] and [`Generations::remove`]: neither call can
+    /// observe a `current` that is mid-rename. [`Generations::candidates`]
+    /// takes no lock at all and needs none — it is `rename`'s own atomicity
+    /// that keeps it from ever reading a `current` that is half-written, not
+    /// this mutex.
     ///
     /// # Errors
     ///
     /// The step that failed. The temporary file is removed on every failure
-    /// path; `current` is untouched.
+    /// path, including a failure to create it in the first place — a
+    /// `.current.new.<pid>` this call cannot write is debris only THIS pid
+    /// could have left, so it is safe for this call to clear it and let the
+    /// next publish attempt start clean.
     pub fn publish(&self, name: &GenerationName, owner: Option<(u32, u32)>) -> io::Result<()> {
-        let temp = self.root.join(CURRENT_TEMP_FILE);
+        let temp = self
+            .root
+            .join(format!("{CURRENT_TEMP_FILE}.{}", std::process::id()));
         let body = format!("{name}\n");
 
-        let file = fs::OpenOptions::new()
+        // `create_new` (`O_EXCL`) rather than `create` + `truncate`: two
+        // processes can no longer open the SAME temp file at once and
+        // interleave their writes into it, because pid-uniqueness above
+        // already means they are never naming the same file. Whatever this
+        // fails on — a real permission problem, or a stale file left by an
+        // earlier process that once held this pid — the temp is cleared
+        // rather than left to wedge every publish after this one the way a
+        // shared, fixed name used to.
+        let file = match fs::OpenOptions::new()
             .write(true)
-            .create(true)
-            .truncate(true)
+            .create_new(true)
             .mode(CURRENT_FILE_MODE)
-            .open(&temp)?;
-        // As in `write_atomically`: an existing temp file keeps its old mode
-        // unless this is set unconditionally, since `.mode()` on `open()` only
-        // applies when the file is newly created.
+            .open(&temp)
+        {
+            Ok(file) => file,
+            Err(error) => {
+                let _ = fs::remove_file(&temp);
+                return Err(error);
+            }
+        };
+        // Re-asserted unconditionally because the process umask can narrow
+        // what `.mode()` requested at creation time — the same defence
+        // `create()` takes for a fresh generation directory. `create_new`
+        // above already rules out the OTHER reason `write_atomically` has to
+        // do this: there is no existing file here wearing a stale mode.
         if let Err(error) = file.set_permissions(fs::Permissions::from_mode(CURRENT_FILE_MODE)) {
             let _ = fs::remove_file(&temp);
             return Err(error);
@@ -574,17 +631,33 @@ impl Generations {
     /// pointer and nothing else: a corrupt or absent pointer must never widen
     /// the set of things this process is willing to delete.
     ///
-    /// A name is eligible once `now - max(created_at, mtime(current)) ≥
-    /// grace`. The `max` is the conservative direction on both axes: the
-    /// candidate's OWN age is a lower bound on how long it has been retired
-    /// (it cannot have stopped serving before it was born), and `current`'s
-    /// mtime is the instant the MOST RECENT publish landed, which is no
-    /// earlier than when this specific candidate was superseded. Taking the
-    /// larger of the two — the more recent instant — means both have to be
-    /// old enough before this candidate is judged old enough; a corrupt clock
-    /// pushing either value into the future makes `duration_since` fail, and a
-    /// failure here is read as NOT eligible, never as eligible with an unknown
-    /// age.
+    /// # The clock a candidate is judged against
+    ///
+    /// A name is eligible once `now - anchor ≥ grace`, and `anchor` is the
+    /// moment THIS candidate stopped being current — which the names on disk
+    /// already encode, with no filesystem timestamp involved. Sorted oldest
+    /// first, every candidate but the newest is superseded by the very next
+    /// name in that order, so its anchor is that successor's own
+    /// [`GenerationName::created_at`]: fixed the instant the successor was
+    /// minted, and untouched by anything that publishes after it. The
+    /// newest non-current generation has no such successor on disk — nothing
+    /// is older than `current` and also newer than it — so it anchors at
+    /// `current`'s own mtime, the instant its own supersession actually
+    /// landed, which is correct for exactly this one candidate and stays
+    /// correct until a further publish makes a different generation the
+    /// newest non-current one, at which point THAT one reads its anchor the
+    /// same way.
+    ///
+    /// This is what F3 replaces: anchoring every candidate at `current`'s
+    /// mtime meant every later publish reset every OLDER candidate's clock
+    /// too, because `current`'s mtime is one value shared by all of them.
+    /// Reading `now - current_mtime` a moment after any publish always read
+    /// as `≈ 0`, so a sweep that landed in the same tick as a renewal — which
+    /// happens exactly when the renewal loop's own `report_sweep` runs, one
+    /// call after `attempt` publishes — retired nothing at all, for as long
+    /// as renewals kept happening. A per-candidate anchor fixed at the
+    /// successor's own mint time cannot be reset by a publish that has
+    /// nothing to do with that candidate.
     #[must_use]
     pub fn candidates(&self, now: SystemTime, grace: Duration) -> Vec<Candidate> {
         let Ok(current) = self.current() else {
@@ -594,7 +667,7 @@ impl Generations {
             .and_then(|meta| meta.modified())
             .unwrap_or(now);
 
-        let mut found = Vec::new();
+        let mut on_disk: Vec<(GenerationName, SystemTime)> = Vec::new();
         if let Ok(entries) = fs::read_dir(&self.root) {
             for entry in entries.flatten() {
                 let Some(name) = entry.file_name().to_str().and_then(GenerationName::parse) else {
@@ -612,19 +685,7 @@ impl Generations {
                 let Some(created_at) = name.created_at() else {
                     continue;
                 };
-                let anchor = created_at.max(current_mtime);
-                let Ok(age) = now.duration_since(anchor) else {
-                    continue;
-                };
-                if age < grace {
-                    continue;
-                }
-                let dir = self.root.join(name.as_str());
-                found.push(Candidate {
-                    name: Some(name),
-                    scope: dir.clone(),
-                    delete: dir,
-                });
+                on_disk.push((name, created_at));
             }
         }
         // By the CLOCK each name encodes, not by the name's own string order:
@@ -632,8 +693,30 @@ impl Generations {
         // place `gen-999-…` after `gen-1000-…` even though it is older. Real
         // timestamps stay the same digit count for centuries, so this only
         // bites a fixture that mints small, hand-picked values — which is
-        // reason enough not to lean on it anywhere.
-        found.sort_by_key(|candidate| candidate.name.as_ref().and_then(GenerationName::created_at));
+        // reason enough not to lean on it anywhere. Sorted first: the loop
+        // below reads each entry's SUCCESSOR straight out of this order, so
+        // `found` comes out oldest-first with no second sort needed.
+        on_disk.sort_by_key(|(_, created_at)| *created_at);
+
+        let mut found = Vec::with_capacity(on_disk.len());
+        for index in 0..on_disk.len() {
+            let (name, _) = &on_disk[index];
+            let anchor = on_disk
+                .get(index + 1)
+                .map_or(current_mtime, |(_, created_at)| *created_at);
+            let Ok(age) = now.duration_since(anchor) else {
+                continue;
+            };
+            if age < grace {
+                continue;
+            }
+            let dir = self.root.join(name.as_str());
+            found.push(Candidate {
+                name: Some(name.clone()),
+                scope: dir.clone(),
+                delete: dir,
+            });
+        }
 
         // The legacy layout carries no age of its own to check: it predates
         // this whole scheme, so there is no `created_at` to read and no
@@ -642,7 +725,7 @@ impl Generations {
         // `current` being `Ok` already establishes — and never before, since a
         // root with no published generation yet has nowhere to have logged
         // out to.
-        if fs::symlink_metadata(self.legacy_dir()).is_ok() {
+        if self.legacy_is_directory() {
             found.push(Candidate {
                 name: None,
                 scope: self.root.clone(),
@@ -659,14 +742,111 @@ impl Generations {
         self.root.join(super::proton::SESSION_SUBDIR)
     }
 
+    /// Whether the legacy layout is on disk as a directory right now.
+    ///
+    /// The same predicate the generation branch of [`Generations::candidates`]
+    /// applies — `symlink_metadata(...).is_dir()`, 39 lines above the legacy
+    /// branch that used to admit on existence alone — extended to the legacy
+    /// path: a symlink or a plain file there is never treated as a directory
+    /// this process may read from, hand to a child, or delete. A `pass-cli`
+    /// child DOES follow a symlink (measured against the real vendor binary),
+    /// unlike [`Generations::remove`]'s own `remove_dir_all`, so this is the
+    /// one guard standing between a planted `.session` symlink and whatever
+    /// it points at.
+    fn legacy_is_directory(&self) -> bool {
+        fs::symlink_metadata(self.legacy_dir()).is_ok_and(|meta| meta.is_dir())
+    }
+
+    /// The legacy layout, when [`Generations::legacy_is_directory`] holds —
+    /// the one thing [`super::proton::ProtonStore::enter`] may still read
+    /// from a root that has never published a generation. `None` once a
+    /// generation exists to read instead, or once there is nothing at
+    /// `<root>/.session` a child may safely be pointed at.
+    #[must_use]
+    pub(crate) fn legacy_layout(&self) -> Option<PathBuf> {
+        self.legacy_is_directory().then(|| self.root.clone())
+    }
+
+    /// Take a pass on the legacy `<root>/.session` layout, counted under
+    /// [`GenerationName::legacy`] exactly as an ordinary generation is
+    /// counted under its own name.
+    ///
+    /// The one caller is [`super::proton::ProtonStore::enter`]'s fallback,
+    /// for a root that has never published a generation. Before this
+    /// existed, that fallback handed out [`Pass::without_generation`], which
+    /// costs no lock and releases nothing on drop — so a vendor child it
+    /// scoped at the legacy directory was invisible to
+    /// [`Generations::drain`], and a retirement of that same directory could
+    /// run `remove_dir_all` under it. Crediting the pass here closes that:
+    /// [`Candidate::drain_key`] returns this same reserved key for the
+    /// legacy candidate, so [`crate::daemon::login::retire`] waits this
+    /// count out before it ever spawns a logout against `<root>`.
+    #[must_use]
+    pub fn enter_legacy(&self) -> Option<Pass<'_>> {
+        let root = self.legacy_layout()?;
+        let mut passes = self.lock();
+        *passes.entry(GenerationName::legacy()).or_insert(0) += 1;
+        drop(passes);
+        Some(Pass {
+            dir: root,
+            held: Some((self, GenerationName::legacy())),
+        })
+    }
+
+    /// `Some` with a message when `<root>/.session` exists and is NOT a
+    /// directory — a symlink or a plain file where the legacy layout should
+    /// be. `None` when nothing is there, or when it IS a directory, which
+    /// [`Generations::candidates`] already retires in the ordinary way.
+    ///
+    /// This process never acts on the obstructed shape — it names it and
+    /// leaves it for an operator to repair by hand. Exists so
+    /// [`crate::daemon::login::sweep`] can report it once per process,
+    /// through [`Generations::mark_failure_reported`], the same mechanism a
+    /// stuck retirement already uses; without it, an obstruction here would
+    /// never surface anywhere, because it is never a [`Candidate`] for
+    /// `sweep`'s own loop to fail on.
+    #[must_use]
+    pub fn legacy_layout_obstruction(&self) -> Option<String> {
+        match fs::symlink_metadata(self.legacy_dir()) {
+            Ok(meta) if !meta.is_dir() => Some(format!(
+                "`{}` is not a directory — a symlink or a plain file where the pre-generation \
+                 session layout should be; left alone rather than logged out or deleted",
+                self.legacy_dir().display()
+            )),
+            _ => None,
+        }
+    }
+
     /// Wait for every in-process pass on `name` to end, for at most `bound`.
     ///
     /// Waits only for `name`'s own count — a pass held on a different
     /// generation, current or otherwise, never delays this call. Once it
-    /// returns `Ok`, no child THIS process spawned is reading `name`, and none
-    /// can start: a pass requires `current() == name` at the instant it is
-    /// taken, and a name eligible for [`Generations::candidates`] is by
-    /// construction never the current one.
+    /// returns `Ok`, no child THIS process spawned is reading `name` through
+    /// [`Generations::enter`], and none can start that way: a pass taken
+    /// there requires `current() == name` at the instant it is taken, and a
+    /// name eligible for [`Generations::candidates`] is by construction
+    /// never the current one. [`GenerationName::legacy`] is the one key this
+    /// reasoning does not cover on its own — [`Generations::enter_legacy`]
+    /// issues a pass under it with no `current()` check at all, so a fresh
+    /// one can start after this call returns. That is the same window every
+    /// candidate already has between this call returning and the vendor
+    /// child [`crate::daemon::login::retire`] spawns next, not a new one the
+    /// legacy key introduces, because the directory a late pass would read
+    /// is exactly the one `retire` is about to delete either way.
+    ///
+    /// # Why nothing re-confirms `name` is still not current, here
+    ///
+    /// The logout children [`crate::daemon::login::retire`] spawns between
+    /// this call returning and [`Generations::remove`]'s own re-check of
+    /// `current` are not guarded by THIS function — the guard that matters
+    /// sits at `remove`, which re-reads `current` under the lock immediately
+    /// before deleting anything. What makes that placement sufficient rather
+    /// than merely convenient is that [`GenerationName::mint`] never repeats
+    /// a name: a name once retired can never become `current` again, so
+    /// there is no ordering in which `name` is current at the instant
+    /// `remove` checks and was ALSO current at some earlier instant this
+    /// function could have checked instead. A minting scheme that ever
+    /// reused a name would need the guard here too.
     ///
     /// # Errors
     ///
@@ -677,6 +857,21 @@ impl Generations {
         let until = Instant::now() + bound;
         let mut passes = self.lock();
         loop {
+            // The name became current while this was waiting, so it is no
+            // longer a thing to retire and draining it says nothing. Refusing
+            // here rather than returning `Ok` is what keeps the guard where
+            // the contract puts it: the caller runs two vendor logouts
+            // between this call and [`Generations::remove`]'s own re-read, and
+            // a `logout --force` deletes the directory's contents, so a
+            // candidate that was republished in that window must stop the
+            // retirement before the first of them is spawned rather than at
+            // the delete. Unreachable while a generation name is minted from
+            // the clock and a pid and is therefore never published twice —
+            // which is exactly why the guard belongs here rather than resting
+            // on that assumption holding for ever.
+            if self.current().as_ref() == Ok(name) {
+                return Err(StillRead);
+            }
             if passes.get(name).copied().unwrap_or(0) == 0 {
                 return Ok(());
             }
@@ -726,22 +921,25 @@ impl Generations {
         }
     }
 
-    /// Whether a retirement failure for `candidate` has already been reported
-    /// by this process. Marks it reported on the first call.
+    /// Whether a failure reported under `label` has already been reported by
+    /// this process. Marks it reported on the first call.
     ///
-    /// `true` the first time a given candidate fails, `false` on every call
-    /// after that — so a caller that only prints on `true` reports each
-    /// candidate's failure once per process rather than once per tick, while a
-    /// candidate that starts failing again after a successful retirement
-    /// (impossible for a generation, since a retired name is gone for good,
-    /// but not impossible for the legacy candidate under a repeated fault) is
-    /// a fresh label and reports again.
-    pub(crate) fn mark_failure_reported(&self, candidate: &Candidate) -> bool {
+    /// `true` the first time a given label fails, `false` on every call after
+    /// that — so a caller that only prints on `true` reports each failure
+    /// once per process rather than once per tick. [`Candidate::label`] is
+    /// the usual label, for a stuck retirement;
+    /// [`Generations::legacy_layout_obstruction`] reports under a label of
+    /// its own the same way, for the same reason: a label that starts
+    /// failing again after a successful retirement (impossible for a
+    /// generation, since a retired name is gone for good, but not impossible
+    /// for the legacy layout under a repeated fault) is a fresh label and
+    /// reports again.
+    pub(crate) fn mark_failure_reported(&self, label: &str) -> bool {
         let mut reported = self
             .reported_failures
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        reported.insert(candidate.label())
+        reported.insert(label.to_owned())
     }
 }
 
@@ -914,20 +1112,25 @@ mod tests {
         let far_past = SystemTime::now() - Duration::from_secs(3600);
         let grace = Duration::from_secs(1);
 
-        // Minted an hour in the past directly, rather than through `create`,
-        // which always mints from the real clock — this membership test is not
-        // about the grace window, and an hour is comfortably past it.
+        // A is minted an hour ago, C five seconds after A, and B — `current`
+        // — ten seconds after that. Under the successor-anchored eligibility
+        // `Generations::candidates` now uses, A's clock reads off C's own
+        // MINTED time, so it is written directly rather than through
+        // `create`/`publish`, which always mint from the real clock. C is
+        // the newest NON-current generation, which has no on-disk successor
+        // to anchor against — it reads `current`'s own mtime instead, so
+        // that alone is back-dated below, exactly as the doc on
+        // `Generations::candidates` says only that one candidate should.
         let a = GenerationName::mint(far_past, 1001);
-        let c = GenerationName::mint(far_past, 1002);
+        let c = GenerationName::mint(far_past + Duration::from_secs(5), 1002);
+        let b = GenerationName::mint(far_past + Duration::from_secs(10), 1003);
         fs::create_dir(dir.join(a.as_str())).expect("mkdir A");
         fs::create_dir(dir.join(c.as_str())).expect("mkdir C");
-        let (b, _) = generations.create(None).expect("create B");
-        generations.publish(&b, None).expect("publish B");
+        fs::create_dir(dir.join(b.as_str())).expect("mkdir B");
+        write_current(&dir, &format!("{b}\n"));
         fs::create_dir(dir.join(super::super::proton::SESSION_SUBDIR)).expect("legacy dir");
         fs::write(dir.join("current.new"), b"decoy").expect("decoy temp file");
         fs::write(dir.join("notes.txt"), b"decoy").expect("decoy plain file");
-        // Back-date `current`'s mtime too, so the grace check's `max` of both
-        // anchors does not itself exclude A and C from this membership test.
         let file = fs::File::options()
             .write(true)
             .open(dir.join(CURRENT_FILE))
@@ -969,14 +1172,21 @@ mod tests {
             .publish(&current, None)
             .expect("publish current");
 
-        // A generation minted NOW: too young on both anchors.
+        // A generation minted NOW: it is the newest thing on disk beside
+        // `current` itself, so it has no successor to anchor against and
+        // falls back to `current`'s own mtime — freshly set by the publish
+        // above, so it reads as far too young.
         let (young, young_dir) = generations.create(None).expect("create young");
-        let _ = young_dir;
         let candidates = generations.candidates(SystemTime::now(), grace);
         assert!(
             !candidates.iter().any(|c| c.name() == Some(&young)),
             "a generation minted moments ago was already a candidate"
         );
+        // Removed before the next check: left on disk, `young` would become
+        // the successor `old` (below) anchors against instead of `current`,
+        // pinning `old`'s clock to `young`'s own recent mint time rather than
+        // to the point actually under test.
+        fs::remove_dir_all(&young_dir).expect("remove young");
 
         // A generation minted an hour ago, with `current`'s own mtime pushed
         // back an hour too — both anchors are old enough, so this one IS
@@ -995,6 +1205,49 @@ mod tests {
             candidates.iter().any(|c| c.name() == Some(&old)),
             "an hour-old generation, with current's mtime also an hour back, was not a \
              candidate: {candidates:?}"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_candidate_is_retired_once_its_own_successor_clears_the_grace_even_though_current_was_just_published()
+     {
+        // CONTROL — the change that makes this fail: anchor every candidate
+        // at `current`'s own mtime (the pre-fix `created_at.max(current_
+        // mtime)`) instead of at its own successor's minted time. `current`
+        // is published moments before `candidates` runs below, so every
+        // candidate's age would read as ≈0 against that mtime and `old`
+        // would not be eligible — the exact starvation a sweep landing in
+        // the same tick as a renewal used to produce (F3).
+        let dir = scratch("candidates-successor-anchor");
+        let generations = Generations::at(dir.clone());
+        let grace = Duration::from_secs(1);
+        let far_past = SystemTime::now() - Duration::from_secs(3600);
+
+        // `old` was superseded by `intermediate` an hour ago — both minted
+        // directly so their clock is fixed by name alone, the way a crash
+        // leftover or a candidate several renewals back would be. `newest`
+        // is published for real, right now, so `current`'s own mtime is as
+        // fresh as a filesystem clock can be at the instant this reads
+        // `candidates`.
+        let old = GenerationName::mint(far_past, 1);
+        let intermediate = GenerationName::mint(far_past + Duration::from_secs(10), 2);
+        fs::create_dir(dir.join(old.as_str())).expect("mkdir old");
+        fs::create_dir(dir.join(intermediate.as_str())).expect("mkdir intermediate");
+        let (newest, _) = generations.create(None).expect("create newest");
+        generations.publish(&newest, None).expect("publish newest");
+
+        let candidates = generations.candidates(SystemTime::now(), grace);
+        assert!(
+            candidates.iter().any(|c| c.name() == Some(&old)),
+            "a candidate whose own successor cleared the grace was starved by a freshly \
+             published `current`: {candidates:?}"
+        );
+        assert!(
+            !candidates.iter().any(|c| c.name() == Some(&intermediate)),
+            "the candidate anchored at the fresh `current` mtime was eligible too soon: \
+             {candidates:?}"
         );
 
         let _ = fs::remove_dir_all(&dir);
@@ -1070,9 +1323,52 @@ mod tests {
         }));
         assert!(panicked.is_err(), "the test's own panic did not happen");
 
+        // Read straight out of the pass table rather than through
+        // [`Generations::drain`]. Draining is a RETIREMENT step and refuses a
+        // name that is current — which A is, having just been published — so
+        // routing this assertion through it would test that precondition
+        // instead of the property this case is named for. What is under test
+        // is only that `Pass`'s `Drop` ran while the stack unwound.
+        let held = generations.lock().get(&a).copied().unwrap_or(0);
+        assert_eq!(
+            held, 0,
+            "the pass on A was still counted after its reader unwound"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_pass_taken_through_the_legacy_fallback_is_waited_out_by_drain_on_its_reserved_key() {
+        // CONTROL — the change that makes this fail: hand out
+        // `Pass::without_generation(root)` from `enter_legacy` instead of a
+        // counted pass — the shape `ProtonStore::enter`'s fallback used
+        // before this fix. A pass with `held: None` costs no lock and
+        // releases nothing on drop, so the first `drain` below would see a
+        // count of zero immediately and return `Ok` while the pass is still
+        // held — the race between a vendor child this fallback spawned and
+        // the legacy candidate's own retirement.
+        let dir = scratch("legacy-pass-drained");
+        let generations = Generations::at(dir.clone());
+        fs::create_dir(dir.join(super::super::proton::SESSION_SUBDIR)).expect("legacy dir");
+
+        let pass = generations
+            .enter_legacy()
+            .expect("a pass over the legacy layout");
+        let legacy_key = GenerationName::legacy();
         assert!(
-            generations.drain(&a, Duration::from_millis(200)).is_ok(),
-            "drain(A) timed out after the only pass on A was dropped by an unwind"
+            generations
+                .drain(&legacy_key, Duration::from_millis(200))
+                .is_err(),
+            "drain returned while a legacy pass was still held"
+        );
+
+        drop(pass);
+        assert!(
+            generations
+                .drain(&legacy_key, Duration::from_millis(200))
+                .is_ok(),
+            "drain did not return once the legacy pass was dropped"
         );
 
         let _ = fs::remove_dir_all(&dir);
@@ -1097,11 +1393,43 @@ mod tests {
             format!("{name}\n")
         );
         assert!(
-            !dir.join(CURRENT_TEMP_FILE).exists(),
+            !dir.join(format!("{CURRENT_TEMP_FILE}.{}", std::process::id()))
+                .exists(),
             "the temporary file was left behind"
         );
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_legacy_session_directory_that_is_a_symlink_is_never_a_retirement_candidate() {
+        let dir = scratch("legacy-symlink-not-a-candidate");
+        let target = scratch("legacy-symlink-not-a-candidate-target");
+        let generations = Generations::at(dir.clone());
+        let (name, _) = generations.create(None).expect("create a generation");
+        generations.publish(&name, None).expect("publish");
+
+        std::os::unix::fs::symlink(&target, dir.join(super::super::proton::SESSION_SUBDIR))
+            .expect("plant a symlink where the legacy layout should be");
+
+        let candidates = generations.candidates(SystemTime::now(), Duration::from_secs(0));
+        assert!(
+            !candidates
+                .iter()
+                .any(|candidate| candidate.name().is_none()),
+            "a symlinked `.session` was admitted as the legacy retirement candidate: {candidates:?}"
+        );
+        assert!(
+            generations.legacy_layout().is_none(),
+            "a symlinked `.session` was handed out as a directory a child may read"
+        );
+        assert!(
+            generations.legacy_layout_obstruction().is_some(),
+            "a symlinked `.session` was not reported as an obstruction"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&target);
     }
 
     #[test]

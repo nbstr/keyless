@@ -1803,13 +1803,14 @@ because the two mistakes are not the same size: a verdict read as transport
 serves a disowned credential for the rest of the window, while transport read
 as a verdict costs one eviction and a fresh lookup.
 
-**A read never lands in the middle of a session renewal.** The daemon replaces
-its own Proton session on a clock — a logout, then a login — and between them
-the session directory holds nothing. A lookup arriving in that gap waits for
-the new session instead of reading the vendor's "not authenticated", which is a
-sentence about the daemon's login that nothing downstream could tell from a
-revoked token. A lookup that waits out its whole ceiling there reports the
-store unavailable, so its cached value is kept rather than thrown away.
+**A read is never made to wait for a session renewal.** The daemon replaces
+its own Proton session by building a fresh generation directory beside the
+one already serving, verifying it, and swapping a one-line pointer once it
+proves itself — never by logging the old one out first. A lookup that starts
+before the swap reads the generation that was current at that instant; one
+that starts after reads the new one. The generation being retired keeps
+answering every reader already pointed at it until they are done, then it is
+logged out and removed — there is no gap for a lookup to land in.
 
 **And there is no local fallback.** Enabling the daemon *disables* every local
 backend — keychain, Infisical, 1Password and Proton Pass alike — whatever each

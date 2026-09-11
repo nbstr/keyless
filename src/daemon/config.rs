@@ -567,11 +567,16 @@ pub struct DaemonProtonConfig {
 ///
 /// # Why it is opt-in
 ///
-/// The loop logs out before it logs in — see [`SessionRenewal::login_after_minutes`] —
-/// so switching it on changes what happens to a session directory an operator
-/// may be managing by hand, from outside this process. A default that started
-/// replacing sessions on upgrade would be a surprising thing for a patch
-/// release to do to a working install.
+/// The loop still ends every generation it replaces with a real,
+/// account-level `pass-cli logout` — see [`crate::daemon::login::retire`] —
+/// even though a read is never made to wait for the replacement itself (see
+/// [`SessionRenewal::login_after_minutes`]). Switching it on for the first
+/// time on an existing install therefore still changes what happens to a
+/// session directory an operator may be managing by hand, from outside this
+/// process — later, and never on a lookup's own time, but a real logout all
+/// the same. A default that started rotating and logging out sessions on
+/// upgrade would be a surprising thing for a patch release to do to a
+/// working install.
 ///
 /// # The shape is Vault Agent's, minus one field
 ///
@@ -1054,6 +1059,18 @@ impl DaemonConfig {
             return None;
         }
         let root = self.stores.proton.session_dir.as_deref()?;
+        // The same guard `ProtonStore::session_dir` applies on the session
+        // side, restated here because a `Some` from this function is what
+        // makes `ProtonStore::enter`'s daemon-side arm skip that call
+        // entirely. Returning `None` for a relative root — rather than
+        // building a `Generations` over it — is what sends the daemon read
+        // path back through `session_dir()`'s own check and its
+        // named-config-line message, instead of degrading later as
+        // `CurrentFault::Absent`, a sentence that points an operator at "no
+        // session established" when the real fault is one config line.
+        if !root.is_absolute() {
+            return None;
+        }
         Some(Arc::new(Generations::at(root.to_path_buf())))
     }
 

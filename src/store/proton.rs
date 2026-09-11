@@ -2079,11 +2079,59 @@ impl ProtonStore {
     /// returns a pass over [`ProtonStore::session_dir`] directly, holding no
     /// count — there is nothing here for a renewal to race, because a session
     /// has no renewal loop.
+    ///
+    /// # The one fallback on the daemon side: a root that has never published
+    ///
+    /// An install with `stores.proton.session.auto_login` off runs no
+    /// renewal loop, so nothing ever writes `<root>/current` — and a
+    /// pre-upgrade install's real, working session sits in `<root>/.session`,
+    /// the layout this crate wrote before generations existed. Reading that
+    /// as an outage rather than as an unmigrated identity is exactly the
+    /// silent break this fallback exists to close: `current()` reporting
+    /// [`proton_session::CurrentFault::Absent`] — never `Malformed`, never
+    /// `Missing`, both of which stay refusals — with the legacy directory
+    /// present as a directory hands out a pass scoped at the ROOT, which is
+    /// what the vendor reads as the legacy layout on its own (it appends
+    /// `.session` itself).
+    ///
+    /// This is the one daemon-side case where reading past `current` is
+    /// safe: `<root>/.session` is what every pre-generations install already
+    /// depended on, and [`proton_session::Generations::candidates`] never
+    /// treats it as retirable until a generation has actually published —
+    /// see that method's own doc. So a root that never publishes keeps
+    /// serving the legacy directory forever, and a root that DOES publish
+    /// serves the new generation from that instant and retires the legacy
+    /// one after its grace, exactly as an ordinary generation would.
+    ///
+    /// # The pass this hands out is counted like any other
+    ///
+    /// [`proton_session::Generations::enter_legacy`] credits the same pass
+    /// table [`proton_session::Generations::drain`] waits on, under
+    /// [`proton_session::GenerationName::legacy`] — a reserved key the
+    /// legacy candidate's own retirement now drains by, through
+    /// [`proton_session::Candidate::drain_key`], before
+    /// [`crate::daemon::login::retire`] spawns a single `pass-cli logout`
+    /// against `<root>`. So a vendor child this fallback spawned, still
+    /// running against `<root>` at the exact instant a first generation
+    /// publishes and the next sweep retires the legacy directory, is waited
+    /// out before that logout and the `remove_dir_all` behind it ever run —
+    /// the same serialisation an ordinary generation's readers already get.
     fn enter(&self) -> Result<proton_session::Pass<'_>, StoreError> {
         match &self.generations {
-            Some(generations) => generations.enter().map_err(|fault| {
-                self.unavailable(format!("{fault} (root {})", generations.root().display()))
-            }),
+            Some(generations) => match generations.enter() {
+                Ok(pass) => Ok(pass),
+                Err(fault @ proton_session::CurrentFault::Absent) => match generations
+                    .enter_legacy()
+                {
+                    Some(pass) => Ok(pass),
+                    None => Err(self
+                        .unavailable(format!("{fault} (root {})", generations.root().display()))),
+                },
+                Err(fault) => {
+                    Err(self
+                        .unavailable(format!("{fault} (root {})", generations.root().display())))
+                }
+            },
             None => {
                 let dir = self.session_dir()?.to_path_buf();
                 Ok(proton_session::Pass::without_generation(dir))
@@ -2697,7 +2745,10 @@ impl Store for ProtonStore {
         // Local facts first, so the message names the closest cause. Both are
         // preconditions of the round trip below: with no session directory there
         // is no identity to ask as, and with no binary there is nothing to ask.
-        let session_dir = self.session_dir()?;
+        // The value itself is not kept — every message below names the
+        // directory the round trip actually read, off `pass`, not this
+        // configured root; see the two remedies further down for why.
+        self.session_dir()?;
 
         if resolve_executable(&self.binary).is_none() {
             return Err(self.unavailable(format!(
@@ -2745,16 +2796,31 @@ impl Store for ProtonStore {
                  `stores.proton.token_expires` first, then whether the token still exists at \
                  the vendor; mint a fresh one, log the session at {} in with it, and write it \
                  with `{} credential --store {STORE_ID}`. The vendor said: {vendor}",
-                session_dir.display(),
+                pass.dir().display(),
                 crate::DAEMON_NAME,
             )));
         }
 
+        // Two audiences, two remedies, and `session_dir` (the configured
+        // ROOT) serves neither. A generation-backed store reads through
+        // `Generations`, and the raw vendor command an operator would paste
+        // by hand — `PROTON_PASS_SESSION_DIR=<root> pass-cli login` — writes
+        // into `<root>/.session`, the LEGACY layout: `current` never moves to
+        // name it, the next sweep treats it as the retirement candidate it
+        // looks like, and it is gone before the operator's next `check`. The
+        // daemon's own verb is the one that actually publishes a generation
+        // `current` can name. A session-side store has no generations to
+        // publish and the raw command is exactly right there, so it keeps
+        // the one it always had.
+        let remedy = if self.generations.is_some() {
+            format!("{} login --store {STORE_ID}", crate::DAEMON_NAME)
+        } else {
+            login_into(pass.dir())
+        };
         Err(self.unavailable(format!(
-            "the session at {} cannot be used: {vendor}; re-mint it with `{}` \
+            "the session at {} cannot be used: {vendor}; re-mint it with `{remedy}` \
              (or re-issue the agent token) and check `stores.proton.session_dir`",
-            session_dir.display(),
-            login_into(session_dir)
+            pass.dir().display(),
         )))
     }
 }
@@ -4253,10 +4319,10 @@ mod tests {
 
     #[test]
     fn a_read_is_never_made_to_wait_for_a_renewal() {
-        // The property `SessionGate` traded away: a renewal in progress must
-        // never make an ordinary read pause, let alone time out. Proven against
-        // a real `Generations` under real, continuous publishing pressure from
-        // another thread, rather than against a single replace.
+        // A renewal in progress must never make an ordinary read pause, let
+        // alone time out. Proven against a real `Generations` under real,
+        // continuous publishing pressure from another thread, rather than
+        // against a single replace.
         let dir = scratch("read-never-waits");
         let generations = Arc::new(Generations::at(dir.clone()));
         let (first, _) = generations
@@ -4337,10 +4403,9 @@ mod tests {
 
     #[test]
     fn a_retirement_waits_for_the_readers_of_that_generation_alone() {
-        // The `ProtonStore::enter` + `Generations::drain` seam, in place of
-        // `SessionGate::replace`'s whole-session close: a retirement of one
-        // generation must wait for readers of THAT generation, and must not
-        // touch readers of the one that replaced it.
+        // The `ProtonStore::enter` + `Generations::drain` seam: a retirement
+        // of one generation must wait for readers of THAT generation, and
+        // must not touch readers of the one that replaced it.
         let dir = scratch("retire-waits-for-readers");
         let generations = Arc::new(Generations::at(dir.clone()));
         let (old, _) = generations.create(None).expect("create the old generation");
