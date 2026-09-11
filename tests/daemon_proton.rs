@@ -3266,3 +3266,775 @@ fn the_same_vendor_sentence_evicts_with_a_healthy_session_and_keeps_the_value_wi
     let _ = std::fs::remove_dir_all(&dir);
     let _ = std::fs::remove_dir_all(&dir2);
 }
+
+// ---------------------------------------------------------------------------
+// The vendor's own store semantics, pinned.
+//
+// Everything above this line is a claim about the DAEMON. The cases below are
+// claims about `pass-cli` — read out of its source at the version installed on
+// this machine and written down so a release that changes one of them arrives
+// as a red test rather than as an undecryptable session store.
+//
+// They drive `support::stub_pass_cli_store` directly, with no daemon anywhere:
+// the stand-in is the subject, and a case that reached it through the daemon
+// could not say whether a wrong answer came from the model or from the adapter.
+// `support::stub_pass_cli_store`'s own doc carries the source citation for each
+// behaviour, and the sentences asserted here are quoted from the vendor.
+// ---------------------------------------------------------------------------
+
+/// One directory a vendor child is pointed at, holding nothing yet.
+fn vendor_scope(dir: &Path, tag: &str) -> std::path::PathBuf {
+    let scope = dir.join(tag);
+    std::fs::create_dir_all(&scope).expect("create the directory the variable names");
+    scope
+}
+
+/// What `PROTON_PASS_KEY_PROVIDER` and `PROTON_PASS_ENCRYPTION_KEY` are set to
+/// for one invocation — or deliberately not set, which is a third answer the
+/// vendor reads differently from either.
+enum Keying {
+    /// `key_provider: fs`, the arrangement that keeps the key in a file.
+    Fs,
+    /// `key_provider: env` with a key, the arrangement this daemon ships.
+    Env(&'static str),
+    /// `key_provider: env` with the key variable left off entirely.
+    EnvWithoutKey,
+    /// `key_provider: env` with the key variable present and EMPTY.
+    EnvWithEmptyKey,
+    /// Neither variable set at all — what a call site that forgot the scope
+    /// hands the vendor.
+    Unset,
+    /// The provider variable present and empty, which is not the same
+    /// omission and, per the vendor, not a different one either.
+    Empty,
+}
+
+/// Run the store stand-in once, exactly as a child of the daemon would be run.
+///
+/// The environment is CLEARED rather than inherited, so a variable the
+/// developer happens to export cannot decide which arm the stand-in takes —
+/// which is the whole subject of several cases below.
+fn run_vendor(vendor: &Path, scope: &Path, keying: &Keying, args: &[&str]) -> std::process::Output {
+    let mut command = std::process::Command::new(vendor);
+    command.args(args);
+    command.env_clear();
+    command.env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin");
+    command.env("PROTON_PASS_SESSION_DIR", scope);
+    match keying {
+        Keying::Fs => {
+            command.env("PROTON_PASS_KEY_PROVIDER", "fs");
+        }
+        Keying::Env(key) => {
+            command.env("PROTON_PASS_KEY_PROVIDER", "env");
+            command.env("PROTON_PASS_ENCRYPTION_KEY", key);
+        }
+        Keying::EnvWithoutKey => {
+            command.env("PROTON_PASS_KEY_PROVIDER", "env");
+        }
+        Keying::EnvWithEmptyKey => {
+            command.env("PROTON_PASS_KEY_PROVIDER", "env");
+            command.env("PROTON_PASS_ENCRYPTION_KEY", "");
+        }
+        Keying::Unset => {}
+        Keying::Empty => {
+            command.env("PROTON_PASS_KEY_PROVIDER", "");
+        }
+    }
+    command
+        .output()
+        .unwrap_or_else(|error| panic!("cannot run the vendor stand-in: {error}"))
+}
+
+fn said(output: &std::process::Output) -> String {
+    String::from_utf8_lossy(&output.stderr).into_owned()
+}
+
+/// The permission bits on `path`, as the three octal digits a person writes.
+fn mode_of(path: &Path) -> u32 {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path)
+        .unwrap_or_else(|error| panic!("cannot stat {}: {error}", path.display()))
+        .permissions()
+        .mode()
+        & 0o777
+}
+
+fn store_stub(dir: &Path, behaviour: &support::VendorStore) -> std::path::PathBuf {
+    let inner = stub_pass_cli_listing(
+        dir,
+        &Backend::Injects(PROTON_DECOY),
+        &Listing::Json(LISTING),
+    );
+    support::stub_pass_cli_store(dir, &inner, behaviour)
+}
+
+#[test]
+fn an_fs_child_pointed_at_an_empty_directory_creates_the_store_the_vendor_creates() {
+    // Two vendor facts in one invocation, because they happen in one stretch of
+    // its startup and a case that separated them would need two fixtures to say
+    // one thing: `get_base_dir` creates `.session` under the variable, mode
+    // 0700, on EVERY verb before dispatch; and the `fs` key provider MINTS
+    // `local.key` at 0600 when it finds none — also on every verb, a read
+    // included.
+    //
+    // That pair is why an operator's mistyped command leaves a whole
+    // old-style layout behind for something else to find later.
+    let dir = scratch("vendor-store-fs-creates");
+    let vendor = store_stub(&dir, &support::VendorStore::INSTANT);
+    let scope = vendor_scope(&dir, "scope");
+
+    let output = run_vendor(&vendor, &scope, &Keying::Fs, &["info"]);
+
+    let base = scope.join(".session");
+    assert!(
+        base.is_dir(),
+        "the vendor creates `.session` under the directory the variable names, on every verb"
+    );
+    assert_eq!(mode_of(&base), 0o700, "`.session` is created owner-only");
+    let key = base.join("local.key");
+    assert!(
+        key.is_file(),
+        "an `fs` child that finds no local key mints one — on a read, not only on a login"
+    );
+    assert_eq!(mode_of(&key), 0o600, "the minted key is created owner-only");
+    // The verb itself still fails: there is no session in this directory. That
+    // is the shape of the hazard — the failure is ordinary and the directory
+    // has been written to anyway.
+    assert!(!output.status.success());
+    assert!(
+        said(&output).contains("This operation requires an authenticated client"),
+        "a verb against a directory with no session is refused in the vendor's own words: {}",
+        said(&output)
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn an_env_child_pointed_at_an_empty_directory_mints_no_key_at_all() {
+    // The counterpart to the case above, and the reason this daemon moved to
+    // `env`: the environment provider derives its key from the variable and
+    // stores nothing, so no file appears beside the session store for a
+    // concurrent child to delete, mint or disagree about.
+    let dir = scratch("vendor-store-env-mints-nothing");
+    let vendor = store_stub(&dir, &support::VendorStore::INSTANT);
+    let scope = vendor_scope(&dir, "scope");
+
+    run_vendor(
+        &vendor,
+        &scope,
+        &Keying::Env(ENCRYPTION_KEY_DECOY),
+        &["info"],
+    );
+
+    assert!(
+        scope.join(".session").is_dir(),
+        "`.session` is still created: that half is the provider's business"
+    );
+    assert!(
+        !scope.join(".session").join("local.key").exists(),
+        "an `env` child must never write a local key"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_child_that_cannot_create_the_local_key_fails_with_the_vendors_own_sentence() {
+    // In production this is a RACE: `create_new(true)` is `O_EXCL`, so two
+    // children that both find `local.key` missing both try to create it and the
+    // loser fails outright rather than reading what the winner wrote.
+    //
+    // The case reaches that branch without running a race, through the vendor's
+    // own guard: it reads the key only when the path exists AND is a file, so a
+    // path that exists and is not one falls through to the same `create_new`,
+    // which fails for the same reason with the same sentence. A test built on
+    // two concurrent children would prove this only on the runs where they
+    // actually collided, and would read as a pass on every run where they did
+    // not.
+    let dir = scratch("vendor-store-key-race-loser");
+    let vendor = store_stub(&dir, &support::VendorStore::INSTANT);
+    let scope = vendor_scope(&dir, "scope");
+    std::fs::create_dir_all(scope.join(".session").join("local.key"))
+        .expect("occupy the key's own path");
+
+    let output = run_vendor(&vendor, &scope, &Keying::Fs, &["info"]);
+
+    assert!(!output.status.success());
+    assert!(
+        said(&output).contains("Error creating local key file"),
+        "the loser of the mint must fail in the vendor's own words: {}",
+        said(&output)
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn an_env_child_with_no_key_is_refused_before_it_can_delete_anything() {
+    // The fact that settles what a probe naming `env` with no key DOES: the
+    // provider's constructor returns an error, the caller propagates it with
+    // `?`, and no client is ever built — so no dispatch runs and no cleanup
+    // path is reached. A probe like that MISCLASSIFIES; it does not destroy
+    // the session.
+    //
+    // An EMPTY value is refused exactly as hard as a missing one, which is the
+    // half a reader assumes rather than checks.
+    let dir = scratch("vendor-store-env-no-key");
+    let vendor = store_stub(&dir, &support::VendorStore::INSTANT);
+    let scope = vendor_scope(&dir, "scope");
+    run_vendor(
+        &vendor,
+        &scope,
+        &Keying::Env(ENCRYPTION_KEY_DECOY),
+        &["login"],
+    );
+    let session = scope.join(".session").join("session.json");
+    assert!(session.is_file(), "the fixture must start from a session");
+
+    for keying in [Keying::EnvWithoutKey, Keying::EnvWithEmptyKey] {
+        let output = run_vendor(&vendor, &scope, &keying, &["run", "--", "true"]);
+        assert!(!output.status.success());
+        assert_eq!(
+            said(&output).trim(),
+            "Error: PROTON_PASS_ENCRYPTION_KEY environment variable must be set and non-empty \
+             when using env key provider",
+            "the refusal is the vendor's own sentence, verbatim"
+        );
+        assert!(
+            session.is_file(),
+            "a read refused at provider construction must leave the session store untouched"
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_child_handed_no_key_provider_lands_on_neither_the_file_nor_the_environment() {
+    // The default when `PROTON_PASS_KEY_PROVIDER` is unset OR EMPTY is
+    // `keyring` — a third provider, not `fs`. A daemon's own uid has an empty
+    // login keyring, and that provider's answer to "no key beside local data"
+    // is to FORCE A LOGOUT, which the `fs` provider has no equivalent of.
+    //
+    // So a call site that forgot to set the provider does not merely read the
+    // wrong key: it destroys the session it was pointed at.
+    let dir = scratch("vendor-store-unset-provider");
+    let vendor = store_stub(&dir, &support::VendorStore::INSTANT);
+
+    for (tag, keying) in [("unset", Keying::Unset), ("empty", Keying::Empty)] {
+        let scope = vendor_scope(&dir, tag);
+        run_vendor(&vendor, &scope, &Keying::Fs, &["login"]);
+        let base = scope.join(".session");
+        assert!(base.join("session.json").is_file(), "{tag}: fixture");
+
+        let output = run_vendor(&vendor, &scope, &keying, &["run", "--", "true"]);
+
+        assert!(!output.status.success(), "{tag}");
+        assert!(
+            said(&output).contains("Forcing logout for security"),
+            "{tag}: the keyring provider's own guard must be what answered: {}",
+            said(&output)
+        );
+        assert!(
+            !base.exists(),
+            "{tag}: that guard force-logs-out, so the whole store is gone"
+        );
+        assert!(
+            scope.is_dir(),
+            "{tag}: the directory the variable names is never what goes"
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_session_written_under_one_key_cannot_be_read_under_another_and_logout_cannot_repair_it() {
+    // The terminal state this whole effort is about, reached deliberately: a
+    // `session.json` on disk under a key no surviving `local.key` holds. The
+    // next child mints a fresh key and every verb fails with the same
+    // sentence.
+    //
+    // And the part that makes it terminal rather than transient: the client is
+    // built — which means the store is decrypted — BEFORE dispatch, for every
+    // command except `logout --force` and `completions`. So the obvious repair,
+    // a plain `logout`, fails for the same reason everything else does.
+    let dir = scratch("vendor-store-undecryptable");
+    let vendor = store_stub(&dir, &support::VendorStore::INSTANT);
+    let scope = vendor_scope(&dir, "scope");
+
+    run_vendor(&vendor, &scope, &Keying::Fs, &["login"]);
+    let base = scope.join(".session");
+    assert!(base.join("session.json").is_file(), "fixture");
+    // Exactly what the concurrent-child class leaves behind: the session file
+    // survives, the key it was written under does not.
+    std::fs::remove_file(base.join("local.key")).expect("take the key away");
+
+    for verb in [
+        vec!["run", "--", "true"],
+        vec!["info"],
+        vec!["item", "list"],
+        vec!["logout"],
+    ] {
+        let output = run_vendor(&vendor, &scope, &Keying::Fs, &verb);
+        assert!(!output.status.success(), "{verb:?} must fail");
+        assert_eq!(
+            said(&output).trim(),
+            "Error: Error decrypting local session(Error decrypting session: aead::Error)",
+            "{verb:?}: the vendor has one sentence for this and every verb gets it"
+        );
+    }
+
+    // `logout --force` is the one command that never opens the store, so it is
+    // the only thing that clears this by hand.
+    let forced = run_vendor(&vendor, &scope, &Keying::Fs, &["logout", "--force"]);
+    assert!(
+        forced.status.success(),
+        "`logout --force` must work where plain `logout` cannot: {}",
+        said(&forced)
+    );
+    assert!(!base.exists(), "the force logout takes the whole store");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_read_whose_session_the_account_revoked_deletes_the_whole_store_on_its_way_out() {
+    // The first of the vendor's three paths to `remove_dir_all`, and the one
+    // that is hardest to believe from the outside: a plain read — no logout
+    // anywhere near it — deletes the session store it was pointed at, and then
+    // reports an ordinary error.
+    //
+    // The other two are asserted beside it, because they fire even EARLIER:
+    // before the command runs at all, off the persisted session's own fields.
+    // Slice by slice this crate survives all three identically or none of them,
+    // so they are one case.
+    let dir = scratch("vendor-store-destructive-reads");
+    // The callback's cleanup is not the only thing an invalidated read does:
+    // the store schedules its own `session.json` write, and with both instant
+    // the two race — which is the vendor, and is the subject of the
+    // concurrent-child case rather than of this one. Starting the write after
+    // the cleanup has finished takes it out of contention, so what this case
+    // observes is the cleanup alone.
+    let vendor = store_stub(
+        &dir,
+        &support::VendorStore {
+            persist_key_delay: Duration::from_millis(300),
+            ..support::VendorStore::INSTANT
+        },
+    );
+
+    let revoked = vendor_scope(&dir, "revoked");
+    run_vendor(&vendor, &revoked, &Keying::Fs, &["login"]);
+    support::revoke_vendor_session(&dir, &revoked);
+    let output = run_vendor(&vendor, &revoked, &Keying::Fs, &["run", "--", "true"]);
+    assert!(!output.status.success());
+    assert!(
+        said(&output).contains("Your session has been invalidated"),
+        "the callback path reports in the vendor's own words: {}",
+        said(&output)
+    );
+    assert!(
+        !revoked.join(".session").exists(),
+        "a READ deleted nothing — the callback's cleanup is a `remove_dir_all`"
+    );
+    assert!(
+        revoked.is_dir(),
+        "the directory the variable names survives"
+    );
+
+    for (tag, state) in [
+        ("unauthenticated", support::VendorSession::NotAuthenticated),
+        ("extra-password", support::VendorSession::NeedsExtraPassword),
+    ] {
+        let scope = vendor_scope(&dir, tag);
+        run_vendor(&vendor, &scope, &Keying::Fs, &["login"]);
+        support::degrade_vendor_session(&scope, &state);
+
+        let output = run_vendor(&vendor, &scope, &Keying::Fs, &["run", "--", "true"]);
+
+        assert!(!output.status.success(), "{tag}");
+        assert!(
+            said(&output).contains("This operation requires an authenticated client"),
+            "{tag}: {}",
+            said(&output)
+        );
+        assert!(
+            !scope.join(".session").exists(),
+            "{tag}: the dispatch deletes the store before the command runs"
+        );
+        assert!(scope.is_dir(), "{tag}: the named directory survives");
+    }
+
+    // Which branch each call took, read off the stand-in's own trace rather
+    // than inferred from an exit status all three share.
+    let outcomes: Vec<String> = support::vendor_store_trace(&dir)
+        .iter()
+        .filter_map(|line| line.split_whitespace().last().map(str::to_owned))
+        .collect();
+    for expected in [
+        "revoked-cleanup",
+        "not-authenticated",
+        "needs-extra-password",
+    ] {
+        assert!(
+            outcomes.iter().any(|outcome| outcome == expected),
+            "no call took the `{expected}` path; the trace holds {outcomes:?}"
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_logout_under_fs_takes_the_key_with_it_and_one_under_env_has_no_key_to_take() {
+    // `logout` calls `remove_key()` unconditionally, BEFORE it deletes the
+    // directory. Under `fs` that unlinks a file a concurrent reader's session
+    // still needs; under `env` the vendor documents it as a no-op, because the
+    // key only ever lived in process memory.
+    //
+    // That difference is the whole of why this daemon moved to `env`, so it is
+    // worth a case that would notice the vendor giving `env` a key file.
+    let dir = scratch("vendor-store-logout-keys");
+    let vendor = store_stub(&dir, &support::VendorStore::INSTANT);
+
+    let on_fs = vendor_scope(&dir, "fs");
+    run_vendor(&vendor, &on_fs, &Keying::Fs, &["login"]);
+    assert!(
+        on_fs.join(".session").join("local.key").is_file(),
+        "an `fs` login leaves a key file behind"
+    );
+    let out = run_vendor(&vendor, &on_fs, &Keying::Fs, &["logout"]);
+    assert!(out.status.success(), "{}", said(&out));
+    assert!(!on_fs.join(".session").exists(), "the store goes too");
+
+    let on_env = vendor_scope(&dir, "env");
+    run_vendor(
+        &vendor,
+        &on_env,
+        &Keying::Env(ENCRYPTION_KEY_DECOY),
+        &["login"],
+    );
+    assert!(
+        !on_env.join(".session").join("local.key").exists(),
+        "an `env` login writes no key file, so a logout has none to unlink"
+    );
+    let out = run_vendor(
+        &vendor,
+        &on_env,
+        &Keying::Env(ENCRYPTION_KEY_DECOY),
+        &["logout"],
+    );
+    assert!(out.status.success(), "{}", said(&out));
+    assert!(!on_env.join(".session").exists());
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn the_stand_ins_info_answers_while_a_read_against_the_same_session_fails() {
+    // `info` is answered by the stand-in itself rather than handed to the
+    // fixture underneath it, and that separation is load-bearing: this crate
+    // classifies a failing read by asking `info` about the same session, so a
+    // stand-in whose `info` shared the read's fate could not tell a verdict
+    // about a NAME from a fault in the SESSION, and every case built on that
+    // distinction would pass for the wrong reason.
+    let dir = scratch("vendor-store-info-independent");
+    // A listing holding no item at all, so a read for the declared name fails
+    // as a verdict about the name while the session behind it is sound.
+    let inner = stub_pass_cli_listing(&dir, &Backend::Injects(PROTON_DECOY), &Listing::EMPTY);
+    let vendor = support::stub_pass_cli_store(&dir, &inner, &support::VendorStore::INSTANT);
+    let scope = vendor_scope(&dir, "scope");
+    run_vendor(&vendor, &scope, &Keying::Fs, &["login"]);
+
+    let listed = run_vendor(
+        &vendor,
+        &scope,
+        &Keying::Fs,
+        &["item", "list", "--vault-name", VAULT, "--output", "json"],
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&listed.stdout).trim(),
+        r#"{"items":[]}"#,
+        "the read reached the fixture underneath and found nothing"
+    );
+
+    let info = run_vendor(&vendor, &scope, &Keying::Fs, &["info"]);
+    assert!(
+        info.status.success(),
+        "`info` must answer from the session's own state: {}",
+        said(&info)
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ---------------------------------------------------------------------------
+// The daemon, against a vendor that behaves the way the real one does.
+// ---------------------------------------------------------------------------
+
+/// Wait until `<root>/current` names something other than `held`, and hand back
+/// what it names instead.
+fn until_current_moves_past(root: &Path, held: &str, patience: Duration) -> String {
+    let deadline = Instant::now() + patience;
+    loop {
+        if let Some(name) = current_generation(root)
+            && name != held
+        {
+            return name;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "`current` still names {held} after {patience:?}"
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
+/// Wait for the renewal loop's first generation and hand back its name.
+fn until_a_generation_is_published(root: &Path, patience: Duration) -> String {
+    let deadline = Instant::now() + patience;
+    loop {
+        if let Some(name) = current_generation(root) {
+            return name;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "no generation was published within {patience:?}"
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
+#[test]
+fn a_generation_the_vendor_destroys_on_a_read_costs_one_degraded_answer_and_is_replaced() {
+    // CONTROL — the change that makes this fail: have the renewal loop repair
+    // the CURRENT generation in place rather than establishing a new one. The
+    // vendor has three ways to delete the directory it is pointed at, two of
+    // them decided before the command runs, and a repair in place hands the
+    // replacement session back to the same directory a concurrent child may be
+    // deleting.
+    //
+    // The three paths are one case rather than three, because the design
+    // survives all of them or none: what the daemon does about a destroyed
+    // generation cannot depend on which branch inside the vendor destroyed it.
+    let dir = scratch("daemon-proton-vendor-destroys-generation");
+    // `key_provider: env`, which is what this daemon ships — the deletions
+    // below are the vendor's dispatch and its invalidation callback, and
+    // neither reads the key provider at all.
+    let vendor = store_stub(&dir, &support::VendorStore::INSTANT);
+    let config = daemon_config_with_generations_loop_env(&dir, &vendor, 90, 1, 60_000);
+    let running = start_daemon(&config, policy_allowing_self());
+    let root = session_dir(&dir);
+
+    let mut current = until_a_generation_is_published(&root, Duration::from_secs(30));
+    let client = client_config(running.socket(), 60_000);
+    let registry = store::build(&client, &Invocation::default()).registry;
+    match registry.resolve(DECLARED) {
+        Resolution::Found { .. } => {}
+        other => panic!("the fixture never resolved at all: {}", other.reason()),
+    }
+
+    for path in ["revoked", "unauthenticated", "extra-password"] {
+        let generation = root.join(&current);
+        match path {
+            "revoked" => support::revoke_vendor_session(&dir, &generation),
+            "unauthenticated" => {
+                support::degrade_vendor_session(
+                    &generation,
+                    &support::VendorSession::NotAuthenticated,
+                );
+            }
+            _ => support::degrade_vendor_session(
+                &generation,
+                &support::VendorSession::NeedsExtraPassword,
+            ),
+        }
+
+        // The read that meets the vendor in that state. It degrades — and on
+        // its way to degrading, the vendor deletes the store it was scoped at.
+        let degraded = registry.resolve(DECLARED);
+        assert!(
+            !matches!(degraded, Resolution::Found { .. }),
+            "{path}: the vendor refuses this read, so it cannot have resolved"
+        );
+        assert!(
+            !generation.join(".session").join("session.json").exists(),
+            "{path}: the vendor deletes the session store on its way out, and this case is \
+             about what the daemon does afterwards — if the file is still there the fixture \
+             did not reproduce the hazard"
+        );
+
+        // The loop's answer: a generation of its own, never a repair of the
+        // one the vendor just emptied.
+        current = until_current_moves_past(&root, &current, Duration::from_secs(60));
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            if matches!(registry.resolve(DECLARED), Resolution::Found { .. }) {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "{path}: reads never came back after the generation was replaced"
+            );
+            std::thread::sleep(Duration::from_millis(200));
+        }
+    }
+
+    // Three destroyed generations, three replacements — read off the vendor's
+    // own trace rather than from the daemon's account of itself.
+    let outcomes: Vec<String> = support::vendor_store_trace(&dir)
+        .iter()
+        .filter_map(|line| line.split_whitespace().last().map(str::to_owned))
+        .collect();
+    for expected in [
+        "revoked-cleanup",
+        "not-authenticated",
+        "needs-extra-password",
+    ] {
+        assert!(
+            outcomes.iter().any(|outcome| outcome == expected),
+            "the vendor never took the `{expected}` path, so this case proved nothing about \
+             it: the trace holds {outcomes:?}"
+        );
+    }
+
+    drop(running);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// How long the concurrent-child case keeps reading while the loop renews.
+///
+/// Not a deadline on anything: it is how long the hazard is OFFERED. The loop
+/// renews on its own interval, and every renewal opens one window in which a
+/// reader becomes a deleter, so this is several windows rather than one.
+const HAZARD_WINDOW: Duration = Duration::from_secs(35);
+
+#[test]
+fn no_read_meets_a_session_store_a_renewal_left_undecryptable() {
+    // The case this whole effort exists for, driven by the vendor's own
+    // behaviour rather than by a description of it.
+    //
+    // The vendor's `logout` revokes the session at the account and only then
+    // deletes locally, so for the width of that window every other child
+    // holding the session is refused — and a refused child runs the
+    // invalidation cleanup AND schedules a `session.json` write whose key it
+    // resolves at one instant and whose rename lands at a later one. A
+    // renewal that logs out the directory readers are using therefore leaves,
+    // deterministically, a session file under a key no surviving `local.key`
+    // holds. The next child mints a fresh key, cannot decrypt what is there,
+    // and every read after that fails the same way: the state is terminal, not
+    // transient.
+    //
+    // The windows below are set so that ordering is arithmetic:
+    //
+    //   the revoke, then 300 ms before anything local is deleted
+    //   a reader landing inside that window resolves the key AT ONCE
+    //   its rename lands 600 ms later — after the deletions, before the rmdir
+    //   each rmdir is 2 s behind its own listing, so the rename beats both
+    //
+    // Against a renewal that replaces the directory in place this goes red on
+    // the first window it is offered. Against a renewal that establishes each
+    // session in a generation of its own it cannot go red at all, because no
+    // logout is ever pointed at a directory a reader is holding.
+    let dir = scratch("daemon-proton-concurrent-children");
+    let vendor = store_stub(
+        &dir,
+        &support::VendorStore {
+            logout_delay: Duration::from_millis(300),
+            rmdir_window: Duration::from_secs(2),
+            persist_key_delay: Duration::ZERO,
+            persist_write_delay: Duration::from_millis(600),
+            login_delay: Duration::ZERO,
+        },
+    );
+    // `key_provider: fs`, because the key that gets minted, deleted and
+    // disagreed about is a FILE under that provider and does not exist at all
+    // under the other. `login_after_minutes: 0` makes every tick due, so the
+    // window is offered on the loop's own interval rather than once.
+    let config = daemon_config_with_generations_loop(&dir, &vendor, 0, 1, 60_000);
+    let running = start_daemon(&config, policy_allowing_self());
+    let root = session_dir(&dir);
+    until_a_generation_is_published(&root, Duration::from_secs(30));
+
+    // Two readers, because one is not concurrency. They read flat out for the
+    // whole window and keep every reason they were given.
+    let stop = Instant::now() + HAZARD_WINDOW;
+    let readers: Vec<_> = (0..2)
+        .map(|_| {
+            let socket = running.socket().to_path_buf();
+            std::thread::spawn(move || {
+                let mut reasons: Vec<String> = Vec::new();
+                let mut answered = 0_usize;
+                while Instant::now() < stop {
+                    let client = Client::new(socket.clone(), Duration::from_secs(30));
+                    match client.request(&Request::resolve(DECLARED)) {
+                        Ok(Reply::Value(_)) => answered += 1,
+                        Ok(Reply::Failed(reason)) => reasons.push(reason),
+                        Ok(other) => reasons.push(format!("{other:?}")),
+                        Err(error) => reasons.push(error.to_string()),
+                    }
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                (answered, reasons)
+            })
+        })
+        .collect();
+
+    let mut answered = 0_usize;
+    let mut reasons: Vec<String> = Vec::new();
+    for reader in readers {
+        let (ok, said) = reader.join().expect("a reader thread panicked");
+        answered += ok;
+        reasons.extend(said);
+    }
+
+    let trace = support::vendor_store_trace(&dir);
+    let outcome = |name: &str| {
+        trace
+            .iter()
+            .filter(|line| line.split_whitespace().last() == Some(name))
+            .count()
+    };
+
+    // The two halves of the fingerprint, in the order the incident produced
+    // them: a `remove_dir_all` that lost its own directory, and then a session
+    // store nothing can decrypt.
+    assert_eq!(
+        outcome("logout-enotempty"),
+        0,
+        "a renewal's `remove_dir_all` raced an entry that appeared after its listing — the \
+         `Directory not empty` half of the incident. The vendor's trace: {trace:?}"
+    );
+    assert_eq!(
+        outcome("undecryptable"),
+        0,
+        "a child met a session store under a key no surviving local key holds — the \
+         terminal half. The vendor's trace: {trace:?}"
+    );
+    let aead: Vec<&String> = reasons
+        .iter()
+        .filter(|reason| reason.contains("aead::Error"))
+        .collect();
+    assert!(
+        aead.is_empty(),
+        "a caller was handed the vendor's undecryptable-session sentence: {aead:?}"
+    );
+
+    // Two controls, because every assertion above is satisfied by a run in
+    // which nothing happened: the hazard has to have been OFFERED.
+    assert!(
+        outcome("logged-in") >= 2,
+        "the renewal loop logged in {} time(s), so the window this case is about was never \
+         opened more than once",
+        outcome("logged-in")
+    );
+    assert!(
+        answered > 0,
+        "no read ever succeeded, so this run says nothing about what readers met"
+    );
+
+    drop(running);
+    let _ = std::fs::remove_dir_all(&dir);
+}
