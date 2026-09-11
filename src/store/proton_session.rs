@@ -397,6 +397,35 @@ pub struct Generations {
     /// tick. Keyed by [`Candidate::label`] rather than by [`GenerationName`]
     /// so the legacy candidate — which has no name — gets the same treatment.
     reported_failures: Mutex<BTreeSet<String>>,
+    /// The last coalesced session-health probe [`Generations::session_fault`]
+    /// actually ran, and what it heard. See that method.
+    probe: Mutex<Option<ProbeMemo>>,
+    /// The generation a read last established cannot be used — a missing
+    /// `session.json`, or a probe that could not reach it — consumed by
+    /// [`Generations::take_session_fault`]: the renewal loop's own cue to
+    /// replace it without waiting out its ordinary interval.
+    ///
+    /// # Why it carries the name rather than a bare flag
+    ///
+    /// A read keeps serving from the generation it entered while a
+    /// replacement is built beside it, so a pass held on one generation can
+    /// fail and report AFTER the loop has already published the next one. A
+    /// flag with no name cannot tell the loop that the report is about a
+    /// generation it has already replaced, and the loop then replaces the
+    /// healthy one — a spurious login, a spurious generation, and a
+    /// spurious retirement, once per late report. The name is free: the
+    /// reporting caller is holding it.
+    ///
+    /// See [`Generations::report_session_fault`].
+    session_fault: Mutex<Option<GenerationName>>,
+}
+
+/// What [`Generations::probe_once_per_window`] last asked, and heard, for one
+/// generation. Only a conclusive answer is ever stored here.
+struct ProbeMemo {
+    generation: GenerationName,
+    at: Instant,
+    answer: bool,
 }
 
 impl Generations {
@@ -410,6 +439,8 @@ impl Generations {
             passes: Mutex::new(BTreeMap::new()),
             changed: Condvar::new(),
             reported_failures: Mutex::new(BTreeSet::new()),
+            probe: Mutex::new(None),
+            session_fault: Mutex::new(None),
         }
     }
 
@@ -941,6 +972,110 @@ impl Generations {
             .unwrap_or_else(PoisonError::into_inner);
         reported.insert(label.to_owned())
     }
+
+    /// Run `check` for `name` at most once per `window`, so a burst of
+    /// callers asking the same question about the same generation costs one
+    /// `check`, not one each.
+    ///
+    /// Generic over what the question is: this type owns WHICH generation a
+    /// verdict belongs to and the arbitration between callers, and the
+    /// caller owns what is being asked. The session-health probe is its one
+    /// caller today.
+    ///
+    /// # Why the lock is held across `check`
+    ///
+    /// The same shape [`super::proton::ProtonStore::cached_items`] already
+    /// uses for a vault listing: the lock is held across the vendor spawn on
+    /// purpose, so every caller racing to ask the same question about the
+    /// same generation waits for the one spawn already in flight and reads
+    /// its answer, rather than each starting a `pass-cli info` of its own. A
+    /// burst of names failing together over one broken session is exactly
+    /// the shape that would otherwise multiply one vendor child into N.
+    ///
+    /// A call for a DIFFERENT generation than the memoised one always runs
+    /// `check` fresh — a cached verdict about a generation that is no longer
+    /// current says nothing about the one that replaced it, and a `window`
+    /// this call reads as elapsed is the same case.
+    ///
+    /// `check` is never called while `self.passes` is locked — [`Generations::enter`]
+    /// and [`Generations::drain`] each take their own, separate lock, so a
+    /// probe in flight here never blocks a reader entering or a retirement
+    /// draining.
+    /// # Why an inconclusive `check` is not memoised
+    ///
+    /// `check` answers `None` when it could not run at all — the machine out
+    /// of process slots, the deadline hit. That is not a verdict about the
+    /// session, so writing it into the memo would fix a non-answer for the
+    /// whole window and deny every caller behind it the question. It is
+    /// returned to this call's own caller and forgotten.
+    pub(crate) fn probe_once_per_window(
+        &self,
+        name: &GenerationName,
+        window: Duration,
+        check: impl FnOnce() -> Option<bool>,
+    ) -> Option<bool> {
+        let mut probe = self.probe.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(memo) = probe.as_ref()
+            && &memo.generation == name
+            && memo.at.elapsed() < window
+        {
+            return Some(memo.answer);
+        }
+        let answer = check()?;
+        *probe = Some(ProbeMemo {
+            generation: name.clone(),
+            at: Instant::now(),
+            answer,
+        });
+        Some(answer)
+    }
+
+    /// Record that `name`'s session cannot be used right now — the renewal
+    /// loop's cue to replace it without waiting out its ordinary interval.
+    /// Idempotent: several callers reporting the same generation before the
+    /// loop next wakes cost one report, not one per caller.
+    pub(crate) fn report_session_fault(&self, name: &GenerationName) {
+        let mut reported = self
+            .session_fault
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        *reported = Some(name.clone());
+    }
+
+    /// Whether a fault is waiting to be acted on, without consuming it —
+    /// what a sleeping renewal loop polls to decide whether to wake early.
+    /// See [`Generations::take_session_fault`], the consuming read that
+    /// actually acts on it.
+    pub(crate) fn session_fault_pending(&self) -> bool {
+        self.session_fault
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .is_some()
+    }
+
+    /// Consume the pending fault, and answer whether it is still about the
+    /// generation now serving. Called once per renewal tick, so the event
+    /// that woke the loop early is also what decides that tick is due — a
+    /// fault reported after this call waits for the next one.
+    ///
+    /// A report is discarded only where it can be PROVEN superseded: the
+    /// `current` pointer resolves, and names a different generation. An
+    /// unreadable pointer proves nothing about the report, and is itself a
+    /// state a replacement fixes, so the fault stands.
+    pub(crate) fn take_session_fault(&self) -> bool {
+        let taken = self
+            .session_fault
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        let Some(reported) = taken else {
+            return false;
+        };
+        match self.current() {
+            Ok(current) => current == reported,
+            Err(_) => true,
+        }
+    }
 }
 
 fn write_all_and_sync(mut file: &fs::File, body: &[u8]) -> io::Result<()> {
@@ -951,6 +1086,7 @@ fn write_all_and_sync(mut file: &fs::File, body: &[u8]) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::Ordering;
 
     fn scratch(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
@@ -1484,5 +1620,214 @@ mod tests {
         };
         assert_eq!(pass.dir(), dir);
         drop(pass); // must not panic, and there is nothing to notify
+    }
+
+    #[test]
+    fn a_burst_of_callers_on_one_generation_costs_one_probe_not_one_each() {
+        // CONTROL — the change that makes this fail: dropping the lock
+        // before calling `check`, so two threads at the same instant both
+        // read `probe` as empty and both spawn one — the shape a coalesced
+        // probe exists to rule out. Asserted below by making `check` COUNT
+        // its own calls rather than by timing anything.
+        use std::sync::{Arc, Barrier};
+
+        let generations = Arc::new(Generations::at(scratch("session-fault-burst")));
+        let name = GenerationName::mint(SystemTime::now(), 1);
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        // Every thread reaches `session_fault` at the same instant rather
+        // than in whatever order the scheduler happens to run them, which is
+        // what makes "one, not N" a property of the coalescing rather than
+        // an accident of how fast eight threads can be spawned.
+        let barrier = Arc::new(Barrier::new(8));
+
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let generations = Arc::clone(&generations);
+                let calls = Arc::clone(&calls);
+                let name = name.clone();
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    generations.probe_once_per_window(&name, Duration::from_secs(3), || {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        // A little slower than an instant return, so the
+                        // seven threads still queued on the lock are
+                        // genuinely waiting on this call rather than each
+                        // finding the memo already written by the time
+                        // they arrive.
+                        std::thread::sleep(Duration::from_millis(50));
+                        Some(true)
+                    })
+                })
+            })
+            .collect();
+
+        let results: Vec<Option<bool>> = handles
+            .into_iter()
+            .map(|handle| handle.join().expect("a probing thread panicked"))
+            .collect();
+
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "eight callers about one generation ran the probe more than once"
+        );
+        assert!(
+            results.iter().all(|&answer| answer == Some(true)),
+            "a caller that waited on the coalesced probe did not get its answer"
+        );
+    }
+
+    #[test]
+    fn a_probe_older_than_its_window_is_asked_again() {
+        let generations = Generations::at(scratch("session-fault-window"));
+        let name = GenerationName::mint(SystemTime::now(), 1);
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+
+        let first = generations.probe_once_per_window(&name, Duration::from_millis(10), || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Some(false)
+        });
+        std::thread::sleep(Duration::from_millis(30));
+        let second = generations.probe_once_per_window(&name, Duration::from_millis(10), || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Some(true)
+        });
+
+        assert_eq!(
+            first,
+            Some(false),
+            "the first probe's own answer was not returned"
+        );
+        assert_eq!(
+            second,
+            Some(true),
+            "a probe past its window reused a stale memo"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "a probe past its window did not run `check` again"
+        );
+    }
+
+    #[test]
+    fn take_session_fault_consumes_the_flag_exactly_once() {
+        let generations = Generations::at(scratch("session-fault-take"));
+        assert!(
+            !generations.take_session_fault(),
+            "a fresh Generations reported a fault nobody raised"
+        );
+
+        let name = GenerationName::mint(SystemTime::now(), 1);
+        generations.report_session_fault(&name);
+        assert!(generations.session_fault_pending(), "peeking consumed it");
+        assert!(
+            generations.session_fault_pending(),
+            "peeking is not idempotent"
+        );
+        assert!(
+            generations.take_session_fault(),
+            "the reported fault was not there to take"
+        );
+        assert!(
+            !generations.take_session_fault(),
+            "the same fault was taken twice"
+        );
+    }
+
+    #[test]
+    fn a_fault_about_a_superseded_generation_is_not_acted_on() {
+        // A read keeps serving from the generation it entered while a
+        // replacement is built beside it, so a pass held on the old one can
+        // fail and report AFTER the loop published the next. Acting on that
+        // report replaces a generation nothing is wrong with — one spurious
+        // login, one spurious generation, one spurious retirement.
+        //
+        // CONTROL — the change that makes this fail: storing a bare flag
+        // rather than the name, or having `take_session_fault` return the
+        // flag without comparing it against `current`. Either way the
+        // assertion below reads `true` and the loop replaces a healthy
+        // generation.
+        let generations = Generations::at(scratch("session-fault-superseded"));
+
+        let (old, _) = generations.create(None).expect("mint the old generation");
+        generations.publish(&old, None).expect("publish the old");
+        generations.report_session_fault(&old);
+
+        let (new, _) = generations.create(None).expect("mint the new generation");
+        generations.publish(&new, None).expect("publish the new");
+
+        assert!(
+            !generations.take_session_fault(),
+            "a fault about a generation `current` no longer names was acted on"
+        );
+    }
+
+    #[test]
+    fn a_fault_about_the_generation_still_serving_is_acted_on() {
+        // The other half of the case above: without this, "discard what is
+        // superseded" could be satisfied by discarding everything, and the
+        // wake would never fire at all.
+        let generations = Generations::at(scratch("session-fault-current"));
+
+        let (name, _) = generations.create(None).expect("mint a generation");
+        generations.publish(&name, None).expect("publish it");
+        generations.report_session_fault(&name);
+
+        assert!(
+            generations.take_session_fault(),
+            "a fault about the generation now serving was discarded"
+        );
+    }
+
+    #[test]
+    fn a_fault_reported_with_no_current_pointer_still_stands() {
+        // An unreadable `current` proves nothing about the report, and is
+        // itself a state a replacement fixes — so the fault survives rather
+        // than being discarded for lack of something to compare against.
+        let generations = Generations::at(scratch("session-fault-no-current"));
+        let name = GenerationName::mint(SystemTime::now(), 1);
+        generations.report_session_fault(&name);
+
+        assert!(
+            generations.take_session_fault(),
+            "a fault was discarded because `current` could not be read"
+        );
+    }
+
+    #[test]
+    fn an_inconclusive_probe_is_not_written_into_the_memo() {
+        // `check` answers `None` when it could not run at all — no process
+        // slot, deadline hit. Memoising that would fix a non-answer for the
+        // whole window and deny every caller behind it the question.
+        //
+        // CONTROL — the change that makes this fail: storing the `None` as a
+        // verdict, or returning the previous memo instead of asking again.
+        // The second call's count below would then read 1, not 2.
+        let generations = Generations::at(scratch("session-fault-inconclusive"));
+        let name = GenerationName::mint(SystemTime::now(), 1);
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+
+        let first = generations.probe_once_per_window(&name, Duration::from_secs(60), || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            None
+        });
+        let second = generations.probe_once_per_window(&name, Duration::from_secs(60), || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Some(true)
+        });
+
+        assert_eq!(first, None, "an inconclusive probe invented an answer");
+        assert_eq!(
+            second,
+            Some(true),
+            "the call after an inconclusive one did not get its own answer"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "an inconclusive probe was memoised, so the next caller was not asked"
+        );
     }
 }

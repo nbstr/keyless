@@ -1290,8 +1290,17 @@ fn a_vendor_that_answers_about_the_item_evicts_the_value_and_the_next_read_degra
     // when a store answers about it, or the adapter reporting this sentence as
     // a transport failure. Either way the poll below never degrades and fails
     // at `NEVER_HAPPENED`.
+    //
+    // Wrapped in `stub_with_session_verbs` with `info_answers: true` since
+    // the session-fault slice landed: this test's whole point is a HEALTHY
+    // session that the account still refuses an item over, and the plain
+    // `Backend::Controlled` stub answers every verb — `info` included —
+    // out of the same `NextCall`, which would misread this exact case as a
+    // dead session.
     let dir = scratch("daemon-proton-warm-verdict");
-    let vendor = stub_pass_cli_listing(&dir, &Backend::Controlled, &Listing::Json(LISTING));
+    let inner = stub_pass_cli_listing(&dir, &Backend::Controlled, &Listing::Json(LISTING));
+    let vendor =
+        stub_with_session_verbs(&dir, &inner, Duration::ZERO, true, LogoutAnswer::Ok, None);
     let config = daemon_config_with_a_warm_cache(&dir, &vendor, FRESHNESS_SECONDS, STALE_SECONDS);
     let running = start_daemon(&config, policy_allowing_self());
 
@@ -2467,4 +2476,447 @@ fn a_read_already_in_flight_finishes_against_an_intact_directory_while_its_gener
 
     drop(running);
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ---------------------------------------------------------------------------
+// A session fault is not a verdict about a name: a vendor failure that is
+// about the daemon's OWN session — never established by matching the
+// vendor's wording — keeps the cache warm, is reported as `Unavailable`, and
+// wakes the renewal loop; the same failure over a healthy session is still a
+// verdict about the item and still evicts.
+// ---------------------------------------------------------------------------
+
+/// A vendor sentence that means nothing to the transport allowlist and
+/// matches no phrase measured anywhere in this crate — the shape "the
+/// account said something about this read" takes when nobody has a more
+/// specific idea what. Used identically across every case below, so what
+/// changes between them is only whether the session answers, never the
+/// words — which is the property this whole slice exists to prove.
+const SESSION_FAULT_SENTENCE: &str =
+    "some arbitrary Proton failure text this build has never measured before";
+
+/// Remove `.session/session.json` from an already-published generation
+/// directory — [`support::publish_generation`] plants one by default, the
+/// way a real `pass-cli login` would have left it, so THIS is the explicit
+/// step a case takes to model the other half of the structural check: the
+/// vendor's own invalidation cleanup having removed it from inside a read.
+fn remove_session_file(generation_dir: &Path) {
+    let path = generation_dir.join(".session").join("session.json");
+    std::fs::remove_file(&path)
+        .unwrap_or_else(|error| panic!("remove the planted session.json at {path:?}: {error}"));
+}
+
+/// How many times `pass-cli info` ran, read out of
+/// [`stub_with_session_verbs`]'s own verb log — the coalesced probe's own
+/// tally, kept separate from [`vendor_call_count`] (the value-reading `run`
+/// verb) and [`listing_count`] (`item list`) for the same reason those two
+/// are kept apart from each other: each is a different claim about a
+/// different verb.
+fn info_call_count(dir: &Path) -> usize {
+    let verbs = std::fs::read_to_string(dir.join("pass-cli.verbs")).unwrap_or_default();
+    parse_verbs(&verbs)
+        .into_iter()
+        .filter(|line| line.verb == "info")
+        .count()
+}
+
+/// A second declared name, addressing the exact same vault, item and field
+/// as [`DECLARED`] — a burst across the two still shares one listing and one
+/// session either way, and reusing the coordinate keeps this fixture inside
+/// the decoy field names `tests/publication.rs` already allowlists rather
+/// than inventing a new one. That is what
+/// [`a_burst_of_failing_names_costs_one_probe_not_one_per_name`] needs: two
+/// failures that can only share a coalesced probe because they share a
+/// GENERATION, never because they share a vault entry.
+const DECLARED_2: &str = "FIXTURE_DECLARED_2";
+
+/// [`daemon_config_with_a_warm_cache`], with [`DECLARED_2`] added beside
+/// [`DECLARED`].
+fn daemon_config_with_two_names(
+    dir: &Path,
+    vendor: &Path,
+    freshness_seconds: u64,
+    stale_seconds: u64,
+) -> DaemonConfig {
+    support::publish_generation(&session_dir(dir));
+    let mut config: DaemonConfig = serde_json::from_str(&format!(
+        r#"{{"socket":"{socket}","audit":"{audit}",
+             "cache_ttl_seconds":0,"idle_timeout_seconds":5,
+             "stores":{{"proton":{{"enabled":true,"binary":"{vendor}",
+                                   "session_dir":"{session}",
+                                   "timeout_ms":60000}}}},
+             "secrets":{{"{DECLARED}":{{"store":"proton","vault":"{VAULT}",
+                                        "item":"{ITEM}","field":"password"}},
+                         "{DECLARED_2}":{{"store":"proton","vault":"{VAULT}",
+                                        "item":"{ITEM}","field":"password"}}}}}}"#,
+        socket = short_socket_path(dir).display(),
+        audit = dir.join("audit.jsonl").display(),
+        session = session_dir(dir).display(),
+        vendor = vendor.display(),
+    ))
+    .expect("valid daemon config");
+    config.cache_ttl_seconds = freshness_seconds;
+    config.cache_stale_seconds = stale_seconds;
+    config
+}
+
+#[test]
+fn a_vendor_failure_whose_info_also_fails_keeps_the_value_and_reports_the_store_unavailable() {
+    // CONTROL — the change that makes this fail: `vendor_failed` still
+    // classifying every non-transport failure as `StoreError::Backend`, the
+    // shape it had before this slice. The value would be evicted instead of
+    // kept, and the second `value_from` below would panic rather than read
+    // `held` back.
+    let dir = scratch("daemon-proton-session-fault-info-fails");
+    let inner = stub_pass_cli_listing(&dir, &Backend::Controlled, &Listing::Json(LISTING));
+    let vendor = stub_with_session_verbs(
+        &dir,
+        &inner,
+        Duration::ZERO,
+        false, // `info` fails too: the session itself cannot answer
+        LogoutAnswer::Ok,
+        None,
+    );
+    // `daemon_config_with_a_warm_cache` publishes the generation this reads
+    // through, with a `.session/session.json` already inside it — see
+    // `support::publish_generation_aged` — so the structural check's `stat`
+    // finds a present, ordinary session and falls through to the coalesced
+    // probe below.
+    let config = daemon_config_with_a_warm_cache(&dir, &vendor, FRESHNESS_SECONDS, STALE_SECONDS);
+    let running = start_daemon(&config, policy_allowing_self());
+
+    let client = client_config(running.socket(), 3_000);
+    let registry = store::build(&client, &Invocation::default()).registry;
+
+    let held = vendor_decoy(1);
+    assert_eq!(value_from(&registry, DECLARED), held);
+
+    set_next_call(&dir, &NextCall::Fails(SESSION_FAULT_SENTENCE));
+    std::thread::sleep(PAST_FRESHNESS);
+
+    assert_eq!(
+        value_from(&registry, DECLARED),
+        held,
+        "a session fault must keep the value the daemon already held"
+    );
+    until_the_vendor_has_been_asked(&dir, 2);
+
+    assert_eq!(
+        value_from(&registry, DECLARED),
+        held,
+        "the value survived the failing refresh and then did not survive the read after it"
+    );
+    assert!(
+        info_call_count(&dir) >= 1,
+        "a non-transport failure never asked the session whether it was still alive"
+    );
+
+    drop(running);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_vendor_failure_whose_info_answers_evicts_the_value_as_a_verdict_about_the_name() {
+    // CONTROL — the change that makes this fail: reading a non-transport
+    // failure as a session fault unconditionally, without ever asking `info`
+    // — the eviction below would never happen and the poll would fail at
+    // `NEVER_HAPPENED`.
+    let dir = scratch("daemon-proton-session-fault-info-answers");
+    let inner = stub_pass_cli_listing(&dir, &Backend::Controlled, &Listing::Json(LISTING));
+    let vendor = stub_with_session_verbs(
+        &dir,
+        &inner,
+        Duration::ZERO,
+        true, // `info` answers: the session is healthy
+        LogoutAnswer::Ok,
+        None,
+    );
+    let config = daemon_config_with_a_warm_cache(&dir, &vendor, FRESHNESS_SECONDS, STALE_SECONDS);
+    let running = start_daemon(&config, policy_allowing_self());
+
+    let client = client_config(running.socket(), 3_000);
+    let registry = store::build(&client, &Invocation::default()).registry;
+
+    let held = vendor_decoy(1);
+    assert_eq!(value_from(&registry, DECLARED), held);
+
+    set_next_call(&dir, &NextCall::Fails(SESSION_FAULT_SENTENCE));
+    std::thread::sleep(PAST_FRESHNESS);
+    let _ = registry.resolve(DECLARED);
+    until_the_vendor_has_been_asked(&dir, 2);
+
+    set_next_call(&dir, &NextCall::Fails(TRANSPORT_FAILURE));
+    let reason = until_the_read_degrades(&registry, DECLARED);
+
+    assert!(
+        reason.contains(TRANSPORT_FRAGMENT),
+        "the read degraded before the value's absence was what caused it: {reason}"
+    );
+    assert!(
+        !reason.contains(&held),
+        "the refusal carried the value it had just disowned"
+    );
+    assert!(
+        info_call_count(&dir) >= 1,
+        "a non-transport failure never asked the session whether it was still alive"
+    );
+
+    drop(running);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_missing_session_json_is_a_session_fault_decided_without_spawning_anything() {
+    // CONTROL — the change that makes this fail: `session_is_at_fault`
+    // skipping the `stat` and going straight to the coalesced probe. The
+    // read below would still keep the value (the probe reads the session as
+    // dead too, since `info` fails here as well) but `info_call_count`
+    // would come back nonzero — the absence was never enough on its own.
+    let dir = scratch("daemon-proton-session-fault-missing-file");
+    let inner = stub_pass_cli_listing(&dir, &Backend::Controlled, &Listing::Json(LISTING));
+    let vendor =
+        stub_with_session_verbs(&dir, &inner, Duration::ZERO, false, LogoutAnswer::Ok, None);
+    let config = daemon_config_with_a_warm_cache(&dir, &vendor, FRESHNESS_SECONDS, STALE_SECONDS);
+    // `daemon_config_with_a_warm_cache` plants a `.session/session.json` by
+    // default (see `support::publish_generation_aged`) — removed here so the
+    // generation directory holds none at all, the vendor's own invalidation
+    // cleanup's signature, per the parent RCA's §3.
+    remove_session_file(&published_generation(&dir));
+    let running = start_daemon(&config, policy_allowing_self());
+
+    let client = client_config(running.socket(), 3_000);
+    let registry = store::build(&client, &Invocation::default()).registry;
+
+    let held = vendor_decoy(1);
+    assert_eq!(value_from(&registry, DECLARED), held);
+
+    set_next_call(&dir, &NextCall::Fails(SESSION_FAULT_SENTENCE));
+    std::thread::sleep(PAST_FRESHNESS);
+
+    assert_eq!(
+        value_from(&registry, DECLARED),
+        held,
+        "a missing session.json must keep the value, exactly as a failing probe does"
+    );
+    until_the_vendor_has_been_asked(&dir, 2);
+
+    assert_eq!(
+        info_call_count(&dir),
+        0,
+        "a missing session.json still spawned a probe to confirm what the stat already knew"
+    );
+
+    drop(running);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_burst_of_failing_names_costs_one_probe_not_one_per_name() {
+    // CONTROL — the change that makes this fail: `session_is_at_fault`
+    // calling the vendor's `info` directly instead of routing it through
+    // `Generations::session_fault`'s coalescing. Two names failing together
+    // would then spawn two `info` calls, and the count below would read 2,
+    // never 1.
+    let dir = scratch("daemon-proton-session-fault-burst");
+    let inner = stub_pass_cli_listing(&dir, &Backend::Controlled, &Listing::Json(LISTING));
+    let vendor =
+        stub_with_session_verbs(&dir, &inner, Duration::ZERO, false, LogoutAnswer::Ok, None);
+    let config = daemon_config_with_two_names(&dir, &vendor, FRESHNESS_SECONDS, STALE_SECONDS);
+    let running = start_daemon(&config, policy_allowing_self());
+
+    let client = client_config(running.socket(), 3_000);
+    let registry = std::sync::Arc::new(store::build(&client, &Invocation::default()).registry);
+
+    // Warm both names first: each is its own read against the same vault, so
+    // the vendor is asked once per field before either failure below.
+    let held_1 = value_from(&registry, DECLARED);
+    let held_2 = value_from(&registry, DECLARED_2);
+
+    set_next_call(&dir, &NextCall::Fails(SESSION_FAULT_SENTENCE));
+    std::thread::sleep(PAST_FRESHNESS);
+
+    // Both names fail at the same instant, on their own threads — a
+    // sequential pair of reads would still coalesce inside the probe's
+    // window, but only a genuine burst exercises the lock held across the
+    // spawn, which is the mechanism under test.
+    use std::sync::{Arc, Barrier};
+    let barrier = Arc::new(Barrier::new(2));
+    let (registry_a, barrier_a) = (Arc::clone(&registry), Arc::clone(&barrier));
+    let first = std::thread::spawn(move || {
+        barrier_a.wait();
+        value_from(&registry_a, DECLARED)
+    });
+    let (registry_b, barrier_b) = (Arc::clone(&registry), barrier);
+    let second = std::thread::spawn(move || {
+        barrier_b.wait();
+        value_from(&registry_b, DECLARED_2)
+    });
+    let answer_1 = first.join().expect("the first reader panicked");
+    let answer_2 = second.join().expect("the second reader panicked");
+
+    assert_eq!(
+        answer_1, held_1,
+        "the first name's value did not survive the burst"
+    );
+    assert_eq!(
+        answer_2, held_2,
+        "the second name's value did not survive the burst"
+    );
+
+    // Pin that BOTH reads actually reached the vendor and failed there,
+    // before the probe count is read. Without this the case is green in a run
+    // where one name's refresh is still queued or is answered inside
+    // `REFRESH_GRACE` from the older value: one vendor failure, one probe,
+    // and a passing count over a burst that never happened. The value
+    // assertions above cannot close that hole — they read the same `held_N`
+    // whether or not that name's refresh ever ran.
+    assert!(
+        vendor_call_count(&dir) >= 4,
+        "the two warm-up reads and the two failing ones did not all reach the vendor, so \
+         the probe count below is not measuring a burst: {}",
+        vendor_call_count(&dir)
+    );
+    assert_eq!(
+        info_call_count(&dir),
+        1,
+        "two names failing over one session cost more than one probe"
+    );
+
+    drop(running);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_session_fault_wakes_the_renewal_loop_inside_min_backoff() {
+    // CONTROL — the change that makes this fail: dropping
+    // `generations.take_session_fault()` from `run`'s own `due` calculation.
+    // The loop would then only ever renew on its age or its own `alive()`
+    // check, and neither is due here — `info` answers healthy throughout,
+    // and `login_after_minutes` / `probe_interval_seconds` both sit far
+    // outside this test's own window — so the poll below would time out
+    // with no second login ever recorded.
+    let dir = scratch("daemon-proton-session-fault-wakes-loop");
+    let inner = stub_pass_cli_listing(&dir, &Backend::Controlled, &Listing::Json(LISTING));
+    let vendor = stub_with_session_verbs(
+        &dir,
+        &inner,
+        Duration::ZERO,
+        true, // `info` always answers: nothing here is due on liveness
+        LogoutAnswer::Ok,
+        None,
+    );
+    // `login_after_minutes: 90` and `probe_interval_seconds: 120` put both
+    // ordinary triggers far outside this test's run, so a second login
+    // inside the poll below can only be the session-fault event.
+    let config = daemon_config_with_generations_loop(&dir, &vendor, 90, 120, 60_000);
+    let running = start_daemon(&config, policy_allowing_self());
+
+    let root = session_dir(&dir);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let original_name = loop {
+        if let Some(name) = current_generation(&root) {
+            break name;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "no generation was ever published"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    };
+
+    // No `.session/session.json` is ever planted under the generation the
+    // fake `login` verb "established" — this stand-in never writes one — so
+    // the read below is classified a session fault by the cheaper of the
+    // two checks, the `stat`, independent of `info_answers` above.
+    let client = client_config(running.socket(), 60_000);
+    let registry = store::build(&client, &Invocation::default()).registry;
+    set_next_call(&dir, &NextCall::Fails(SESSION_FAULT_SENTENCE));
+    let _ = registry.resolve(DECLARED);
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if let Some(name) = current_generation(&root)
+            && name != original_name
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "no second login happened within 30s of the session-fault event, though the \
+             configured interval is 120s"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    drop(running);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn the_same_vendor_sentence_evicts_with_a_healthy_session_and_keeps_the_value_without_one() {
+    // CONTROL — the change this whole slice exists to rule out: classifying
+    // by matching `SESSION_FAULT_SENTENCE`, or any fixed wording, into the
+    // transport allowlist. That would make both halves below evict, or both
+    // keep, regardless of the session's own health — the two assertions
+    // could never disagree, which is exactly what this test exists to catch.
+    let dir = scratch("daemon-proton-session-fault-control");
+    let inner = stub_pass_cli_listing(&dir, &Backend::Controlled, &Listing::Json(LISTING));
+    let healthy_vendor =
+        stub_with_session_verbs(&dir, &inner, Duration::ZERO, true, LogoutAnswer::Ok, None);
+    let config =
+        daemon_config_with_a_warm_cache(&dir, &healthy_vendor, FRESHNESS_SECONDS, STALE_SECONDS);
+    let running = start_daemon(&config, policy_allowing_self());
+
+    let client = client_config(running.socket(), 3_000);
+    let registry = store::build(&client, &Invocation::default()).registry;
+
+    let held = vendor_decoy(1);
+    assert_eq!(value_from(&registry, DECLARED), held);
+
+    set_next_call(&dir, &NextCall::Fails(SESSION_FAULT_SENTENCE));
+    std::thread::sleep(PAST_FRESHNESS);
+    let _ = registry.resolve(DECLARED);
+    until_the_vendor_has_been_asked(&dir, 2);
+
+    set_next_call(&dir, &NextCall::Fails(TRANSPORT_FAILURE));
+    let reason = until_the_read_degrades(&registry, DECLARED);
+    assert!(
+        reason.contains(TRANSPORT_FRAGMENT),
+        "the healthy-session half degraded before the value's absence was the cause: {reason}"
+    );
+
+    drop(running);
+
+    // Second half: the identical sentence, a fresh daemon, a dead session —
+    // the only thing that changed.
+    let dir2 = scratch("daemon-proton-session-fault-control-2");
+    let inner2 = stub_pass_cli_listing(&dir2, &Backend::Controlled, &Listing::Json(LISTING));
+    let dead_vendor = stub_with_session_verbs(
+        &dir2,
+        &inner2,
+        Duration::ZERO,
+        false,
+        LogoutAnswer::Ok,
+        None,
+    );
+    let config2 =
+        daemon_config_with_a_warm_cache(&dir2, &dead_vendor, FRESHNESS_SECONDS, STALE_SECONDS);
+    let running2 = start_daemon(&config2, policy_allowing_self());
+
+    let client2 = client_config(running2.socket(), 3_000);
+    let registry2 = store::build(&client2, &Invocation::default()).registry;
+
+    assert_eq!(value_from(&registry2, DECLARED), held);
+    set_next_call(&dir2, &NextCall::Fails(SESSION_FAULT_SENTENCE));
+    std::thread::sleep(PAST_FRESHNESS);
+
+    assert_eq!(
+        value_from(&registry2, DECLARED),
+        held,
+        "the SAME sentence, over a dead session, must keep the value rather than evict it"
+    );
+
+    drop(running2);
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&dir2);
 }

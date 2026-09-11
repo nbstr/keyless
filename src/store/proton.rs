@@ -746,6 +746,52 @@ impl InterruptedWrite {
 /// The name of the file the temp files are renamed over.
 const SESSION_FILE: &str = "session.json";
 
+/// Whether `<dir>/.session/session.json` is there at all.
+///
+/// Metadata only — the same read [`interrupted_write`] already makes of this
+/// directory, and for the same reason: nothing in this crate opens a session
+/// file. A symlink counts as present; this is a presence check, not a
+/// trust check, and [`ProtonStore::info_probe_answers`] is what actually asks
+/// whether the thing it names still works.
+fn session_file_present(dir: &Path) -> bool {
+    fs::symlink_metadata(dir.join(SESSION_SUBDIR).join(SESSION_FILE)).is_ok()
+}
+
+/// How long a coalesced session-health probe's verdict is trusted before a
+/// later failure asks the vendor again.
+///
+/// A few seconds: long enough that a burst of names failing over one broken
+/// session inside a single renewal interval costs one `pass-cli info`, short
+/// enough that a session an operator repairs by hand is not still read as
+/// faulted seconds after it started answering again.
+const SESSION_PROBE_WINDOW: Duration = Duration::from_secs(3);
+
+/// The longest a session-health probe may run before it is read as having no
+/// answer.
+///
+/// Deliberately far below the per-call ceiling every other vendor child gets.
+/// Two reasons, and the first is the one that bites: this probe runs on the
+/// caller's own thread, after a read that has ALREADY spent its own budget
+/// failing, so borrowing the full ceiling doubles the latency of exactly the
+/// lookup that is already going wrong — and `crate::ipc::client`'s own
+/// exchange ceiling is derived from how many vendor calls one lookup may
+/// make. The second: the question is only whether a local session store
+/// answers at all, which is not vault work, so a probe still silent after
+/// this long is a session fault on any reading.
+const SESSION_PROBE_CEILING: Duration = Duration::from_secs(3);
+
+/// The message a session-fault classification reports, wrapping the vendor's
+/// own words with what decided this was about the session rather than the
+/// name.
+fn session_fault_detail(detail: &str, dir: &Path) -> String {
+    format!(
+        "{detail} — the daemon's own session at {} is not answering, so nothing was decided \
+         about this name; every value already cached stays, and the session is due to be \
+         replaced",
+        dir.display()
+    )
+}
+
 /// The oldest unfinished session write that is still the LAST thing to happen.
 ///
 /// Reads the directory listing and each entry's modification time, and nothing
@@ -2142,15 +2188,176 @@ impl ProtonStore {
     /// What a vendor child's failure says about the item.
     ///
     /// [`StoreError::Unavailable`] where its own words name a transport
-    /// failure, because nothing was decided; [`StoreError::Backend`] otherwise,
-    /// which is the vendor answering about this name. The daemon's cache reads
-    /// the variant: a `Backend` evicts the value, an `Unavailable` keeps it.
-    fn vendor_failed(&self, detail: String, said: &str) -> StoreError {
+    /// failure, because nothing was decided; the same where the failure is
+    /// about the daemon's OWN session rather than about `name` — see
+    /// [`ProtonStore::session_is_at_fault`], the structural check below.
+    /// [`StoreError::Backend`] otherwise, which is the vendor answering
+    /// about this name. The daemon's cache reads the variant: a `Backend`
+    /// evicts the value, an `Unavailable` keeps it.
+    ///
+    /// # Why the session check is structural, not a second phrase in the
+    /// # allowlist
+    ///
+    /// [`UNREACHABLE`] is measured phrases, joined only once seen — the right
+    /// discipline for a fault that is genuinely about wording. A session
+    /// fault has no phrase to measure: the vendor's own sentence for "this
+    /// session store cannot be decrypted",
+    /// `Error decrypting local session(Error decrypting session: aead::Error)`,
+    /// is one string for a key mismatch, an interrupted write, and a
+    /// concurrent deleter alike, so matching it would classify every failure
+    /// like it correctly until the vendor rewords it, then wrongly for good.
+    /// [`ProtonStore::session_is_at_fault`] asks the session itself instead —
+    /// a question this crate owns — which survives a reword because it
+    /// depends on no words at all.
+    fn vendor_failed(
+        &self,
+        pass: &proton_session::Pass<'_>,
+        detail: String,
+        said: &str,
+    ) -> StoreError {
         if reached_no_service(said) {
-            self.unavailable(detail)
-        } else {
-            self.backend(detail)
+            return self.unavailable(detail);
         }
+        if self.session_is_at_fault(pass) {
+            return self.unavailable(session_fault_detail(&detail, pass.dir()));
+        }
+        self.backend(detail)
+    }
+
+    /// Is this failure about the daemon's own session rather than about the
+    /// name the vendor was asked for?
+    ///
+    /// Two checks, cheapest first:
+    ///
+    /// 1. **`stat` the current generation's `session.json`.** The vendor's
+    ///    own invalidation cleanup removes it from inside a READ — see the
+    ///    behaviours this crate's RCA reads out of the vendor's source — so
+    ///    its absence is a session fault this process can establish with no
+    ///    vendor call and no text involved at all.
+    /// 2. **Present → one coalesced `pass-cli info`** against the same
+    ///    generation, through
+    ///    [`proton_session::Generations::probe_once_per_window`]. A read that
+    ///    fails while `info` REFUSES is a session failure whatever the
+    ///    vendor's stderr said; a read that fails while `info` answers is
+    ///    about the name, and falls through to [`ProtonStore::backend`].
+    ///
+    /// # A probe that could not run is not a verdict
+    ///
+    /// The two wrong answers here do not cost the same. Reading a name's
+    /// verdict as a session fault means the daemon KEEPS SERVING a credential
+    /// its owner revoked, for the whole cached window; reading a session
+    /// fault as a name's verdict evicts a good value and the next read
+    /// degrades. So an inconclusive probe — the machine out of process slots,
+    /// the deadline hit — answers `false` here and lets the eviction stand,
+    /// which is the safe direction for a credential and is what this call
+    /// did before the classification existed. It still REPORTS the fault, so
+    /// a renewal loop repairs the session either way: refusing to decide
+    /// about the name is not the same as declining to fix the session.
+    ///
+    /// `false` on a `keyless` SESSION, which carries no
+    /// [`proton_session::Generations`] and no renewal loop to wake — there is
+    /// no daemon-owned identity here for a structural check to ask about,
+    /// and inheriting whatever is already logged in is that side's whole
+    /// contract. Only a daemon-hosted store, mid-[`ProtonStore::enter`], ever
+    /// reaches the two checks above.
+    ///
+    /// # What this does NOT depend on
+    ///
+    /// Whether a renewal loop is running. The classification answers what the
+    /// failure was ABOUT, and an install whose operator maintains the session
+    /// by hand gets the same answer as one running the loop — what differs is
+    /// only who performs the repair, which is why
+    /// [`session_fault_detail`] promises a replacement is due rather than
+    /// that a loop has been woken. On an install with no loop the kept value
+    /// still expires on the cache's own `ttl + stale`, so the exposure is the
+    /// warm cache's ordinary one rather than an unbounded new one.
+    fn session_is_at_fault(&self, pass: &proton_session::Pass<'_>) -> bool {
+        let (Some(name), Some(generations)) = (pass.generation(), self.generations.as_ref()) else {
+            return false;
+        };
+
+        if !session_file_present(pass.dir()) {
+            generations.report_session_fault(name);
+            return true;
+        }
+
+        let answered = generations.probe_once_per_window(name, SESSION_PROBE_WINDOW, || {
+            self.info_probe_answers(pass.dir())
+        });
+        match answered {
+            // The session refused: this failure is about the session.
+            Some(false) => {
+                generations.report_session_fault(name);
+                true
+            }
+            // The session answered: the vendor's failure was about the name.
+            Some(true) => false,
+            // No answer at all. Repair the session, decide nothing about the
+            // name — see this function's own doc.
+            None => {
+                generations.report_session_fault(name);
+                false
+            }
+        }
+    }
+
+    /// One `pass-cli info` against `dir`. `Some(true)` the session answered,
+    /// `Some(false)` it refused, `None` the probe could not be run at all.
+    ///
+    /// # Why a failure to run is `None` rather than `false`
+    ///
+    /// `capture` answers `Err` for a spawn that never happened and for a
+    /// deadline hit, and neither is evidence about the session: this crate
+    /// already records `EAGAIN` from `fork` under a process-table limit, and
+    /// a vendor child that spends hundredths of a second of CPU against a
+    /// wall-clock ceiling under memory pressure. Collapsing those into "the
+    /// session refused" would turn a loaded machine into a verdict that keeps
+    /// a revoked credential alive — see [`ProtonStore::session_is_at_fault`]
+    /// for which way the two wrong answers cost.
+    fn info_probe_answers(&self, dir: &Path) -> Option<bool> {
+        match capture(
+            self.info_probe_command(dir, std::env::vars_os()),
+            self.timeout.min(SESSION_PROBE_CEILING),
+        ) {
+            Ok(captured) => Some(captured.status.success()),
+            Err(_) => None,
+        }
+    }
+
+    /// Build one `pass-cli info` invocation, scoped at `dir` — the
+    /// structural probe [`ProtonStore::session_is_at_fault`] uses.
+    ///
+    /// # Why it carries the login every other builder carries
+    ///
+    /// `info` asks nothing about an item and needs no account token to do
+    /// it — but under [`KeyProvider::Env`] the login also carries
+    /// [`ENCRYPTION_KEY_VAR`], which is what lets the vendor OPEN the local
+    /// session store at all. A probe built without it would name the `env`
+    /// provider with nothing for it to read, fail for that reason on every
+    /// call, and latch every vendor verdict into a session fault for as long
+    /// as the install ran. The credential is scoped to the child's
+    /// environment by [`ProtonStore::scope`] like every other vendor call.
+    ///
+    /// This is not `crate::daemon::login::info_command` because that takes a
+    /// `Coordinates`, which is daemon-side state this type does not hold, and
+    /// because the two scopes differ deliberately — the loop's drops
+    /// privilege unconditionally and carries no reason, this one drops only
+    /// where `run_as` is set and names why it ran.
+    fn info_probe_command<I>(&self, session_dir: &Path, ambient: I) -> Command
+    where
+        I: IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
+    {
+        let mut command = Command::new(&self.binary);
+        command.arg("info");
+        remove_ambient_references(&mut command, ambient);
+        self.scope(
+            &mut command,
+            session_dir,
+            &self.vendor_login().unwrap_or_default(),
+            self.reason
+                .for_action("checking", "whether the session answers"),
+        );
+        command
     }
 
     /// The configured session directory, or the reason there will be no lookup.
@@ -2202,7 +2409,7 @@ impl ProtonStore {
 
     /// Put the things every child of this adapter needs on one command.
     ///
-    /// Written once and called from all four builders, because the set is not
+    /// Written once and called from all five builders, because the set is not
     /// obviously complete and a builder that quietly lacked one of them would
     /// fail in a way nobody reads as a missing variable:
     ///
@@ -2449,7 +2656,11 @@ impl ProtonStore {
             // the only way "I typed the vault wrong" is distinguishable from "my
             // token expired".
             let said = summarise(&captured.stderr);
-            return Err(self.vendor_failed(format!("cannot list vault `{vault}`: {said}"), &said));
+            return Err(self.vendor_failed(
+                pass,
+                format!("cannot list vault `{vault}`: {said}"),
+                &said,
+            ));
         }
 
         serde_json::from_slice::<ItemListing>(&captured.stdout)
@@ -2591,7 +2802,7 @@ impl ProtonStore {
 
         if !captured.status.success() {
             let said = summarise(&captured.stderr);
-            return Err(self.vendor_failed(format!("cannot list vaults: {said}"), &said));
+            return Err(self.vendor_failed(pass, format!("cannot list vaults: {said}"), &said));
         }
 
         serde_json::from_slice::<VaultListing>(&captured.stdout)
@@ -2642,10 +2853,11 @@ impl Store for ProtonStore {
             )));
         };
 
-        // One pass spans both children this lookup may spawn — the listing
-        // inside `reference_for` and the probe below — so a retirement waits
-        // for at most one reader's worth of vendor children rather than
-        // treating each spawn as its own pass.
+        // One pass spans every child this lookup may spawn — the listing
+        // inside `reference_for`, the probe below, and a session-health
+        // `info` should the probe fail — so a retirement waits for at most
+        // one reader's worth of vendor children rather than treating each
+        // spawn as its own pass.
         let pass = self.enter()?;
 
         // Resolved every time, never stored: a share id belongs to one session.
@@ -2672,12 +2884,14 @@ impl Store for ProtonStore {
             self.timeout,
         )
         .map_err(|error| self.unreachable(&error))?;
-        drop(pass);
 
         if !captured.status.success() {
             let said = summarise(&captured.stderr);
-            return Err(self.vendor_failed(said.clone(), &said));
+            let error = self.vendor_failed(&pass, said.clone(), &said);
+            drop(pass);
+            return Err(error);
         }
+        drop(pass);
 
         let mut bytes = std::mem::take(&mut captured.stdout);
         strip_one_newline(&mut bytes);
@@ -2922,15 +3136,18 @@ impl Discover for ProtonStore {
             self.timeout,
         )
         .map_err(|error| self.unreachable(&error))?;
-        drop(pass);
 
         if !captured.status.success() {
             // stderr only, as everywhere else in this crate. `item view` puts the
             // item's contents on stdout, so a message built from stdout would be
             // the leak this verb exists to avoid.
             let said = summarise(&captured.stderr);
-            return Err(self.vendor_failed(format!("cannot inspect `{item}`: {said}"), &said));
+            let error =
+                self.vendor_failed(&pass, format!("cannot inspect `{item}`: {said}"), &said);
+            drop(pass);
+            return Err(error);
         }
+        drop(pass);
 
         // From here to the end of this function the plaintext is in this process.
         // `captured` scrubs its stdout on drop, `view` scrubs every string in the
@@ -2990,12 +3207,15 @@ fn is_executable(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        Address, ItemAddress, ItemListing, ItemRecord, ItemView, Listed, PROBE_VAR, ProtonStore,
-        REASON_MAX, REASON_VAR, Reason, SESSION_DIR_VAR, TempEnvFile, assert_vendor_switch_offs,
-        env_value, looks_concealed, resolve_executable,
+        Address, AgentToken, ENCRYPTION_KEY_VAR, ItemAddress, ItemListing, ItemRecord, ItemView,
+        KeyProvider, Listed, PROBE_VAR, ProtonStore, REASON_MAX, REASON_VAR, Reason,
+        SESSION_DIR_VAR, SESSION_FILE, SESSION_SUBDIR, TOKEN_VAR, TempEnvFile,
+        assert_vendor_switch_offs, env_value, looks_concealed, resolve_executable,
+        session_file_present,
     };
     use crate::config::Config;
     use crate::error::StoreError;
+    use crate::secret::Secret;
     use crate::store::Store;
     use crate::store::discover::Discover;
     use crate::store::proton_session::Generations;
@@ -3248,6 +3468,84 @@ mod tests {
 
     fn argv(store: &ProtonStore, name: &str) -> Vec<String> {
         argv_of(&command_for(store, name))
+    }
+
+    /// A credential source that answers every entry with a fixed value, so a
+    /// case can build an [`AgentToken`] without a file on disk.
+    struct Fixed;
+    impl Store for Fixed {
+        fn id(&self) -> &str {
+            "fixed"
+        }
+        fn resolve(&self, _name: &str) -> Result<Option<Secret>, StoreError> {
+            Ok(Some(Secret::new("decoy-credential".to_owned())))
+        }
+        fn health(&self) -> Result<(), StoreError> {
+            Ok(())
+        }
+    }
+
+    /// The variables a built command SETS, as a sorted list of names. A
+    /// removal — which `get_envs` reports as a `None` value — is not a set.
+    fn set_variables(command: &std::process::Command) -> Vec<String> {
+        let mut names: Vec<String> = command
+            .get_envs()
+            .filter(|(_, value)| value.is_some())
+            .map(|(key, _)| key.to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn the_session_probe_carries_every_credential_the_read_beside_it_carries() {
+        // The probe asks nothing about an item, so carrying the account token
+        // reads as unnecessary — and under `KeyProvider::Env` the same login
+        // also carries `ENCRYPTION_KEY_VAR`, which is what lets the vendor
+        // OPEN the local session store at all. A probe built without it names
+        // the `env` provider with nothing for it to read, fails for that
+        // reason on every call, and latches every vendor verdict into a
+        // session fault for as long as the install runs — while the daemon
+        // keeps serving values the account may already have revoked.
+        //
+        // CONTROL — the change that makes this fail: passing `&[]` as the
+        // login, which is what this builder did when it was written. The
+        // probe's variable list then loses both credential variables and the
+        // assertion below names them.
+        let credentials = AgentToken::new(
+            Box::new(Fixed),
+            [
+                (TOKEN_VAR.to_owned(), "AGENT_TOKEN".to_owned()),
+                (ENCRYPTION_KEY_VAR.to_owned(), "LOCAL_KEY".to_owned()),
+            ]
+            .into_iter()
+            .collect(),
+        );
+        let store = store_from("{}")
+            .with_agent_token(Some(credentials))
+            .with_key_provider(Some(KeyProvider::Env));
+
+        let probe = set_variables(&store.info_probe_command(Path::new(SCOPED), ambient()));
+        let read = set_variables(&store.list_command(
+            Path::new(SCOPED),
+            "personal",
+            "DECOY",
+            &store.vendor_login().expect("the decoy login resolves"),
+            ambient(),
+        ));
+
+        for variable in [TOKEN_VAR, ENCRYPTION_KEY_VAR] {
+            assert!(
+                read.contains(&variable.to_owned()),
+                "the read this case compares against does not carry {variable}, so the \
+                 comparison proves nothing: {read:?}"
+            );
+            assert!(
+                probe.contains(&variable.to_owned()),
+                "the session probe runs without {variable}, so under the `env` key provider \
+                 it cannot open the session it is asking about: {probe:?}"
+            );
+        }
     }
 
     /// The value the child would see for `key`, as the adapter set it.
@@ -4228,6 +4526,37 @@ mod tests {
         assert!(resolve_executable(Path::new("sh")).is_some());
     }
 
+    #[test]
+    fn session_file_present_reads_the_generations_own_session_json() {
+        // CONTROL — the change that makes this fail: checking `session_dir`
+        // (the daemon's root) instead of the generation directory the caller
+        // hands in, which would read `true` here even though nothing was
+        // ever planted at the path under test.
+        let dir = std::env::temp_dir().join(format!(
+            "keyless-tests-session-file-present-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+
+        assert!(
+            !session_file_present(&dir),
+            "an empty generation directory reported a session file"
+        );
+
+        let session_subdir = dir.join(SESSION_SUBDIR);
+        std::fs::create_dir_all(&session_subdir).expect("session subdir");
+        std::fs::write(session_subdir.join(SESSION_FILE), b"{}").expect("plant session.json");
+
+        assert!(
+            session_file_present(&dir),
+            "a planted session.json was not found"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// A store built from parts, with no config behind it.
     fn parts_store() -> ProtonStore {
         let secrets: std::collections::BTreeMap<String, crate::config::SecretRoute> =
@@ -4282,9 +4611,17 @@ mod tests {
         // `Unavailable` keeps a value alive past its freshness window and a
         // `Backend` evicts it. So the classification has to survive the trip
         // through the store, not merely hold inside the predicate above.
-        let store = parts_store();
+        // The session side (no `Generations` behind it, an explicit
+        // directory so `enter()` has somewhere to read) is what `parts_store`
+        // builds without a session dir added — see the test beside this one
+        // — so `session_is_at_fault` short-circuits on `pass.generation()`
+        // being `None` and the vendor's own words are the only thing
+        // deciding either verdict below.
+        let store = parts_store().in_session_dir(Some(std::path::PathBuf::from(SCOPED)));
+        let pass = store.enter().expect("no generations is not a refusal");
 
         let silent = store.vendor_failed(
+            &pass,
             "cannot list vault `company`: failed to connect to host".to_owned(),
             "failed to connect to host",
         );
@@ -4294,6 +4631,7 @@ mod tests {
         );
 
         let verdict = store.vendor_failed(
+            &pass,
             "cannot list vault `company`: no such vault".to_owned(),
             "no such vault",
         );

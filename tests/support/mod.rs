@@ -1044,6 +1044,16 @@ pub fn publish_generation(root: &Path) -> PathBuf {
 /// The same, minted `age` in the past with `current`'s own mtime pushed back
 /// to match — the shape a retirement fixture needs to make a generation
 /// eligible without waiting out a real grace period.
+///
+/// Also plants `.session/session.json`, the way a real `pass-cli login`
+/// leaves the directory it just wrote to — see
+/// [`keyless::store::proton::ProtonStore`]'s own structural session-fault
+/// check, which reads exactly this path. A fixture whose case is the
+/// vendor's own invalidation cleanup having removed it — see
+/// `tests/daemon_proton.rs`'s `a_missing_session_json_…` case — deletes it
+/// after calling this, rather than this function ever omitting it: omitting
+/// it by default would make every OTHER fixture here an unrealistic
+/// directory the real vendor never produces.
 pub fn publish_generation_aged(root: &Path, age: std::time::Duration) -> PathBuf {
     std::fs::create_dir_all(root).expect("create the generation root");
     let minted_at = std::time::SystemTime::now()
@@ -1058,6 +1068,10 @@ pub fn publish_generation_aged(root: &Path, age: std::time::Duration) -> PathBuf
 
     let dir = root.join(&name);
     std::fs::create_dir_all(&dir).expect("create the generation directory");
+    let session_subdir = dir.join(".session");
+    std::fs::create_dir_all(&session_subdir).expect("create .session");
+    std::fs::write(session_subdir.join("session.json"), b"not a real session")
+        .expect("plant session.json");
 
     let current = root.join("current");
     std::fs::write(&current, format!("{name}\n")).expect("write current");

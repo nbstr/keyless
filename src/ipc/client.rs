@@ -85,8 +85,17 @@ use crate::ipc::protocol::{ProtocolError, Reply, Request, read_frame, write_fram
 const MAX_EXCHANGE: Duration =
     Duration::from_millis(VENDOR_CALLS_PER_LOOKUP * crate::config::MAX_TIMEOUT_MS);
 
-/// A store that resolves a name through a vault listing makes two calls: the
-/// listing, then the read.
+/// A store that resolves a name through a vault listing makes two calls that
+/// are each bounded by the per-call ceiling: the listing, then the read.
+///
+/// A read that FAILS adds a third child — the session-health probe that
+/// decides whether the failure was about the session or about the name — but
+/// that one carries a ceiling of its own, a few seconds rather than the
+/// per-call maximum, precisely so it does not enter this product. Its
+/// constant sits beside the probe in `crate::store::proton`; the arithmetic
+/// here covers the two calls that can each run to
+/// [`crate::config::MAX_TIMEOUT_MS`], and a bounded third is what keeps that
+/// true.
 const VENDOR_CALLS_PER_LOOKUP: u64 = 2;
 
 /// A configured route to a daemon.
