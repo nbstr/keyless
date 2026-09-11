@@ -248,6 +248,13 @@ fn run(
 
     let mut established: Option<Instant> = None;
     let mut failures: u32 = 0;
+    // When the loop last actually attempted a login, of any outcome — the
+    // floor a session-fault event's early wake is measured against, so a
+    // burst of them cannot turn into a burst of attempts. Seeded at "now"
+    // rather than left unset: a fault reported before this thread's first
+    // tick has even run waits out one `min_backoff` like any other, instead
+    // of firing the instant the thread starts.
+    let mut last_attempt = Instant::now();
 
     // Once before the clock below ever runs, so a crash leftover — a
     // generation a previous process created and never published, or one it
@@ -256,14 +263,28 @@ fn run(
     report_sweep(coordinates, owner, generations, grace, timeout_ms, stop);
 
     while !stop.load(Ordering::Relaxed) {
-        // Two triggers, and the second is not redundant. Age alone would sit
-        // for the whole lifetime over a session the vendor had already taken
-        // away — and it does take them away without warning, ahead of the cap.
-        // So each tick asks the vendor whether one still answers, which is the
-        // `pass-cli info || login` Proton publishes.
-        let due = established.is_none_or(|at| at.elapsed() >= lifetime)
+        // Three triggers, and the third is not redundant with the second.
+        // Liveness re-asks the vendor's own `info` fresh, on THIS tick; a
+        // session-fault event is the record that a READ already asked —
+        // possibly seconds ago, possibly while this thread was mid-sleep —
+        // and got a structural answer this crate itself decided, not the
+        // vendor's wording. `take_session_fault` is what turns "the store
+        // reported one" into "the loop acted on it", exactly once per
+        // report: a fault raised again while an attempt is in flight is
+        // caught by the next tick's own read of the flag, not lost.
+        // Taken FIRST and unconditionally, never as an arm of the `||`
+        // below: `||` short-circuits, and the two conditions ahead of it are
+        // true in exactly the states a fault is reported in — an expired
+        // session, or one `alive` finds dead. Left in the chain, the flag
+        // survives the renewal that fixes it and spends itself on the NEXT
+        // tick, buying a second login, a second generation and a second
+        // retirement for a session that was just replaced.
+        let faulted = generations.take_session_fault();
+        let due = faulted
+            || established.is_none_or(|at| at.elapsed() >= lifetime)
             || !alive(coordinates, owner, generations);
         if due {
+            last_attempt = Instant::now();
             match attempt(coordinates, owner, generations) {
                 Ok(name) => {
                     established = Some(Instant::now());
@@ -303,7 +324,14 @@ fn run(
         } else {
             backoff(min_backoff, max_backoff, failures)
         };
-        sleep_until_stopped(wait, stop);
+        // The floor the event path may shorten a sleep to is the wait this
+        // loop just computed for ITSELF, not the constant minimum. While
+        // logins are succeeding that is `min_backoff`, so a fault still wakes
+        // the loop promptly out of a long healthy interval. While they are
+        // failing it is the grown backoff, so the event path can no longer
+        // shorten a sleep the failure path lengthened.
+        let floor = if failures == 0 { min_backoff } else { wait };
+        sleep_until_stopped(wait, floor, last_attempt, generations, stop);
     }
 }
 
@@ -503,11 +531,53 @@ fn backoff(min: Duration, max: Duration, failures: u32) -> Duration {
     min.saturating_mul(factor).min(max)
 }
 
-/// Sleep, waking early if the daemon is stopping.
-fn sleep_until_stopped(total: Duration, stop: &AtomicBool) {
+/// Sleep, waking early on a stop request or — no sooner than `floor` after
+/// `last_attempt` — a pending session-fault event.
+///
+/// # Why the event is only peeked here, never consumed
+///
+/// This function decides only WHEN to look again; `run`'s own
+/// `generations.take_session_fault()` at the top of the next iteration is
+/// what actually acts on it, once, on the tick that wakes for it — see that
+/// call's own doc. Consuming the flag here instead would let a tick this
+/// function chose NOT to wake for (because `floor` had not yet elapsed)
+/// clear a fault nobody had acted on, and the loop would then sleep out the
+/// rest of `total` over a session everyone had already stopped checking.
+///
+/// # Why the floor is the caller's own computed wait
+///
+/// A single read discovering a session fault is one event; a daemon under
+/// load discovers the same fault on every read against it until the loop
+/// replaces the session, which is a stream of them, all re-reporting while
+/// this call is asleep. Waking on the very first one would make the interval
+/// between attempts exactly the polling granularity below rather than
+/// anything this crate chose — a failing store turned into a spawn storm by
+/// the one mechanism meant to make it recover faster.
+///
+/// A floor of `min_backoff` is not enough to stop that, and this is the trap
+/// worth naming: while logins are FAILING, `run` has already lengthened its
+/// own wait by `backoff`, and a flat `min_backoff` floor lets the event path
+/// return after the minimum on every tick regardless. The loop then attempts
+/// a login every `min_backoff` for the whole outage — with defaults, one
+/// every 5 s against a backoff that had grown to 300 s. Hammering an account
+/// endpoint at 60× the intended rate is how a recoverable session fault
+/// becomes a rate-limited or locked token, which is an outage no amount of
+/// retrying exits. So `run` hands its own `wait` in as the floor whenever it
+/// is backing off, and the event path can only ever shorten a sleep the
+/// failure path did not lengthen.
+fn sleep_until_stopped(
+    total: Duration,
+    floor: Duration,
+    last_attempt: Instant,
+    generations: &Generations,
+    stop: &AtomicBool,
+) {
     let start = Instant::now();
     while start.elapsed() < total {
         if stop.load(Ordering::Relaxed) {
+            return;
+        }
+        if generations.session_fault_pending() && last_attempt.elapsed() >= floor {
             return;
         }
         thread::sleep(STOP_POLL);
@@ -527,6 +597,7 @@ fn report(line: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::store::proton_session::GenerationName;
 
     #[test]
     fn backoff_starts_at_the_minimum() {
@@ -557,8 +628,148 @@ mod tests {
     #[test]
     fn a_stopping_daemon_does_not_wait_out_its_interval() {
         let stop = AtomicBool::new(true);
+        let generations = Generations::at(scratch_generations_root("stopping"));
         let start = Instant::now();
-        sleep_until_stopped(Duration::from_secs(600), &stop);
+        sleep_until_stopped(
+            Duration::from_secs(600),
+            Duration::from_secs(5),
+            Instant::now(),
+            &generations,
+            &stop,
+        );
         assert!(start.elapsed() < Duration::from_secs(1));
+    }
+
+    /// A scratch root for a bare `Generations` — this module's tests never
+    /// publish anything into it, so it exists only to give the type a path
+    /// of its own rather than to be read from.
+    fn scratch_generations_root(tag: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "keyless-daemon-session-{tag}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ))
+    }
+
+    #[test]
+    fn a_pending_session_fault_ends_the_sleep_once_min_backoff_has_elapsed() {
+        // CONTROL — the change that makes this fail: `sleep_until_stopped`
+        // never consulting `generations` at all, the shape it had before
+        // this event existed. The sleep would then run out its full
+        // `total` (here, ten seconds — bounded rather than the minutes an
+        // interval runs for in production, so a red run still finishes),
+        // the assertion on elapsed time would fail, and the renewal loop
+        // would keep silently sleeping through a fault a read had already
+        // reported.
+        let stop = AtomicBool::new(false);
+        let generations = Generations::at(scratch_generations_root("wakes"));
+        let min_backoff = Duration::from_millis(100);
+        generations.report_session_fault(
+            &GenerationName::parse("gen-1-1").expect("a well-formed generation name"),
+        );
+
+        let start = Instant::now();
+        sleep_until_stopped(
+            Duration::from_secs(10),
+            min_backoff,
+            start,
+            &generations,
+            &stop,
+        );
+        let elapsed = start.elapsed();
+
+        assert!(
+            elapsed >= min_backoff,
+            "the sleep ended before its min_backoff floor: {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "a pending fault did not end a ten-second sleep early: {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn a_session_fault_reported_before_min_backoff_does_not_end_the_sleep_early() {
+        // The floor's other half: an event that arrives with the previous
+        // attempt only moments old must not shorten the wait at all, or the
+        // floor is decorative.
+        let stop = AtomicBool::new(false);
+        let generations = Generations::at(scratch_generations_root("floored"));
+        let min_backoff = Duration::from_secs(600);
+        generations.report_session_fault(
+            &GenerationName::parse("gen-1-1").expect("a well-formed generation name"),
+        );
+
+        let start = Instant::now();
+        sleep_until_stopped(
+            Duration::from_millis(300),
+            min_backoff,
+            start,
+            &generations,
+            &stop,
+        );
+        let elapsed = start.elapsed();
+
+        assert!(
+            elapsed >= Duration::from_millis(300),
+            "a fault younger than min_backoff still cut the sleep short: {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn the_event_path_cannot_shorten_a_sleep_the_failure_path_lengthened() {
+        // The expensive failure, and the reason the floor is the caller's own
+        // computed wait rather than the constant minimum. While logins are
+        // failing, `run` lengthens its wait by `backoff` — and a flat
+        // `min_backoff` floor would let a pending fault end that sleep after
+        // the minimum on EVERY tick, so the loop attempts a login every
+        // `min_backoff` for the whole outage. With production defaults that
+        // is one login every 5 s against a backoff that had grown to 300 s:
+        // hammering the account endpoint at 60x the intended rate, which is
+        // how a recoverable session fault turns into a locked token.
+        //
+        // Here the loop is "backing off": the wait it computed is 400 ms, and
+        // that same value is handed in as the floor. A fault is pending the
+        // whole time, and the sleep must still run to completion.
+        //
+        // CONTROL — the change that makes this fail: passing `min_backoff`
+        // as the floor instead of the computed wait. The sleep then returns
+        // in roughly one poll interval and the elapsed assertion below fails.
+        let stop = AtomicBool::new(false);
+        let generations = Generations::at(scratch_generations_root("backing-off"));
+        let grown_wait = Duration::from_millis(400);
+        generations.report_session_fault(&GenerationName::parse("gen-1-1").expect("a name"));
+
+        let start = Instant::now();
+        sleep_until_stopped(grown_wait, grown_wait, start, &generations, &stop);
+        let elapsed = start.elapsed();
+
+        assert!(
+            elapsed >= grown_wait,
+            "a pending fault shortened a sleep the failure path had already \
+             lengthened, which is the login storm this floor exists to stop: {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn no_pending_fault_sleeps_out_the_full_interval_up_to_a_stop() {
+        // The control for the two cases above: with nothing reported, the
+        // fault check never fires and the function behaves exactly as it
+        // did before the event existed.
+        let stop = AtomicBool::new(false);
+        let generations = Generations::at(scratch_generations_root("quiet"));
+
+        let start = Instant::now();
+        sleep_until_stopped(
+            Duration::from_millis(250),
+            Duration::from_millis(1),
+            start,
+            &generations,
+            &stop,
+        );
+        assert!(
+            start.elapsed() >= Duration::from_millis(250),
+            "the sleep ended early with no fault ever reported"
+        );
     }
 }
