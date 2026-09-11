@@ -129,6 +129,12 @@ const TOKEN_ENTRY: &str = "FIXTURE_AGENT_TOKEN";
 /// enough that a grep for it in any output means a real leak.
 const TOKEN_DECOY: &str = "decoy-Pat8-agent-token-never-real-0606";
 
+/// The stand-in local encryption key, for `key_provider: env` fixtures.
+/// Distinct from [`TOKEN_DECOY`] and long enough that a grep for it in any
+/// output means a real leak. Its LENGTH, never its text, is what any
+/// assertion here may compare against.
+const ENCRYPTION_KEY_DECOY: &str = "decoy-Lk4l-local-encryption-key-never-real-0911";
+
 /// Where a credential-carrying stand-in records the login it was handed.
 fn vendor_token(dir: &Path) -> std::path::PathBuf {
     dir.join("pass-cli.token")
@@ -262,13 +268,19 @@ fn a_declared_name_resolves_through_the_daemon_and_names_the_provider_it_ran_und
         "the daemon read some other identity's session"
     );
 
-    // And it named a key provider. Left unset under a uid with no keyring,
-    // `pass-cli` finds no local key beside an existing session store and
-    // reinitialises it — so an absent variable here is this adapter destroying
-    // its own login on every lookup, silently.
+    // And it named a key provider — the literal `"env"`, not
+    // `KeyProvider::default().as_str()`: the fixture declares none of its own
+    // on purpose, so this pins the crate's ACTUAL default rather than
+    // comparing that default against itself, which would hold whatever the
+    // default became. Left unset under a uid with no keyring, `pass-cli`
+    // finds no local key beside an existing session store and reinitialises
+    // it — so an absent variable here is this adapter destroying its own
+    // login on every lookup, silently. A future default change is meant to
+    // edit this literal, not to be absorbed by it — see `KeyProvider`'s own
+    // doc for why `env` is that default now.
     assert_eq!(
         support::recorded(&vendor_key_provider(&dir)),
-        "fs",
+        "env",
         "the key provider did not reach the vendor"
     );
 
@@ -1516,7 +1528,13 @@ fn stub_with_session_verbs(
          scoped=\"$PROTON_PASS_SESSION_DIR\"\n\
          root=\"$(dirname \"$scoped\")\"\n\
          now_current=\"$(cat \"$root/current\" 2>/dev/null | tr -d '\\n')\"\n\
-         printf '%s %s current=%s\\n' \"$1\" \"$scoped\" \"$now_current\" >> '{verbs}'\n\
+         if [ -n \"${{PROTON_PASS_ENCRYPTION_KEY+x}}\" ]; then\n\
+         \x20 key_len=${{#PROTON_PASS_ENCRYPTION_KEY}}\n\
+         else\n\
+         \x20 key_len=\"<unset>\"\n\
+         fi\n\
+         printf '%s %s current=%s key_provider=%s key_len=%s\\n' \"$1\" \"$scoped\" \
+         \"$now_current\" \"${{PROTON_PASS_KEY_PROVIDER-<unset>}}\" \"$key_len\" >> '{verbs}'\n\
          case \"$1\" in\n\
          \x20 login)\n\
          \x20   sleep {login_delay}\n\
@@ -1563,12 +1581,18 @@ fn daemon_config_with_generations_loop(
     std::fs::write(dir.join("audit.jsonl"), b"").expect("audit");
     let credentials = dir.join("proton.json");
     write_secrets(&credentials, &[("AGENT_TOKEN", TOKEN_DECOY)]);
+    // `key_provider` is pinned to `fs` explicitly, rather than left to the
+    // type's own default, so the generation-timing cases below stay about
+    // generation timing when that default moves — see
+    // `daemon_config_with_generations_loop_env` for the cases that are
+    // actually about the key provider.
     serde_json::from_str(&format!(
         r#"{{"socket":"{socket}","audit":"{audit}",
              "cache_ttl_seconds":0,"idle_timeout_seconds":5,
              "stores":{{"proton":{{"enabled":true,"binary":"{vendor}",
                         "session_dir":"{session}",
                         "timeout_ms":{timeout_ms},
+                        "key_provider":"fs",
                         "credentials_file":"{credentials}",
                         "credentials":{{"PROTON_PASS_PERSONAL_ACCESS_TOKEN":"AGENT_TOKEN"}},
                         "session":{{"auto_login":true,"login_after_minutes":{login_after_minutes},
@@ -1585,12 +1609,66 @@ fn daemon_config_with_generations_loop(
     .expect("valid daemon config")
 }
 
+/// The same fixture as [`daemon_config_with_generations_loop`], scoped at
+/// `key_provider: env` with [`ENCRYPTION_KEY_DECOY`] already written under
+/// its declared entry — the state a real install reaches once
+/// `credential::ensure_proton_local_key` has run once, which this fixture
+/// stands in for rather than re-exercising: that generation step is proven
+/// at the unit level in `daemon::credential`'s own tests.
+fn daemon_config_with_generations_loop_env(
+    dir: &Path,
+    vendor: &Path,
+    login_after_minutes: u64,
+    probe_interval_seconds: u64,
+    timeout_ms: u64,
+) -> DaemonConfig {
+    std::fs::write(dir.join("audit.jsonl"), b"").expect("audit");
+    let credentials = dir.join("proton.json");
+    write_secrets(
+        &credentials,
+        &[
+            ("AGENT_TOKEN", TOKEN_DECOY),
+            ("LOCAL_KEY", ENCRYPTION_KEY_DECOY),
+        ],
+    );
+    serde_json::from_str(&format!(
+        r#"{{"socket":"{socket}","audit":"{audit}",
+             "cache_ttl_seconds":0,"idle_timeout_seconds":5,
+             "stores":{{"proton":{{"enabled":true,"binary":"{vendor}",
+                        "session_dir":"{session}",
+                        "timeout_ms":{timeout_ms},
+                        "key_provider":"env",
+                        "credentials_file":"{credentials}",
+                        "credentials":{{"PROTON_PASS_PERSONAL_ACCESS_TOKEN":"AGENT_TOKEN",
+                                        "PROTON_PASS_ENCRYPTION_KEY":"LOCAL_KEY"}},
+                        "session":{{"auto_login":true,"login_after_minutes":{login_after_minutes},
+                                    "probe_interval_seconds":{probe_interval_seconds},
+                                    "min_backoff_seconds":1,"max_backoff_seconds":5}}}}}},
+             "secrets":{{"{DECLARED}":{{"store":"proton","vault":"{VAULT}",
+                                        "item":"{ITEM}","field":"password"}}}}}}"#,
+        socket = short_socket_path(dir).display(),
+        audit = dir.join("audit.jsonl").display(),
+        credentials = credentials.display(),
+        session = session_dir(dir).display(),
+        vendor = vendor.display(),
+    ))
+    .expect("valid daemon config")
+}
+
 /// One recorded line of `pass-cli.verbs`, parsed.
+///
+/// `key_provider` and `key_len` read `<unset>` for a stub predating this
+/// pair — every stand-in built through [`stub_with_session_verbs`] carries
+/// both, so the only way to see the sentinel is a variable the vendor child
+/// genuinely never received. `key_len` is a character COUNT, never the
+/// value: see `stub_with_session_verbs`'s own script for why.
 #[derive(Debug)]
 struct VerbLine {
     verb: String,
     dir: String,
     current: String,
+    key_provider: String,
+    key_len: String,
 }
 
 fn parse_verbs(text: &str) -> Vec<VerbLine> {
@@ -1604,7 +1682,23 @@ fn parse_verbs(text: &str) -> Vec<VerbLine> {
                 .strip_prefix("current=")
                 .unwrap_or_default()
                 .to_owned();
-            Some(VerbLine { verb, dir, current })
+            let key_provider = fields
+                .next()
+                .and_then(|field| field.strip_prefix("key_provider="))
+                .unwrap_or("<unset>")
+                .to_owned();
+            let key_len = fields
+                .next()
+                .and_then(|field| field.strip_prefix("key_len="))
+                .unwrap_or("<unset>")
+                .to_owned();
+            Some(VerbLine {
+                verb,
+                dir,
+                current,
+                key_provider,
+                key_len,
+            })
         })
         .collect()
 }
@@ -1702,6 +1796,226 @@ fn the_renewal_loop_establishes_each_session_in_a_fresh_generation_and_makes_it_
                 line.verb
             );
         }
+    }
+
+    drop(running);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_fs_daemon_never_sets_the_local_key_variable_at_all() {
+    // CONTROL for the case below: under `fs` no credential names
+    // `PROTON_PASS_ENCRYPTION_KEY`, so `login::extra_credentials` resolves
+    // nothing and the variable never reaches a child at all — not empty,
+    // UNSET. Read before the `env` case so a fixture bug that made every
+    // spawn's `key_len` read `<unset>` regardless of provider cannot pass
+    // both tests by accident: this one is the one that is SUPPOSED to see
+    // `<unset>`.
+    let dir = scratch("daemon-proton-key-fs");
+    let inner = stub_pass_cli_listing(
+        &dir,
+        &Backend::Injects(PROTON_DECOY),
+        &Listing::Json(LISTING),
+    );
+    let vendor = stub_with_session_verbs(
+        &dir,
+        &inner,
+        Duration::ZERO,
+        true,
+        LogoutAnswer::AlreadyLoggedOut,
+        None,
+    );
+    let config = daemon_config_with_generations_loop(&dir, &vendor, 0, 1, 60_000);
+    let running = start_daemon(&config, policy_allowing_self());
+
+    let root = session_dir(&dir);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if current_generation(&root).is_some() {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "no generation was ever published"
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
+
+    let verbs = std::fs::read_to_string(dir.join("pass-cli.verbs")).unwrap_or_default();
+    let lines = parse_verbs(&verbs);
+    assert!(!lines.is_empty(), "the stand-in recorded nothing");
+    for line in &lines {
+        assert_eq!(
+            line.key_provider, "fs",
+            "`{}` at {} did not carry `PROTON_PASS_KEY_PROVIDER=fs`",
+            line.verb, line.dir
+        );
+        assert_eq!(
+            line.key_len, "<unset>",
+            "`{}` at {} carried a local-key variable under `fs`, which owns no such value",
+            line.verb, line.dir
+        );
+    }
+
+    drop(running);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn every_proton_spawn_under_env_carries_the_key_provider_and_the_local_keys_length() {
+    // The defect this proves closed: `daemon::login::info_command` and
+    // `logout_command` used to be built with `&[]`, so the vendor was asked
+    // to open a session under `key_provider: env` with nothing to open it
+    // WITH — the same shape of bug review already caught once in
+    // `ProtonStore::info_probe_command` (`&[]` where every other builder
+    // passed the login), just in the sibling module that spawns `login`,
+    // `info` and `logout` rather than the one that spawns `run`/`item`/
+    // `vault`. Reverting `establish`'s `info_command` call back to `&[]`
+    // turns this red: every `info` line reports `key_len=<unset>` while
+    // `login` still carries it. The retirement `logout` is the case below.
+    let dir = scratch("daemon-proton-key-env");
+    let inner = stub_pass_cli_listing(
+        &dir,
+        &Backend::Injects(PROTON_DECOY),
+        &Listing::Json(LISTING),
+    );
+    let vendor = stub_with_session_verbs(
+        &dir,
+        &inner,
+        Duration::ZERO,
+        true,
+        LogoutAnswer::AlreadyLoggedOut,
+        None,
+    );
+    // The suite's generous ceiling, because this case waits on a READ and not
+    // on the grace: `timeout_ms` is the store's own read ceiling as well as
+    // the input the retirement grace is derived from, so a value small enough
+    // to retire quickly is also a deadline the read has to beat on a machine
+    // running four test binaries at once. The retirement half is its own case
+    // below, which waits on the grace and reads nothing.
+    let config = daemon_config_with_generations_loop_env(&dir, &vendor, 0, 1, 60_000);
+    let running = start_daemon(&config, policy_allowing_self());
+
+    let root = session_dir(&dir);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if current_generation(&root).is_some() {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "no generation was ever published"
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
+
+    // A real read too, so the assertion below covers the verbs a LOOKUP
+    // spawns and not only the login flow's own three.
+    let client = client_config(running.socket(), 60_000);
+    let registry = store::build(&client, &Invocation::default()).registry;
+    match registry.resolve(DECLARED) {
+        Resolution::Found { .. } => {}
+        other => panic!("a declared name must resolve: {}", other.reason()),
+    }
+
+    let verbs = std::fs::read_to_string(dir.join("pass-cli.verbs")).unwrap_or_default();
+    let lines = parse_verbs(&verbs);
+    assert!(!lines.is_empty(), "the stand-in recorded nothing");
+    let expected_len = ENCRYPTION_KEY_DECOY.len().to_string();
+    let mut verbs_seen = std::collections::BTreeSet::new();
+    for line in &lines {
+        verbs_seen.insert(line.verb.clone());
+        assert_eq!(
+            line.key_provider, "env",
+            "`{}` at {} did not carry `PROTON_PASS_KEY_PROVIDER=env`",
+            line.verb, line.dir
+        );
+        assert_eq!(
+            line.key_len, expected_len,
+            "`{}` at {} did not carry the local key — carries no value, only its length",
+            line.verb, line.dir
+        );
+    }
+    for verb in ["login", "info"] {
+        assert!(
+            verbs_seen.contains(verb),
+            "`{verb}` never ran, so this run proves nothing about it: {verbs_seen:?}"
+        );
+    }
+    assert!(
+        verbs_seen
+            .iter()
+            .any(|verb| !["login", "info", "logout"].contains(&verb.as_str())),
+        "only login-flow verbs ran, so the lookup path is unproven here: {verbs_seen:?}"
+    );
+
+    drop(running);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_retirement_logout_under_env_carries_the_key_it_needs_to_end_the_session() {
+    // The other half of the case above, split off it because the two want
+    // opposite things from `timeout_ms`: this one waits on the retirement
+    // GRACE (`2 × timeout_ms + 2s + 1s`), so it wants that number small, and
+    // it reads nothing through the daemon, so a small read ceiling costs it
+    // nothing.
+    //
+    // The defect it pins: `retire` built `logout_command` with `&[]`, so
+    // under `KeyProvider::Env` the plain logout that ends a superseded
+    // session's account side could not open that session at all — it failed
+    // on the missing key, fell through to `--force`, and left the account
+    // session to expire on the vendor's own clock instead of being ended.
+    let dir = scratch("daemon-proton-key-env-retire");
+    let inner = stub_pass_cli_listing(
+        &dir,
+        &Backend::Injects(PROTON_DECOY),
+        &Listing::Json(LISTING),
+    );
+    let vendor = stub_with_session_verbs(
+        &dir,
+        &inner,
+        Duration::ZERO,
+        true,
+        LogoutAnswer::AlreadyLoggedOut,
+        None,
+    );
+    // `3_000` (grace 9s) with `login_after_minutes: 0`: a renewal every tick,
+    // so a superseded generation clears the grace inside a run short enough
+    // for CI.
+    let config = daemon_config_with_generations_loop_env(&dir, &vendor, 0, 1, 3_000);
+    let running = start_daemon(&config, policy_allowing_self());
+
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let logouts = loop {
+        let verbs = std::fs::read_to_string(dir.join("pass-cli.verbs")).unwrap_or_default();
+        let lines: Vec<_> = parse_verbs(&verbs)
+            .into_iter()
+            .filter(|line| line.verb == "logout")
+            .collect();
+        if !lines.is_empty() {
+            break lines;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "no retirement logout ran in time, so this case proves nothing"
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    };
+
+    let expected_len = ENCRYPTION_KEY_DECOY.len().to_string();
+    for line in &logouts {
+        assert_eq!(
+            line.key_provider, "env",
+            "the retirement logout at {} did not carry `PROTON_PASS_KEY_PROVIDER=env`",
+            line.dir
+        );
+        assert_eq!(
+            line.key_len, expected_len,
+            "the retirement logout at {} did not carry the local key — carries no value, \
+             only its length",
+            line.dir
+        );
     }
 
     drop(running);

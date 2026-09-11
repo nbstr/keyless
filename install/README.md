@@ -443,8 +443,15 @@ not having a keychain.
 
 So the daemon always names a key provider, and `keyring` is not a value
 `keylessd.json` will accept — it refuses to start rather than run that way.
-`fs` keeps the key in the session directory beside the store, at the same
-`0600` under the same uid.
+
+`env`, the default, has the daemon hold that key itself: it generates one into
+its own `0600` credential file at first start and hands it to every `pass-cli`
+child in the environment. No file sits beside the store, so nothing the vendor
+does to one can strand it. `fs` is the other accepted value, and it keeps the
+key in the session directory beside the store at the same `0600` under the same
+uid — where the vendor mints it on any verb that finds it missing, deletes it on
+every `logout` before it deletes the data, and leaves a reader whose session
+outlived its key with a store nothing can open.
 
 ### Mint the agent token
 
@@ -481,10 +488,11 @@ Coordinates only; there is no field in `keylessd.json` a credential fits in:
   "enabled": true,
   "binary": "/absolute/path/to/pass-cli",
   "session_dir": "/usr/local/var/lib/keyless/proton-session",
-  "key_provider": "fs",
+  "key_provider": "env",
   "token_expires": "<YYYY-MM-DD>",
   "credentials_file": "/usr/local/var/lib/keyless/proton.json",
-  "credentials": { "PROTON_PASS_PERSONAL_ACCESS_TOKEN": "AGENT_TOKEN" },
+  "credentials": { "PROTON_PASS_PERSONAL_ACCESS_TOKEN": "AGENT_TOKEN",
+                   "PROTON_PASS_ENCRYPTION_KEY": "LOCAL_KEY" },
   "session": { "auto_login": true }
 }
 ```
@@ -493,9 +501,14 @@ Coordinates only; there is no field in `keylessd.json` a credential fits in:
   falls back to a location derived from the caller's home, which for a daemon
   uid is either nothing or something nobody meant to be a credential store.
   Every Proton name degrades instead, and startup says so.
-- **`key_provider`** is `fs` or `env`, and defaults to `fs`. `env` takes the
-  key from `PROTON_PASS_ENCRYPTION_KEY`, which then has to be named under
-  `credentials` beside the token. `keyring` is refused at parse time.
+- **`key_provider`** is `env` or `fs`, and defaults to `env`. `env` takes the
+  local encryption key from `PROTON_PASS_ENCRYPTION_KEY`, which has to be named
+  under `credentials` beside the token — the value itself is one `keylessd`
+  GENERATES the first time it starts with that entry declared and nothing under
+  it, so it is never typed and never pasted. `fs` keeps the key in a file inside
+  the session directory instead, where the vendor mints it on any verb that
+  finds it missing and deletes it on every `logout`; it stays accepted for a
+  machine not yet reconfigured. `keyring` is refused at parse time.
 - **`token_expires`** is a date you write down, not one anything can discover.
 - **`session.auto_login`** keeps the session alive. Off by default; see *Keeping
   the session alive* below, which is the section to read before deciding you do
@@ -587,9 +600,16 @@ default. The daemon's own sweep, or the next plain login, retires the old
 generation once its readers have drained.
 
 `keylessd credential --store proton --name <entry>` still writes that file on
-its own, without touching the session. That is the verb for a `key_provider` of
-`env`, whose local key is a second credential the login reads back rather than
-prompting for twice.
+its own, without touching the session — the verb for a value you hold, such as
+a token you are placing outside a login.
+
+**The local encryption key is not one of those.** Under `key_provider: env`
+both `keylessd run` and `keylessd login` generate it into the entry
+`credentials` names, once, the first time they start against a config that
+declares it and a file that holds nothing under it — and reuse it on every
+later start, because a value regenerated on a restart would leave every
+generation encrypted under the previous one unreadable. So it is never typed,
+and there is no prompt for it: one writer, and it is this daemon.
 
 ### What `check` can and cannot tell you
 

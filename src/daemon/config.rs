@@ -2355,9 +2355,10 @@ mod tests {
             assert_eq!(config.stores.proton.key_provider.as_str(), word);
         }
 
-        // And the default is the safe one, so a config that says nothing is
-        // not silently the vendor's default.
-        assert_eq!(parse("{}").stores.proton.key_provider.as_str(), "fs");
+        // And the default is `env`, so a config that says nothing is not
+        // silently the vendor's `keyring` default — see `KeyProvider`'s own
+        // doc for why `env` rather than `fs` is that default now.
+        assert_eq!(parse("{}").stores.proton.key_provider.as_str(), "env");
     }
 
     #[test]

@@ -729,8 +729,20 @@ cat <<'NEXT'
 # it cannot find beside a session store that exists, `pass-cli` FORCES A LOGOUT
 # and reinitialises the store. So the daemon always sets a key provider, and
 # `keyring` is not a value keylessd.json will accept -- it refuses to start
-# rather than run that way. `fs` keeps the key inside the generation directory
-# beside its store, at the same 0600 under the same uid.
+# rather than run that way.
+#
+# "env" is the default, and it is the one to use unless you have a reason
+# not to: the key arrives in PROTON_PASS_ENCRYPTION_KEY, derived per process
+# and never written to disk by the vendor, so there is no file a daemon
+# child can race to mint or a `logout` can delete out from under a reader.
+# `keylessd` GENERATES that value itself, once, into the credential file
+# named in step (b) below, the first time it starts with an entry declared
+# and none there yet -- you never type it, the way you type the token in
+# step (c). "fs" keeps the key inside the generation directory instead, at
+# the same 0600 under the same uid; it still works and stays accepted, but
+# carries hazards of its own (a file two children can race to create, one
+# `logout` deletes unconditionally) that "env" has no equivalent of. Use it
+# only on a machine you are not ready to reconfigure yet.
 #
 # a. Create a VIEWER-role agent token at the vendor, scoped to exactly the one
 #    vault the daemon may read. `agent create` prints it once:
@@ -755,10 +767,11 @@ cat <<'NEXT'
 #        "enabled": true,
 #        "binary": "/absolute/path/to/pass-cli",
 #        "session_dir": "$LIB_DIR/proton-session",
-#        "key_provider": "fs",
+#        "key_provider": "env",
 #        "token_expires": "<YYYY-MM-DD, the day step (a) printed>",
 #        "credentials_file": "$LIB_DIR/proton.json",
-#        "credentials": { "PROTON_PASS_PERSONAL_ACCESS_TOKEN": "AGENT_TOKEN" },
+#        "credentials": { "PROTON_PASS_PERSONAL_ACCESS_TOKEN": "AGENT_TOKEN",
+#                          "PROTON_PASS_ENCRYPTION_KEY": "LOCAL_KEY" },
 #        "session": { "auto_login": true }
 #      }
 #
@@ -772,6 +785,16 @@ cat <<'NEXT'
 #    and a mistyped one, so without it the first symptom of expiry is every
 #    Proton name degrading at an hour nobody chose. `check` reports the days
 #    remaining and turns red a month out.
+#
+#    "PROTON_PASS_ENCRYPTION_KEY" under "credentials" names WHERE the local
+#    key lives in proton.json, never what it is -- `keylessd` writes the
+#    value there itself the first time it starts against this config with
+#    nothing under "LOCAL_KEY" yet, the same one atomic 0600 write
+#    `keylessd credential` uses for a value you typed. Leave the entry name
+#    out and "env" degrades every Proton name with a sentence saying so;
+#    there is no flag or prompt that supplies the value, because generating
+#    it here is what "no `pass-cli` process can ever create, replace or lose
+#    a key" means in practice.
 #
 #    Each name is an item in that vault, by vault name, title and field. None
 #    of the three is defaulted, and that is what makes an invented name cost

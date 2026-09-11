@@ -296,21 +296,52 @@ pub(crate) fn assert_vendor_switch_offs(command: &Command) {
 /// Naming a provider that keeps the key somewhere a daemon can reach is
 /// therefore not a convenience — it is the difference between an adapter that
 /// works behind a uid boundary and one that empties a session store every time
-/// it runs. So the field is not optional, its default is the safe value, and
-/// the unsafe value cannot be written into a config at all: a `keyring` there
-/// is a parse error, which on a daemon means it refuses to start, which is
-/// visible. See [`crate::daemon::config`] on why that is the right direction
-/// for a daemon to fail in.
+/// it runs. So the field is not optional, and the unsafe value cannot be
+/// written into a config at all: a `keyring` there is a parse error, which on
+/// a daemon means it refuses to start, which is visible. See
+/// [`crate::daemon::config`] on why that is the right direction for a daemon
+/// to fail in.
+///
+/// # The default is `env`, and `fs` is not merely the OTHER safe value
+///
+/// `fs`'s file — read out of `pass-cli`'s own source, in
+/// `FsLocalKeyProvider::get_local_key` — is minted with `create_new(true)` on
+/// ANY verb that finds none, so of two children that both find it missing the
+/// one that loses the race fails that call outright rather than picking up
+/// the key the winner just wrote, and `local_key_path`
+/// calls `std::fs::canonicalize` on the session directory, so it errors
+/// instead of minting when that directory does not exist yet. Worse,
+/// `pass-cli logout` calls `remove_key` UNCONDITIONALLY before it deletes the
+/// session data — which for `fs` deletes the file — so a concurrent reader's
+/// still-open session outlives its own key by however long the race takes,
+/// and the generation is undecryptable from that moment on with no local
+/// symptom until the next read.
+///
+/// `env` has none of that surface, not a narrower version of it: the key
+/// arrives in [`ENCRYPTION_KEY_VAR`] and is derived per process, so there is
+/// no file to race for, none to be absent, and `EnvLocalKeyProvider::remove_key`
+/// is a documented no-op — "Nothing to remove since the key only lives in
+/// process memory". Pairing it with a daemon that generates that value once,
+/// into its own credential file, at first start (see
+/// [`crate::daemon::credential`]) is what makes "no `pass-cli` process can
+/// ever create, replace or lose a key" true rather than merely likely: there
+/// is exactly one writer, and it is not the vendor.
+///
+/// `fs` stays accepted for a machine not yet reconfigured onto `env` — it is
+/// still safer than the vendor's own `keyring` default, which is why it was
+/// the default here first.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum KeyProvider {
     /// The key is a file inside the session directory. Whoever owns that
     /// directory can read it, and nobody else, which is the same boundary the
-    /// session store itself has.
-    #[default]
+    /// session store itself has — but see this type's own doc for why it is
+    /// no longer the default.
     Fs,
-    /// The key arrives in [`ENCRYPTION_KEY_VAR`], base64url-encoded. Nothing
-    /// is written beside the session store, at the cost of the daemon having
-    /// to hold one more value in its own credential file.
+    /// The key arrives in [`ENCRYPTION_KEY_VAR`], base64url-shaped. Nothing is
+    /// written beside the session store, at the cost of the daemon having to
+    /// hold one more value in its own credential file — which it generates
+    /// itself; see [`crate::daemon::credential`].
+    #[default]
     Env,
 }
 
