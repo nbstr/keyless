@@ -711,3 +711,46 @@ fn an_install_directory_that_is_not_on_path_removes_nothing() {
         "the report did not name the directory nothing reaches: {plan}"
     );
 }
+
+#[test]
+fn the_installer_creates_the_access_group_only_when_it_is_not_already_there() {
+    // `dseditgroup -o create` against a record that exists is not idempotent:
+    // it asks whether to overwrite, and it asks on the TERMINAL. So a re-run
+    // under `set -e` either hangs waiting for a person or dies on their answer
+    // — which is what happened on 2026-09-11, half way through a deploy, with
+    // the daemon left running the old binary.
+    //
+    // Overwriting is also the wrong thing to want. `-i` carries a gid, and
+    // every file under the daemon's state directory is owned by the one that
+    // is already there, so a replaced record orphans all of them.
+    //
+    // The membership edits are deliberately NOT guarded: adding a member that
+    // is already a member is idempotent, costs nothing, and is what repairs a
+    // group somebody edited by hand.
+    let script = installer();
+
+    let create =
+        r#"step dseditgroup -o create -i "$NEW_GID" -r "keyless socket access" "$ACCESS_GROUP""#;
+    assert!(
+        script.contains(create),
+        "install/install.sh no longer creates the access group at all. Expected:\n  {create}"
+    );
+
+    let guarded = format!("if [[ -z \"$EXISTING_GID\" ]]; then\n  {create}\nfi");
+    assert!(
+        script.contains(&guarded),
+        "install/install.sh creates the access group unconditionally, so a re-install \
+         prompts on the terminal and a scripted deploy stops half way. Expected the create \
+         to sit inside an existence check:\n{guarded}"
+    );
+
+    // The control: the two membership edits must stay unguarded, or a group
+    // that lost a member is never repaired by re-running the installer.
+    for member in ["$TARGET_USER", "$DAEMON_USER"] {
+        let edit = format!(r#"step dseditgroup -o edit -a "{member}" -t user "$ACCESS_GROUP""#);
+        assert!(
+            script.contains(&edit),
+            "install/install.sh no longer re-asserts {member}'s membership. Expected:\n  {edit}"
+        );
+    }
+}

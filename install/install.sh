@@ -202,7 +202,19 @@ fi
 # --- the group, which is the only thing that connects you to the daemon -----
 
 note "The access group. You and the daemon are both in it; nobody else is."
-step dseditgroup -o create -i "$NEW_GID" -r "keyless socket access" "$ACCESS_GROUP"
+# Created only when it is not already there, because `-o create` against an
+# existing record is not idempotent: it asks whether to overwrite, and it asks
+# on the TERMINAL, so an install re-run from a script either hangs or takes
+# whatever the answer happened to be. Overwriting is also the wrong thing to
+# want — `-i` would move the gid, and every file under the daemon's state
+# directory is owned by the old one, so a replaced record orphans the lot.
+#
+# The membership edits below are unconditional on purpose. They ARE idempotent,
+# they are what actually has to be true, and re-asserting them is how a group
+# somebody edited by hand comes back to what this installer says it should be.
+if [[ -z "$EXISTING_GID" ]]; then
+  step dseditgroup -o create -i "$NEW_GID" -r "keyless socket access" "$ACCESS_GROUP"
+fi
 step dseditgroup -o edit -a "$TARGET_USER" -t user "$ACCESS_GROUP"
 
 # --- the daemon's user -----------------------------------------------------
