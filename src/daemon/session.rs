@@ -879,6 +879,7 @@ mod tests {
             &credentials,
             KEY_ENTRY,
             &crate::secret::Secret::new(KEY_DECOY.to_owned()),
+            None,
         )
         .expect("write the local key the daemon generated");
 
