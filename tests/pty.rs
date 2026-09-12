@@ -58,7 +58,7 @@ use nix::sys::signal::{Signal, kill};
 use nix::sys::termios::{self, LocalFlags, Termios};
 use nix::unistd::Pid;
 
-use support::{DECOY_VALUE, Stub, scratch, stub_security, within};
+use support::{DECOY_VALUE, Stub, keychain_stub_config, scratch, within};
 
 const BIN: &str = env!("CARGO_BIN_EXE_keyless");
 
@@ -103,15 +103,7 @@ nix::ioctl_write_ptr_bad!(set_winsize, nix::libc::TIOCSWINSZ, Winsize);
 
 /// A config wired to a `security` stub, so no real keychain is ever consulted.
 fn config_with_stub(dir: &std::path::Path, behaviour: &Stub) -> std::path::PathBuf {
-    let stub = stub_security(dir, behaviour);
-    let path = dir.join("config.json");
-    let body = format!(
-        r#"{{"stores":{{"keychain":{{"service":"keyless","binary":"{}"}}}},
-            "secrets":{{"DECOY":{{}}}}}}"#,
-        stub.display()
-    );
-    std::fs::write(&path, body).expect("write config");
-    path
+    keychain_stub_config(dir, behaviour, r#"{"DECOY":{}}"#)
 }
 
 /// Who owns the terminal `keyless` is attached to.

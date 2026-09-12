@@ -1218,7 +1218,7 @@ fn a_backend_nobody_enabled_is_never_spawned() {
     let infisical = stub_infisical(&dir, &Backend::Injects(INFISICAL_DECOY));
     let config = format!(
         r#"{{"stores":{{"keychain":{{"enabled":false}},
-             "infisical":{{"binary":"{}"}}}},
+             "infisical":{{"binary":"{}","timeout_ms":60000}}}},
             "secrets":{{"DECOY":{{}}}}}}"#,
         infisical.display()
     );

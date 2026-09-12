@@ -94,6 +94,40 @@ pub enum Stub {
     Dead,
 }
 
+/// Write a config at `<dir>/config.json` whose keychain store is a stub, with
+/// `secrets` as its declarations.
+///
+/// `secrets` is the caller's because it is the only half that differs between
+/// the four sites this replaced — one of them declares a second name to prove
+/// the narrowing, the rest declare `DECOY` alone. The store half is identical
+/// at all four and now has one home.
+///
+/// # Why the deadline is written here at all
+///
+/// `timeout_ms` is a CEILING, never a measurement: not one case using this
+/// config asserts anything about how long the stub took. Left out, the store
+/// inherits `keyless::config::DEFAULT_TIMEOUT_MS` — the PRODUCTION default, ten
+/// seconds — and the only thing that number then decides is how loaded the
+/// machine has to be before a passing test reports a failure. So the value is
+/// `keyless::config::MAX_TIMEOUT_MS`, the top of the range the tool will
+/// honour, which is the nearest a config can be spelled to the "no deadline"
+/// these cases actually want.
+///
+/// It was written into four copies of this literal before this function
+/// existed, and `tests/suite_hygiene.rs`'s deadline gate is what refuses a
+/// fifth that leaves it out.
+pub fn keychain_stub_config(dir: &Path, behaviour: &Stub, secrets: &str) -> PathBuf {
+    let stub = stub_security(dir, behaviour);
+    let path = dir.join("config.json");
+    let body = format!(
+        r#"{{"stores":{{"keychain":{{"service":"keyless","binary":"{binary}","timeout_ms":60000}}}},
+            "secrets":{secrets}}}"#,
+        binary = stub.display(),
+    );
+    std::fs::write(&path, body).expect("write config");
+    path
+}
+
 /// Write an executable stand-in for `/usr/bin/security`.
 ///
 /// The real binary is never invoked by this suite. A stub means the tests can

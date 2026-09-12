@@ -581,8 +581,8 @@ fn detected_reads_the_config_this_machine_actually_uses() {
         format!(
             r#"{{"stores": {{
                  "keychain": {{"enabled": false}},
-                 "infisical": {{"enabled": true, "binary": "{}", "project_id": "proj"}},
-                 "proton": {{"enabled": true, "binary": "{}", "session_dir": "{}"}},
+                 "infisical": {{"enabled": true, "binary": "{}", "project_id": "proj", "timeout_ms": 60000}},
+                 "proton": {{"enabled": true, "binary": "{}", "session_dir": "{}", "timeout_ms": 60000}},
                  "default": "infisical"
                }},
                "secrets": {{"DECOY": {{"store": "infisical", "env": "staging"}}}}}}"#,

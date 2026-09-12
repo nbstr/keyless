@@ -475,7 +475,7 @@ fn two_store_daemon(dir: &std::path::Path, under_stores: &str, at_top_level: &st
              "cache_ttl_seconds":0,
              "idle_timeout_seconds":5,
              "stores":{{"file":{{"enabled":true,"path":{file}}},
-                        "keychain":{{"enabled":true,"binary":{binary},
+                        "keychain":{{"enabled":true,"timeout_ms":60000,"binary":{binary},
                                      "keychain":{keychain}}}{under_stores}}}
              {at_top_level}}}"#,
         socket = json_path(&short_socket_path(dir)),

@@ -66,8 +66,8 @@ use keyless::store::keychain::KeychainStore;
 use keyless::store::{Registry, Store};
 
 use support::{
-    DECOY_VALUE, PATIENCE, Stub, install_executable, run_with, scratch, stub_security, within,
-    witness, witnessed,
+    DECOY_VALUE, PATIENCE, Stub, install_executable, keychain_stub_config, run_with, scratch,
+    stub_security, within, witness, witnessed,
 };
 
 /// A `security` stand-in that behaves badly in one specific way.
@@ -677,17 +677,7 @@ fn a_backgrounded_grandchild_does_not_hold_the_process_open() {
             // would inherit exactly the hang under test and report it as its own.
             let dir = scratch("backgrounded-grandchild");
             let marker = dir.join("witness");
-            let stub = stub_security(&dir, &Stub::Returns(DECOY_VALUE));
-            let config = dir.join("config.json");
-            std::fs::write(
-                &config,
-                format!(
-                    r#"{{"stores":{{"keychain":{{"service":"keyless","binary":"{}"}}}},
-                    "secrets":{{"DECOY":{{}}}}}}"#,
-                    stub.display()
-                ),
-            )
-            .expect("write config");
+            let config = keychain_stub_config(&dir, &Stub::Returns(DECOY_VALUE), r#"{"DECOY":{}}"#);
             let sink = std::fs::File::create(dir.join("out")).expect("create the sink");
 
             let started = Instant::now();
@@ -755,18 +745,8 @@ fn the_output_of_a_child_that_exits_normally_is_not_truncated() {
             // Through the real binary, because a library-level test writes to this
             // process's own stdout and cannot count what arrived.
             let dir = scratch("drain-keeps-output");
-            let stub = stub_security(&dir, &Stub::Returns(DECOY_VALUE));
             let sink = dir.join("out");
-            let config = dir.join("config.json");
-            std::fs::write(
-                &config,
-                format!(
-                    r#"{{"stores":{{"keychain":{{"service":"keyless","binary":"{}"}}}},
-                    "secrets":{{"DECOY":{{}}}}}}"#,
-                    stub.display()
-                ),
-            )
-            .expect("write config");
+            let config = keychain_stub_config(&dir, &Stub::Returns(DECOY_VALUE), r#"{"DECOY":{}}"#);
 
             let out = std::fs::File::create(&sink).expect("create the sink");
             let status = std::process::Command::new(env!("CARGO_BIN_EXE_keyless"))
