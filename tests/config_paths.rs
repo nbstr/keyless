@@ -397,9 +397,9 @@ fn every_session_config_path_field_expands() {
     let json = format!(
         r#"{{"stores":{{
              "daemon":{{"socket":"{}"}},
-             "keychain":{{"binary":"{}"}},
-             "infisical":{{"binary":"{}","config_dir":"{}","probe_binary":"{}"}},
-             "proton":{{"binary":"{}","session_dir":"{}","probe_binary":"{}",
+             "keychain":{{"binary":"{}","timeout_ms":60000}},
+             "infisical":{{"binary":"{}","config_dir":"{}","probe_binary":"{}","timeout_ms":60000}},
+             "proton":{{"binary":"{}","session_dir":"{}","probe_binary":"{}","timeout_ms":60000,
                         "manager":{{"session_dir":"{}"}}}}}}}}"#,
         path(fields[0]),
         path(fields[1]),
@@ -473,7 +473,7 @@ fn every_daemon_config_path_field_expands() {
     let json = format!(
         r#"{{"socket":"{}","audit":"{}",
              "stores":{{"file":{{"path":"{}"}},
-                        "keychain":{{"binary":"{}","keychain":"{}"}}}}}}"#,
+                        "keychain":{{"binary":"{}","keychain":"{}","timeout_ms":60000}}}}}}"#,
         expected("daemon-socket").0,
         expected("daemon-audit").0,
         expected("daemon-file").0,
@@ -518,7 +518,7 @@ fn a_bare_binary_name_is_left_alone_so_path_lookup_still_works() {
     // An implementation that made every config path absolute would break every
     // default install, and every test above would still pass.
     let config: Config = serde_json::from_str(
-        r#"{"stores":{"proton":{"binary":"pass-cli"},"infisical":{"binary":"infisical"}}}"#,
+        r#"{"stores":{"proton":{"binary":"pass-cli","timeout_ms":60000},"infisical":{"binary":"infisical","timeout_ms":60000}}}"#,
     )
     .expect("valid config");
     assert_eq!(config.stores.proton.binary.as_path(), Path::new("pass-cli"));
