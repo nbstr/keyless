@@ -68,7 +68,7 @@ use crate::store::proton_session::Generations;
 use crate::{NAME, State};
 
 use self::config::DaemonConfig;
-use self::resolver::{Outcome, Refresher, Resolver};
+use self::resolver::{Answer, FailureKind, Outcome, Refresher, Resolver, Source};
 
 /// Socket mode: owner and group may connect, nobody else.
 ///
@@ -127,6 +127,14 @@ pub struct Daemon {
     /// when Proton is disabled or names no `session_dir` — see
     /// [`DaemonConfig::generations`]. See [`Running::spawn`].
     generations: Option<Arc<Generations>>,
+}
+
+/// Where a resolved value came from, for [`Daemon::record`] — [`Answer`]'s
+/// `source` and `age` carried together, since neither reaches a row without
+/// the other and a call that has one always has both.
+struct Served {
+    source: Source,
+    age: Option<Duration>,
 }
 
 impl Daemon {
@@ -356,7 +364,14 @@ impl Connection {
         let attestation = attest(stream.as_fd(), &self.policy);
 
         if let Some(denial) = attestation.denial() {
-            self.record(&request, &attestation, denial.kind(), State::Degraded, None);
+            self.record(
+                &request,
+                &attestation,
+                denial.kind(),
+                State::Degraded,
+                None,
+                None,
+            );
             return Reply::Denied(denial.to_string());
         }
 
@@ -371,19 +386,30 @@ impl Connection {
 
     fn resolve(&self, stream: &UnixStream, request: &Request, attestation: &Attestation) -> Reply {
         if request.name.is_empty() || request.name.chars().count() > MAX_NAME_CHARS {
-            self.record(request, attestation, "bad-name", State::Degraded, None);
+            self.record(
+                request,
+                attestation,
+                "bad-name",
+                State::Degraded,
+                None,
+                None,
+            );
             return Reply::Failed(format!(
                 "a name must be between 1 and {MAX_NAME_CHARS} characters"
             ));
         }
 
-        let outcome = if request.progress {
+        let answer = if request.progress {
             self.resolve_aloud(stream, &request.name)
         } else {
-            self.resolver.resolve(&request.name).outcome
+            self.resolver.resolve(&request.name)
         };
+        let served = Some(Served {
+            source: answer.source,
+            age: answer.age,
+        });
 
-        match outcome {
+        match answer.outcome {
             Outcome::Found(secret) => {
                 self.record(
                     request,
@@ -391,6 +417,7 @@ impl Connection {
                     "allow",
                     State::Injected,
                     Some(secret.as_ref()),
+                    served,
                 );
                 // One more copy of the plaintext, which the reply owns and
                 // zeroizes when it is dropped. The `Arc` in the cache keeps
@@ -398,11 +425,25 @@ impl Connection {
                 Reply::Value(Secret::new(secret.expose().to_owned()))
             }
             Outcome::Absent => {
-                self.record(request, attestation, "absent", State::Degraded, None);
+                self.record(
+                    request,
+                    attestation,
+                    "absent",
+                    State::Degraded,
+                    None,
+                    served,
+                );
                 Reply::Absent
             }
-            Outcome::Failed(reason) => {
-                self.record(request, attestation, "store-failed", State::Degraded, None);
+            Outcome::Failed { reason, kind } => {
+                self.record(
+                    request,
+                    attestation,
+                    kind.as_str(),
+                    State::Degraded,
+                    None,
+                    served,
+                );
                 Reply::Failed(reason)
             }
         }
@@ -427,26 +468,26 @@ impl Connection {
     /// would throw away the work and make the next attempt pay for it again —
     /// which, on a store that is slow enough to have reached this code, is how
     /// a client ends up unable to resolve a name it asks for repeatedly.
-    fn resolve_aloud(&self, stream: &UnixStream, name: &str) -> Outcome {
+    fn resolve_aloud(&self, stream: &UnixStream, name: &str) -> Answer {
         let resolver = Arc::clone(&self.resolver);
         let asked = name.to_owned();
         let (sender, receiver) = std::sync::mpsc::channel();
         if thread::Builder::new()
             .name(format!("{NAME}d-lookup"))
             .spawn(move || {
-                let _ = sender.send(resolver.resolve(&asked).outcome);
+                let _ = sender.send(resolver.resolve(&asked));
             })
             .is_err()
         {
             // No thread to be had. Answering late is better than not answering,
             // and late is exactly what this daemon did before it could speak.
-            return self.resolver.resolve(name).outcome;
+            return self.resolver.resolve(name);
         }
 
         let mut heard = true;
         loop {
             match receiver.recv_timeout(HEARTBEAT) {
-                Ok(outcome) => return outcome,
+                Ok(answer) => return answer,
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                     if heard {
                         heard = write_frame(
@@ -458,9 +499,20 @@ impl Connection {
                 }
                 // The worker ended without sending, which a panic under
                 // `panic = "unwind"` is the only way to reach. Under the
-                // release profile's `abort` the daemon is already gone.
+                // release profile's `abort` the daemon is already gone. Never
+                // a store's own silence — no store was even asked by this
+                // thread — but the same audit word applies: nothing was
+                // decided about the name, so a cached value would still
+                // stand had one existed.
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                    return Outcome::Failed("the lookup ended without a result".to_owned());
+                    return Answer {
+                        outcome: Outcome::Failed {
+                            reason: "the lookup ended without a result".to_owned(),
+                            kind: FailureKind::Silent,
+                        },
+                        source: Source::Store,
+                        age: None,
+                    };
                 }
             }
         }
@@ -472,6 +524,13 @@ impl Connection {
     /// that put the value on its own command line — the habit this tool
     /// replaces — must not have it copied into the daemon's log, which is the
     /// one log the caller cannot edit afterwards.
+    ///
+    /// `served` is `None` on a row that never asked the resolver at all — an
+    /// attestation denial, a malformed name — and `Some` on every row that
+    /// did, whatever it decided. A `Some` row naming [`Source::Stale`] is the
+    /// fact [`resolver::Source::as_str`] exists for: the value this row
+    /// served was not read from the vendor a moment ago, and its `age` says
+    /// how long ago it was.
     fn record(
         &self,
         request: &Request,
@@ -479,6 +538,7 @@ impl Connection {
         decision: &str,
         state: State,
         secret: Option<&Secret>,
+        served: Option<Served>,
     ) {
         let masker = match secret {
             Some(secret) => Masker::from_secrets([(request.name.as_str(), secret)]),
@@ -503,6 +563,13 @@ impl Connection {
             .with_cwd(masker.mask_str(&request.cwd))
             .with_unresolved(unresolved)
             .with_decision(decision);
+
+        if let Some(served) = served {
+            event = event.with_source(served.source.as_str());
+            if let Some(age) = served.age {
+                event = event.with_age(age);
+            }
+        }
 
         if let Some(peer) = attestation.peer() {
             event = event.with_peer(Peer {
