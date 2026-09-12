@@ -17,6 +17,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import harness  # noqa: E402
 import test_adversarial  # noqa: E402
 import test_contract  # noqa: E402
+import test_daemon_advice  # noqa: E402
 import test_failopen  # noqa: E402
 import test_false_positive  # noqa: E402
 import test_install  # noqa: E402
@@ -31,6 +32,7 @@ MIN_CHECKS = {
     "test_false_positive": 120,
     "test_failopen": 60,
     "test_adversarial": 60,
+    "test_daemon_advice": 15,
     "test_install": 8,
     "test_latency": 4,
     "test_latency_controls": 10,
@@ -41,7 +43,7 @@ MIN_CHECKS = {
 def main():
     fast = "--fast" in sys.argv
     layers = [test_contract, test_false_positive, test_failopen,
-              test_adversarial, test_install, test_publication,
+              test_adversarial, test_daemon_advice, test_install, test_publication,
               test_latency.CONTROLS]
     if not fast:
         layers.append(test_latency)
