@@ -30,7 +30,7 @@
 mod support;
 
 use std::io::Write;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
@@ -704,6 +704,111 @@ fn an_undeclared_expiry_is_said_out_loud_and_a_declared_one_is_not() {
     let rendered = said(&output);
     assert!(output.status.success(), "{rendered}");
     assert!(rendered.contains("token_expires"), "{rendered}");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Run `keylessd credential`, feeding the value on stdin.
+fn credential(config: &Path, name: &str, store: &str, value: &str) -> Output {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_keylessd"))
+        .args([
+            "credential",
+            "--name",
+            name,
+            "--store",
+            store,
+            "--config",
+            &config.display().to_string(),
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn keylessd credential");
+    child
+        .stdin
+        .take()
+        .expect("stdin")
+        .write_all(value.as_bytes())
+        .expect("write the value");
+    child.wait_with_output().expect("keylessd credential")
+}
+
+#[test]
+fn the_credential_verb_gives_a_file_it_creates_to_the_daemon_and_not_to_whoever_typed_sudo() {
+    // This verb is typed with `sudo`, so the uid running it is root and the
+    // daemon's is not. Where the credential file does not exist yet there is no
+    // owner to preserve, and the file used to keep the one that wrote it —
+    // `0600` under `root:wheel`, inside a directory the daemon owns, readable
+    // by the daemon in-process and by nothing else running as its uid.
+    //
+    // An unprivileged run cannot be root, so the proof runs the other way: point
+    // the config's audit log — the file the daemon's uid is read off, and the
+    // one `keylessd check` judges this credential against — at a file owned by
+    // somebody else, and the verb resolves an owner this process cannot chown
+    // to. The refusal naming that uid is what proves the verb carried the
+    // daemon's answer into the write rather than letting the file keep its own.
+    let dir = scratch("credential-owner");
+    let audit = Path::new("/usr/bin/env");
+    let foreign = std::fs::metadata(audit)
+        .expect("stat a file owned by somebody else")
+        .uid();
+    let mine = {
+        let path = dir.join("whoami");
+        std::fs::write(&path, b"").expect("a file of my own");
+        std::fs::metadata(&path).expect("stat").uid()
+    };
+    assert_ne!(
+        foreign,
+        mine,
+        "this case needs {} to be owned by somebody other than the suite",
+        audit.display()
+    );
+
+    let credentials = dir.join("proton.json");
+    let config = dir.join("keylessd.json");
+    std::fs::write(
+        &config,
+        format!(
+            r#"{{
+                 "socket": "{dir}/keylessd.sock",
+                 "audit": "{audit}",
+                 "stores": {{
+                   "proton": {{
+                     "enabled": true,
+                     "session_dir": "{dir}/session",
+                     "key_provider": "fs",
+                     "timeout_ms": 60000,
+                     "credentials_file": "{credentials}",
+                     "credentials": {{ "PROTON_PASS_PERSONAL_ACCESS_TOKEN": "AGENT_TOKEN" }}
+                   }}
+                 }}
+               }}"#,
+            dir = dir.display(),
+            audit = audit.display(),
+            credentials = credentials.display(),
+        ),
+    )
+    .expect("config");
+
+    let output = credential(&config, "AGENT_TOKEN", "proton", TOKEN_DECOY);
+    let rendered = said(&output);
+    assert!(
+        !output.status.success(),
+        "the write succeeded, so the file kept whoever ran it: {rendered}"
+    );
+    assert!(
+        rendered.contains(&format!("uid {foreign}")),
+        "the verb wrote without the daemon's own owner: {rendered}"
+    );
+    assert!(
+        !rendered.contains(TOKEN_DECOY),
+        "the refusal carried the value: {rendered}"
+    );
+    assert!(
+        !credentials.exists(),
+        "a refused write left a credential file behind"
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
 }

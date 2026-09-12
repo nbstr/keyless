@@ -36,6 +36,16 @@
 //! verdict is given. A guess would be worse than a gap: "owned by the right
 //! user" is precisely the claim that must not be made without evidence.
 //!
+//! **The writer answers out of that same file, and this is one sentence rather
+//! than two mechanisms.** [`store_entry`] takes the daemon's owner from its
+//! caller, resolved by [`daemon_owner`] — so a file this module creates is
+//! given to the uid [`inspect`] will later judge it against, and the two cannot
+//! disagree about what "the daemon" means. It matters only where the file does
+//! not exist yet: where one does, its own owner is preserved and nothing else
+//! is consulted. And the reading side's refusal holds on the writing side too
+//! — no audit log resolves, nothing is inferred, and the file keeps the uid
+//! that wrote it for [`inspect`] to report.
+//!
 //! # Writing it
 //!
 //! [`store_entry`] is the only writer, and it takes a [`Secret`] rather than a
@@ -43,6 +53,14 @@
 //! The value reaches it from stdin — echoed nowhere, in no shell history and in
 //! no process table — which is the same discipline `keyless put` follows and
 //! the reason neither verb has a `--value` flag.
+//!
+//! What it does NOT take from an argument is who the file belongs to on the
+//! path where it is created from nothing. Both writing verbs are typed with
+//! `sudo`, so the uid running them is root and the daemon's is not; a file that
+//! kept the writer's uid there would be a `0600` credential under `root:wheel`
+//! inside a directory the daemon owns — which the daemon itself reads in
+//! process and every other reader running as its uid is refused, including the
+//! repair tooling somebody reaches for once the store is already degraded.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -661,11 +679,40 @@ pub fn prompt_for(subject: &str, remedy: &str) -> Result<Secret, String> {
 /// file owned by whoever typed `sudo` — is a credential the daemon cannot read,
 /// which is a failure that looks exactly like a wrong credential.
 ///
+/// # Why the daemon's owner is an argument
+///
+/// Preserving needs a file that already exists, and on the path where none does
+/// the process's own uid is the wrong answer: `keylessd login` and `keylessd
+/// credential` are typed with `sudo`, so that answer is `root:wheel` for a file
+/// the daemon has to read as itself. `daemon` is who it should be instead,
+/// resolved by the caller from [`daemon_owner`] — the audit log, which the
+/// module header argues is the one source of that fact that is evidence rather
+/// than a guess, and which [`inspect`] already judges this file's owner
+/// against. Writer and reader therefore answer "the daemon's uid" out of the
+/// same file, which is the property a locally inferred owner would give up.
+///
+/// It is threaded rather than read here because this function takes a path and
+/// bytes and knows nothing of a config. [`crate::store::proton_session`]'s
+/// `create` and `publish` take the same pair for the same reason, from the same
+/// callers.
+///
+/// `None` where no audit log resolves, and then nothing is inferred: the file
+/// keeps the uid that wrote it, which is what happened before this argument
+/// existed, and [`inspect`] reports it. A machine with no audit log has never
+/// run the daemon, so there is no uid to attribute the file to — and this
+/// module refuses to name an owner it has no evidence for on the reading side
+/// for exactly that reason.
+///
 /// # Errors
 ///
 /// [`CredentialError`] naming the step that failed. Nothing here is printed and
 /// no error carries the value.
-pub fn store_entry(path: &Path, name: &str, value: &Secret) -> Result<(), CredentialError> {
+pub fn store_entry(
+    path: &Path,
+    name: &str,
+    value: &Secret,
+    daemon: Option<(u32, u32)>,
+) -> Result<(), CredentialError> {
     if name.is_empty() {
         return Err(CredentialError::Refused(
             "an entry name is required: it is the name `credentials` in keylessd.json \
@@ -691,7 +738,10 @@ pub fn store_entry(path: &Path, name: &str, value: &Secret) -> Result<(), Creden
     }
     body.push(b'\n');
 
-    let result = write_atomically(path, &body, owner);
+    // `owner` is `None` only when the file was absent — `read_existing` errors
+    // on a file whose owner cannot be read — so the daemon's answers exactly
+    // where there is nothing to preserve.
+    let result = write_atomically(path, &body, owner.or(daemon));
     body.zeroize();
     result
 }
@@ -738,7 +788,11 @@ pub enum GeneratedEntry {
 ///
 /// Whatever [`store_entry`] could not do, a malformed existing file, or a
 /// generator failure ([`crate::random::generate`]'s own `/dev/urandom` read).
-pub fn ensure_generated_entry(path: &Path, name: &str) -> Result<GeneratedEntry, CredentialError> {
+pub fn ensure_generated_entry(
+    path: &Path,
+    name: &str,
+    daemon: Option<(u32, u32)>,
+) -> Result<GeneratedEntry, CredentialError> {
     // The read and the write are ONE act, and two processes reach it: the
     // daemon's own start, and the `login` verb an operator runs beside it —
     // which the installer's documented sequence puts back to back. Left
@@ -766,7 +820,7 @@ pub fn ensure_generated_entry(path: &Path, name: &str) -> Result<GeneratedEntry,
 
     let value = crate::random::generate(GENERATED_LOCAL_KEY_LENGTH)
         .map_err(|error| io_error(path, format!("a value could not be generated: {error}")))?;
-    store_entry(path, name, &value)?;
+    store_entry(path, name, &value, daemon)?;
     Ok(GeneratedEntry::Generated)
 }
 
@@ -815,7 +869,8 @@ pub fn ensure_proton_local_key(
     let Some(entry) = entries.get(proton::ENCRYPTION_KEY_VAR) else {
         return Ok(None);
     };
-    ensure_generated_entry(&credentials_file, entry).map(Some)
+    let daemon = daemon_owner(&config.audit).map(|owner| (owner.uid, owner.gid));
+    ensure_generated_entry(&credentials_file, entry, daemon).map(Some)
 }
 
 /// How long a writer waits for a claim another process is holding.
@@ -974,25 +1029,24 @@ fn read_existing(
     }
 }
 
-/// Rename a fresh `0600` file over the old one, keeping its owner.
+/// Rename a fresh `0600` file over the old one, giving it to `owner`.
 fn write_atomically(path: &Path, body: &[u8], owner: Option<Owner>) -> Result<(), CredentialError> {
-    let parent = path.parent().filter(|p| !p.as_os_str().is_empty());
+    let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) else {
+        return Err(io_error(path, "has no directory to write into"));
+    };
     // The process id is in the name because two `keylessd` processes can write
     // this file — the daemon's own start and an operator's `login` — and a
     // SHARED temporary is one inode two writers truncate and fill at their own
     // offsets, which leaves a splice of two JSON images that parses as neither.
     // A claim serialises the generator; this is what keeps every other writer
     // from colliding whether or not it took one.
-    let temporary = match parent {
-        Some(dir) => dir.join(format!(
-            ".{}.{}.new",
-            path.file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("credentials"),
-            std::process::id()
-        )),
-        None => return Err(io_error(path, "has no directory to write into")),
-    };
+    let temporary = parent.join(format!(
+        ".{}.{}.new",
+        path.file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("credentials"),
+        std::process::id()
+    ));
 
     // Created at 0600 BEFORE anything is written to it, rather than written and
     // then chmodded: between those two calls the file would exist at whatever
@@ -1025,7 +1079,7 @@ fn write_atomically(path: &Path, body: &[u8], owner: Option<Owner>) -> Result<()
         let _ = fs::remove_file(&temporary);
         return Err(io_error(
             &temporary,
-            format!("cannot be given back to uid {uid}: {error}"),
+            format!("cannot be given to uid {uid}: {error}"),
         ));
     }
 
@@ -1204,7 +1258,13 @@ mod tests {
     fn a_written_entry_is_readable_by_the_file_store_and_by_nobody_else() {
         let dir = scratch("write");
         let path = dir.join("infisical.json");
-        store_entry(&path, "MACHINE_IDENTITY", &Secret::new(DECOY.to_owned())).expect("stored");
+        store_entry(
+            &path,
+            "MACHINE_IDENTITY",
+            &Secret::new(DECOY.to_owned()),
+            None,
+        )
+        .expect("stored");
 
         let mode = fs::metadata(&path).expect("stat").permissions().mode() & 0o7777;
         assert_eq!(mode, MODE, "written at {mode:04o}");
@@ -1225,8 +1285,14 @@ mod tests {
         // and no client id, and the failure would arrive at the next lookup.
         let dir = scratch("append");
         let path = dir.join("infisical.json");
-        store_entry(&path, "CLIENT_ID", &Secret::new("decoy-id-0909".to_owned())).expect("first");
-        store_entry(&path, "CLIENT_SECRET", &Secret::new(DECOY.to_owned())).expect("second");
+        store_entry(
+            &path,
+            "CLIENT_ID",
+            &Secret::new("decoy-id-0909".to_owned()),
+            None,
+        )
+        .expect("first");
+        store_entry(&path, "CLIENT_SECRET", &Secret::new(DECOY.to_owned()), None).expect("second");
 
         let store = crate::store::file::FileStore::new(path);
         for (name, expected) in [("CLIENT_ID", "decoy-id-0909"), ("CLIENT_SECRET", DECOY)] {
@@ -1250,7 +1316,13 @@ mod tests {
         let dir = scratch("empty");
         let path = dir.join("infisical.json");
         fs::write(&path, b"").expect("create");
-        store_entry(&path, "MACHINE_IDENTITY", &Secret::new(DECOY.to_owned())).expect("stored");
+        store_entry(
+            &path,
+            "MACHINE_IDENTITY",
+            &Secret::new(DECOY.to_owned()),
+            None,
+        )
+        .expect("stored");
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -1259,7 +1331,7 @@ mod tests {
         let dir = scratch("malformed");
         let path = dir.join("infisical.json");
         fs::write(&path, format!("{{\"BROKEN\": \"{DECOY}\"")).expect("create");
-        let said = store_entry(&path, "X", &Secret::new("decoy-x".to_owned()))
+        let said = store_entry(&path, "X", &Secret::new("decoy-x".to_owned()), None)
             .expect_err("a truncated object is not a store")
             .to_string();
         assert!(
@@ -1283,7 +1355,7 @@ mod tests {
         let dir = scratch("generate-once");
         let path = dir.join("proton.json");
 
-        let first = ensure_generated_entry(&path, "PROTON_LOCAL_KEY").expect("first call");
+        let first = ensure_generated_entry(&path, "PROTON_LOCAL_KEY", None).expect("first call");
         assert_eq!(first, GeneratedEntry::Generated, "nothing was there yet");
 
         let store = crate::store::file::FileStore::new(path.clone());
@@ -1299,7 +1371,7 @@ mod tests {
             "a generated value is not the expected length"
         );
 
-        let second = ensure_generated_entry(&path, "PROTON_LOCAL_KEY").expect("second call");
+        let second = ensure_generated_entry(&path, "PROTON_LOCAL_KEY", None).expect("second call");
         assert_eq!(
             second,
             GeneratedEntry::AlreadyPresent,
@@ -1338,10 +1410,16 @@ mod tests {
         // the verdict.
         let dir = scratch("generate-keeps");
         let path = dir.join("proton.json");
-        store_entry(&path, "PROTON_LOCAL_KEY", &Secret::new(DECOY.to_owned())).expect("write");
+        store_entry(
+            &path,
+            "PROTON_LOCAL_KEY",
+            &Secret::new(DECOY.to_owned()),
+            None,
+        )
+        .expect("write");
 
         assert_eq!(
-            ensure_generated_entry(&path, "PROTON_LOCAL_KEY").expect("no error"),
+            ensure_generated_entry(&path, "PROTON_LOCAL_KEY", None).expect("no error"),
             GeneratedEntry::AlreadyPresent
         );
 
@@ -1367,13 +1445,60 @@ mod tests {
         let dir = scratch("generate-malformed");
         let path = dir.join("proton.json");
         fs::write(&path, format!("{{\"BROKEN\": \"{DECOY}\"")).expect("create");
-        let said = ensure_generated_entry(&path, "PROTON_LOCAL_KEY")
+        let said = ensure_generated_entry(&path, "PROTON_LOCAL_KEY", None)
             .expect_err("a truncated object is not a store")
             .to_string();
         assert!(
             !said.contains(DECOY),
             "the refusal quoted the file's contents: {said}"
         );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_daemons_first_start_hands_its_own_owner_to_the_key_it_generates() {
+        // The path the defect arrives on, end to end from the entry point the
+        // daemon's start calls. `ensure_proton_local_key` is the one caller
+        // that resolves the owner rather than receiving it, so a resolve that
+        // never reaches the write is invisible to every case that hands the
+        // owner in by hand. Pointing the config's audit log at a file owned by
+        // somebody else makes the resolved answer a uid this process cannot
+        // chown to, and the refusal naming it is what proves the two ends are
+        // joined.
+        let dir = scratch("first-start-owner");
+        let audit = Path::new("/usr/bin/env");
+        let meta = fs::metadata(audit).expect("stat a file owned by somebody else");
+        assert_ne!(
+            meta.uid(),
+            mine().0,
+            "this case needs {} to be owned by somebody other than the suite",
+            audit.display()
+        );
+
+        let config: super::super::config::DaemonConfig = serde_json::from_str(&format!(
+            r#"{{"audit":"{audit}",
+                 "stores":{{"proton":{{"enabled":true,
+                                       "session_dir":"{dir}/session",
+                                       "credentials_file":"{dir}/proton.json",
+                                       "key_provider":"env",
+                                       "credentials":{{"PROTON_PASS_ENCRYPTION_KEY":"PROTON_LOCAL_KEY"}}}}}}}}"#,
+            audit = audit.display(),
+            dir = dir.display(),
+        ))
+        .expect("a valid daemon config");
+
+        let said = ensure_proton_local_key(&config)
+            .expect_err("this process cannot give the key file to another uid")
+            .to_string();
+        assert!(
+            said.contains(&format!("uid {}", meta.uid())),
+            "the generated key was written without the daemon's own owner: {said}"
+        );
+        assert!(
+            !dir.join("proton.json").exists(),
+            "a refused generation left a credential file behind"
+        );
+
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -1495,7 +1620,7 @@ mod tests {
             let handles: Vec<_> = (0..2)
                 .map(|_| {
                     let path = path.clone();
-                    scope.spawn(move || ensure_generated_entry(&path, "PROTON_LOCAL_KEY"))
+                    scope.spawn(move || ensure_generated_entry(&path, "PROTON_LOCAL_KEY", None))
                 })
                 .collect();
             handles
@@ -1690,7 +1815,13 @@ mod tests {
         let missing = inspect(&path, Some(300)).expect_err("nothing is there");
         assert!(missing.contains("does not exist"), "{missing}");
 
-        store_entry(&path, "MACHINE_IDENTITY", &Secret::new(DECOY.to_owned())).expect("stored");
+        store_entry(
+            &path,
+            "MACHINE_IDENTITY",
+            &Secret::new(DECOY.to_owned()),
+            None,
+        )
+        .expect("stored");
         let owner = fs::metadata(&path).expect("stat").uid();
 
         // Sound: right mode, and the owner is the uid the daemon runs as.
@@ -1764,17 +1895,28 @@ mod tests {
 
         // The remedy the malformed message prescribes: move it aside, because
         // the writer will not rewrite a file it cannot parse.
-        store_entry(&path, "CLIENT_ID", &Secret::new("decoy-id-0177".to_owned()))
-            .expect_err("the writer refuses to overwrite what it cannot read");
+        store_entry(
+            &path,
+            "CLIENT_ID",
+            &Secret::new("decoy-id-0177".to_owned()),
+            None,
+        )
+        .expect_err("the writer refuses to overwrite what it cannot read");
         fs::remove_file(&path).expect("aside");
 
         // And a file with a login in it says how much is in it, so a rewrite
         // that dropped one half of a two-part identity is visible in the row
         // rather than only at the next lookup.
-        store_entry(&path, "CLIENT_ID", &Secret::new("decoy-id-0177".to_owned())).expect("first");
+        store_entry(
+            &path,
+            "CLIENT_ID",
+            &Secret::new("decoy-id-0177".to_owned()),
+            None,
+        )
+        .expect("first");
         let one = inspect(&path, Some(owner)).expect("a sound file");
         assert!(one.contains("1 entry"), "{one}");
-        store_entry(&path, "CLIENT_SECRET", &Secret::new(DECOY.to_owned())).expect("second");
+        store_entry(&path, "CLIENT_SECRET", &Secret::new(DECOY.to_owned()), None).expect("second");
         let two = inspect(&path, Some(owner)).expect("a sound file");
         assert!(two.contains("2 entries"), "{two}");
 
@@ -1788,7 +1930,13 @@ mod tests {
         // way as the wording changes.
         let dir = scratch("no-value");
         let path = dir.join("infisical.json");
-        store_entry(&path, "MACHINE_IDENTITY", &Secret::new(DECOY.to_owned())).expect("stored");
+        store_entry(
+            &path,
+            "MACHINE_IDENTITY",
+            &Secret::new(DECOY.to_owned()),
+            None,
+        )
+        .expect("stored");
 
         let owner = fs::metadata(&path).expect("stat").uid();
 
@@ -1805,13 +1953,197 @@ mod tests {
             inspect(&path, None).unwrap_or_else(|e| e),
             inspect(&dir.join("absent.json"), Some(owner)).unwrap_or_else(|e| e),
             inspect(&broken, Some(owner)).unwrap_or_else(|e| e),
-            store_entry(&dir, "X", &Secret::new(DECOY.to_owned()))
+            store_entry(&dir, "X", &Secret::new(DECOY.to_owned()), None)
                 .map(|()| String::new())
                 .unwrap_or_else(|e| e.to_string()),
         ]
         .join(" ");
         assert!(!said.contains(DECOY), "{said}");
 
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A uid and gid this process is not, and cannot become. `chown` to another
+    /// uid is root's alone, so handing this pair to a write that reaches the
+    /// syscall makes the refusal itself the evidence — which is the only way an
+    /// unprivileged suite can watch an owner other than its own be applied.
+    const NOT_THIS_PROCESS: Owner = (4242, 4243);
+
+    /// This process's own uid and gid, read off a file it just made. The crate
+    /// carries no libc dependency and does not need one for this.
+    fn mine() -> Owner {
+        let path = std::env::temp_dir().join(format!(
+            "keyless-credential-whoami-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        fs::write(&path, b"").expect("a file of my own");
+        let meta = fs::metadata(&path).expect("stat");
+        let _ = fs::remove_file(&path);
+        (meta.uid(), meta.gid())
+    }
+
+    #[test]
+    fn a_file_created_from_nothing_is_given_to_the_daemon_and_not_to_whoever_wrote_it() {
+        // The defect, in the one form an unprivileged suite can actually watch.
+        // A scratch directory is this process's, so a file written into one
+        // carries this process's uid whatever the code decided — asserting that
+        // uid would pass against the bug it is meant to catch. What cannot pass
+        // by construction is a `chown` to somebody else: it is refused to
+        // everybody but root, so the refusal naming the uid is proof the write
+        // reached the syscall with the daemon's answer in hand. Before this
+        // argument existed the same call succeeded silently and left the file
+        // to whoever ran it.
+        let dir = scratch("created-owner");
+        let path = dir.join("proton.json");
+
+        let refused = store_entry(
+            &path,
+            "MACHINE_IDENTITY",
+            &Secret::new(DECOY.to_owned()),
+            Some(NOT_THIS_PROCESS),
+        )
+        .expect_err("this process cannot give a file to another uid");
+
+        let said = refused.to_string();
+        assert!(
+            said.contains(&format!("uid {}", NOT_THIS_PROCESS.0)),
+            "the write did not try to give the file to the daemon: {said}"
+        );
+        assert!(!said.contains(DECOY), "{said}");
+        // Nothing half-made is left behind: the temporary goes with the refusal
+        // and the target was never created.
+        assert!(
+            !path.exists(),
+            "a refused write left a credential file behind"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_file_that_already_exists_keeps_its_own_owner_and_the_daemons_is_not_consulted() {
+        // The preserving arm has to win, and the same uid that makes the case
+        // above fail is what makes this one observable: were the daemon's
+        // answer allowed to override an owner that already exists, this write
+        // would be refused exactly as that one was. It succeeds, so the
+        // existing owner was preferred rather than merely coinciding.
+        let dir = scratch("existing-owner");
+        let path = dir.join("proton.json");
+        fs::write(&path, b"{}\n").expect("a file that already exists");
+        fs::set_permissions(&path, fs::Permissions::from_mode(MODE)).expect("chmod");
+        let before = fs::metadata(&path).expect("stat").uid();
+
+        store_entry(
+            &path,
+            "MACHINE_IDENTITY",
+            &Secret::new(DECOY.to_owned()),
+            Some(NOT_THIS_PROCESS),
+        )
+        .expect("an existing owner is preserved, so no foreign chown is attempted");
+
+        let after = fs::metadata(&path).expect("stat").uid();
+        assert_eq!(
+            after, before,
+            "the rewrite moved a file that already had an owner"
+        );
+        assert_eq!(
+            fs::metadata(&path).expect("stat").mode() & 0o7777,
+            MODE,
+            "the rewrite widened the file"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn no_daemon_owner_infers_none_rather_than_guessing_one() {
+        // A machine with no audit log has never run the daemon, so there is no
+        // uid to attribute a new file to. The module refuses to NAME an owner
+        // without evidence on the reading side — `inspect` reports and gives no
+        // verdict — and this is the same refusal on the writing side: nothing is
+        // inferred, the file keeps the uid that wrote it, and `inspect` is what
+        // says so. A fallback invented here would be that guess, one file over.
+        let dir = scratch("no-daemon-owner");
+        let path = dir.join("proton.json");
+
+        store_entry(
+            &path,
+            "MACHINE_IDENTITY",
+            &Secret::new(DECOY.to_owned()),
+            None,
+        )
+        .expect("a write with no daemon owner still writes");
+
+        let file = fs::metadata(&path).expect("stat");
+        assert_eq!(
+            (file.uid(), file.gid()),
+            mine(),
+            "an owner was inferred where there was no evidence for one"
+        );
+        assert_eq!(file.mode() & 0o7777, MODE, "the write widened the file");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_generator_hands_the_daemons_owner_to_the_write_it_makes() {
+        // The generator is the path the defect arrived on: it creates the entry
+        // at first start, so on a machine whose credential file nobody made it
+        // is what creates the file. A generator that resolved the owner and did
+        // not pass it on would leave that file to whoever ran the daemon while
+        // every other case here stayed green.
+        let dir = scratch("generator-owner");
+        let path = dir.join("proton.json");
+
+        let refused = ensure_generated_entry(&path, "PROTON_LOCAL_KEY", Some(NOT_THIS_PROCESS))
+            .expect_err("this process cannot give a file to another uid");
+
+        let said = refused.to_string();
+        assert!(
+            said.contains(&format!("uid {}", NOT_THIS_PROCESS.0)),
+            "the generated entry was written without the daemon's owner: {said}"
+        );
+        assert!(
+            !path.exists(),
+            "a refused generation left a credential file behind"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_daemons_owner_is_the_one_the_audit_log_carries() {
+        // Writer and reader have to answer "the daemon's uid" out of the same
+        // file, or a credential file can satisfy the write and fail `inspect`.
+        // Both read it here: `daemon_owner` is what the caller passes in, and
+        // `daemon_uid` is what `inspect` judges against. Pointed at a file this
+        // process does not own, the pair answers with that file's uid rather
+        // than with this process's — which is what makes it evidence rather
+        // than a restatement of whoever is running.
+        let (my_uid, _) = mine();
+        let foreign = Path::new("/usr/bin/env");
+        let meta = fs::metadata(foreign).expect("stat a file owned by somebody else");
+        assert_ne!(
+            meta.uid(),
+            my_uid,
+            "this case needs {} to be owned by somebody other than the suite",
+            foreign.display()
+        );
+
+        assert_eq!(
+            daemon_owner(foreign),
+            Some(super::super::login::Owner {
+                uid: meta.uid(),
+                gid: meta.gid()
+            })
+        );
+        assert_eq!(daemon_uid(foreign), Some(meta.uid()));
+
+        // And an audit log that is not there is `None` rather than a guess,
+        // which is the value `store_entry` reads as "infer nothing".
+        let dir = scratch("no-audit-log");
+        assert_eq!(daemon_owner(&dir.join("audit.jsonl")), None);
         let _ = fs::remove_dir_all(&dir);
     }
 }
@@ -1876,7 +2208,13 @@ mod report_tests {
         // witness left.
         let dir = super::tests::scratch("orphan");
         let path = dir.join("infisical.json");
-        store_entry(&path, "MACHINE_IDENTITY", &Secret::new(DECOY.to_owned())).expect("stored");
+        store_entry(
+            &path,
+            "MACHINE_IDENTITY",
+            &Secret::new(DECOY.to_owned()),
+            None,
+        )
+        .expect("stored");
 
         let config = config_from(&format!(
             r#"{{"stores":{{"infisical":{{"credentials_file":"{path}"}}}}}}"#,
@@ -1917,7 +2255,13 @@ mod report_tests {
         // the reader edits the right one.
         let dir = super::tests::scratch("orphan-onepassword");
         let path = dir.join("onepassword.json");
-        store_entry(&path, "SERVICE_ACCOUNT", &Secret::new(DECOY.to_owned())).expect("stored");
+        store_entry(
+            &path,
+            "SERVICE_ACCOUNT",
+            &Secret::new(DECOY.to_owned()),
+            None,
+        )
+        .expect("stored");
 
         let config = config_from(&format!(
             r#"{{"stores":{{"onepassword":{{"credentials_file":"{path}"}}}}}}"#,
@@ -1945,7 +2289,13 @@ mod report_tests {
         let path = dir.join("infisical.json");
         let audit = dir.join("audit.jsonl");
         std::fs::write(&audit, b"").expect("audit");
-        store_entry(&path, "MACHINE_IDENTITY", &Secret::new(DECOY.to_owned())).expect("stored");
+        store_entry(
+            &path,
+            "MACHINE_IDENTITY",
+            &Secret::new(DECOY.to_owned()),
+            None,
+        )
+        .expect("stored");
 
         let config = config_from(&format!(
             r#"{{"audit":"{audit}",
