@@ -438,6 +438,65 @@ pub fn stub_pass_cli(dir: &Path, behaviour: &Backend) -> PathBuf {
     stub_pass_cli_listing(dir, behaviour, &Listing::EMPTY)
 }
 
+/// The argument walk every `pass-cli` stand-in starts with.
+///
+/// # Why it is factored out rather than copied
+///
+/// It is not boilerplate: it is the vendor's own parse, measured against
+/// `pass-cli` 2.2.5 and documented at [`stub_pass_cli_discovery`] — clap reads
+/// any standalone argument beginning with a single `-` as a short-flag cluster
+/// and refuses the command with exit 2, whatever option came before it. In two
+/// copies, a correction measured against a new vendor release lands in one and
+/// leaves the other green against a stub that no longer imitates the vendor.
+///
+/// Sets `env_file` from either spelling of `--env-file`, and stops at `--` the
+/// way clap does, because everything after it belongs to the child.
+fn vendor_arg_walk() -> &'static str {
+    "# Parse like the vendor up to `--`: both spellings of an option value,\n\
+     # and a refusal for anything the vendor reads as a short-flag cluster.\n\
+     # Ahead of every verb, because clap parses before it dispatches.\n\
+     env_file=''\n\
+     for arg in \"$@\"; do\n\
+     \x20 if [ \"$arg\" = '--' ]; then break; fi\n\
+     \x20 case \"$arg\" in\n\
+     \x20   --env-file=*) env_file=\"${arg#--env-file=}\" ;;\n\
+     \x20   --*|-) ;;\n\
+     \x20   -*) echo \"error: unexpected argument '$arg' found\" >&2; exit 2 ;;\n\
+     \x20 esac\n\
+     \x20 if [ \"$prev\" = '--env-file' ]; then env_file=\"$arg\"; fi\n\
+     \x20 prev=\"$arg\"\n\
+     done\n"
+}
+
+/// What a `pass-cli` stand-in does once every listing verb has declined: record
+/// the invocation, resolve the reference out of the env file the way the real
+/// CLI would, and hand `$child` and `$key` to a [`Backend`].
+///
+/// Factored for [`vendor_arg_walk`]'s reason. The env-file resolution is the
+/// half a test reads back to assert which item was addressed, so two copies of
+/// it is two ways for that assertion to stop meaning the same thing.
+fn vendor_run_tail(dir: &Path, behaviour: &Backend) -> String {
+    format!(
+        "printf '%s\\n' \"$@\" > '{argv}'\n\
+         printf '%s' \"$PROTON_PASS_AGENT_REASON\" > '{reason}'\n\
+         printf '%s' \"${{PROTON_PASS_SESSION_DIR-<unset>}}\" > '{session}'\n\
+         # Resolve the reference the way the real CLI would: out of the env file.\n\
+         if [ -n \"$env_file\" ]; then\n\
+         \x20 sed -e 's/^[^=]*=//' \"$env_file\" > '{reference}'\n\
+         fi\n\
+         while [ \"$1\" != \"--\" ] && [ $# -gt 0 ]; do shift; done\n\
+         shift\n\
+         child=\"$1\"\n\
+         key=\"$2\"\n\
+         {body}",
+        argv = dir.join("pass-cli.argv").display(),
+        reason = dir.join("pass-cli.reason").display(),
+        session = dir.join("pass-cli.session").display(),
+        reference = dir.join("pass-cli.reference").display(),
+        body = behaviour.body(dir),
+    )
+}
+
 /// Write a stand-in for the `pass-cli` binary.
 ///
 /// Records its argv at `<dir>/pass-cli.argv`, the reason it was given at
@@ -452,28 +511,9 @@ pub fn stub_pass_cli(dir: &Path, behaviour: &Backend) -> PathBuf {
 /// one line appended per invocation, which is how "the listing was memoised"
 /// is checked by counting spawns rather than by reading the cache.
 pub fn stub_pass_cli_listing(dir: &Path, behaviour: &Backend, listing: &Listing) -> PathBuf {
-    let list_argv_log = dir.join("pass-cli.list.argv");
-    let list_count_log = dir.join("pass-cli.list.count");
-    let argv_log = dir.join("pass-cli.argv");
-    let reason_log = dir.join("pass-cli.reason");
-    let reference_log = dir.join("pass-cli.reference");
-    let session_log = dir.join("pass-cli.session");
     let body = format!(
         "#!/bin/sh\n\
-         # Parse like the vendor up to `--`: both spellings of an option value,\n\
-         # and a refusal for anything the vendor reads as a short-flag cluster.\n\
-         # Ahead of every verb, because clap parses before it dispatches.\n\
-         env_file=''\n\
-         for arg in \"$@\"; do\n\
-         \x20 if [ \"$arg\" = '--' ]; then break; fi\n\
-         \x20 case \"$arg\" in\n\
-         \x20   --env-file=*) env_file=\"${{arg#--env-file=}}\" ;;\n\
-         \x20   --*|-) ;;\n\
-         \x20   -*) echo \"error: unexpected argument '$arg' found\" >&2; exit 2 ;;\n\
-         \x20 esac\n\
-         \x20 if [ \"$prev\" = '--env-file' ]; then env_file=\"$arg\"; fi\n\
-         \x20 prev=\"$arg\"\n\
-         done\n\
+         {walk}\
          if [ \"$1\" = 'item' ] && [ \"$2\" = 'list' ]; then\n\
          \x20 printf '%s\\n' \"$@\" > '{list_argv}'\n\
          \x20 printf '%s' \"$PROTON_PASS_AGENT_REASON\" > '{reason}'\n\
@@ -481,26 +521,14 @@ pub fn stub_pass_cli_listing(dir: &Path, behaviour: &Backend, listing: &Listing)
          \x20 echo one >> '{list_count}'\n\
          \x20 {listing}\
          fi\n\
-         printf '%s\\n' \"$@\" > '{argv}'\n\
-         printf '%s' \"$PROTON_PASS_AGENT_REASON\" > '{reason}'\n\
-         printf '%s' \"${{PROTON_PASS_SESSION_DIR-<unset>}}\" > '{session}'\n\
-         # Resolve the reference the way the real CLI would: out of the env file.\n\
-         if [ -n \"$env_file\" ]; then\n\
-         \x20 sed -e 's/^[^=]*=//' \"$env_file\" > '{reference}'\n\
-         fi\n\
-         while [ \"$1\" != \"--\" ] && [ $# -gt 0 ]; do shift; done\n\
-         shift\n\
-         child=\"$1\"\n\
-         key=\"$2\"\n\
-         {body}",
-        argv = argv_log.display(),
-        list_argv = list_argv_log.display(),
-        list_count = list_count_log.display(),
+         {tail}",
+        walk = vendor_arg_walk(),
+        list_argv = dir.join("pass-cli.list.argv").display(),
+        list_count = dir.join("pass-cli.list.count").display(),
         listing = listing.body(),
-        reason = reason_log.display(),
-        session = session_log.display(),
-        reference = reference_log.display(),
-        body = behaviour.body(dir)
+        reason = dir.join("pass-cli.reason").display(),
+        session = dir.join("pass-cli.session").display(),
+        tail = vendor_run_tail(dir, behaviour),
     );
     write_stub(dir, "pass-cli-stub", &body)
 }
@@ -576,6 +604,73 @@ pub fn stub_pass_cli_discovery(dir: &Path, vaults: &str, listing: &str, view: &s
         view = view_file.display(),
     );
     write_stub(dir, "pass-cli-discovery-stub", &body)
+}
+
+/// A `pass-cli` stand-in that answers all four verbs a catalogue exercises.
+///
+/// `vault list`, `item list`, `item view` AND `run`, which no other fixture
+/// does: a catalogue test needs the daemon to enumerate and then to resolve
+/// what it enumerated, and a stub that answers only the discovery verbs turns
+/// "the retry resolved" into "the retry could never have resolved".
+///
+/// Each fixture is read from a FILE on every call, so a test can change what
+/// the vault holds while the daemon keeps running — which is the whole point:
+/// the claim under test is that a new item becomes usable with no restart, and
+/// a fixture baked into the script at write time cannot express that.
+///
+/// Tallies one line per verb into `pass-cli.vault.count`,
+/// `pass-cli.list.count` and `pass-cli.view.count`, so a test asserts what was
+/// NOT spawned by counting rather than by reading the adapter's cache.
+pub fn stub_pass_cli_catalogue(
+    dir: &Path,
+    behaviour: &Backend,
+    vaults: &str,
+    listing: &str,
+    view: &str,
+) -> PathBuf {
+    std::fs::write(dir.join("vaults.json"), vaults).expect("write the vault fixture");
+    set_catalogue_listing(dir, listing);
+    std::fs::write(dir.join("view.json"), view).expect("write the view fixture");
+
+    let body = format!(
+        "#!/bin/sh\n\
+         {walk}\
+         if [ \"$1\" = 'vault' ] && [ \"$2\" = 'list' ]; then\n\
+         \x20 echo one >> '{vault_count}'; cat '{vaults}'; exit 0; fi\n\
+         if [ \"$1\" = 'item' ] && [ \"$2\" = 'list' ]; then\n\
+         \x20 echo one >> '{list_count}'; cat '{listing}'; exit 0; fi\n\
+         if [ \"$1\" = 'item' ] && [ \"$2\" = 'view' ]; then\n\
+         \x20 echo one >> '{view_count}'; cat '{view}'; exit 0; fi\n\
+         {tail}",
+        walk = vendor_arg_walk(),
+        vaults = dir.join("vaults.json").display(),
+        listing = dir.join("listing.json").display(),
+        view = dir.join("view.json").display(),
+        vault_count = dir.join("pass-cli.vault.count").display(),
+        list_count = dir.join("pass-cli.list.count").display(),
+        view_count = dir.join("pass-cli.view.count").display(),
+        tail = vendor_run_tail(dir, behaviour),
+    );
+    write_stub(dir, "pass-cli-catalogue-stub", &body)
+}
+
+/// Change what `item list` answers, while the daemon keeps running.
+pub fn set_catalogue_listing(dir: &Path, listing: &str) {
+    std::fs::write(dir.join("listing.json"), listing).expect("write the listing fixture");
+}
+
+/// How many times the stub's `vault list` ran.
+pub fn vault_list_count(dir: &Path) -> usize {
+    std::fs::read_to_string(dir.join("pass-cli.vault.count"))
+        .map(|text| text.lines().count())
+        .unwrap_or(0)
+}
+
+/// How many times the stub's `item view` ran.
+pub fn view_count(dir: &Path) -> usize {
+    std::fs::read_to_string(dir.join("pass-cli.view.count"))
+        .map(|text| text.lines().count())
+        .unwrap_or(0)
 }
 
 /// A `pass-cli` stand-in whose session is dead: every verb is refused.
@@ -1590,7 +1685,6 @@ pub fn daemon_config(dir: &Path) -> DaemonConfig {
             },
             ..DaemonStores::default()
         },
-        names: Vec::new(),
         // One store, so nothing needs routing. The fixtures that DO run two
         // stores build their config from JSON instead, because an unread key
         // is dropped in silence and a struct literal cannot show that.

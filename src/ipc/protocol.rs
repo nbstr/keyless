@@ -135,6 +135,33 @@ impl Request {
         }
     }
 
+    /// Ask what the daemon will serve.
+    ///
+    /// Names only — this is `ls` over the socket, and [`Op::Names`] is as
+    /// incapable of returning a value as `ls` is.
+    ///
+    /// # Why this constructor did not exist until now
+    ///
+    /// The daemon has answered [`Op::Names`] since the verb was added, and
+    /// nothing in this crate ever sent one: the handler was reachable only by a
+    /// hand-written frame. So `keyless ls` on a machine whose secrets live
+    /// behind the daemon printed an EMPTY listing — the one case where the
+    /// listing is the only way to find out what is available at all.
+    ///
+    /// Asks for no heartbeat, for [`Request::ping`]'s reason: this reads no
+    /// store and cannot be slow about it.
+    #[must_use]
+    pub fn names() -> Self {
+        Request {
+            v: PROTOCOL_VERSION,
+            op: Op::Names,
+            name: String::new(),
+            cwd: String::new(),
+            argv: Vec::new(),
+            progress: false,
+        }
+    }
+
     /// Serialize to one frame, newline included.
     ///
     /// Cannot fail in practice — every field is a plain string — but the error
@@ -180,7 +207,12 @@ pub enum Reply {
     Failed(String),
     /// Answer to [`Op::Ping`] and [`Op::Names`].
     Info {
-        /// Declared names. Empty for a ping.
+        /// Every name the daemon will serve — what an operator declared, and
+        /// whatever its enumerable stores mint. Empty for a ping.
+        ///
+        /// Names, and never the coordinates behind them: a client may learn
+        /// what this daemon will SERVE and must never learn what a store
+        /// HOLDS. See [`crate::store::catalogue::Catalogue::names`].
         names: Vec<String>,
     },
     /// The daemon has the request and has not finished it yet.

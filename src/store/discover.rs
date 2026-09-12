@@ -68,6 +68,26 @@ impl FieldKind {
 /// One item a store holds. Every field is a coordinate.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ItemSummary {
+    /// The backend's own identifier for this item.
+    ///
+    /// # Why a title is not enough, and why this is reported
+    ///
+    /// A title is not unique. Two live items in one vault may share one, and
+    /// both adapters already parse an id and both already need it for exactly
+    /// that reason — 1Password's exists so "a lookup and `fields` agree on
+    /// which item they mean even when two share a title". Dropping it here
+    /// pushed that fact back onto every consumer, each of which then had to
+    /// hold two same-titled items apart with a comment rather than with a
+    /// value.
+    ///
+    /// It is a coordinate like every other field here, so reporting it is
+    /// already inside this seam's line: it says which item, never anything
+    /// about what is in it.
+    ///
+    /// A backend whose vocabulary has no separate identity says so at its own
+    /// implementation rather than defaulting this to the title — Infisical's
+    /// key IS its identity, and that is stated there.
+    pub id: String,
     /// The vault it is in, when the store has vaults.
     pub vault: String,
     /// The item's title, which is what a config entry's `item` must match.
@@ -241,6 +261,7 @@ mod tests {
     #[test]
     fn a_trashed_item_is_reported_as_not_active() {
         let summary = |state: &str| ItemSummary {
+            id: "It3mOne".to_owned(),
             vault: "personal".to_owned(),
             title: "decoy".to_owned(),
             state: state.to_owned(),

@@ -25,8 +25,11 @@
 //! rows was told the install was healthy while the report beneath it said it
 //! was not.
 
+use std::collections::BTreeSet;
 use std::io::{self, Write};
 use std::path::Path;
+
+use crate::store::catalogue::{Catalogue, IndexBuilder, Provenance, Route, Source};
 
 use super::config::DaemonConfig;
 use super::credential;
@@ -88,7 +91,15 @@ pub fn report(
     // below asks whether the vendor accepts it.
     sound &= credential::report(config, out)?;
 
-    for store in config.registry(None).stores() {
+    // Built once for the whole report. `registry(None)` and the catalogue rows
+    // each used to build their own, and each build runs `proton_routing()` — a
+    // clone of every declared route — plus a `stat` of the audit path to work
+    // out which uid the vendor runs as. Two builds is four `ProtonStore`s, four
+    // whole-map clones and four stats per run of a verb somebody is standing
+    // there reading.
+    let backends = config.backends(None, None);
+
+    for store in backends.registry.stores() {
         match store.health() {
             Ok(()) => writeln!(out, "store    {} ok", store.id())?,
             Err(error) => {
@@ -117,12 +128,144 @@ pub fn report(
             .count()
     )?;
 
+    sound &= catalogue_rows(config, &backends.sources, out)?;
+
     let warnings = config.warnings();
     for warning in &warnings {
         writeln!(out, "warning  {warning}")?;
     }
 
     Ok(sound && warnings.is_empty())
+}
+
+/// What the vault holds and what the config says about it, compared.
+///
+/// # Why this comparison exists at all, and why it runs here
+///
+/// The daemon derives names from what a store enumerates, so a declaration is
+/// no longer the only way a name is served — which makes the two able to drift
+/// apart in both directions, and neither direction announces itself:
+///
+/// - **An item nobody declared.** Not a fault: it is the ordinary state now,
+///   and reporting it as one would make every healthy install red. It is
+///   COUNTED, because an operator who expected a name to be declared and finds
+///   it derived has learned something, and because a count that jumps is how a
+///   vault somebody else edited becomes visible.
+/// - **A declared name no item backs.** A fault. The declaration reads as
+///   correct from every angle — the config parses, the name lists, the store is
+///   healthy — and it resolves to nothing, because the item behind it was
+///   renamed or moved.
+/// - **A collision.** A fault, and the ONE place the colliding item titles may
+///   be named: this runs root-side against the daemon's own config, where the
+///   socket's rule about coordinates does not apply. Over the socket the same
+///   collision is reported as store ids and a count.
+///
+/// A store that cannot be enumerated prints `unproven` and is not a fault, and
+/// its declared names are left uncompared — the same distinction
+/// [`client_row`] makes, for the same reason: a comparison nobody could make
+/// must not read as one that passed, and must not read as one that failed
+/// either.
+fn catalogue_rows(
+    config: &DaemonConfig,
+    sources: &[Source],
+    out: &mut dyn Write,
+) -> io::Result<bool> {
+    if sources.is_empty() {
+        return Ok(true);
+    }
+
+    let mut sound = true;
+    let mut building = IndexBuilder::new();
+    let mut enumerated: BTreeSet<String> = BTreeSet::new();
+
+    // Minted through `IndexBuilder`, never by hand. It already owns the trashed
+    // skip, the naming rule and one entry per item, and a second copy of that
+    // here would be a report claiming the two halves agree while being derived
+    // from a different rule than the one that serves them.
+    for source in sources {
+        let store = source.mint.store().to_owned();
+        match source.discover.items(None) {
+            Ok(items) => {
+                enumerated.insert(store);
+                for item in &items {
+                    building.item(source.mint.as_ref(), item);
+                }
+            }
+            Err(error) => writeln!(out, "catalog  {store} unproven {error}")?,
+        }
+    }
+    let index = building.finish();
+
+    for (name, items) in index.minted() {
+        if items.len() > 1 {
+            writeln!(
+                out,
+                "catalog  {name} PROBLEM {} items mint this name, so it resolves to none of \
+                 them: {}. Declare it against one of them to settle it",
+                items.len(),
+                items
+                    .iter()
+                    .map(|item| format!("`{}` in {}", item.title, item.vault))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )?;
+            sound = false;
+        }
+    }
+
+    let backed: BTreeSet<(String, String, String)> = index
+        .items()
+        .into_iter()
+        .map(|item| (item.store, item.vault, item.title))
+        .collect();
+
+    for (name, route) in &config.secrets {
+        let Some(store) = route.store.as_deref() else {
+            continue;
+        };
+        if !enumerated.contains(store) {
+            continue;
+        }
+        let (Some(vault), Some(item)) = (route.vault.as_deref(), route.item.as_deref()) else {
+            continue;
+        };
+        if !backed.contains(&(store.to_owned(), vault.to_owned(), item.to_owned())) {
+            writeln!(
+                out,
+                "catalog  {name} PROBLEM declared against `{item}` in vault `{vault}` of \
+                 {store}, and no live item there is titled that. It was renamed, moved \
+                 or trashed, and this name resolves to nothing"
+            )?;
+            sound = false;
+        }
+    }
+
+    // Counted off the CATALOGUE rather than off the two inputs, so the row
+    // describes what the daemon would actually serve — a declaration outranks a
+    // minting by being looked up first, and only the catalogue applies that.
+    let catalogue = Catalogue::new(&config.secrets);
+    catalogue.install(index);
+    let (declared, derived) = catalogue
+        .names()
+        .iter()
+        .fold((0, 0), |(declared, derived), name| {
+            match catalogue.route(name) {
+                Route::Known(entry) => match entry.provenance {
+                    Provenance::Declared => (declared + 1, derived),
+                    Provenance::Derived => (declared, derived + 1),
+                },
+                _ => (declared, derived),
+            }
+        });
+    writeln!(
+        out,
+        "catalog  {} name(s) served from {} enumerable store(s): {declared} declared, \
+         {derived} derived",
+        declared + derived,
+        enumerated.len()
+    )?;
+
+    Ok(sound)
 }
 
 /// Whether the `keyless` a shell reaches is the one this daemon pins.
