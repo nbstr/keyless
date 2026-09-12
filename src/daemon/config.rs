@@ -40,6 +40,7 @@ use crate::config::{Policy as StorePolicy, SecretRoute};
 use crate::error::ConfigError;
 use crate::ipc::peer::decode_hex;
 use crate::paths::ConfigPath;
+use crate::store::catalogue::{Catalogue, ProtonMint, Source};
 use crate::store::file::FileStore;
 use crate::store::infisical::{
     ACCESS_TOKEN, IDENTITY_CLIENT_ID, IDENTITY_CLIENT_SECRET, InfisicalStore, Routing,
@@ -90,12 +91,6 @@ pub struct DaemonConfig {
     /// Where the values come from.
     #[serde(default)]
     pub stores: DaemonStores,
-    /// Names the daemon will admit to knowing, for the `names` operation.
-    ///
-    /// Empty means "answer with nothing", which is the safe default: name
-    /// enumeration is a small leak, but it is a leak, and it should be opt-in.
-    #[serde(default)]
-    pub names: Vec<String>,
     /// Which store each name lives in, when the daemon runs more than one.
     ///
     /// Deliberately [`crate::config::SecretRoute`], the same type and the same
@@ -118,6 +113,15 @@ pub struct DaemonConfig {
     pub secrets: BTreeMap<String, SecretRoute>,
 }
 
+/// The stores a daemon resolves through, and the ones it can enumerate.
+pub struct Backends {
+    /// Every configured store, in search order.
+    pub registry: Registry,
+    /// The enumerable subset, paired with its naming rule. Empty where no
+    /// catalogue was handed in.
+    pub sources: Vec<Source>,
+}
+
 impl Default for DaemonConfig {
     fn default() -> Self {
         DaemonConfig {
@@ -128,7 +132,6 @@ impl Default for DaemonConfig {
             idle_timeout_seconds: default_idle_seconds(),
             peer: PeerConfig::default(),
             stores: DaemonStores::default(),
-            names: Vec::new(),
             secrets: BTreeMap::new(),
         }
     }
@@ -1122,6 +1125,59 @@ impl DaemonConfig {
         Some(Arc::new(Generations::at(root.to_path_buf())))
     }
 
+    /// The Proton adapter this daemon reads through.
+    ///
+    /// Factored out because the daemon builds TWO of them over one identity —
+    /// the one that resolves, and the one the catalogue rebuilder enumerates
+    /// through — and two constructions of the same fifteen settings would be
+    /// free to disagree about which vault, which timeout, which key provider.
+    /// The disagreement would be invisible: the rebuilder would simply mint
+    /// names for a vault the resolver cannot read.
+    ///
+    /// `catalogue` is `None` for the discovering twin: enumeration takes no
+    /// route, so an index that fed itself would only be a way for a stale
+    /// snapshot to keep itself alive.
+    fn proton_store(
+        &self,
+        generations: Option<&Arc<Generations>>,
+        catalogue: Option<Arc<Catalogue>>,
+    ) -> ProtonStore {
+        let settings = &self.stores.proton;
+        ProtonStore::new(
+            settings.binary.to_path_buf(),
+            settings.probe_binary.to_path_buf(),
+            self.proton_routing().with_catalogue(catalogue),
+            // Not `Reason::for_run(argv)`. The reason is written into
+            // Proton's own remote audit trail, permanently, and a
+            // daemon's `argv` arrives from a client — `crate::audit`
+            // records it as a CLAIM, never a fact. A registry is built
+            // once at startup anyway, so there is no per-request reason
+            // to be had here even if one were wanted.
+            ProtonReason::for_verb(crate::DAEMON_NAME),
+        )
+        .in_session_dir(
+            settings
+                .session_dir
+                .as_deref()
+                .map(|path| path.to_path_buf()),
+        )
+        // Always named here, never left to the vendor's default. See
+        // `KeyProvider`: the default is a keyring, a daemon uid has
+        // none, and `pass-cli` answers that by reinitialising the
+        // session store it was asked to read.
+        .with_key_provider(Some(settings.key_provider))
+        // Whoever runs the vendor owns what it writes, and it writes on
+        // invocations that only read. Read off the audit log, which is
+        // the same source the login verbs use.
+        .with_run_as(
+            super::credential::daemon_owner(&self.audit).map(|owner| (owner.uid, owner.gid)),
+        )
+        .with_timeout(settings.timeout_ms)
+        .with_listing_ttl(settings.listing_ttl_ms)
+        .with_generations(generations.cloned())
+        .with_agent_token(self.agent_token())
+    }
+
     /// Build the store registry, with the routing that decides which store
     /// answers a name.
     ///
@@ -1145,6 +1201,34 @@ impl DaemonConfig {
     /// to read `<root>/current` to report on the store honestly.
     #[must_use]
     pub fn registry(&self, shared: Option<&Arc<Generations>>) -> Registry {
+        self.backends(shared, None).registry
+    }
+
+    /// The registry, and the sources a catalogue rebuild enumerates through.
+    ///
+    /// Both at once because the discovering twin has to be built over the
+    /// resolving store's own listing cache, and the sharing pays in ONE
+    /// direction: the twin refuses a cached listing — see
+    /// [`ProtonStore::always_relisting`], which exists because a rebuild queued
+    /// by a miss cannot answer that miss out of a listing fetched before the
+    /// item existed — so it never reuses anything. What it does is WRITE: the
+    /// fresh listing it fetches lands in the shared slot, and the next cold
+    /// resolve is served from it instead of spawning a `pass-cli item list` of
+    /// its own. Built over separate caches, every rebuild would be a listing
+    /// nobody else could use.
+    ///
+    /// `catalogue` decides only what the RESOLVING adapters read their
+    /// undeclared addresses out of. The sources are built either way, so a
+    /// caller that wants to enumerate — `keylessd check` — does not have to
+    /// construct a catalogue it will not read. The cost is one `ProtonStore`
+    /// built and dropped by [`DaemonConfig::registry`], which is a struct and
+    /// no vendor call.
+    #[must_use]
+    pub fn backends(
+        &self,
+        shared: Option<&Arc<Generations>>,
+        catalogue: Option<&Arc<Catalogue>>,
+    ) -> Backends {
         let generations = shared.cloned().or_else(|| self.generations());
         let mut stores: Vec<Box<dyn Store>> = Vec::new();
         if self.stores.file.enabled {
@@ -1210,49 +1294,26 @@ impl DaemonConfig {
                 .with_vendor_credentials(self.service_account()),
             ));
         }
+        let mut sources: Vec<Source> = Vec::new();
         if self.stores.proton.enabled {
-            let settings = &self.stores.proton;
-            stores.push(Box::new(
-                ProtonStore::new(
-                    settings.binary.to_path_buf(),
-                    settings.probe_binary.to_path_buf(),
-                    self.proton_routing(),
-                    // Not `Reason::for_run(argv)`. The reason is written into
-                    // Proton's own remote audit trail, permanently, and a
-                    // daemon's `argv` arrives from a client — `crate::audit`
-                    // records it as a CLAIM, never a fact. A registry is built
-                    // once at startup anyway, so there is no per-request reason
-                    // to be had here even if one were wanted.
-                    ProtonReason::for_verb(crate::DAEMON_NAME),
-                )
-                .in_session_dir(
-                    settings
-                        .session_dir
-                        .as_deref()
-                        .map(|path| path.to_path_buf()),
-                )
-                // Always named here, never left to the vendor's default. See
-                // `KeyProvider`: the default is a keyring, a daemon uid has
-                // none, and `pass-cli` answers that by reinitialising the
-                // session store it was asked to read.
-                .with_key_provider(Some(settings.key_provider))
-                // Whoever runs the vendor owns what it writes, and it writes on
-                // invocations that only read. Read off the audit log, which is
-                // the same source the login verbs use.
-                .with_run_as(
-                    super::credential::daemon_owner(&self.audit)
-                        .map(|owner| (owner.uid, owner.gid)),
-                )
-                .with_timeout(settings.timeout_ms)
-                .with_listing_ttl(settings.listing_ttl_ms)
-                .with_generations(generations.clone())
-                .with_agent_token(self.agent_token()),
-            ));
+            let resolving = self.proton_store(generations.as_ref(), catalogue.cloned());
+            sources.push(Source {
+                discover: Box::new(
+                    self.proton_store(generations.as_ref(), None)
+                        .sharing_listings_with(&resolving)
+                        .always_relisting(),
+                ),
+                mint: Box::new(ProtonMint),
+            });
+            stores.push(Box::new(resolving));
         }
-        Registry::new(stores)
-            .with_routes(self.routes())
-            .with_policy(self.stores.policy)
-            .with_default_store(self.stores.default_store.clone())
+        Backends {
+            registry: Registry::new(stores)
+                .with_routes(self.routes())
+                .with_policy(self.stores.policy)
+                .with_default_store(self.stores.default_store.clone()),
+            sources,
+        }
     }
 
     /// Problems worth telling an operator about that are not fatal.

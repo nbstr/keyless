@@ -45,6 +45,7 @@ pub mod sha256;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use serde::Serialize;
 
@@ -116,6 +117,8 @@ pub struct Event {
     peer: Option<Peer>,
     decision: Option<String>,
     identities: Vec<String>,
+    source: Option<String>,
+    age_ms: Option<u64>,
 }
 
 impl Event {
@@ -160,6 +163,8 @@ impl Event {
             peer: None,
             decision: None,
             identities: Vec::new(),
+            source: None,
+            age_ms: None,
         }
     }
 
@@ -198,6 +203,28 @@ impl Event {
     #[must_use]
     pub fn with_decision(mut self, decision: &str) -> Self {
         self.decision = Some(decision.to_owned());
+        self
+    }
+
+    /// Record where a resolved value came from, in the fixed vocabulary
+    /// `Source::as_str` produces in the daemon's own resolver.
+    ///
+    /// Set on every row that asked the resolver at all — a value found, a
+    /// name absent, or a lookup failed — never on a row that never reached it,
+    /// such as an attestation denial. A `"stale"` row is the fact this method
+    /// exists for: the value it served was not read from the vendor a moment
+    /// ago, and [`Event::with_age`] says how long ago it was.
+    #[must_use]
+    pub fn with_source(mut self, source: &str) -> Self {
+        self.source = Some(source.to_owned());
+        self
+    }
+
+    /// Record how long ago the store answered, for a `memory` or `stale`
+    /// [`Event::with_source`].
+    #[must_use]
+    pub fn with_age(mut self, age: Duration) -> Self {
+        self.age_ms = Some(u64::try_from(age.as_millis()).unwrap_or(u64::MAX));
         self
     }
 
@@ -244,6 +271,10 @@ struct Row<'a> {
     decision: Option<&'a str>,
     #[serde(skip_serializing_if = "<[String]>::is_empty")]
     identities: &'a [String],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    age_ms: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     peer_uid: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -543,6 +574,8 @@ fn render(
         exit_code: event.exit_code,
         decision: event.decision.as_deref(),
         identities: &event.identities,
+        source: event.source.as_deref(),
+        age_ms: event.age_ms,
         peer_uid: event.peer.as_ref().map(|p| p.uid),
         peer_pid: event.peer.as_ref().map(|p| p.pid),
         peer_generation: event.peer.as_ref().map(|p| p.generation),

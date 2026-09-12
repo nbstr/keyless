@@ -134,10 +134,10 @@ impl Machine {
 
         let body = format!(
             r#"{{"stores": {{
-                 "keychain": {{"binary": "{keychain}"}},
-                 "infisical": {{"binary": "{infisical}", "project_id": "proj-init"}},
-                 "onepassword": {{"binary": "{onepassword}", "vault": "company"}},
-                 "proton": {{"binary": "{proton}", "session_dir": "{session}"}}
+                 "keychain": {{"binary": "{keychain}", "timeout_ms": 60000}},
+                 "infisical": {{"binary": "{infisical}", "project_id": "proj-init", "timeout_ms": 60000}},
+                 "onepassword": {{"binary": "{onepassword}", "vault": "company", "timeout_ms": 60000}},
+                 "proton": {{"binary": "{proton}", "session_dir": "{session}", "timeout_ms": 60000}}
                }},
                "secrets": {{"DECOY": {{"store": "infisical", "env": "staging"}}}}}}"#,
             keychain = keychain.display(),
@@ -833,7 +833,7 @@ impl Guarded {
         std::fs::write(
             root.join("config.json"),
             format!(
-                r#"{{"stores": {{"keychain": {{"binary": "{}"}}}}}}"#,
+                r#"{{"stores": {{"keychain": {{"binary": "{}", "timeout_ms": 60000}}}}}}"#,
                 root.join("no-security-here").display()
             ),
         )

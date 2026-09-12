@@ -11,22 +11,19 @@ use std::path::Path;
 use std::process::{Command, Output};
 
 use support::{
-    Backend, DECOY_VALUE, INFISICAL_DECOY, Stub, scratch, stub_infisical, stub_security,
+    Backend, DECOY_VALUE, INFISICAL_DECOY, Stub, keychain_stub_config, scratch, stub_infisical,
+    stub_security,
 };
 
 const BIN: &str = env!("CARGO_BIN_EXE_keyless");
 
 /// Write a config wired to a `security` stub, so no real keychain is touched.
+///
+/// `OTHER` is declared and asked for by nobody here: it is what makes the
+/// narrowing cases mean something, since a config holding one name cannot show
+/// that only the names requested reach the child.
 fn config_with_stub(dir: &Path, behaviour: &Stub) -> std::path::PathBuf {
-    let stub = stub_security(dir, behaviour);
-    let path = dir.join("config.json");
-    let body = format!(
-        r#"{{"stores":{{"keychain":{{"service":"keyless","binary":"{}"}}}},
-            "secrets":{{"DECOY":{{"note":"a decoy"}},"OTHER":{{}}}}}}"#,
-        stub.display()
-    );
-    std::fs::write(&path, body).expect("write config");
-    path
+    keychain_stub_config(dir, behaviour, r#"{"DECOY":{"note":"a decoy"},"OTHER":{}}"#)
 }
 
 fn keyless(args: &[&str]) -> Output {
@@ -298,7 +295,7 @@ fn new_prints_where_it_stored_the_value_and_never_the_value() {
     std::fs::write(
         &config,
         format!(
-            r#"{{"stores":{{"keychain":{{"service":"svc","binary":"{}"}}}},
+            r#"{{"stores":{{"keychain":{{"service":"svc","binary":"{}","timeout_ms":60000}}}},
                 "secrets":{{"DECOY":{{}}}}}}"#,
             stub.display()
         ),
@@ -1524,7 +1521,7 @@ fn doctor_says_which_variables_a_name_actually_delivers() {
     std::fs::write(
         &config,
         format!(
-            r#"{{"stores":{{"keychain":{{"service":"keyless","binary":"{}"}}}},
+            r#"{{"stores":{{"keychain":{{"service":"keyless","binary":"{}","timeout_ms":60000}}}},
                 "secrets":{{"STAGING_URL":{{"var":"DATABASE_URL"}},"PLAIN":{{}}}}}}"#,
             stub.display()
         ),

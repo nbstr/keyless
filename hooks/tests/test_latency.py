@@ -56,6 +56,13 @@ def _env():
     e = dict(os.environ)
     e["KEYLESS_HOOKS_STATE"] = harness._state_dir()
     e["KEYLESS_HOOKS_CONFIG"] = os.path.join(e["KEYLESS_HOOKS_STATE"], "absent.json")
+    # Same reason as `harness.drive`: `served.py` reads keyless's own config,
+    # a different file, and must not pick up this machine's real one — a live
+    # daemon on the other end would turn every "worked" measurement below into
+    # a socket round trip instead of the in-process cost this file exists to
+    # isolate.
+    e["KEYLESS_CONFIG"] = os.path.join(e["KEYLESS_HOOKS_STATE"], "absent-keyless-config.json")
+    e.pop("KEYLESS_SOCKET", None)
     return e
 
 

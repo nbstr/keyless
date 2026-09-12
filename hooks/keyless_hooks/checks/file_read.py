@@ -21,6 +21,7 @@ spellings walk straight past a `Bash(cat:*)` deny.
 import os
 import time
 
+from .. import served as served_mod
 from ..secretpaths import is_protected, names_in, resolve
 from ..shellview import (delegated_head, expand_local_assignments,
                          file_operands_spanned, flatten_substitutions,
@@ -85,11 +86,12 @@ def _write_view(path, names, note):
         "# This is a NAMES-ONLY view. No value from that file appears below,",
         "# and no value from it is available to this session.",
         "#",
-        "# Use one without reading it:   keyless run -s <NAME> -- <your command>",
-        "# See what keyless can resolve: keyless ls",
-        "",
     ]
     if names:
+        served_result = served_mod.served()
+        header.extend("# %s" % line
+                       for line in served_mod.advice_lines(names, served_result))
+        header.append("")
         body = ["%s=[keyless:redacted]" % n for n in names]
     else:
         body = ["# no names could be read from this file (%s)." % (note or "unknown"),
@@ -150,9 +152,8 @@ def _read_rewrite(payload, cfg):
 
     message = (
         "[%s] %s matched the protected pattern `%s`, so this Read was redirected "
-        "to a names-only view at %s. The %d name(s) it declares are listed there; "
-        "no value is. To use one, run the consuming command under keyless: "
-        "`keyless run -s <NAME> -- <your command>`. Nothing else is needed and the "
+        "to a names-only view at %s. The %d name(s) it declares are listed there, "
+        "each with what keyless will actually do for it; no value is, and the "
         "plaintext is not obtainable in this session."
         % (CHECK, resolved, pattern, view, len(names)))
     return ("rewrite", message, {"file_path": view})
@@ -161,20 +162,25 @@ def _read_rewrite(payload, cfg):
 def _deny_text(target, pattern, names, note, how):
     listed = ", ".join(names[:25]) if names else "(none readable: %s)" % (note or "unknown")
     more = " …and %d more" % (len(names) - 25) if len(names) > 25 else ""
+    if names:
+        served_result = served_mod.served()
+        remedy = "\n".join("    %s" % line
+                           for line in served_mod.advice_lines(names[:25], served_result))
+    else:
+        remedy = "    keyless run -s <NAME> -- <the command you were going to run>"
     return (
         "[%s] %s matched the protected pattern `%s`. Its content is a credential, "
         "so this %s is refused.\n\n"
         "The names it declares — no values: %s%s\n\n"
-        "Use one without reading it:\n"
-        "    keyless run -s <NAME> -- <the command you were going to run>\n"
-        "`keyless ls` lists every name keyless can resolve. There is no verb that "
-        "prints a value, so re-issuing this read in another spelling will not "
-        "produce one.\n\n"
+        "What keyless will do for each name above:\n"
+        "%s\n"
+        "There is no verb that prints a value, so re-issuing this read in "
+        "another spelling will not produce one.\n\n"
         "An operator can exempt a path by adding it to `allowed` in "
         "~/.config/keyless/hooks.json, or disable this pack for a session by "
         "setting KEYLESS_HOOKS_DISABLE=1 in the settings file's `env` block. "
         "A session cannot set its own environment, which is the point."
-        % (CHECK, target, pattern, how, listed, more))
+        % (CHECK, target, pattern, how, listed, more, remedy))
 
 
 def _names_for(target):

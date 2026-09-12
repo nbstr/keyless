@@ -889,13 +889,21 @@ def run():
                 v.kind == "allow", False)
 
     # ── KL-DEST: the message is a prompt, not an error code ─────────────────
-    v = drive(edit(os.path.join(root, ".env")))
+    #
+    # STRIPE_KEY is declared in a throwaway keyless config here so the message
+    # legitimately offers the `keyless run -s` route for it — the remedy is
+    # per name (see test_daemon_advice), and a name declared nowhere gets a
+    # plain "keyless does not serve this" instead, never the run command.
+    dest_cfg = harness.keyless_config(
+        os.path.join(harness._state_dir(), "kl-dest-cfg", "config.json"),
+        secrets=["STRIPE_KEY"])
+    v = drive(edit(os.path.join(root, ".env")), env={"KEYLESS_CONFIG": dest_cfg})
     s.check("KL-DEST message fires as a deny", v.kind, "deny")
     s.check_in("KL-DEST names itself", "[KL-DEST]", v.message)
     s.check_in("KL-DEST names the pattern that matched", "`.env`", v.message)
     s.check_in("KL-DEST names WHERE the copy goes", "file-history", v.message)
     s.check_in("KL-DEST names the runnable alternative", "sed -i", v.message)
-    s.check_in("KL-DEST names the keyless route", "keyless run -s", v.message)
+    s.check_in("KL-DEST names the keyless route", "keyless run -s STRIPE_KEY", v.message)
     s.check_in("KL-DEST names the explicit no-op exit", "allowed", v.message)
     s.check_in("KL-DEST names what the copy would contain", "STRIPE_KEY", v.message)
     s.check("KL-DEST leaks no value", DECOY["stripe"] in v.message, False)

@@ -162,6 +162,7 @@
 //! `tests/session_coordinate.rs` fails the suite when a published file writes a
 //! command line the variable is absent from.
 
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::fmt;
 use std::fs;
@@ -179,6 +180,7 @@ use crate::config::{Config, SecretRoute};
 use crate::error::StoreError;
 use crate::secret::Secret;
 use crate::store::Store;
+use crate::store::catalogue::{Catalogue, Route as CatalogueRoute};
 use crate::store::discover::{Discover, FieldKind, FieldSummary, ItemSummary};
 use crate::store::exec::{self, CaptureError, capture, strip_one_newline, summarise};
 use crate::store::proton_session::{self, GenerationName, Generations};
@@ -1820,6 +1822,13 @@ pub struct Routing {
     /// name -> where its value lives. An entry that says nothing about Proton
     /// is absent, exactly as it is absent from a session's own projection.
     addresses: BTreeMap<String, Address>,
+    /// The daemon's derived index, when it has one.
+    ///
+    /// `None` on a session, which has no enumerating side and no index to read.
+    /// Consulted only after `addresses` has answered nothing, so a declaration
+    /// wins by lookup order rather than by a precedence rule somebody has to
+    /// remember. See [`crate::store::catalogue`].
+    catalogue: Option<Arc<Catalogue>>,
 }
 
 impl Routing {
@@ -1839,7 +1848,20 @@ impl Routing {
                     Address::from_route(route).map(|address| (name.clone(), address))
                 })
                 .collect(),
+            catalogue: None,
         }
+    }
+
+    /// Read derived addresses out of `catalogue` as well as declared ones.
+    ///
+    /// The arrow points this way on purpose: this routing HOLDS the catalogue
+    /// and reads from it. A catalogue that held the adapters would close a
+    /// cycle, which is why the rebuilder — the thing that owns the discoverers
+    /// — pushes snapshots in rather than being called out to.
+    #[must_use]
+    pub fn with_catalogue(mut self, catalogue: Option<Arc<Catalogue>>) -> Self {
+        self.catalogue = catalogue;
+        self
     }
 
     /// How many names carry a Proton address of any kind, usable or not.
@@ -1859,8 +1881,25 @@ impl Routing {
     /// `None` is the property `tests/daemon_proton.rs` asserts as the absence
     /// of a vendor process: see [`ProtonStore::resolve`], which turns it into
     /// an error before a temporary file is written or a child is created.
-    fn route(&self, name: &str) -> Option<&Address> {
-        self.addresses.get(name)
+    fn route(&self, name: &str) -> Option<Cow<'_, Address>> {
+        // Borrowed on the declared path, owned on the derived one. A resolve
+        // that produces a value must not gain an allocation it did not have,
+        // and a declared `Address::Named` is three `String`s — cloned here, a
+        // cold resolve of a declared name would allocate them per lookup where
+        // it used to borrow.
+        if let Some(declared) = self.addresses.get(name) {
+            return Some(Cow::Borrowed(declared));
+        }
+        // An ambiguous or unknown name yields nothing here, so it never reaches
+        // a spawn. That is the same absence the paragraph above describes, and
+        // `tests/catalogue_daemon.rs` asserts it the same way: by counting the
+        // vendor processes that were not created.
+        match self.catalogue.as_ref()?.route(name) {
+            CatalogueRoute::Known(entry) if entry.store == STORE_ID => {
+                Address::from_route(&entry.route).map(Cow::Owned)
+            }
+            _ => None,
+        }
     }
 }
 
@@ -1938,7 +1977,22 @@ pub struct ProtonStore {
     /// In memory and nowhere else. A cache on disk that the client can read is
     /// a `get` verb with extra steps, which is the one thing this tool does not
     /// offer.
-    listings: Mutex<BTreeMap<String, VaultSlot>>,
+    /// vault name -> that vault's items, until they expire.
+    ///
+    /// Behind an `Arc` so two stores over one identity can share it. The daemon
+    /// builds two: the one that RESOLVES, and the one the rebuilder enumerates
+    /// through. Given separate caches they would each spend a `pass-cli item
+    /// list` per vault — and the cost argument for deriving names at all is
+    /// that stage one is already fetched on every cold resolve. Sharing is what
+    /// makes that true rather than nearly true.
+    ///
+    /// `VaultSlot` is itself an `Arc<Mutex<..>>`, so the per-vault single-flight
+    /// is unaffected: two stores contending for one vault still produce one
+    /// listing, which is the property this sharing exists to extend.
+    listings: Arc<Mutex<BTreeMap<String, VaultSlot>>>,
+    /// Whether [`Discover::items`] refuses a cached listing. See
+    /// [`ProtonStore::always_relisting`].
+    relist: bool,
 }
 
 /// One vault's cache entry, and the gate that makes it fill exactly once.
@@ -2037,9 +2091,67 @@ impl ProtonStore {
             reason,
             routing,
             listing_ttl: bounded_listing_ttl(crate::config::default_listing_ttl_ms()),
-            listings: Mutex::new(BTreeMap::new()),
+            listings: Arc::new(Mutex::new(BTreeMap::new())),
+            relist: false,
             generations: None,
         }
+    }
+
+    /// Refuse to reuse a cached listing, however fresh it is — in BOTH
+    /// enumeration verbs.
+    ///
+    /// `items` and `fields` each read a listing, and both readings are the
+    /// rebuild's. `fields` resolves a title to an id through it, so a store
+    /// that relisted for `items` and not for `fields` would enumerate a fresh
+    /// vault and then address an item out of a stale one.
+    ///
+    /// # Why exactly one caller wants this, and why the shared cache survives it
+    ///
+    ///
+    /// The catalogue's rebuilder enumerates through the SAME listing cache a
+    /// resolve fills — that sharing is what makes stage one of a rebuild free.
+    /// But a rebuild is queued BY a miss, and the listing it would reuse was
+    /// fetched before the item that caused the miss existed. So the one reader
+    /// that cannot accept a cached listing is the one this sharing was built
+    /// for: at the default `listing_ttl_ms` of 60000 it would spend a minute
+    /// unable to learn the thing it was started to learn, and would report the
+    /// vault unchanged the whole time.
+    ///
+    /// It does not throw the sharing away, because the direction that pays is
+    /// the other one: the fresh listing this store fetches lands in the shared
+    /// slot, so the next cold resolve reuses it. And the cost is bounded by the
+    /// rebuilder's own retry floor, the same shape the resolver's refresh queue
+    /// uses — a caller naming garbage spends at most one listing per floor.
+    #[must_use]
+    pub fn always_relisting(mut self) -> Self {
+        self.relist = true;
+        self
+    }
+
+    /// How old a listing this store will reuse.
+    ///
+    /// Zero when this store is the rebuilder's: an enumeration that accepted a
+    /// listing older than the question that queued it cannot answer that
+    /// question. See [`ProtonStore::always_relisting`].
+    fn reusable_for(&self) -> Duration {
+        if self.relist {
+            Duration::ZERO
+        } else {
+            self.listing_ttl
+        }
+    }
+
+    /// Share another store's listing cache.
+    ///
+    /// Only ever called between two stores built over the SAME session
+    /// directory and the same identity: a listing is what one identity can see,
+    /// and the generation stamped on each entry is what keeps a renewal from
+    /// being served out of it. See the field's own docs for why the daemon
+    /// wants this.
+    #[must_use]
+    pub fn sharing_listings_with(mut self, other: &ProtonStore) -> Self {
+        self.listings = Arc::clone(&other.listings);
+        self
     }
 
     /// Which logged-in identity answers every child this store spawns.
@@ -2634,11 +2746,27 @@ impl ProtonStore {
         vault: &str,
         name: &str,
     ) -> Result<Arc<Vec<ItemRecord>>, StoreError> {
+        self.listed_items(pass, vault, name, self.listing_ttl)
+    }
+
+    /// The same, with the caller saying how old a reusable entry may be.
+    ///
+    /// `reusable_for` of zero forces a fetch. Only the freshness test moves:
+    /// the map lock, the slot lock and the single-flight across the spawn are
+    /// exactly as above, so a forced listing still coalesces with every other
+    /// reader of that vault and still fills the shared slot for them.
+    fn listed_items(
+        &self,
+        pass: &proton_session::Pass<'_>,
+        vault: &str,
+        name: &str,
+        reusable_for: Duration,
+    ) -> Result<Arc<Vec<ItemRecord>>, StoreError> {
         let generation = pass.generation().cloned();
         let slot = Arc::clone(self.cache().entry(vault.to_owned()).or_default());
         let mut slot = slot.lock().unwrap_or_else(PoisonError::into_inner);
         if let Some(cached) = slot.as_ref()
-            && cached.at.elapsed() < self.listing_ttl
+            && cached.at.elapsed() < reusable_for
             && cached.generation == generation
         {
             return Ok(Arc::clone(&cached.items));
@@ -2892,7 +3020,7 @@ impl Store for ProtonStore {
         let pass = self.enter()?;
 
         // Resolved every time, never stored: a share id belongs to one session.
-        let reference = match address {
+        let reference = match address.as_ref() {
             Address::Reference(reference) => reference.clone(),
             Address::Named(address) => self.reference_for(&pass, name, address)?,
             Address::Unusable(detail) => return Err(self.backend(detail.clone())),
@@ -3090,8 +3218,9 @@ impl Discover for ProtonStore {
 
         let mut summaries = Vec::new();
         for name in vaults {
-            let items = self.cached_items(&pass, &name, &name)?;
+            let items = self.listed_items(&pass, &name, &name, self.reusable_for())?;
             summaries.extend(items.iter().map(|record| ItemSummary {
+                id: record.id.clone(),
                 vault: name.clone(),
                 title: record.title.clone(),
                 // Verbatim, including `Trashed`: somebody hunting a name that
@@ -3123,7 +3252,12 @@ impl Discover for ProtonStore {
 
         // One pass spans the listing below and the `item view` capture.
         let pass = self.enter()?;
-        let items = self.cached_items(&pass, vault, item)?;
+        // The same freshness rule `items` takes, and for the same reason one
+        // level down: a rebuilder's `fields` resolves the item through this
+        // listing, so a stale one lets it address an item that has been renamed
+        // or trashed — the defect `always_relisting` exists for, arriving at
+        // the other half of the same store.
+        let items = self.listed_items(&pass, vault, item, self.reusable_for())?;
         let record = match match_title(&items, item) {
             Matched::One(only) => only,
             Matched::None => {
@@ -3405,18 +3539,26 @@ mod tests {
         ];
 
         for (name, want) in &expected {
-            assert_eq!(session.route(name), want.as_ref(), "session, `{name}`");
-            assert_eq!(daemon.route(name), want.as_ref(), "daemon, `{name}`");
+            assert_eq!(
+                session.route(name).as_deref(),
+                want.as_ref(),
+                "session, `{name}`"
+            );
+            assert_eq!(
+                daemon.route(name).as_deref(),
+                want.as_ref(),
+                "daemon, `{name}`"
+            );
         }
 
         // The half-written one carries a sentence rather than a coordinate, so
         // the variant is what is pinned — on each side separately.
         assert!(matches!(
-            session.route("HALF_WRITTEN"),
+            session.route("HALF_WRITTEN").as_deref(),
             Some(Address::Unusable(_))
         ));
         assert!(matches!(
-            daemon.route("HALF_WRITTEN"),
+            daemon.route("HALF_WRITTEN").as_deref(),
             Some(Address::Unusable(_))
         ));
         assert_eq!(session.declared(), 3);

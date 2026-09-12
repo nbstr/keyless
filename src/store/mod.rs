@@ -55,6 +55,7 @@
 //! here would either default to a no-op the two of them never override, or
 //! force every adapter to implement a property half of them do not have.
 
+pub mod catalogue;
 pub mod daemon;
 pub mod discover;
 pub mod envnames;

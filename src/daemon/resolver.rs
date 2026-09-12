@@ -106,9 +106,14 @@ pub enum Outcome {
     Found(Arc<Secret>),
     /// Every store was healthy and none had it.
     Absent,
-    /// At least one store could not answer. Carries the reason, which comes
-    /// from a store's error text and therefore never contains a value.
-    Failed(String),
+    /// At least one store could not answer as asked.
+    Failed {
+        /// Comes from a store's error text and therefore never contains a
+        /// value.
+        reason: String,
+        /// Whether anything was actually decided about the name.
+        kind: FailureKind,
+    },
 }
 
 impl std::fmt::Debug for Outcome {
@@ -116,7 +121,42 @@ impl std::fmt::Debug for Outcome {
         match self {
             Outcome::Found(_) => f.write_str("Found(<redacted>)"),
             Outcome::Absent => f.write_str("Absent"),
-            Outcome::Failed(reason) => write!(f, "Failed({reason})"),
+            Outcome::Failed { reason, kind } => write!(f, "Failed({kind:?}, {reason})"),
+        }
+    }
+}
+
+/// Whether a failed lookup means a store took a position on the name, or
+/// nothing was decided about it at all.
+///
+/// This is the split [`Fetched::is_silent`] already drew to decide eviction —
+/// a silent failure leaves a cached value standing, a verdict evicts it —
+/// carried onto [`Outcome`] itself so the audit boundary can tell the two
+/// apart too. Before this type existed `record` in
+/// [`crate::daemon`] flattened every failure to the same word, which is what
+/// made a dead session and a store's own refusal indistinguishable after the
+/// fact: distinguishing them required correlating every other row in the log
+/// against the daemon's stderr, to reconstruct a fact the daemon already held
+/// here and discarded at the boundary.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FailureKind {
+    /// Every store asked was unreachable — no network, the binary missing,
+    /// the daemon's own Proton session dead — or none could be asked at all.
+    /// The name's standing is exactly what it was before this call.
+    Silent,
+    /// A store was reached and took a position: refused the item, revoked or
+    /// renamed it, or declined to be asked because the request itself is
+    /// underspecified. Whatever was cached is now known wrong.
+    Verdict,
+}
+
+impl FailureKind {
+    /// The word an audit row carries for a failed lookup.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            FailureKind::Silent => "store-silent",
+            FailureKind::Verdict => "store-verdict",
         }
     }
 }
@@ -170,8 +210,25 @@ pub struct Answer {
 #[derive(Clone)]
 struct Fetched {
     outcome: Outcome,
-    /// Every error was a store that could not answer.
-    silent: bool,
+}
+
+impl Fetched {
+    /// Whether the store said nothing about the name at all.
+    ///
+    /// Derived from the outcome rather than stored beside it, so there is
+    /// exactly one place this call's classification lives — [`FailureKind`]
+    /// on [`Outcome::Failed`] — rather than a second copy computed
+    /// independently in [`Resolver::ask_upstream`] and left to agree with it
+    /// by convention.
+    fn is_silent(&self) -> bool {
+        matches!(
+            self.outcome,
+            Outcome::Failed {
+                kind: FailureKind::Silent,
+                ..
+            }
+        )
+    }
 }
 
 struct Cached {
@@ -370,18 +427,16 @@ impl Resolver {
         // second rather than a vendor process's whole latency.
         let flight = self.queue_refresh(name);
         if let Some(fetched) = flight.and_then(|flight| wait_for_timeout(&flight, REFRESH_GRACE)) {
-            match fetched {
-                // The store answered. Its answer replaced or evicted the entry
-                // in the worker; either way it is what this caller gets.
-                Fetched { outcome, silent } if !silent => {
-                    return Some(Answer {
-                        outcome,
-                        source: Source::Store,
-                        age: None,
-                    });
-                }
-                // It could not answer, which says nothing about the value.
-                _ => {}
+            // The store answered. Its answer replaced or evicted the entry in
+            // the worker; either way it is what this caller gets. A silent
+            // failure says nothing about the value, and falls through to the
+            // stale answer below instead.
+            if !fetched.is_silent() {
+                return Some(Answer {
+                    outcome: fetched.outcome,
+                    source: Source::Store,
+                    age: None,
+                });
             }
         }
         Some(Answer {
@@ -539,26 +594,23 @@ impl Resolver {
                 flight.ready.notify_all();
                 return fetched;
             }
-            match &fetched {
+            match &fetched.outcome {
                 // A value: it replaces whatever was there, and its clock starts
                 // again.
-                Fetched {
-                    outcome: outcome @ Outcome::Found(_),
-                    ..
-                } if !self.ttl.is_zero() => {
+                Outcome::Found(_) if !self.ttl.is_zero() => {
                     shared.silent_since.remove(name);
                     evict_if_full(&mut shared.cache);
                     shared.cache.insert(
                         name.to_owned(),
                         Cached {
-                            outcome: outcome.clone(),
+                            outcome: fetched.outcome.clone(),
                             at: Instant::now(),
                         },
                     );
                 }
                 // The store could not answer. The entry stands, and the floor
                 // stops the next reader asking again immediately.
-                Fetched { silent: true, .. } => {
+                _ if fetched.is_silent() => {
                     shared.silent_since.insert(name.to_owned(), Instant::now());
                 }
                 // The store answered about this name and had nothing, or
@@ -604,11 +656,20 @@ impl Resolver {
 
     fn ask_upstream(&self, name: &str) -> Fetched {
         self.upstream_calls.fetch_add(1, Ordering::Relaxed);
-        let silent = |errors: &[StoreError]| {
-            !errors.is_empty()
+        // Every error unavailable means no store took a position: each one
+        // was never reached, so nothing here disagrees with a cached value.
+        // Any other error mix means at least one store WAS reached and had
+        // something to say, which is what makes the value worth evicting.
+        let kind_of = |errors: &[StoreError]| {
+            if !errors.is_empty()
                 && errors
                     .iter()
                     .all(|error| matches!(error, StoreError::Unavailable { .. }))
+            {
+                FailureKind::Silent
+            } else {
+                FailureKind::Verdict
+            }
         };
         let outcome = match self.registry.resolve(name) {
             Resolution::Found { secret, .. } => Outcome::Found(Arc::new(secret)),
@@ -637,15 +698,14 @@ impl Resolver {
                 // Read before the errors are flattened into one sentence: the
                 // variants are what say whether a store answered, and a string
                 // cannot be asked that afterwards.
-                let could_not_answer = silent(&errors);
+                let kind = kind_of(&errors);
                 let reason = errors
                     .iter()
                     .map(ToString::to_string)
                     .collect::<Vec<_>>()
                     .join("; ");
                 return Fetched {
-                    outcome: Outcome::Failed(reason),
-                    silent: could_not_answer,
+                    outcome: Outcome::Failed { reason, kind },
                 };
             }
             // Several of the daemon's own backends could have meant this name
@@ -664,19 +724,22 @@ impl Resolver {
             // file they belong in, and the reader of a degraded run is holding
             // the wrong one: their session's pins were dropped on purpose by
             // `store::build`, so editing them changes nothing at all.
-            ambiguous @ Resolution::Ambiguous { .. } => Outcome::Failed(format!(
-                "{} — in keylessd's own config file, not this session's; \
-                 a session cannot settle which of the daemon's stores a name means",
-                ambiguous.reason()
-            )),
+            ambiguous @ Resolution::Ambiguous { .. } => Outcome::Failed {
+                reason: format!(
+                    "{} — in keylessd's own config file, not this session's; \
+                     a session cannot settle which of the daemon's stores a name means",
+                    ambiguous.reason()
+                ),
+                // No store was asked, but the daemon's own config was —  and
+                // answered that this name cannot be resolved as configured,
+                // which is a position on the name, not silence about it.
+                kind: FailureKind::Verdict,
+            },
         };
         // Everything that reaches here is the store's own answer about the
         // name, including an ambiguity, which is this daemon's config saying
         // no store may be asked at all.
-        Fetched {
-            outcome,
-            silent: false,
-        }
+        Fetched { outcome }
     }
 
     /// A poisoned mutex means some other thread panicked while holding it. The
@@ -698,8 +761,10 @@ fn wait_for(flight: &Arc<Flight>) -> Fetched {
             .unwrap_or_else(PoisonError::into_inner);
     }
     done.clone().unwrap_or(Fetched {
-        outcome: Outcome::Failed("the resolution finished without a result".to_owned()),
-        silent: true,
+        outcome: Outcome::Failed {
+            reason: "the resolution finished without a result".to_owned(),
+            kind: FailureKind::Silent,
+        },
     })
 }
 
@@ -741,7 +806,7 @@ fn evict_if_full(cache: &mut HashMap<String, Cached>) {
 
 #[cfg(test)]
 mod tests {
-    use super::{MAX_CACHE_ENTRIES, Outcome, Resolver};
+    use super::{FailureKind, MAX_CACHE_ENTRIES, Outcome, Resolver};
     use crate::error::StoreError;
     use crate::secret::Secret;
     use crate::store::{Registry, Store};
@@ -916,10 +981,49 @@ mod tests {
             Registry::new(vec![Box::new(Broken)]),
             Duration::from_secs(600),
         );
-        assert!(matches!(resolver.resolve("X").outcome, Outcome::Failed(_)));
-        assert!(matches!(resolver.resolve("X").outcome, Outcome::Failed(_)));
+        for _ in 0..2 {
+            assert!(matches!(
+                resolver.resolve("X").outcome,
+                Outcome::Failed {
+                    kind: FailureKind::Silent,
+                    ..
+                }
+            ));
+        }
         assert_eq!(resolver.cached_len(), 0);
         assert_eq!(resolver.upstream_calls(), 2);
+    }
+
+    #[test]
+    fn a_store_that_refuses_the_item_fails_with_a_verdict_not_a_silence() {
+        // The two errors a real store can return read identically as strings —
+        // this is the distinction `FailureKind` exists to keep past that.
+        struct Refusing;
+        impl Store for Refusing {
+            fn id(&self) -> &str {
+                "refusing"
+            }
+            fn resolve(&self, _name: &str) -> Result<Option<Secret>, StoreError> {
+                Err(StoreError::Backend {
+                    store: "refusing".to_owned(),
+                    detail: "no such item".to_owned(),
+                })
+            }
+            fn health(&self) -> Result<(), StoreError> {
+                Ok(())
+            }
+        }
+        let resolver = Resolver::new(
+            Registry::new(vec![Box::new(Refusing)]),
+            Duration::from_secs(600),
+        );
+        assert!(matches!(
+            resolver.resolve("X").outcome,
+            Outcome::Failed {
+                kind: FailureKind::Verdict,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -980,10 +1084,11 @@ mod tests {
             .resolve("DATABASE_URL")
             .outcome
         {
-            Outcome::Failed(reason) => {
+            Outcome::Failed { reason, kind } => {
                 assert!(reason.contains("keylessd"), "{reason}");
                 assert!(reason.contains("stores.default"), "{reason}");
                 assert!(!reason.contains("decoy-"), "the reason leaked a value");
+                assert_eq!(kind, FailureKind::Verdict);
             }
             other => panic!("expected a failure naming the candidates, got {other:?}"),
         }
@@ -1200,7 +1305,10 @@ mod tests {
         let answered = resolver.resolve("X");
         assert_eq!(answered.source, super::Source::Store);
         assert!(
-            matches!(answered.outcome, Outcome::Failed(ref reason) if reason.contains("trash")),
+            matches!(
+                &answered.outcome,
+                Outcome::Failed { reason, kind: FailureKind::Verdict } if reason.contains("trash")
+            ),
             "{:?}",
             answered.outcome
         );

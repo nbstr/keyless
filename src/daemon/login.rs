@@ -848,6 +848,7 @@ pub fn perform(
         &coordinates.credentials_file,
         &coordinates.token_entry,
         token,
+        Some((owner.uid, owner.gid)),
     )
     .map_err(|error| {
         logged_in_but_unwritten(

@@ -1,9 +1,29 @@
 //! `keyless ls` — names and where they point, never values.
 //!
-//! Lists what has been declared in the config. It does not contact a store, so
-//! it cannot prompt for keychain access and cannot be slow; and it makes no
+//! Lists what has been declared in the config, and — where the daemon is
+//! enabled — what the daemon says it will serve. It contacts no STORE, so it
+//! cannot prompt for keychain access and cannot be slow; and it makes no
 //! statement about whether a name currently resolves, which is `doctor --probe`'s
 //! job.
+//!
+//! # Why the daemon is asked at all
+//!
+//! Behind the daemon the session's own config declares nothing: the `secrets`
+//! map lives in a root-owned file the calling user cannot read, which is what
+//! turns "declared" into a boundary rather than a convention. So this listing
+//! was EMPTY on exactly the installs where it is the only way to find out what
+//! is available — a person could ask for a name and get it, and had no way to
+//! learn the name existed.
+//!
+//! The daemon answers with names and nothing else. It cannot be asked what it
+//! HOLDS — `src/store/discover.rs` refuses to enumerate the `daemon` store for
+//! that reason — so a daemon row carries `daemon` as its store and `-` for the
+//! two columns that would be coordinates.
+//!
+//! A daemon that cannot answer degrades to the local listing with one line on
+//! stderr, the way `src/store/daemon.rs` degrades every other failure: a
+//! listing that fails outright would make an absent daemon look like an empty
+//! vault.
 //!
 //! # Why the environment is a column
 //!
@@ -42,9 +62,11 @@
 //! parser is a fifth record that parses. A person gets the label; a pipe gets
 //! exactly the bytes it always got.
 
+use std::collections::BTreeMap;
 use std::io::{self, Write};
 
 use crate::config::Config;
+use crate::store::daemon::{DAEMON_STORE_ID, DaemonStore};
 use crate::store::infisical::Routing;
 use crate::store::{self, infisical};
 
@@ -72,22 +94,54 @@ const NOTE_HEADING: &str = "NOTE (yours, unchecked)";
 /// say, so a parser never has to count them.
 ///
 /// `interactive` says whether `out` is a terminal, and decides one thing only:
-/// whether the header is written. It is a parameter rather than a call to
+/// whether the header is written. `err` takes the one line a daemon that cannot
+/// answer produces. It is a parameter rather than a call to
 /// [`std::io::IsTerminal`] so a test drives both paths, and so the caller —
 /// which already knows — is the one that decides. Same seam, same reason, as
 /// [`crate::cmd::write::put`].
-pub fn ls(config: &Config, interactive: bool, out: &mut dyn Write) -> io::Result<()> {
-    if config.secrets.is_empty() {
+pub fn ls(
+    config: &Config,
+    interactive: bool,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> io::Result<()> {
+    // Built once. `ls` describes the config, so it passes no invocation
+    // environment: `--env` belongs to a `run`, and claiming it here would show
+    // an environment this listing cannot know a future command will supply.
+    let routing = Routing::from_config(config, None);
+
+    let mut rows: BTreeMap<&str, Row<'_>> = config
+        .secrets
+        .iter()
+        .map(|(name, route)| {
+            (
+                name.as_str(),
+                Row {
+                    store: route.store.as_deref().unwrap_or("*"),
+                    location: location_of(config, &routing, name),
+                    note: route.note.as_deref().unwrap_or(NO_LOCATION),
+                },
+            )
+        })
+        .collect();
+
+    // A local declaration keeps its own row: it says which store answers and
+    // where, which the daemon's names-only answer cannot. A name only the
+    // daemon knows about is added rather than replacing anything.
+    let served = served_names(config, err);
+    for name in &served {
+        rows.entry(name.as_str()).or_insert(Row {
+            store: DAEMON_STORE_ID,
+            location: NO_LOCATION.to_owned(),
+            note: NO_LOCATION,
+        });
+    }
+
+    if rows.is_empty() {
         return Ok(());
     }
 
-    let width = config
-        .secrets
-        .keys()
-        .map(String::len)
-        .max()
-        .unwrap_or(0)
-        .max(4);
+    let width = rows.keys().map(|name| name.len()).max().unwrap_or(0).max(4);
 
     if interactive {
         // `#` first, so the one reader that does get a header can drop it with
@@ -100,18 +154,50 @@ pub fn ls(config: &Config, interactive: bool, out: &mut dyn Write) -> io::Result
         )?;
     }
 
-    // Built once. `ls` describes the config, so it passes no invocation
-    // environment: `--env` belongs to a `run`, and claiming it here would show
-    // an environment this listing cannot know a future command will supply.
-    let routing = Routing::from_config(config, None);
-
-    for (name, route) in &config.secrets {
-        let store = route.store.as_deref().unwrap_or("*");
-        let location = location_of(config, &routing, name);
-        let note = route.note.as_deref().unwrap_or(NO_LOCATION);
-        writeln!(out, "{name:<width$}\t{store}\t{location}\t{note}")?;
+    for (name, row) in &rows {
+        writeln!(
+            out,
+            "{name:<width$}\t{}\t{}\t{}",
+            row.store, row.location, row.note
+        )?;
     }
     Ok(())
+}
+
+/// One rendered line, before it is widened to the column.
+struct Row<'a> {
+    store: &'a str,
+    location: String,
+    note: &'a str,
+}
+
+/// What the daemon says it will serve, or nothing plus a line on stderr.
+///
+/// Empty on every failure and on a daemon that is not enabled. A listing is not
+/// a lookup: nothing downstream of this decides whether a name resolves, so the
+/// worst a degrade costs is a short listing, where a hard failure would cost the
+/// only view of what is available.
+fn served_names(config: &Config, err: &mut dyn Write) -> Vec<String> {
+    if !config.stores.daemon.enabled {
+        return Vec::new();
+    }
+    let settings = &config.stores.daemon;
+    let said = match DaemonStore::new(settings.socket_path(), settings.timeout()).names() {
+        Ok(names) => return names,
+        // Through the store rather than a `Client` built here: it is the one
+        // route every other verb reaches the daemon by, and its own error
+        // mapping is what tells an absent socket from a daemon that never
+        // finished. A client built at this call site phrased both the same way
+        // while `doctor` distinguished them.
+        Err(error) => error.to_string(),
+    };
+    // Best effort: a listing must not fail because stderr is closed.
+    let _ = writeln!(
+        err,
+        "{}: the daemon could not say what it serves ({said}); listing the local config only",
+        crate::NAME
+    );
+    Vec::new()
 }
 
 /// Where a name points, when that is a question with an answer worth printing.
@@ -141,7 +227,8 @@ mod tests {
     fn render_as(json: &str, interactive: bool) -> String {
         let config: Config = serde_json::from_str(json).expect("valid config");
         let mut out: Vec<u8> = Vec::new();
-        ls(&config, interactive, &mut out).expect("writing to a Vec cannot fail");
+        let mut err: Vec<u8> = Vec::new();
+        ls(&config, interactive, &mut out, &mut err).expect("writing to a Vec cannot fail");
         String::from_utf8(out).expect("utf-8")
     }
 

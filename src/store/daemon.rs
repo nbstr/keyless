@@ -65,6 +65,35 @@ impl DaemonStore {
         }
     }
 
+    /// What the daemon says it will serve. Names only.
+    ///
+    /// Beside `health` rather than at the caller, so `keyless ls` reaches the
+    /// daemon by the one route every other verb takes and phrases a failure the
+    /// way every other verb does. Built by hand at the call site it took the
+    /// same `Client` and lost [`DaemonStore::transport_error`]'s split, so a
+    /// dead socket and a daemon that never finished read identically there
+    /// while `doctor` told them apart.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError`], on the same terms as every other method here: absent
+    /// socket, refused attestation, garbage on the wire. There is no path that
+    /// returns a name the daemon did not send.
+    pub fn names(&self) -> Result<Vec<String>, StoreError> {
+        match self.client.request(&Request::names()) {
+            Ok(Reply::Info { names }) => Ok(names),
+            Ok(Reply::Denied(reason)) => {
+                Err(self.backend(format!("refused by the daemon: {reason}")))
+            }
+            Ok(Reply::Failed(reason)) => Err(self.backend(reason)),
+            Ok(other) => Err(self.backend(format!(
+                "the daemon answered a listing with `{}`",
+                other.status()
+            ))),
+            Err(error) => Err(self.transport_error(&error)),
+        }
+    }
+
     /// Map a transport failure onto the store's two error kinds.
     ///
     /// The split matters only to `doctor`: `Unavailable` means the daemon is

@@ -135,12 +135,14 @@ mod tests {
         fn items(&self, vault: Option<&str>) -> Result<Vec<ItemSummary>, StoreError> {
             Ok(vec![
                 ItemSummary {
+                    id: "It3mL1v3".to_owned(),
                     vault: vault.unwrap_or("personal").to_owned(),
                     title: "demo api key".to_owned(),
                     state: "Active".to_owned(),
                     kind: "custom".to_owned(),
                 },
                 ItemSummary {
+                    id: "It3mDead".to_owned(),
                     vault: vault.unwrap_or("personal").to_owned(),
                     title: "keyless-decoy-alpha".to_owned(),
                     state: "Trashed".to_owned(),

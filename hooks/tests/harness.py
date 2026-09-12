@@ -96,6 +96,16 @@ def drive(payload, env=None, raw_stdin=None, state=None):
     e.pop("KEYLESS_HOOKS_DISABLE", None)
     e.pop("KEYLESS_HOOKS_OBSERVE", None)
     e["KEYLESS_HOOKS_CONFIG"] = os.path.join(e["KEYLESS_HOOKS_STATE"], "no-such-config.json")
+    # `served.py` reads keyless's OWN config (a different file from the hook
+    # pack's above) and, where it declares a daemon, dials a real socket. Left
+    # to inherit the ambient environment, a suite run on a machine with its
+    # own keyless install would read that install's real config and — if its
+    # daemon happens to be enabled and reachable — really contact it, making
+    # every test that reaches `served()` depend on this machine's own state.
+    # Point both at nothing by default; a test that wants a daemon in the
+    # picture says so explicitly through `env`.
+    e["KEYLESS_CONFIG"] = os.path.join(e["KEYLESS_HOOKS_STATE"], "no-such-keyless-config.json")
+    e.pop("KEYLESS_SOCKET", None)
     if env:
         e.update(env)
     data = raw_stdin if raw_stdin is not None else json.dumps(payload)
@@ -280,3 +290,20 @@ def write(path, content, cwd=None):
     return {"hook_event_name": "PreToolUse", "tool_name": "Write",
             "tool_input": {"file_path": path, "content": content},
             "cwd": cwd or fixtures(), "session_id": "test-session"}
+
+
+def keyless_config(path, secrets=(), daemon=None):
+    """Write a keyless CLI `config.json` (not this pack's own `hooks.json`)
+    at `path` and return it, for `env={"KEYLESS_CONFIG": ...}` in `drive`.
+
+    `secrets` declares names locally, free of any daemon. `daemon`, given,
+    is the `stores.daemon` object verbatim — `served.py` reads `enabled`,
+    `socket` and `timeout_ms` off it exactly as `src/config.rs` does.
+    """
+    data = {"secrets": {name: {} for name in secrets}}
+    if daemon is not None:
+        data["stores"] = {"daemon": daemon}
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w") as fh:
+        fh.write(json.dumps(data))
+    return path

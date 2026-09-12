@@ -158,13 +158,25 @@ gets what it was actually after:
 # This is a NAMES-ONLY view. No value from that file appears below,
 # and no value from it is available to this session.
 #
-# Use one without reading it:   keyless run -s <NAME> -- <your command>
-# See what keyless can resolve: keyless ls
+# keyless run -s DATABASE_URL -- <the command that needs it>
+# STRIPE_KEY — the daemon did not answer in time, so keyless cannot say
+# whether this name is servable. `keyless run -s STRIPE_KEY` will say so
+# directly; this refusal does not.
+# DEBUG — keyless does not serve this name: it is declared nowhere and
+# minted by no enumerated vault item. If it is a credential, declare it
+# under `secrets` or add it to the vault so keyless can serve it. If it
+# is not a developer-tooling credential at all — a port, a URL, a value
+# your deployed application reads at runtime — keyless is the wrong
+# tool for it.
 
 DATABASE_URL=[keyless:redacted]
 STRIPE_KEY=[keyless:redacted]
 DEBUG=[keyless:redacted]
 ```
+
+Each name gets its own remedy rather than one blanket suggestion: `keyless run
+-s <NAME>` is offered only for a name keyless will actually serve — the daemon's
+own declared-or-minted index — never for every key a `.env` happens to define.
 
 **A bare environment dump is masked, and the pipeline survives.**
 

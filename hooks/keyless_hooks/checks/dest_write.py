@@ -68,6 +68,7 @@ one of them that also takes a plaintext copy on the way through.
 
 import os
 
+from .. import served as served_mod
 from ..secretpaths import is_protected, names_in, resolve
 
 CHECK = "KL-DEST"
@@ -141,8 +142,12 @@ def _deny_text(target, pattern, names, note, verb):
         more = " …and %d more" % (len(names) - 25) if len(names) > 25 else ""
         inventory = ("The %d name(s) that copy would contain — no values: %s%s"
                      % (len(names), listed, more))
+        served_result = served_mod.served()
+        remedy = "\n".join("        %s" % line
+                           for line in served_mod.advice_lines(names[:25], served_result))
     else:
         inventory = "Names could not be read from it (%s)." % (note or "unknown")
+        remedy = "        keyless run -s <NAME> -- <the command that needs it>"
 
     return (
         "[%s] %s matched the protected pattern `%s`. Its content is a credential, "
@@ -158,13 +163,13 @@ def _deny_text(target, pattern, names, note, verb):
         "  * Change a value that is NOT itself a secret, in place, from the "
         "shell — an in-place shell edit is not copied:\n"
         "        sed -i '' 's|^SOME_HOST=.*|SOME_HOST=new.example|' %s\n"
-        "  * Use a value without reading it:\n"
-        "        keyless run -s <NAME> -- <the command that needs it>\n"
-        "  * `keyless ls` lists every name keyless can resolve.\n\n"
+        "  * Use a value without reading it — what keyless will do for each name "
+        "above:\n"
+        "%s\n\n"
         "If this path holds no real secret — a fixture, a template, an example — "
         "add it to `allowed` in ~/.config/keyless/hooks.json and this refusal "
         "stops for it. An operator can disable the whole pack for a session with "
         "KEYLESS_HOOKS_DISABLE=1 in the settings file's `env` block. A session "
         "cannot set its own environment, which is the point. Re-issuing this "
         "write in another spelling will not produce a different answer."
-        % (CHECK, target, pattern, verb, inventory, target))
+        % (CHECK, target, pattern, verb, inventory, target, remedy))

@@ -516,7 +516,14 @@ mod daemon {
             Err(detail) => return fail(&detail),
         };
 
-        if let Err(error) = credential::store_entry(&path, &args.name, &value) {
+        // The daemon's own uid, read off the audit log — the same file
+        // `keylessd check` judges this credential's owner against. It matters
+        // only where the file does not exist yet, which under `sudo` is where
+        // it would otherwise land as `root:wheel`; `None` where no audit log
+        // resolves, and then nothing is inferred.
+        let daemon =
+            credential::daemon_owner(config.audit.as_path()).map(|owner| (owner.uid, owner.gid));
+        if let Err(error) = credential::store_entry(&path, &args.name, &value, daemon) {
             return fail(&error.to_string());
         }
 
