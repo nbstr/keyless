@@ -508,7 +508,9 @@ def claims_in_message(body):
 # message is unrewritable. Install it in every clone that commits:
 #
 #     ln -sf ../../install/commit-msg.sh .git/hooks/commit-msg
-KNOWN_UNSCRUBBED = []
+KNOWN_UNSCRUBBED = [
+    "208f29f8da35a406fb40383d1fdc12b804a5f0d0",
+]
 
 # One planted message per shape that was really written into this history.
 # Invented magnitudes, for the reason PLANTS gives above.
