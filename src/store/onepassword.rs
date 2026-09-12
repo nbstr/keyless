@@ -1239,6 +1239,7 @@ impl Discover for OnePasswordStore {
         Ok(items
             .iter()
             .map(|record| ItemSummary {
+                id: record.id.clone(),
                 vault: vault.to_owned(),
                 title: record.title.clone(),
                 state: record.state_word(),

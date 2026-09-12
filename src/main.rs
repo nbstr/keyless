@@ -551,7 +551,12 @@ fn dispatch() -> i32 {
 
         // The header is for a person; a pipe gets the four fields it always
         // got. `stdout` is the stream being asked about, so it is the one asked.
-        Verb::Ls => match ls(&load.config, io::stdout().is_terminal(), &mut io::stdout()) {
+        Verb::Ls => match ls(
+            &load.config,
+            io::stdout().is_terminal(),
+            &mut io::stdout(),
+            &mut io::stderr(),
+        ) {
             Ok(()) => {
                 // An empty `ls` printed nothing at all and exited 0, which is
                 // the same output a broken install produces — and the state

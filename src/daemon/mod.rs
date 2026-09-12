@@ -64,6 +64,7 @@ use crate::audit::{AuditLog, Event, Peer};
 use crate::ipc::protocol::{Op, Reply, Request, read_frame, write_frame};
 use crate::mask::Masker;
 use crate::secret::Secret;
+use crate::store::catalogue::{Catalogue, Rebuilder, Route};
 use crate::store::proton_session::Generations;
 use crate::{NAME, State};
 
@@ -119,7 +120,16 @@ pub struct Daemon {
     policy: Arc<Policy>,
     resolver: Arc<Resolver>,
     audit: Arc<AuditLog>,
-    names: Arc<Vec<String>>,
+    /// Every name this daemon can serve — the operator's declarations, and
+    /// whatever the enumerable stores mint. See [`crate::store::catalogue`].
+    catalogue: Arc<Catalogue>,
+    /// Keeps that index current, off the request path.
+    ///
+    /// Held behind an `Arc` and handed to every connection, because a miss is
+    /// the only thing that starts a rebuild and a miss happens on a connection
+    /// thread. Its worker stops when the last of those `Arc`s drops, which is
+    /// when the accept thread lets go of the daemon.
+    rebuilder: Arc<Rebuilder>,
     idle: Duration,
     live: Arc<AtomicUsize>,
     /// Shared with the stores this daemon resolves through, and with the
@@ -165,19 +175,31 @@ impl Daemon {
         // the loop; the loop knows nothing of the stores.
         let generations = config.generations();
 
+        // The declared half is fixed here; the derived half arrives from the
+        // rebuilder below. Built before the registry because the adapters read
+        // their undeclared addresses out of it.
+        let catalogue = Arc::new(Catalogue::new(&config.secrets));
+        let backends = config.backends(generations.as_ref(), Some(&catalogue));
+        // Started, not asked. Nothing is enumerated until something asks a
+        // question the declared set cannot answer — a miss, or a listing over a
+        // daemon that has never built one. An enumeration at bind would spend a
+        // vendor call, and a permanent off-machine audit entry, on every daemon
+        // start whether or not anybody ever asks it anything.
+        let rebuilder = Arc::new(Rebuilder::start(&catalogue, backends.sources));
+
         Ok(Daemon {
             listener,
             socket: config.socket.to_path_buf(),
             policy: Arc::new(policy),
             resolver: Arc::new(
-                Resolver::new(config.registry(generations.as_ref()), config.ttl())
-                    .with_stale_window(config.stale()),
+                Resolver::new(backends.registry, config.ttl()).with_stale_window(config.stale()),
             ),
             audit: Arc::new(
                 AuditLog::new(config.audit.to_path_buf())
                     .with_mode(crate::audit::MODE_GROUP_READABLE),
             ),
-            names: Arc::new(config.names.clone()),
+            catalogue,
+            rebuilder,
             idle: config.idle_timeout(),
             live: Arc::new(AtomicUsize::new(0)),
             generations,
@@ -240,7 +262,8 @@ impl Daemon {
             policy: Arc::clone(&self.policy),
             resolver: Arc::clone(&self.resolver),
             audit: Arc::clone(&self.audit),
-            names: Arc::clone(&self.names),
+            catalogue: Arc::clone(&self.catalogue),
+            rebuilder: Arc::clone(&self.rebuilder),
             idle: self.idle,
             live: Arc::clone(&self.live),
         };
@@ -285,7 +308,8 @@ struct Connection {
     policy: Arc<Policy>,
     resolver: Arc<Resolver>,
     audit: Arc<AuditLog>,
-    names: Arc<Vec<String>>,
+    catalogue: Arc<Catalogue>,
+    rebuilder: Arc<Rebuilder>,
     idle: Duration,
     live: Arc<AtomicUsize>,
 }
@@ -377,9 +401,20 @@ impl Connection {
 
         match request.op {
             Op::Ping => Reply::Info { names: Vec::new() },
-            Op::Names => Reply::Info {
-                names: self.names.as_ref().clone(),
-            },
+            Op::Names => {
+                // A listing over a daemon that has never enumerated answers the
+                // declared set and asks for the rest. The asker gets today's
+                // answer immediately rather than waiting on a vault, and the
+                // next listing is complete — which is the same demand-driven
+                // shape a miss takes, for the same reason: nothing here runs on
+                // a clock.
+                if self.catalogue.indexed_at().is_none() {
+                    self.rebuilder.queue_full();
+                }
+                Reply::Info {
+                    names: self.catalogue.names(),
+                }
+            }
             Op::Resolve => self.resolve(stream, &request, &attestation),
         }
     }
@@ -425,6 +460,9 @@ impl Connection {
                 Reply::Value(Secret::new(secret.expose().to_owned()))
             }
             Outcome::Absent => {
+                // The verdict is dropped: `Reply::Absent` carries no sentence,
+                // so composing one would walk every title for nothing.
+                let _ = self.missed(&request.name);
                 self.record(
                     request,
                     attestation,
@@ -436,6 +474,7 @@ impl Connection {
                 Reply::Absent
             }
             Outcome::Failed { reason, kind } => {
+                let route = self.missed(&request.name);
                 self.record(
                     request,
                     attestation,
@@ -444,9 +483,37 @@ impl Connection {
                     None,
                     served,
                 );
-                Reply::Failed(reason)
+                let advice = self.catalogue.advice(&request.name, &route);
+                Reply::Failed(format!("{reason}; {advice}"))
             }
         }
+    }
+
+    /// Queue whatever a name that produced no value needs, and hand back what
+    /// the catalogue said about it.
+    ///
+    /// # Why this runs AFTER the resolve and never before it
+    ///
+    /// Two reasons, and the second is the one that bites. A resolve that
+    /// produces a value must not gain a lock or a lookup it did not have, so
+    /// the catalogue is off the happy path entirely.
+    ///
+    /// And the catalogue must not GATE a request. The keychain store defaults
+    /// its account to the name itself and the file store keys on the name, so
+    /// both serve names that appear in no `secrets` entry and in no index. A
+    /// gate would turn every one of those into a miss — the tool would stop
+    /// serving names it serves today, and the index would look correct while
+    /// doing it.
+    fn missed(&self, name: &str) -> Route {
+        let route = self.catalogue.route(name);
+        if matches!(route, Route::Unknown { .. }) {
+            self.rebuilder.queue(name);
+        }
+        // Handed back rather than recomputed by whoever wants the sentence:
+        // this verdict already cost a walk of the index, and `advice` would
+        // otherwise make the same walk a second time on the one arm that uses
+        // it.
+        route
     }
 
     /// Resolve on a worker thread, saying so on the socket every

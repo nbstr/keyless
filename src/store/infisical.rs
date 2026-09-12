@@ -1520,6 +1520,12 @@ impl Discover for InfisicalStore {
             let vault = at.describe();
             summaries.extend(self.names_at(&at, &probe)?.into_iter().map(|key| {
                 ItemSummary {
+                    // A key IS this backend's identity: an environment holds one
+                    // value per key, so there is no second item a title could
+                    // collide with and nothing separate to report. Set to the
+                    // key rather than left empty, so a consumer keying on the id
+                    // holds one entry per secret here too.
+                    id: key.clone(),
                     vault: vault.clone(),
                     // What a config entry's `key` must match, and what its
                     // `name` defaults to.
