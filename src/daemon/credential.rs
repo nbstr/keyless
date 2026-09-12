@@ -770,108 +770,6 @@ pub fn ensure_generated_entry(path: &Path, name: &str) -> Result<GeneratedEntry,
     Ok(GeneratedEntry::Generated)
 }
 
-/// How long a claim may be held before the next writer takes it over.
-///
-/// A holder that died — a daemon killed mid-start, an operator's `login` that
-/// hit Ctrl-C — leaves its claim behind, and a claim nobody can break wedges
-/// every later start permanently. Long enough that a live holder doing a read,
-/// a generate and an atomic write is never overtaken; short enough that a
-/// machine recovers on its own.
-const CLAIM_STALE: Duration = Duration::from_secs(30);
-
-/// How long a writer waits for a claim before reporting that it could not take
-/// one.
-const CLAIM_WAIT: Duration = Duration::from_secs(5);
-
-/// An exclusive claim on one credential file, held across a read-then-write.
-///
-/// `create_new` IS the mechanism: the kernel admits exactly one creator of a
-/// path, so the claim file's existence is the lock and nothing else has to
-/// agree about it. No `flock`, because that would be a dependency for a
-/// property one `open` flag already provides.
-struct Guard {
-    path: PathBuf,
-}
-
-impl Guard {
-    /// Claim `target`, waiting up to [`CLAIM_WAIT`] for a live holder and
-    /// taking over one older than [`CLAIM_STALE`].
-    fn take(target: &Path) -> Result<Self, CredentialError> {
-        let path = claim_path(target)?;
-        let deadline = Instant::now() + CLAIM_WAIT;
-        loop {
-            match fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .mode(MODE)
-                .open(&path)
-            {
-                Ok(_) => return Ok(Self { path }),
-                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-                    if claim_is_stale(&path) {
-                        // Not a race between the reader of the age and the
-                        // remover: whoever removes it still has to win the
-                        // `create_new` above to hold it.
-                        let _ = fs::remove_file(&path);
-                        continue;
-                    }
-                    if Instant::now() >= deadline {
-                        return Err(io_error(
-                            target,
-                            format!(
-                                "another `{}` is writing it and did not finish within {} \
-                                 seconds: {} is held",
-                                crate::DAEMON_NAME,
-                                CLAIM_WAIT.as_secs(),
-                                path.display()
-                            ),
-                        ));
-                    }
-                    std::thread::sleep(Duration::from_millis(50));
-                }
-                Err(error) => {
-                    return Err(io_error(
-                        target,
-                        format!("cannot be claimed for writing: {error}"),
-                    ));
-                }
-            }
-        }
-    }
-}
-
-impl Drop for Guard {
-    fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
-    }
-}
-
-/// Where one credential file's claim lives — beside it, so it inherits the
-/// directory's own mode and never lands somewhere world-writable.
-fn claim_path(target: &Path) -> Result<PathBuf, CredentialError> {
-    let parent = target
-        .parent()
-        .filter(|path| !path.as_os_str().is_empty())
-        .ok_or_else(|| io_error(target, "has no directory to write into"))?;
-    let name = target
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("credentials");
-    Ok(parent.join(format!(".{name}.claim")))
-}
-
-/// Whether a claim is old enough that its holder is presumed gone.
-///
-/// An unreadable claim reads as NOT stale: it is there, something made it, and
-/// breaking one this process cannot even stat is the move that turns a
-/// permission problem into two writers.
-fn claim_is_stale(path: &Path) -> bool {
-    fs::metadata(path)
-        .and_then(|meta| meta.modified())
-        .map(|at| at.elapsed().unwrap_or_default() > CLAIM_STALE)
-        .unwrap_or(false)
-}
-
 /// Give [`crate::store::proton::KeyProvider::Env`] a local key to read,
 /// generated once at the daemon's own first start.
 ///
@@ -918,6 +816,121 @@ pub fn ensure_proton_local_key(
         return Ok(None);
     };
     ensure_generated_entry(&credentials_file, entry).map(Some)
+}
+
+/// How long a writer waits for a claim another process is holding.
+///
+/// A holder that is alive is doing one file read and one atomic write, so a
+/// wait this long is never spent in practice. What it bounds is the CALLER:
+/// the renewal loop must not sit here while a session it could be renewing
+/// expires, and giving up costs nothing now that the loop attempts the
+/// generation again on its next tick.
+///
+/// Matched to the renewal loop's own shutdown grace deliberately. The wait
+/// does not consult the stop flag — it cannot, since this module knows nothing
+/// about a loop — so a wait longer than that grace would let a contended tick
+/// outlive the patience shutdown has for it, and the process would report that
+/// it was waiting on the vendor when it was waiting on a file.
+const CLAIM_WAIT: Duration = Duration::from_secs(5);
+
+/// An exclusive claim on one credential file, held across a read-then-write.
+///
+/// # Why the kernel holds this and no rule of ours does
+///
+/// The claim has to be released when its holder dies — killed by a signal, or
+/// by the restart that installed the binary it was running. A claim marked by
+/// the mere EXISTENCE of a file cannot be: a signal runs no destructor, so the
+/// marker outlives the process and every later writer reads it as live. The
+/// obvious repair is to break a claim that looks old, and it is a trap — every
+/// way of reading "old" can fail (a clock that moved, a file another uid owns,
+/// an mtime a filesystem rounds), each failure reads as "still held", and the
+/// break itself un-serialises the one read-then-write the claim exists to
+/// protect. Measured on 2026-09-11: a claim left by a killed start wedged
+/// every later start for 87 minutes, and the timestamp repair for it would
+/// have let two writers generate two keys and the slower one overwrite the
+/// value the faster one had already published a session under.
+///
+/// `flock` answers it exactly, and answers nothing else. The lock belongs to
+/// the open file description rather than to a path or a rule, so the kernel
+/// releases it when the descriptor closes — which a process exit does, however
+/// that exit happens. There is no staleness to judge, nothing to break, and no
+/// identity to record: a dead holder holds nothing, and a live one is never
+/// overtaken.
+///
+/// Read from the vendor rather than assumed: `File::try_lock` is
+/// `flock(LOCK_EX | LOCK_NB)` on Unix, and "the lock will be released when this
+/// file (along with any other file descriptors/handles duplicated or inherited
+/// from it) is closed" — <https://doc.rust-lang.org/std/fs/struct.File.html>.
+/// The descriptor is not inherited by the vendor children this daemon spawns,
+/// because the standard library opens files close-on-exec.
+///
+/// The claim file itself is never removed. Unlinking a path another process
+/// holds open is what reintroduces the identity problem this design removes,
+/// and an empty file costs nothing.
+struct Guard {
+    /// The lock lives with this handle and is released when it drops.
+    _file: fs::File,
+}
+
+impl Guard {
+    /// Claim `target`, waiting up to [`CLAIM_WAIT`] for a live holder.
+    fn take(target: &Path) -> Result<Self, CredentialError> {
+        Self::take_within(target, CLAIM_WAIT)
+    }
+
+    /// The same, with the wait named by the caller, so a test can prove
+    /// contention without spending the real one.
+    fn take_within(target: &Path, wait: Duration) -> Result<Self, CredentialError> {
+        let path = claim_path(target)?;
+        let file = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(MODE)
+            .open(&path)
+            .map_err(|error| io_error(target, format!("cannot be claimed for writing: {error}")))?;
+
+        let deadline = Instant::now() + wait;
+        loop {
+            match file.try_lock() {
+                Ok(()) => return Ok(Self { _file: file }),
+                Err(fs::TryLockError::WouldBlock) => {
+                    if Instant::now() >= deadline {
+                        return Err(io_error(
+                            target,
+                            format!(
+                                "a claim on it is held and was not released within {} \
+                                 seconds: {} is locked by another process",
+                                wait.as_secs(),
+                                path.display()
+                            ),
+                        ));
+                    }
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                Err(fs::TryLockError::Error(error)) => {
+                    return Err(io_error(
+                        target,
+                        format!("cannot be claimed for writing: {error}"),
+                    ));
+                }
+            }
+        }
+    }
+}
+
+/// Where one credential file's claim lives — beside it, so it inherits the
+/// directory's own mode and never lands somewhere world-writable.
+fn claim_path(target: &Path) -> Result<PathBuf, CredentialError> {
+    let parent = target
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .ok_or_else(|| io_error(target, "has no directory to write into"))?;
+    let name = target
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("credentials");
+    Ok(parent.join(format!(".{name}.claim")))
 }
 
 /// A file's owning uid and gid, kept together so a rewrite can hand them back.
@@ -1513,6 +1526,107 @@ mod tests {
                 .len(),
             43,
             "the surviving value is not one whole generated key"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_claim_a_dead_holder_left_behind_is_free_the_moment_it_dies() {
+        // The outage of 2026-09-11, as a case. A start took the claim and the
+        // restart that installed it killed the process mid-generation; the
+        // marker outlived its holder, every later start read it as live, and
+        // the machine served no Proton name for 87 minutes.
+        //
+        // Held by a REAL other process, because that is the only way to prove
+        // the property that matters: the kernel releases the lock when the
+        // holder dies, with no rule of ours judging how long is too long. The
+        // child is killed rather than asked to exit, so nothing it might have
+        // run on the way out can be what frees the claim.
+        let dir = scratch("claim-dead-holder");
+        fs::create_dir_all(&dir).expect("scratch");
+        let path = dir.join("proton.json");
+        let claim = claim_path(&path).expect("a claim path");
+        fs::write(&claim, b"").expect("the claim file the holder will lock");
+
+        let mut holder = std::process::Command::new("/usr/bin/python3")
+            .arg("-c")
+            .arg(
+                "import fcntl, sys, time\n\
+                 handle = open(sys.argv[1], 'r+')\n\
+                 fcntl.flock(handle, fcntl.LOCK_EX)\n\
+                 print('held', flush=True)\n\
+                 time.sleep(300)\n",
+            )
+            .arg(&claim)
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("a holder to contend with");
+
+        // Wait for the child to say it holds the lock, rather than sleeping a
+        // guess: a race here would test nothing and pass.
+        let mut ready = String::new();
+        {
+            use std::io::{BufRead, BufReader};
+            let stdout = holder.stdout.take().expect("the holder's stdout");
+            BufReader::new(stdout)
+                .read_line(&mut ready)
+                .expect("the holder never reported");
+        }
+        assert_eq!(ready.trim(), "held", "the holder did not take the lock");
+
+        let contended = Guard::take_within(&path, Duration::from_millis(200))
+            .err()
+            .map(|error| error.to_string());
+        assert!(
+            contended.is_some_and(|said| said.contains("is locked by another process")),
+            "a claim a live holder is holding was taken anyway"
+        );
+
+        holder.kill().expect("kill the holder");
+        holder.wait().expect("reap the holder");
+
+        let taken = Guard::take_within(&path, Duration::from_millis(200))
+            .expect("a claim whose holder died must be free at once");
+        drop(taken);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn two_writers_of_one_file_never_hold_the_claim_at_once() {
+        // What the claim is FOR, and the assertion the previous design could
+        // not make: the generator's read and its write are one act. Threads
+        // rather than processes, because `flock` is held per open file
+        // description and two threads opening the file separately contend
+        // exactly as two processes do.
+        let dir = scratch("claim-exclusive");
+        fs::create_dir_all(&dir).expect("scratch");
+        let path = dir.join("proton.json");
+
+        let held = Guard::take_within(&path, Duration::from_millis(200)).expect("first claim");
+
+        let blocked = std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    Guard::take_within(&path, Duration::from_millis(200))
+                        .err()
+                        .map(|error| error.to_string())
+                })
+                .join()
+                .expect("the contender panicked")
+        });
+        assert!(
+            blocked.is_some(),
+            "two writers held the claim on one file at the same time"
+        );
+
+        drop(held);
+
+        let after = Guard::take_within(&path, Duration::from_millis(200));
+        assert!(
+            after.is_ok(),
+            "the claim was not released when its guard dropped"
         );
 
         let _ = fs::remove_dir_all(&dir);

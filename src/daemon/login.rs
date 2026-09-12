@@ -683,13 +683,32 @@ pub fn extra_credentials(coordinates: &Coordinates) -> Result<Vec<(String, Secre
         match file.resolve(entry) {
             Ok(Some(secret)) => resolved.push((variable.clone(), secret)),
             Ok(None) => {
+                // Two remedies, and naming the wrong one sends an operator at
+                // a verb this daemon refuses. The local key is a value this
+                // daemon GENERATES — `credential` declines to write it,
+                // precisely because a typed value there makes every published
+                // generation unreadable — so what is owed is a restart, or
+                // simply the next tick of a renewal loop that generates before
+                // it logs in. Every other entry is a value a person holds, and
+                // for those `credential` is exactly right.
+                let remedy = if variable == proton::ENCRYPTION_KEY_VAR {
+                    format!(
+                        "this is a value `{}` writes itself at its first start and reuses on \
+                         every later one — nothing has to be typed. Restart it, or wait for \
+                         the renewal loop's next attempt, which generates it before it logs in",
+                        crate::DAEMON_NAME
+                    )
+                } else {
+                    format!(
+                        "write it first, without the value passing through a command line: \
+                         `{} credential --store {STORE} --name {entry}`",
+                        crate::DAEMON_NAME
+                    )
+                };
                 return Err(format!(
                     "`{variable}` is declared to live in `{entry}` of {}, which holds no such \
-                     entry — and the login cannot establish a session without it. Write it \
-                     first, without the value passing through a command line: `{} credential \
-                     --store {STORE} --name {entry}`",
+                     entry — and the login cannot establish a session without it. {remedy}",
                     coordinates.credentials_file.display(),
-                    crate::DAEMON_NAME
                 ));
             }
             Err(error) => {

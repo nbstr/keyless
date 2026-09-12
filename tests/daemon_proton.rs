@@ -1562,11 +1562,13 @@ fn stub_with_session_verbs(
          now_current=\"$(cat \"$root/current\" 2>/dev/null | tr -d '\\n')\"\n\
          if [ -n \"${{PROTON_PASS_ENCRYPTION_KEY+x}}\" ]; then\n\
          \x20 key_len=${{#PROTON_PASS_ENCRYPTION_KEY}}\n\
+         \x20 key_fp=$(printf '%s' \"$PROTON_PASS_ENCRYPTION_KEY\" | shasum | cut -c1-12)\n\
          else\n\
          \x20 key_len=\"<unset>\"\n\
+         \x20 key_fp=\"<unset>\"\n\
          fi\n\
-         printf '%s %s current=%s key_provider=%s key_len=%s\\n' \"$1\" \"$scoped\" \
-         \"$now_current\" \"${{PROTON_PASS_KEY_PROVIDER-<unset>}}\" \"$key_len\" >> '{verbs}'\n\
+         printf '%s %s current=%s key_provider=%s key_len=%s key_fp=%s\\n' \"$1\" \"$scoped\" \
+         \"$now_current\" \"${{PROTON_PASS_KEY_PROVIDER-<unset>}}\" \"$key_len\" \"$key_fp\" >> '{verbs}'\n\
          case \"$1\" in\n\
          \x20 login)\n\
          \x20   sleep {login_delay}\n\
@@ -1654,15 +1656,40 @@ fn daemon_config_with_generations_loop_env(
     probe_interval_seconds: u64,
     timeout_ms: u64,
 ) -> DaemonConfig {
+    daemon_config_env_with_key(
+        dir,
+        vendor,
+        login_after_minutes,
+        probe_interval_seconds,
+        timeout_ms,
+        true,
+    )
+}
+
+/// The same, with `key_written` deciding whether the credential file already
+/// holds the local key — `false` is the state a machine reaches when its first
+/// start lost the race to generate one.
+fn daemon_config_env_with_key(
+    dir: &Path,
+    vendor: &Path,
+    login_after_minutes: u64,
+    probe_interval_seconds: u64,
+    timeout_ms: u64,
+    key_written: bool,
+) -> DaemonConfig {
     std::fs::write(dir.join("audit.jsonl"), b"").expect("audit");
     let credentials = dir.join("proton.json");
-    write_secrets(
-        &credentials,
-        &[
-            ("AGENT_TOKEN", TOKEN_DECOY),
-            ("LOCAL_KEY", ENCRYPTION_KEY_DECOY),
-        ],
-    );
+    if key_written {
+        write_secrets(
+            &credentials,
+            &[
+                ("AGENT_TOKEN", TOKEN_DECOY),
+                ("LOCAL_KEY", ENCRYPTION_KEY_DECOY),
+            ],
+        );
+    } else {
+        write_secrets(&credentials, &[("AGENT_TOKEN", TOKEN_DECOY)]);
+    }
     serde_json::from_str(&format!(
         r#"{{"socket":"{socket}","audit":"{audit}",
              "cache_ttl_seconds":0,"idle_timeout_seconds":5,
@@ -1701,6 +1728,12 @@ struct VerbLine {
     current: String,
     key_provider: String,
     key_len: String,
+    /// A fingerprint of the key the child was handed — a hash prefix, never
+    /// the value. A LENGTH cannot tell two keys apart, because every key this
+    /// daemon generates is the same length: a run that generated one key,
+    /// published a session under it, and then wrote a second over it reads
+    /// identically to a correct one under a length oracle.
+    key_fp: String,
 }
 
 fn parse_verbs(text: &str) -> Vec<VerbLine> {
@@ -1724,12 +1757,18 @@ fn parse_verbs(text: &str) -> Vec<VerbLine> {
                 .and_then(|field| field.strip_prefix("key_len="))
                 .unwrap_or("<unset>")
                 .to_owned();
+            let key_fp = fields
+                .next()
+                .and_then(|field| field.strip_prefix("key_fp="))
+                .unwrap_or("<unset>")
+                .to_owned();
             Some(VerbLine {
                 verb,
                 dir,
                 current,
                 key_provider,
                 key_len,
+                key_fp,
             })
         })
         .collect()
@@ -1979,6 +2018,85 @@ fn every_proton_spawn_under_env_carries_the_key_provider_and_the_local_keys_leng
             .iter()
             .any(|verb| !["login", "info", "logout"].contains(&verb.as_str())),
         "only login-flow verbs ran, so the lookup path is unproven here: {verbs_seen:?}"
+    );
+
+    drop(running);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_daemon_whose_key_was_never_written_generates_one_and_logs_in_without_a_restart() {
+    // The outage of 2026-09-11, end to end. A machine moved to `key_provider:
+    // env` whose first start lost the race to generate the key served no
+    // Proton name for twenty minutes, because generation happened once at
+    // start and nothing tried again — the renewal loop logged the same
+    // failure every tick while holding the one thing that could have fixed it.
+    //
+    // CONTROL, and the reason this case is about the LOOP rather than about
+    // the generator: the harness builds the daemon directly, so `serve`'s own
+    // start-time generation never runs here. Every key this case sees is one
+    // the loop generated. Reverting `report_key_generation` out of the due
+    // branch turns it red with the vendor never carrying a key at all.
+    let dir = scratch("daemon-proton-key-absent");
+    let inner = stub_pass_cli_listing(
+        &dir,
+        &Backend::Injects(PROTON_DECOY),
+        &Listing::Json(LISTING),
+    );
+    let vendor = stub_with_session_verbs(
+        &dir,
+        &inner,
+        Duration::ZERO,
+        true,
+        LogoutAnswer::AlreadyLoggedOut,
+        None,
+    );
+    let config = daemon_config_env_with_key(&dir, &vendor, 0, 1, 60_000, false);
+    let running = start_daemon(&config, policy_allowing_self());
+
+    let root = session_dir(&dir);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if current_generation(&root).is_some() {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "no generation was ever published, so the loop never recovered from a missing key"
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
+
+    let verbs = std::fs::read_to_string(dir.join("pass-cli.verbs")).unwrap_or_default();
+    let lines = parse_verbs(&verbs);
+    assert!(!lines.is_empty(), "the stand-in recorded nothing");
+    for line in &lines {
+        assert_eq!(
+            line.key_provider, "env",
+            "`{}` did not carry `PROTON_PASS_KEY_PROVIDER=env`",
+            line.verb
+        );
+        // The generated length, not a decoy's: nothing wrote this value but
+        // the daemon, so its length is the generator's own and a literal is
+        // the only oracle this case can hold it to.
+        assert_eq!(
+            line.key_len, "43",
+            "`{}` ran without the key the loop was supposed to generate",
+            line.verb
+        );
+    }
+
+    // ONE key, not merely one of the right length. Every key this generator
+    // draws is 43 characters, so a length oracle passes a run that generated a
+    // key, published a session under it, and then wrote a second one over it —
+    // which is precisely the corruption a claim exists to prevent, and the
+    // reason the stand-in records a fingerprint.
+    let fingerprints: std::collections::BTreeSet<_> =
+        lines.iter().map(|line| line.key_fp.clone()).collect();
+    assert_eq!(
+        fingerprints.len(),
+        1,
+        "the vendor was handed more than one local key across this run: {fingerprints:?}"
     );
 
     drop(running);
@@ -2332,7 +2450,13 @@ fn a_renewal_whose_old_store_cannot_be_decrypted_still_establishes_a_new_generat
     // the only renewal this run performs, so the old generation's one and
     // only successor is minted once and its grace clears on a later,
     // sweep-only tick.
-    let config = daemon_config_with_generations_loop(&dir, &vendor, 90, 1, 3_000);
+    // `10_000` rather than `3_000`: this case performs a READ at the end, and
+    // `timeout_ms` is the store's own per-call ceiling as well as the input the
+    // grace derives from — so the small value that kept the grace short also
+    // gave a stub spawn three seconds to answer on a machine running several
+    // suites at once, which it does not always manage. The grace grows to 23s
+    // and still clears inside the 60s deadline below.
+    let config = daemon_config_with_generations_loop(&dir, &vendor, 90, 1, 10_000);
     let running = start_daemon(&config, policy_allowing_self());
 
     let old_generation = before
