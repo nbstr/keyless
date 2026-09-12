@@ -43,6 +43,41 @@ set -uo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 source scripts/lib.sh
 
+# ---- git hooks wired --------------------------------------------------------
+#
+# Ahead of the --staged branch, and never skipped by it: this checks the
+# developer's own checkout, not the tree a commit would create, so it applies
+# the same whether this run gates a working tree or a staged one. Everything
+# else in this file assumes scripts/install-hooks.sh ran here, rather than the
+# manual step it documents having been silently skipped -- which is exactly
+# what happened to every clone of this repository until this check existed. A
+# commit message cannot be edited once it is pushed, so the arm that stops the
+# next unscrubbable one being WRITTEN is the commit-msg hook, and nothing about
+# its absence shows up anywhere else this file looks.
+check_git_hooks_installed() {
+  local hooks_dir; hooks_dir="$(git rev-parse --git-path hooks)" || return 1
+  if [ ! -f "$hooks_dir/pre-commit" ] || ! grep -q 'scripts/verify.sh' "$hooks_dir/pre-commit" 2>/dev/null; then
+    echo "$hooks_dir/pre-commit is missing or does not run scripts/verify.sh." >&2
+    echo "Run: scripts/install-hooks.sh" >&2
+    return 1
+  fi
+  local target
+  target="$(readlink "$hooks_dir/commit-msg" 2>/dev/null)" || {
+    echo "$hooks_dir/commit-msg is not installed." >&2
+    echo "Run: scripts/install-hooks.sh" >&2
+    return 1
+  }
+  case "$target" in
+    */install/commit-msg.sh) ;;
+    *)
+      echo "$hooks_dir/commit-msg points at '$target', not install/commit-msg.sh." >&2
+      echo "Run: scripts/install-hooks.sh" >&2
+      return 1
+      ;;
+  esac
+}
+run_step "git hooks installed (scripts/install-hooks.sh)" check_git_hooks_installed
+
 if [ "${1:-}" = "--staged" ]; then
   # Sourced here rather than from lib.sh: this is the only caller, and the
   # other gates have no index to gate.

@@ -4,11 +4,22 @@
 # Git hooks live in `.git/hooks/`, which is not part of the repository, so a
 # fresh clone has none of this. Running this script is the one manual step
 # between cloning and being gated.
-set -uo pipefail
+#
+# Hooks live in the COMMON git dir, shared by every worktree of this
+# repository -- never in a worktree's own `.git`, which is a FILE rather than
+# a directory. The first version of this script wrote `$root/.git/hooks/...`
+# directly: inside a worktree that path runs straight through the file, `cat >
+# "$hook"` failed with "Not a directory", and with only `set -uo pipefail` --
+# no `-e` -- the script carried on past that failure and printed "installed
+# $hook" anyway, exit 0. Every worktree of this repository ran ungated from
+# that day forward while the one script meant to fix it insisted otherwise.
+# `set -e` below is as load-bearing as the path fix: a write that fails must
+# stop the script, not get narrated as a success.
+set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
-root=$(git rev-parse --show-toplevel) || exit 1
-hook="$root/.git/hooks/pre-commit"
+hooks_dir=$(git rev-parse --git-path hooks) || exit 1
+hook="$hooks_dir/pre-commit"
 
 if [ -e "$hook" ] && ! grep -q 'scripts/verify.sh' "$hook" 2>/dev/null; then
   echo "$hook already exists and is not this one. Move it aside first:" >&2
@@ -54,7 +65,7 @@ echo "$(git rev-parse --git-common-dir)/keyless-gate -- disposable, at the cost 
 # measurement of one machine -- in a commit message, which is the one place the
 # publication guards in tests/publication.rs cannot reach, because a message is
 # not a file in the tree.
-msg="$root/.git/hooks/commit-msg"
+msg="$hooks_dir/commit-msg"
 if [ -e "$msg" ] && [ ! -L "$msg" ]; then
   echo "$msg exists and is not a symlink. Move it aside first." >&2
   exit 1

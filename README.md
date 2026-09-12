@@ -2240,13 +2240,12 @@ receives, and reading the tree alone reports it clean.
 
 The publication layer of the hook suite refuses a number standing next to a
 word that makes it a measurement of one machine, in `hooks/` prose **and in
-commit messages**. Install the matching `commit-msg` hook so the second one
-fires before the message is written, which is the only point at which it can
-still be edited:
-
-```console
-ln -sf ../../install/commit-msg.sh .git/hooks/commit-msg
-```
+commit messages**. The second one fires before the message is written, which is
+the only point at which it can still be edited — it is the `commit-msg` hook
+`scripts/install-hooks.sh` puts in place, above; `scripts/verify.sh` refuses to
+run at all when it finds that hook missing, so a clone that skipped the one
+manual step hears about it on the very first gate rather than the first time
+someone tries to rewrite a published message.
 
 Who built it stays. What is inside their machine does not: the copyright, the
 author and the reasoning are identity, and a count only they can reproduce is an
