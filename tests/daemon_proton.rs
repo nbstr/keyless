@@ -1973,6 +1973,93 @@ fn a_hung_login_is_killed_and_counted_as_a_failed_attempt_so_the_next_one_still_
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// The daemon's uid is read off the audit log on every renewal attempt, never
+/// once for the life of the loop.
+///
+/// A uid captured at start is right until the file it came from changes, and
+/// then it is wrong for as long as the process lives: a daemon that started
+/// against a misowned audit log spawned every vendor child as that owner and
+/// failed every attempt until somebody restarted it, however promptly the
+/// owner was put back.
+///
+/// Changing a file's owner to another uid needs privilege this suite does not
+/// have, so the source is made wrong the one way an unprivileged test can:
+/// the audit log is taken away. While it is gone no attempt may spawn a vendor
+/// child — there is no uid to run one as, and reusing the last attempt's would
+/// be the stale identity this case exists to rule out. Once it is back, the
+/// next attempt publishes a generation with the same daemon still running.
+///
+/// CONTROL — the change that makes this fail: capture the owner once in
+/// `session::spawn` and hand it to the loop. The loop then keeps logging in
+/// with the uid it read at start while the audit log is absent, and the
+/// "no vendor child while the source is gone" assertion goes red.
+#[test]
+fn the_renewal_loop_rereads_the_daemon_uid_so_a_restored_audit_log_needs_no_restart() {
+    let dir = scratch("daemon-proton-uid-per-attempt");
+    let inner = stub_pass_cli_listing(
+        &dir,
+        &Backend::Injects(PROTON_DECOY),
+        &Listing::Json(LISTING),
+    );
+    let vendor = stub_with_session_verbs(
+        &dir,
+        &inner,
+        Duration::ZERO,
+        true,
+        LogoutAnswer::AlreadyLoggedOut,
+        None,
+    );
+    // Every one-second tick is due, so an attempt that is allowed to run does.
+    let config = daemon_config_with_generations_loop(&dir, &vendor, 0, 1, 60_000);
+    let audit = dir.join("audit.jsonl");
+    let verbs_log = dir.join("pass-cli.verbs");
+    let running = start_daemon(&config, policy_allowing_self());
+
+    let root = session_dir(&dir);
+    let until = |what: &str, done: &dyn Fn() -> bool| {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !done() {
+            assert!(Instant::now() < deadline, "{what}");
+            std::thread::sleep(Duration::from_millis(200));
+        }
+    };
+    until("the loop never published a first generation", &|| {
+        current_generation(&root).is_some()
+    });
+
+    std::fs::remove_file(&audit).expect("take the audit log away");
+    // One tick already past its owner read may still finish its children;
+    // what follows is measured after it has had the time to.
+    std::thread::sleep(Duration::from_millis(2_500));
+    let settled = std::fs::read_to_string(&verbs_log).unwrap_or_default();
+    let during = current_generation(&root);
+    std::thread::sleep(Duration::from_secs(4));
+    let after = std::fs::read_to_string(&verbs_log).unwrap_or_default();
+    let spawned: Vec<_> = parse_verbs(&after[settled.len()..])
+        .into_iter()
+        .map(|line| line.verb)
+        .collect();
+    assert!(
+        spawned.is_empty(),
+        "the loop ran vendor children with no audit log to read a uid off, so it reused an \
+         earlier attempt's: {spawned:?}"
+    );
+    assert_eq!(
+        current_generation(&root),
+        during,
+        "a generation was published while the daemon's uid could not be resolved"
+    );
+
+    std::fs::write(&audit, b"").expect("restore the audit log");
+    until(
+        "no generation was published after the audit log came back, so the loop needs a restart",
+        &|| current_generation(&root) != during,
+    );
+
+    drop(running);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn a_fs_daemon_never_sets_the_local_key_variable_at_all() {
     // CONTROL for the case below: under `fs` no credential names
