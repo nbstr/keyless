@@ -90,25 +90,26 @@ const STOP_POLL: Duration = Duration::from_millis(100);
 /// # Why waiting for ever is not an option here
 ///
 /// The loop is stopped by a flag it reads BETWEEN ticks. A tick spends most of
-/// its time inside [`login::run`], which is `Command::output()` and
-/// deliberately unbounded — the reasoning recorded there is that a deadline
-/// killing a login part way is how a session store ends up half-written, which
-/// is the one damage this vendor cannot repair.
+/// its time inside [`login::run`], which kills a hung vendor child at its own
+/// deadline — [`login::login_deadline`] for a login, [`login::probe_deadline`]
+/// for an info or a logout — but a configured `timeout_ms` can still exceed
+/// this constant, and the flag is only ever read between ticks, never inside
+/// one.
 ///
-/// That reasoning holds, and it is about the login VERB, where a person is
-/// waiting. Inside a daemon it collides with shutdown: a thread parked against
-/// a vendor that never returns cannot see the flag, so joining it unconditionally
-/// means SIGTERM never completes, the socket is never removed, and launchd's
-/// `ExitTimeOut` SIGKILL is the only thing that ends the process.
+/// So a thread parked inside a `run` that outlasts `SHUTDOWN_GRACE` still
+/// cannot see the flag in time: joining it unconditionally would mean SIGTERM
+/// never completes, the socket is never removed, and launchd's `ExitTimeOut`
+/// SIGKILL is the only thing that ends the process.
 ///
 /// Measured, not reasoned: with a vendor stubbed as `sleep 60`, dropping a
 /// `Running` blocked for the whole sixty seconds.
 ///
-/// So shutdown waits this long and then stops waiting. The child is left to
-/// finish rather than killed, which keeps the half-write reasoning intact —
-/// what is given up is the join, not the process. Well under any plausible
-/// `ExitTimeOut`, whose default the manual page declines to name, so that a
-/// daemon which is merely slow still exits on its own terms.
+/// So shutdown waits this long and then stops waiting. The child is left
+/// running rather than joined — `run`'s own deadline still kills and reaps
+/// it, on its own schedule — and what is given up here is the join, not the
+/// kill. Well under any plausible `ExitTimeOut`, whose default the manual
+/// page declines to name, so that a daemon which is merely slow still exits
+/// on its own terms.
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 
 /// A running renewal loop. Dropping it stops the thread.
@@ -265,12 +266,12 @@ fn run(
     generations: &Generations,
     stop: &AtomicBool,
 ) {
-    // Derived here rather than handed in: all three are the config's own, and
-    // a parameter list that carries a value its neighbour already holds is one
-    // a later change can make disagree with itself.
+    // Derived here rather than handed in: a parameter list that carries a
+    // value its neighbour already holds is one a later change can make
+    // disagree with itself. `grace` reads `coordinates.timeout_ms`, which is
+    // `stores.proton.timeout_ms` read once by `login::coordinates`.
     let settings = config.stores.proton.session;
-    let timeout_ms = config.stores.proton.timeout_ms;
-    let grace = login::grace(timeout_ms);
+    let grace = login::grace(coordinates.timeout_ms);
 
     let interval = Duration::from_secs(settings.probe_interval_seconds).max(MIN_INTERVAL);
     let lifetime = Duration::from_secs(settings.login_after_minutes.saturating_mul(60));
@@ -300,7 +301,7 @@ fn run(
     // generation a previous process created and never published, or one it
     // published and never got to retire — is swept before this process's
     // first attempt rather than waiting out a whole interval for it.
-    report_sweep(coordinates, owner, generations, grace, timeout_ms, stop);
+    report_sweep(coordinates, owner, generations, grace, stop);
 
     while !stop.load(Ordering::Relaxed) {
         // Three triggers, and the third is not redundant with the second.
@@ -366,7 +367,7 @@ fn run(
         // renewal's, so a generation superseded three ticks ago is retired
         // the moment it clears its grace rather than waiting for the next
         // renewal to notice it.
-        report_sweep(coordinates, owner, generations, grace, timeout_ms, stop);
+        report_sweep(coordinates, owner, generations, grace, stop);
 
         let wait = if failures == 0 {
             interval
@@ -398,7 +399,6 @@ fn report_sweep(
     owner: Owner,
     generations: &Generations,
     grace: Duration,
-    timeout_ms: u64,
     stop: &AtomicBool,
 ) {
     let mut rows: Vec<u8> = Vec::new();
@@ -407,7 +407,6 @@ fn report_sweep(
         owner,
         generations,
         grace,
-        timeout_ms,
         Some(stop),
         &mut rows,
     );
@@ -460,12 +459,13 @@ fn undirectable(coordinates: &Coordinates, owner: Owner, detail: &str) -> String
 ///
 /// # Why a failed probe is read as "no session" rather than ignored
 ///
-/// The three ways this comes back false are a dead session, a vendor binary
-/// that will not spawn, and a directory the daemon cannot open — and the
-/// response to all three is the same: try to log in, and report what that says.
-/// A login is safe against every one of them (`--replace` treats "already
-/// logged out" as success), and the failure path already carries the vendor's
-/// own sentence, which is more specific than anything a probe could add.
+/// The four ways this comes back false are a dead session, a vendor binary
+/// that will not spawn, a directory the daemon cannot open, and a probe
+/// killed at its own [`login::probe_deadline`] — and the response to all four
+/// is the same: try to log in, and report what that says. A login is safe
+/// against every one of them (`--replace` treats "already logged out" as
+/// success), and the failure path already carries the vendor's own sentence,
+/// which is more specific than anything a probe could add.
 ///
 /// The alternative — treating an unanswerable probe as healthy — is the reading
 /// that produces silence over an outage.
@@ -485,9 +485,12 @@ fn alive(coordinates: &Coordinates, owner: Owner, generations: &Generations) -> 
         return false;
     };
     let login = login::extra_credentials(coordinates).unwrap_or_default();
-    login::run(login::info_command(coordinates, pass.dir(), &login, owner))
-        .map(|(status, _)| status.success())
-        .unwrap_or(false)
+    login::run(
+        login::info_command(coordinates, pass.dir(), &login, owner),
+        login::probe_deadline(coordinates.timeout_ms),
+    )
+    .map(|(status, _)| status.success())
+    .unwrap_or(false)
 }
 
 /// One renewal: read the token the daemon already holds, and use it.
@@ -908,6 +911,7 @@ mod tests {
                 crate::store::proton::ENCRYPTION_KEY_VAR.to_owned(),
                 KEY_ENTRY.to_owned(),
             )]),
+            timeout_ms: crate::config::DEFAULT_TIMEOUT_MS,
         };
 
         let answered = alive(&coordinates, owner, &generations);

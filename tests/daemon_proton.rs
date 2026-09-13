@@ -33,7 +33,7 @@
 
 mod support;
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
 
 use keyless::daemon::config::DaemonConfig;
@@ -1868,6 +1868,106 @@ fn the_renewal_loop_establishes_each_session_in_a_fresh_generation_and_makes_it_
             );
         }
     }
+
+    drop(running);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A `pass-cli` that hangs on its FIRST `login` and never returns, then
+/// behaves normally on every later invocation.
+///
+/// On the first `login` it records its own pid in `<dir>/hung-login.pid`,
+/// then execs `sleep 600`, which no test deadline waits out — so that login
+/// never reaches `recovers` and appears in no verb log. Every other
+/// invocation (a later `login`, any `info`, any `logout`) execs `recovers`,
+/// the ordinary session-verbs stand-in, which logs it as usual.
+fn stub_hangs_once_then_recovers(dir: &Path, recovers: &Path) -> PathBuf {
+    let pidfile = dir.join("hung-login.pid");
+    install_executable(
+        &dir.join("pass-cli-hangs-once"),
+        &format!(
+            "#!/bin/sh\n\
+             if [ \"$1\" = login ] && [ ! -e '{pidfile}' ]; then\n\
+             \x20 echo $$ > '{pidfile}'\n\
+             \x20 exec sleep 600\n\
+             fi\n\
+             exec '{recovers}' \"$@\"\n",
+            pidfile = pidfile.display(),
+            recovers = recovers.display(),
+        ),
+    )
+}
+
+#[test]
+fn a_hung_login_is_killed_and_counted_as_a_failed_attempt_so_the_next_one_still_publishes() {
+    // CONTROL — the change that makes this fail: reverting `login::run` to an
+    // unbounded `Command::output()`. The loop then waits on `sleep 600`
+    // forever, no generation is ever published, and this test times out
+    // against its own 60 s poll deadline rather than seeing a second login.
+    let dir = scratch("daemon-proton-hung-login");
+    let inner = stub_pass_cli_listing(
+        &dir,
+        &Backend::Injects(PROTON_DECOY),
+        &Listing::Json(LISTING),
+    );
+    let recovers = stub_with_session_verbs(
+        &dir,
+        &inner,
+        Duration::ZERO,
+        true,
+        LogoutAnswer::AlreadyLoggedOut,
+        None,
+    );
+    let verbs_log = dir.join("pass-cli.verbs");
+    let vendor = stub_hangs_once_then_recovers(&dir, &recovers);
+
+    // Small enough that the login deadline (2x this, per `login::login_deadline`)
+    // is a few seconds — long enough for a real vendor spawn, short enough
+    // that the sleeping stand-in is killed well inside this test's own poll
+    // deadline.
+    const TIMEOUT_MS: u64 = 1500;
+    let config = daemon_config_with_generations_loop(&dir, &vendor, 0, 1, TIMEOUT_MS);
+    let running = start_daemon(&config, policy_allowing_self());
+
+    let root = session_dir(&dir);
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        if current_generation(&root).is_some() {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "no generation was ever published — a hung login stalled the loop instead of \
+             being killed and counted as a failed attempt"
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
+
+    let verbs = std::fs::read_to_string(&verbs_log).unwrap_or_default();
+    let login_lines = parse_verbs(&verbs)
+        .iter()
+        .filter(|line| line.verb == "login")
+        .count();
+    // The hung login never reaches the logging stand-in, so every `login`
+    // line here is a later attempt — the one the loop made after the kill.
+    assert!(
+        login_lines >= 1,
+        "no login followed the hung one, saw {login_lines}: {verbs}"
+    );
+
+    let hung_pid: i32 = std::fs::read_to_string(dir.join("hung-login.pid"))
+        .expect("the hung child never recorded its own pid")
+        .trim()
+        .parse()
+        .expect("a pid");
+    assert!(
+        nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(hung_pid),
+            None::<nix::sys::signal::Signal>
+        )
+        .is_err(),
+        "the hung pass-cli child (pid {hung_pid}) is still alive — it was never killed and reaped"
+    );
 
     drop(running);
     let _ = std::fs::remove_dir_all(&dir);
