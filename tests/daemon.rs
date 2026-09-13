@@ -80,6 +80,131 @@ fn a_secret_reaches_the_child_through_the_daemon_and_nothing_else() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// `YYYY-MM-DD` for `offset` days from now, the same way the daemon's own
+/// `credential.rs` fixtures build one.
+fn in_days(offset: i64) -> String {
+    let millis = keyless::time::now_unix_millis() as i64 + offset * 86_400_000;
+    keyless::time::rfc3339_utc(millis as u128)[..10].to_owned()
+}
+
+#[test]
+fn keyless_run_warns_on_stderr_while_the_agent_token_is_inside_its_window() {
+    let dir = scratch("daemon-token-expiry-inside");
+    let mut config = daemon_config(&dir);
+    write_secrets(&config.stores.file.path, &[("DECOY", DECOY_VALUE)]);
+    // Ten days out is inside the run warning's 14-day window and outside the
+    // separate `keylessd check` one, which is the case this ticket is about:
+    // a caller running commands, not an operator reading a log.
+    let soon = in_days(10);
+    config.stores.proton.token_expires = Some(soon.clone());
+    let running = start_daemon(&config, policy_allowing_self());
+
+    let client = client_config(running.socket(), 3_000);
+    let built = store::build(&client, &Invocation::default());
+    let marker = dir.join("marker");
+    let argv = witness(&marker, "DECOY", 0);
+
+    let mut notes: Vec<u8> = Vec::new();
+    let outcome = run(
+        RunRequest {
+            bindings: &[Binding::parse("DECOY").expect("valid")],
+            unusable: &[],
+            argv: &argv,
+            registry: &built.registry,
+            audit: None,
+            warnings: &[],
+            tty: TtyPolicy::Pipes,
+        },
+        &mut notes,
+    )
+    .expect("run");
+
+    assert_eq!(outcome.state, State::Injected);
+    assert_eq!(witnessed(&marker), DECOY_VALUE);
+    let said = String::from_utf8_lossy(&notes);
+    assert!(said.contains(&soon), "{said}");
+    assert!(said.contains("expires"), "{said}");
+
+    drop(running);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn keyless_run_says_nothing_outside_the_agent_tokens_window() {
+    let dir = scratch("daemon-token-expiry-outside");
+    let mut config = daemon_config(&dir);
+    write_secrets(&config.stores.file.path, &[("DECOY", DECOY_VALUE)]);
+    // Comfortably past the 14-day run window (and the 30-day check one), so
+    // this proves the run stays quiet rather than merely proving one date.
+    config.stores.proton.token_expires = Some(in_days(90));
+    let running = start_daemon(&config, policy_allowing_self());
+
+    let client = client_config(running.socket(), 3_000);
+    let built = store::build(&client, &Invocation::default());
+    let marker = dir.join("marker");
+    let argv = witness(&marker, "DECOY", 0);
+
+    let mut notes: Vec<u8> = Vec::new();
+    run(
+        RunRequest {
+            bindings: &[Binding::parse("DECOY").expect("valid")],
+            unusable: &[],
+            argv: &argv,
+            registry: &built.registry,
+            audit: None,
+            warnings: &[],
+            tty: TtyPolicy::Pipes,
+        },
+        &mut notes,
+    )
+    .expect("run");
+
+    let said = String::from_utf8_lossy(&notes);
+    assert!(!said.contains("expires"), "{said}");
+    assert!(!said.contains("EXPIRED"), "{said}");
+
+    drop(running);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn keyless_run_says_nothing_with_no_token_expires_configured() {
+    // `daemon_config` declares no `token_expires` at all, which is the
+    // ordinary state of an install that has never set one — every other test
+    // in this file runs under exactly this condition and stays quiet.
+    let dir = scratch("daemon-token-expiry-undeclared");
+    let config = daemon_config(&dir);
+    assert!(config.stores.proton.token_expires.is_none());
+    write_secrets(&config.stores.file.path, &[("DECOY", DECOY_VALUE)]);
+    let running = start_daemon(&config, policy_allowing_self());
+
+    let client = client_config(running.socket(), 3_000);
+    let built = store::build(&client, &Invocation::default());
+    let marker = dir.join("marker");
+    let argv = witness(&marker, "DECOY", 0);
+
+    let mut notes: Vec<u8> = Vec::new();
+    run(
+        RunRequest {
+            bindings: &[Binding::parse("DECOY").expect("valid")],
+            unusable: &[],
+            argv: &argv,
+            registry: &built.registry,
+            audit: None,
+            warnings: &[],
+            tty: TtyPolicy::Pipes,
+        },
+        &mut notes,
+    )
+    .expect("run");
+
+    let said = String::from_utf8_lossy(&notes);
+    assert!(!said.contains("expires"), "{said}");
+
+    drop(running);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn a_value_from_the_daemon_is_masked_out_of_the_childs_output() {
     // The masker is compiled from whatever resolved, and a value that arrived

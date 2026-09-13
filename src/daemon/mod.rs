@@ -137,6 +137,12 @@ pub struct Daemon {
     /// when Proton is disabled or names no `session_dir` — see
     /// [`DaemonConfig::generations`]. See [`Running::spawn`].
     generations: Option<Arc<Generations>>,
+    /// `stores.proton.token_expires`, read once at bind time — see
+    /// [`credential::run_expiry_advisory`] for why every `Op::Resolve` this
+    /// daemon answers is checked against it rather than the CLI reading the
+    /// same file. Config is read once at startup like every other value here,
+    /// so a changed date takes effect on the next restart.
+    token_expires: Option<String>,
 }
 
 /// Where a resolved value came from, for [`Daemon::record`] — [`Answer`]'s
@@ -203,6 +209,7 @@ impl Daemon {
             idle: config.idle_timeout(),
             live: Arc::new(AtomicUsize::new(0)),
             generations,
+            token_expires: config.stores.proton.token_expires.clone(),
         })
     }
 
@@ -266,6 +273,7 @@ impl Daemon {
             rebuilder: Arc::clone(&self.rebuilder),
             idle: self.idle,
             live: Arc::clone(&self.live),
+            token_expires: self.token_expires.clone(),
         };
         self.live.fetch_add(1, Ordering::Relaxed);
         if thread::Builder::new()
@@ -312,6 +320,8 @@ struct Connection {
     rebuilder: Arc<Rebuilder>,
     idle: Duration,
     live: Arc<AtomicUsize>,
+    /// See [`Daemon::token_expires`].
+    token_expires: Option<String>,
 }
 
 impl Drop for Connection {
@@ -362,8 +372,8 @@ impl Connection {
                 }
             };
 
-            let reply = self.answer(&stream, &frame);
-            let encoded = match reply.encode() {
+            let (reply, advisory) = self.answer(&stream, &frame);
+            let encoded = match reply.encode_with_advisory(advisory.as_deref()) {
                 Ok(encoded) => encoded,
                 Err(_) => return,
             };
@@ -379,10 +389,14 @@ impl Connection {
     /// connection was accepted. A process can `exec` a different image without
     /// closing its sockets, so a per-connection decision would authorise a
     /// program that is no longer running.
-    fn answer(&self, stream: &UnixStream, frame: &[u8]) -> Reply {
+    ///
+    /// The advisory alongside the reply is `Some` only down the [`Op::Resolve`]
+    /// path — every `keyless run` request, and no other verb — see
+    /// [`credential::run_expiry_advisory`].
+    fn answer(&self, stream: &UnixStream, frame: &[u8]) -> (Reply, Option<String>) {
         let request = match Request::decode(frame) {
             Ok(request) => request,
-            Err(error) => return Reply::Failed(error.to_string()),
+            Err(error) => return (Reply::Failed(error.to_string()), None),
         };
 
         let attestation = attest(stream.as_fd(), &self.policy);
@@ -396,11 +410,11 @@ impl Connection {
                 None,
                 None,
             );
-            return Reply::Denied(denial.to_string());
+            return (Reply::Denied(denial.to_string()), None);
         }
 
         match request.op {
-            Op::Ping => Reply::Info { names: Vec::new() },
+            Op::Ping => (Reply::Info { names: Vec::new() }, None),
             Op::Names => {
                 // A listing over a daemon that has never enumerated answers the
                 // declared set and asks for the rest. The asker gets today's
@@ -411,15 +425,25 @@ impl Connection {
                 if self.catalogue.indexed_at().is_none() {
                     self.rebuilder.queue_full();
                 }
-                Reply::Info {
-                    names: self.catalogue.names(),
-                }
+                (
+                    Reply::Info {
+                        names: self.catalogue.names(),
+                    },
+                    None,
+                )
             }
             Op::Resolve => self.resolve(stream, &request, &attestation),
         }
     }
 
-    fn resolve(&self, stream: &UnixStream, request: &Request, attestation: &Attestation) -> Reply {
+    fn resolve(
+        &self,
+        stream: &UnixStream,
+        request: &Request,
+        attestation: &Attestation,
+    ) -> (Reply, Option<String>) {
+        let advisory = credential::run_expiry_advisory(self.token_expires.as_deref());
+
         if request.name.is_empty() || request.name.chars().count() > MAX_NAME_CHARS {
             self.record(
                 request,
@@ -429,9 +453,12 @@ impl Connection {
                 None,
                 None,
             );
-            return Reply::Failed(format!(
-                "a name must be between 1 and {MAX_NAME_CHARS} characters"
-            ));
+            return (
+                Reply::Failed(format!(
+                    "a name must be between 1 and {MAX_NAME_CHARS} characters"
+                )),
+                advisory,
+            );
         }
 
         let answer = if request.progress {
@@ -444,7 +471,7 @@ impl Connection {
             age: answer.age,
         });
 
-        match answer.outcome {
+        let reply = match answer.outcome {
             Outcome::Found(secret) => {
                 self.record(
                     request,
@@ -486,7 +513,8 @@ impl Connection {
                 let advice = self.catalogue.advice(&request.name, &route);
                 Reply::Failed(format!("{reason}; {advice}"))
             }
-        }
+        };
+        (reply, advisory)
     }
 
     /// Queue whatever a name that produced no value needs, and hand back what

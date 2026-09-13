@@ -93,6 +93,15 @@ pub trait Store: Send + Sync {
 
     /// Cheap reachability check that reads no secret.
     fn health(&self) -> Result<(), StoreError>;
+
+    /// An operational notice this backend wants surfaced on stderr once, from
+    /// its most recent lookup — never a secret, and never tied to the name
+    /// that was asked for. `None` for every backend but [`daemon::DaemonStore`],
+    /// which relays whatever the daemon's own reply carried; a local backend
+    /// has no daemon reply to relay one from.
+    fn advisory(&self) -> Option<String> {
+        None
+    }
 }
 
 /// What the registry concluded about one name.
