@@ -407,6 +407,27 @@ mod tests {
     }
 
     #[test]
+    fn a_kernel_failure_denial_names_the_call_that_failed() {
+        // The audit row for `peer-unreadable` used to carry only this fixed
+        // word — nothing said whether `getpeereid`, `csops`, `proc_pidinfo` or
+        // one of the others was the one that refused to answer. `kind()` stays
+        // the fixed grep-able word; `Display` is what an operator reads to
+        // find out which kernel fact could not be established.
+        use crate::ipc::peer::PeerError;
+
+        let denial = Denial::Unidentified(PeerError::Kernel {
+            call: "proc_pidinfo",
+            source: std::io::Error::from_raw_os_error(3), // ESRCH
+        });
+        assert_eq!(denial.kind(), "peer-unreadable");
+        let detail = denial.to_string();
+        assert!(
+            detail.contains("proc_pidinfo"),
+            "the refusal did not name the failing call: {detail}"
+        );
+    }
+
+    #[test]
     fn interpreters_are_recognised_including_versioned_names() {
         for name in [
             "node",
