@@ -352,8 +352,11 @@ struct InitArgs {
     #[arg(long)]
     yes: bool,
 
-    /// Replace an existing config file. Without it, an existing file is left
-    /// exactly as it is and the run reports what it found.
+    /// Replace an existing config file's store choice. Without it, an
+    /// existing file is left exactly as it is and the run reports what it
+    /// found. Every name already declared under `secrets` is carried over —
+    /// this switches which backend is default, it does not forget what you
+    /// told it to fetch.
     #[arg(long)]
     force: bool,
 
