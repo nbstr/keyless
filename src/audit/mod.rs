@@ -67,6 +67,8 @@ pub const MAX_NAMES: usize = 64;
 /// Cap on a recorded image path, so a deep path cannot crowd out the rest of a
 /// row.
 pub const MAX_IMAGE_CHARS: usize = 120;
+/// Cap on a recorded decision's free-text detail.
+pub const MAX_REASON_CHARS: usize = 200;
 /// Schema version, so a later reader can tell rows apart.
 ///
 /// Still 1 after the daemon's peer fields were added, and deliberately: every
@@ -116,6 +118,7 @@ pub struct Event {
     exit_code: Option<i32>,
     peer: Option<Peer>,
     decision: Option<String>,
+    reason: Option<String>,
     identities: Vec<String>,
     source: Option<String>,
     age_ms: Option<u64>,
@@ -162,6 +165,7 @@ impl Event {
             exit_code: None,
             peer: None,
             decision: None,
+            reason: None,
             identities: Vec::new(),
             source: None,
             age_ms: None,
@@ -203,6 +207,18 @@ impl Event {
     #[must_use]
     pub fn with_decision(mut self, decision: &str) -> Self {
         self.decision = Some(decision.to_owned());
+        self
+    }
+
+    /// Record the free-text detail behind a decision — which kernel call
+    /// failed and with what OS error, which two facts disagreed, or which
+    /// generation a recycled pid carried. `decision` stays a fixed word an
+    /// operator can grep for; this is the sentence that says why *this* row
+    /// earned it.
+    #[must_use]
+    pub fn with_reason(mut self, reason: &str) -> Self {
+        let (clipped, _) = clip(reason, MAX_REASON_CHARS);
+        self.reason = Some(clipped);
         self
     }
 
@@ -269,6 +285,8 @@ struct Row<'a> {
     exit_code: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     decision: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<&'a str>,
     #[serde(skip_serializing_if = "<[String]>::is_empty")]
     identities: &'a [String],
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -573,6 +591,7 @@ fn render(
         argv_truncated: parts.truncated,
         exit_code: event.exit_code,
         decision: event.decision.as_deref(),
+        reason: event.reason.as_deref(),
         identities: &event.identities,
         source: event.source.as_deref(),
         age_ms: event.age_ms,
@@ -634,7 +653,7 @@ fn clip(text: &str, max_chars: usize) -> (String, bool) {
 
 #[cfg(test)]
 mod tests {
-    use super::{AuditLog, Event, MAX_LINE_BYTES};
+    use super::{AuditLog, Event, MAX_LINE_BYTES, MAX_REASON_CHARS};
     use crate::State;
     use crate::mask::Masker;
     use crate::secret::Secret;
@@ -1408,9 +1427,56 @@ mod tests {
             "peer_code_hash",
             "peer_image",
             "decision",
+            "reason",
         ] {
             assert!(!raw.contains(absent), "{absent} leaked into a session row");
         }
+    }
+
+    #[test]
+    fn a_decisions_reason_is_carried_into_the_written_row() {
+        // `decision` stays the fixed word an operator greps for; this is the
+        // free-text detail beside it — which kernel call failed and why, for a
+        // `peer-unreadable` row that used to carry no more than its own name.
+        let path = temp_path("reason");
+        let log = AuditLog::new(path.clone());
+        let event = Event::new(
+            "resolve",
+            State::Degraded,
+            vec!["DECOY".to_owned()],
+            &[] as &[String],
+            &Masker::new(),
+        )
+        .with_decision("peer-unreadable")
+        .with_reason("proc_pidinfo failed: No such process (os error 3)");
+        log.append(&event).expect("append");
+
+        let raw = std::fs::read_to_string(&path).expect("read");
+        assert!(raw.contains("\"decision\":\"peer-unreadable\""));
+        assert!(
+            raw.contains("\"reason\":\"proc_pidinfo failed"),
+            "the row did not carry which kernel call failed: {raw}"
+        );
+        assert_eq!(log.verify().expect("verify"), 1);
+    }
+
+    #[test]
+    fn an_over_long_reason_is_clipped_rather_than_left_to_blow_the_atomic_write_cap() {
+        let path = temp_path("reason-clip");
+        let log = AuditLog::new(path.clone());
+        let event = Event::new(
+            "resolve",
+            State::Degraded,
+            vec![],
+            &[] as &[String],
+            &Masker::new(),
+        )
+        .with_reason(&"x".repeat(MAX_REASON_CHARS * 4));
+        log.append(&event).expect("append");
+
+        let raw = std::fs::read_to_string(&path).expect("read");
+        let line = raw.lines().next().expect("one row");
+        assert!(line.len() <= MAX_LINE_BYTES, "row was {} bytes", line.len());
     }
 
     #[test]

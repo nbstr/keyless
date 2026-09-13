@@ -58,6 +58,10 @@ const F_SETFD: std::ffi::c_int = 2;
 ///   different loaded image. This is what proves attestation happens per
 ///   request rather than once per connection.
 /// - `inherited` — use the socket already on fd 3.
+/// - `abandon` — connect, send the request, then exit without ever reading a
+///   reply. Stands in for a real caller that gave up waiting and moved on: the
+///   process this daemon is about to attest is, by design, not going to be
+///   there for long.
 pub fn run(tag: &str) {
     let mode = std::env::var("KLP_MODE").unwrap_or_else(|_| "once".to_owned());
     let name = std::env::var("KLP_NAME").unwrap_or_else(|_| "DECOY".to_owned());
@@ -92,6 +96,32 @@ pub fn run(tag: &str) {
                 .unwrap_or(400);
             std::thread::sleep(Duration::from_millis(millis));
             report(tag, exchange_on(&stream, &name));
+        }
+        "abandon" => {
+            let stream = match UnixStream::connect(socket_path()) {
+                Ok(stream) => stream,
+                Err(error) => {
+                    report(tag, Err(format!("connect: {error}")));
+                    return;
+                }
+            };
+            let mut request = Request::resolve(&name);
+            request.progress = false;
+            if let Ok(frame) = request.encode() {
+                let _ = write_frame(&mut &stream, &frame);
+            }
+            // Long enough that the daemon's accept loop has certainly reached
+            // this connection — short enough that no real client's own
+            // deadline is anywhere close. What this process does next is the
+            // point: it leaves without reading anything back, so whatever the
+            // daemon decides about it has to be decided against a peer that
+            // may already be gone.
+            let millis: u64 = std::env::var("KLP_ABANDON_MS")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(15);
+            std::thread::sleep(Duration::from_millis(millis));
+            std::process::exit(0);
         }
         "exec" => {
             let socket = socket_path();
