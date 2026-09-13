@@ -417,28 +417,26 @@ def is_this_repository():
         return 'name = "keyless"' in fh.read()
 
 
-def published_ref():
-    """The ref that says what has been pushed, or None if nothing says.
+def knows_the_remote():
+    """True when any remote-tracking ref exists to say what has been pushed.
 
-    Tried in order: the current branch's upstream, then `origin/HEAD`, then
-    `origin/master`. A checkout with none of the three cannot answer whether a
-    commit is still amendable, and says so on its own row rather than passing.
+    A checkout with none cannot answer whether a commit is still amendable,
+    and says so on its own row rather than passing.
     """
-    for ref in ("@{upstream}", "origin/HEAD", "origin/master"):
-        if _git("rev-parse", "--verify", "--quiet", ref) is not None:
-            return ref
-    return None
+    return bool((_git("for-each-ref", "--count=1", "refs/remotes/") or "").strip())
 
 
-def _is_published(sha, ref):
-    """True when `sha` is reachable from `ref`, so amending it means a rewrite.
+def _is_published(sha):
+    """True when any remote-tracking ref contains `sha`, so amending it means a rewrite.
 
-    `git merge-base --is-ancestor` answers with its exit code and prints
-    nothing, so the empty string it yields on success is a PASS. Comparing
-    truthiness here would read every published commit as unpublished and turn
-    this guard into a permanent red.
+    Every remote branch counts, not one chosen ref. The pre-commit gate runs in
+    a detached worktree, where `@{upstream}` does not resolve, so a single-ref
+    answer falls back to the default branch and reads a commit pushed only to
+    the base being built on as never pushed. An unknown sha makes git exit
+    non-zero, which reads as unpublished rather than as a pass.
     """
-    return _git("merge-base", "--is-ancestor", sha, ref) is not None
+    return bool((_git("for-each-ref", "--contains", sha, "--format=%(refname)",
+                      "refs/remotes/") or "").strip())
 
 
 def commit_messages():
@@ -509,6 +507,7 @@ def claims_in_message(body):
 # once per clone, before the first commit.
 KNOWN_UNSCRUBBED = [
     "208f29f8da35a406fb40383d1fdc12b804a5f0d0",
+    "145d8e08a1f146de643cf2270005752f5a738ef6",
 ]
 
 # One planted message per shape that was really written into this history.
@@ -760,15 +759,14 @@ def _check_commit_messages(s):
     # this one accepts is "the message is published, so no edit can reach it".
     # That is a property of the repository, not a claim in a diff: a commit the
     # remote has never seen is amendable, and amending it is the fix.
-    ref = published_ref()
-    if ref is None:
+    if not knows_the_remote():
         # Visible, never silent. A clone with no remote cannot tell an
         # unrewritable message from a lazy one, and must not imply it can.
         s.check("no ref names what is published, so admission is unproven",
                 True, True)
     else:
         s.check("every known-unscrubbed sha is published, so no edit can reach it",
-                sorted(sha[:12] for sha in known if not _is_published(sha, ref)),
+                sorted(sha[:12] for sha in known if not _is_published(sha)),
                 [])
 
 
