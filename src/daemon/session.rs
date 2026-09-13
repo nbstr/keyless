@@ -61,6 +61,7 @@
 //! keeps trying; every other store keeps answering.
 
 use std::io;
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{self, JoinHandle};
@@ -179,9 +180,11 @@ pub fn spawn(
     // key and no way back until a person restarts it, which is the state this
     // machine reached on 2026-09-11.
     let for_key = config.clone();
-    let Some(owner) = super::credential::daemon_owner(&config.audit) else {
+    // Checked here and not kept: the loop reads the owner again on every
+    // attempt, through `owner_for_attempt`.
+    if super::credential::daemon_owner(&config.audit).is_none() {
         return Err(login::no_daemon_uid(&config.audit));
-    };
+    }
     let Some(generations) = generations else {
         return Err(format!(
             "`stores.{}.session_dir` names a directory to renew, but no `Generations` was \
@@ -200,7 +203,7 @@ pub fn spawn(
             // Moved in so it is dropped when this thread returns, however it
             // returns. That drop is what shutdown waits on.
             let _alive = alive;
-            run(&coordinates, &for_key, owner, &generations, &flag);
+            run(&coordinates, &for_key, &generations, &flag);
         })
         .map_err(|error| format!("cannot start the Proton session loop: {error}"))?;
 
@@ -262,7 +265,6 @@ fn report_key_generation(config: &DaemonConfig, said: &mut Option<String>) {
 fn run(
     coordinates: &Coordinates,
     config: &DaemonConfig,
-    owner: Owner,
     generations: &Generations,
     stop: &AtomicBool,
 ) {
@@ -290,6 +292,7 @@ fn run(
     // tick has even run waits out one `min_backoff` like any other, instead
     // of firing the instant the thread starts.
     let mut last_attempt = Instant::now();
+    let running_as = running_as();
 
     // Before the sweep, not only before the first login: the sweep spawns
     // vendor children of its own, and a retirement's logout under `env` cannot
@@ -300,10 +303,31 @@ fn run(
     // Once before the clock below ever runs, so a crash leftover — a
     // generation a previous process created and never published, or one it
     // published and never got to retire — is swept before this process's
-    // first attempt rather than waiting out a whole interval for it.
-    report_sweep(coordinates, owner, generations, grace, stop);
+    // first attempt rather than waiting out a whole interval for it. Skipped
+    // without a word when no owner resolves: the first tick reports that.
+    if let Ok(owner) = owner_for_attempt(&config.audit, running_as) {
+        report_sweep(coordinates, owner, generations, grace, stop);
+    }
 
     while !stop.load(Ordering::Relaxed) {
+        // Resolved before the fault flag is taken, so a tick that cannot run
+        // leaves the flag for the tick that can.
+        let owner = match owner_for_attempt(&config.audit, running_as) {
+            Ok(owner) => owner,
+            Err(detail) => {
+                renewal_failed(&detail, &mut established, &mut failures);
+                pause(
+                    interval,
+                    (min_backoff, max_backoff),
+                    failures,
+                    last_attempt,
+                    generations,
+                    stop,
+                );
+                continue;
+            }
+        };
+
         // Three triggers, and the third is not redundant with the second.
         // Liveness re-asks the vendor's own `info` fresh, on THIS tick; a
         // session-fault event is the record that a READ already asked —
@@ -348,17 +372,7 @@ fn run(
                         report(&format!("established generation {name}"));
                     }
                 }
-                Err(detail) => {
-                    established = None;
-                    failures = failures.saturating_add(1);
-                    // Every Proton name is degrading while this is true, so it
-                    // is said on the first failure rather than after a
-                    // threshold. The message carries the vendor's own words:
-                    // `login::establish` never puts a value in one.
-                    report(&format!(
-                        "Proton session renewal failed ({failures} in a row): {detail}"
-                    ));
-                }
+                Err(detail) => renewal_failed(&detail, &mut established, &mut failures),
             }
         }
 
@@ -369,20 +383,54 @@ fn run(
         // renewal to notice it.
         report_sweep(coordinates, owner, generations, grace, stop);
 
-        let wait = if failures == 0 {
-            interval
-        } else {
-            backoff(min_backoff, max_backoff, failures)
-        };
-        // The floor the event path may shorten a sleep to is the wait this
-        // loop just computed for ITSELF, not the constant minimum. While
-        // logins are succeeding that is `min_backoff`, so a fault still wakes
-        // the loop promptly out of a long healthy interval. While they are
-        // failing it is the grown backoff, so the event path can no longer
-        // shorten a sleep the failure path lengthened.
-        let floor = if failures == 0 { min_backoff } else { wait };
-        sleep_until_stopped(wait, floor, last_attempt, generations, stop);
+        pause(
+            interval,
+            (min_backoff, max_backoff),
+            failures,
+            last_attempt,
+            generations,
+            stop,
+        );
     }
+}
+
+/// Count a failed attempt and say so.
+///
+/// Every Proton name is degrading while this is true, so it is said on the
+/// first failure rather than after a threshold. The detail carries the
+/// vendor's own words or this module's own sentence, and neither ever holds a
+/// value.
+fn renewal_failed(detail: &str, established: &mut Option<Instant>, failures: &mut u32) {
+    *established = None;
+    *failures = failures.saturating_add(1);
+    report(&format!(
+        "Proton session renewal failed ({failures} in a row): {detail}"
+    ));
+}
+
+/// Sleep until the next tick: the healthy interval, or the backoff while
+/// attempts are failing.
+fn pause(
+    interval: Duration,
+    (min_backoff, max_backoff): (Duration, Duration),
+    failures: u32,
+    last_attempt: Instant,
+    generations: &Generations,
+    stop: &AtomicBool,
+) {
+    let wait = if failures == 0 {
+        interval
+    } else {
+        backoff(min_backoff, max_backoff, failures)
+    };
+    // The floor the event path may shorten a sleep to is the wait this
+    // loop just computed for ITSELF, not the constant minimum. While
+    // logins are succeeding that is `min_backoff`, so a fault still wakes
+    // the loop promptly out of a long healthy interval. While they are
+    // failing it is the grown backoff, so the event path can no longer
+    // shorten a sleep the failure path lengthened.
+    let floor = if failures == 0 { min_backoff } else { wait };
+    sleep_until_stopped(wait, floor, last_attempt, generations, stop);
 }
 
 /// Run [`login::sweep`] and translate its tab-separated rows into the plain
@@ -491,6 +539,83 @@ fn alive(coordinates: &Coordinates, owner: Owner, generations: &Generations) -> 
     )
     .map(|(status, _)| status.success())
     .unwrap_or(false)
+}
+
+/// This process's own euid/egid, or `None` when it is root.
+///
+/// Root may become any uid, so [`owner_for_attempt`] accepts any audit-log
+/// owner when this is `None`; anybody else may only become itself.
+fn running_as() -> Option<Owner> {
+    let uid = nix::unistd::geteuid();
+    if uid.is_root() {
+        return None;
+    }
+    Some(Owner {
+        uid: uid.as_raw(),
+        gid: nix::unistd::getegid().as_raw(),
+    })
+}
+
+/// The uid/gid this attempt's vendor children run as, read off the audit
+/// log's owner now.
+///
+/// Read on every attempt for the reason [`attempt`] re-reads the token: a value
+/// captured at start is wrong for the life of the process once its source
+/// changes, and a restored owner should take effect on the next attempt rather
+/// than at the next restart. So a failed read never falls back to an earlier
+/// attempt's owner — that stale uid is exactly the one this exists to drop.
+///
+/// # Errors
+///
+/// The audit log is gone, or its owner is not `running_as`: a daemon cannot
+/// become another uid, so every vendor child would be refused. The kernel's own
+/// refusal reaches the operator as the interactive login's "run it with sudo",
+/// which a daemon cannot act on, so the mismatch is caught here and answered
+/// with a remedy the operator can actually run: `chown` when the file is
+/// there under the wrong owner, `install` — creating it from `/dev/null` at
+/// the mode the daemon opens its audit log with — when there is nothing to
+/// `chown`.
+/// `running_as: None` is root, which may become anyone, and skips the
+/// comparison.
+fn owner_for_attempt(audit: &Path, running_as: Option<Owner>) -> Result<Owner, String> {
+    const NO_RESTART: &str = "The next attempt reads it again, so no restart is needed";
+
+    let Some(owner) = super::credential::daemon_owner(audit) else {
+        let remedy = running_as
+            .map(|mine| {
+                format!(
+                    " Put it back as this daemon's own:\n\tsudo install -m {:04o} -o {} -g {} \
+                     /dev/null {}\n",
+                    crate::audit::MODE_GROUP_READABLE,
+                    mine.uid,
+                    mine.gid,
+                    audit.display()
+                )
+            })
+            .unwrap_or_else(|| " ".to_owned());
+        return Err(format!(
+            "{} is not there, and this daemon reads the uid its vendor children run as off that \
+             file's owner, so this attempt runs nothing.{remedy}{NO_RESTART}",
+            audit.display()
+        ));
+    };
+    if let Some(mine) = running_as
+        && owner != mine
+    {
+        return Err(format!(
+            "{} is owned by {}:{}, but this daemon runs as {}:{} and cannot become anyone else, \
+             so no vendor child can start. Give it back:\n\tsudo chown {}:{} {}\n{NO_RESTART}",
+            audit.display(),
+            owner.uid,
+            owner.gid,
+            mine.uid,
+            mine.gid,
+            mine.uid,
+            mine.gid,
+            audit.display()
+        ));
+    }
+    Ok(owner)
 }
 
 /// One renewal: read the token the daemon already holds, and use it.
@@ -926,5 +1051,167 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    fn scratch_audit_path(tag: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "keyless-daemon-session-owner-{tag}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ))
+    }
+
+    #[test]
+    fn an_absent_audit_log_is_an_error_naming_the_path_and_never_advises_sudo_login() {
+        // CONTROL — the change that makes this fail: reusing
+        // `login::no_daemon_uid`, whose remedy ("start the daemon once") is
+        // written for a daemon that has never run, or reusing
+        // `login::cannot_spawn`'s literal "Run it with `sudo`", which is
+        // advice for the interactive `keylessd login` verb and wrong for a
+        // daemon that cannot rerun itself.
+        let audit = scratch_audit_path("absent");
+        let _ = fs::remove_file(&audit);
+
+        let error = owner_for_attempt(&audit, Some(Owner { uid: 501, gid: 20 }))
+            .expect_err("no file exists at this path");
+
+        assert!(
+            error.contains(&audit.display().to_string()),
+            "the error does not name the audit path: {error:?}"
+        );
+        assert!(
+            !error.contains("Run it with"),
+            "the error carries the interactive login verb's sudo advice, wrong for a daemon: \
+             {error:?}"
+        );
+        assert!(
+            error.contains(&format!(
+                "sudo install -m {:04o} -o 501 -g 20 /dev/null {}",
+                crate::audit::MODE_GROUP_READABLE,
+                audit.display()
+            )),
+            "the error does not carry the create-it remedy: {error:?}"
+        );
+        assert!(
+            !error.contains("chown"),
+            "chown cannot fix a file that is not there: {error:?}"
+        );
+    }
+
+    #[test]
+    fn an_audit_log_owned_by_someone_else_is_an_error_naming_both_pairs_and_the_chown() {
+        let audit = scratch_audit_path("mismatch");
+        fs::write(&audit, b"").expect("write the audit log");
+        let file_owner = {
+            let meta = fs::metadata(&audit).expect("stat");
+            Owner {
+                uid: meta.uid(),
+                gid: meta.gid(),
+            }
+        };
+        // A daemon uid that is provably not the file's own, whatever this
+        // test happens to run as.
+        let running_as = Owner {
+            uid: file_owner.uid.wrapping_add(1),
+            gid: file_owner.gid.wrapping_add(1),
+        };
+
+        let error = owner_for_attempt(&audit, Some(running_as)).expect_err("the owners disagree");
+
+        assert!(
+            error.contains(&format!("{}:{}", file_owner.uid, file_owner.gid)),
+            "the error does not name the file's own owner: {error:?}"
+        );
+        assert!(
+            error.contains(&format!("{}:{}", running_as.uid, running_as.gid)),
+            "the error does not name the uid this daemon runs as: {error:?}"
+        );
+        assert!(
+            error.contains(&format!(
+                "sudo chown {}:{} {}",
+                running_as.uid,
+                running_as.gid,
+                audit.display()
+            )),
+            "the error does not carry the literal remedy: {error:?}"
+        );
+
+        let _ = fs::remove_file(&audit);
+    }
+
+    #[test]
+    fn an_audit_log_owned_by_running_as_resolves() {
+        let audit = scratch_audit_path("match");
+        fs::write(&audit, b"").expect("write the audit log");
+        let running_as = {
+            let meta = fs::metadata(&audit).expect("stat");
+            Owner {
+                uid: meta.uid(),
+                gid: meta.gid(),
+            }
+        };
+
+        let owner =
+            owner_for_attempt(&audit, Some(running_as)).expect("the file's own owner must resolve");
+        assert_eq!(owner.uid, running_as.uid);
+        assert_eq!(owner.gid, running_as.gid);
+
+        let _ = fs::remove_file(&audit);
+    }
+
+    #[test]
+    fn a_root_daemon_accepts_whatever_the_audit_log_carries() {
+        // CONTROL — the change that makes this fail: comparing the file's
+        // owner against `running_as` even when it is `None`, which would
+        // refuse a root daemon's own audit log the instant it is not owned
+        // by uid 0 — the ordinary case, since the installer creates it owned
+        // by the daemon's own uid, never root's.
+        let audit = scratch_audit_path("root-accepts-anyone");
+        fs::write(&audit, b"").expect("write the audit log");
+        let file_owner = {
+            let meta = fs::metadata(&audit).expect("stat");
+            Owner {
+                uid: meta.uid(),
+                gid: meta.gid(),
+            }
+        };
+
+        let owner = owner_for_attempt(&audit, None).expect("root may become anyone");
+        assert_eq!(owner.uid, file_owner.uid);
+        assert_eq!(owner.gid, file_owner.gid);
+
+        let _ = fs::remove_file(&audit);
+    }
+
+    #[test]
+    fn the_owner_is_re_resolved_on_every_call_so_a_restored_file_needs_no_restart() {
+        // The per-attempt property at unit level: the same path, read twice
+        // around a removal and a restoration, answers `Err` then `Ok` —
+        // never a value carried over from the first call.
+        let audit = scratch_audit_path("per-attempt");
+        fs::write(&audit, b"").expect("write the audit log");
+        let running_as = {
+            let meta = fs::metadata(&audit).expect("stat");
+            Owner {
+                uid: meta.uid(),
+                gid: meta.gid(),
+            }
+        };
+
+        assert!(owner_for_attempt(&audit, Some(running_as)).is_ok());
+
+        fs::remove_file(&audit).expect("take the audit log away");
+        assert!(
+            owner_for_attempt(&audit, Some(running_as)).is_err(),
+            "an attempt right after removal must not reuse the earlier resolution"
+        );
+
+        fs::write(&audit, b"").expect("restore the audit log");
+        assert!(
+            owner_for_attempt(&audit, Some(running_as)).is_ok(),
+            "an attempt right after restoration must not still see the removal"
+        );
+
+        let _ = fs::remove_file(&audit);
     }
 }
