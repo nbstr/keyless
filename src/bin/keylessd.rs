@@ -746,13 +746,12 @@ mod daemon {
         // a candidate whose readers have not finished is simply left for the
         // next sweeper, a running daemon's own tick or the next invocation of
         // this verb.
-        let grace = login::grace(config.stores.proton.timeout_ms);
+        let grace = login::grace(coordinates.timeout_ms);
         let _ = login::sweep(
             &coordinates,
             owner,
             &generations,
             grace,
-            config.stores.proton.timeout_ms,
             None,
             &mut io::stdout(),
         );

@@ -56,13 +56,13 @@
 use std::io::{self, BufRead, Read};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc;
+use std::sync::{Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use zeroize::Zeroize;
 
-use crate::ipc::protocol::{ProtocolError, Reply, Request, read_frame, write_frame};
+use crate::ipc::protocol::{self, ProtocolError, Reply, Request, read_frame, write_frame};
 
 /// The longest one exchange may run, however talkative the daemon is.
 ///
@@ -99,10 +99,16 @@ const MAX_EXCHANGE: Duration =
 const VENDOR_CALLS_PER_LOOKUP: u64 = 2;
 
 /// A configured route to a daemon.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct Client {
     socket: PathBuf,
     timeout: Duration,
+    /// The advisory carried by the most recent reply, if any — see
+    /// [`Client::take_advisory`]. A `Mutex` rather than a `Cell` because
+    /// [`crate::store::Store`] requires `Sync`, and a caller like
+    /// [`crate::store::daemon::DaemonStore`] may be resolving several names
+    /// for one `keyless run` concurrently, each over its own connection.
+    last_advisory: Mutex<Option<String>>,
 }
 
 /// What the worker thread tells the waiting caller.
@@ -115,8 +121,10 @@ enum Event {
     Connected,
     /// A heartbeat arrived: the daemon has the request and has not finished.
     Working,
-    /// The exchange is over, one way or the other.
-    Done(Result<Reply, ClientError>),
+    /// The exchange is over, one way or the other. The advisory travels
+    /// alongside a successful reply because it is read off the same frame,
+    /// never off the reply's own status — see [`protocol::decode_advisory`].
+    Done(Result<(Reply, Option<String>), ClientError>),
 }
 
 /// Why a request did not produce a reply.
@@ -168,7 +176,11 @@ impl Client {
     /// Point at a socket, with a deadline for how long it may say nothing.
     #[must_use]
     pub fn new(socket: PathBuf, timeout: Duration) -> Self {
-        Client { socket, timeout }
+        Client {
+            socket,
+            timeout,
+            last_advisory: Mutex::new(None),
+        }
     }
 
     /// The socket this client talks to.
@@ -200,7 +212,29 @@ impl Client {
             })
             .map_err(ClientError::Transport)?;
 
-        self.wait(&receiver, silence)
+        let (reply, advisory) = self.wait(&receiver, silence)?;
+        // Overwritten unconditionally, `None` included: a request that lands
+        // outside the daemon's warning window is exactly what retires an
+        // advisory a previous request on this client carried, so a stale line
+        // does not keep printing once the daemon has stopped sending one.
+        if let Ok(mut slot) = self.last_advisory.lock() {
+            *slot = advisory;
+        }
+        Ok(reply)
+    }
+
+    /// The advisory carried by the most recent reply this client received, if
+    /// any, and clear it.
+    ///
+    /// Read this once per request, right after issuing it — a caller that
+    /// leaves it unread past the next request loses it, and one that reads it
+    /// twice for one request gets it once and then `None`.
+    #[must_use]
+    pub fn take_advisory(&self) -> Option<String> {
+        self.last_advisory
+            .lock()
+            .ok()
+            .and_then(|mut slot| slot.take())
     }
 
     /// Wait on the worker, resetting the silence deadline at every sign of life.
@@ -208,7 +242,7 @@ impl Client {
         &self,
         receiver: &mpsc::Receiver<Event>,
         silence: Duration,
-    ) -> Result<Reply, ClientError> {
+    ) -> Result<(Reply, Option<String>), ClientError> {
         let started = Instant::now();
         let mut working = false;
         loop {
@@ -272,7 +306,7 @@ fn exchange(
     frame: &[u8],
     silence: Duration,
     report: impl Fn(Event) -> bool,
-) -> Result<Reply, ClientError> {
+) -> Result<(Reply, Option<String>), ClientError> {
     let stream = UnixStream::connect(socket).map_err(ClientError::Unreachable)?;
     // The connect returning is itself evidence, and it is the only evidence
     // there will be until the daemon has read the request.
@@ -303,6 +337,7 @@ fn exchange(
             )));
         };
         let reply = Reply::decode(&raw).map_err(ClientError::Protocol);
+        let advisory = protocol::decode_advisory(&raw);
         raw.zeroize();
         match reply? {
             Reply::Working => {
@@ -310,7 +345,7 @@ fn exchange(
                     return Err(abandoned());
                 }
             }
-            answered => return Ok(answered),
+            answered => return Ok((answered, advisory)),
         }
     }
 }
@@ -437,6 +472,63 @@ mod tests {
             client.request(&Request::ping()),
             Err(ClientError::Unreachable(_))
         ));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn an_advisory_on_the_reply_is_readable_once_then_gone() {
+        let path = short_socket_path(std::path::Path::new("ipc-client-advisory"));
+        let _ = std::fs::remove_file(&path);
+        let listener = std::os::unix::net::UnixListener::bind(&path).expect("bind");
+        std::thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accept");
+            let mut reader = std::io::BufReader::new(stream.try_clone().expect("clone"));
+            let _ = crate::ipc::protocol::read_frame(&mut reader);
+            let reply = crate::ipc::protocol::Reply::Absent
+                .encode_with_advisory(Some("the token expires soon"))
+                .expect("encode");
+            let _ = crate::ipc::protocol::write_frame(&mut &stream, &reply);
+        });
+
+        let client = Client::new(path.clone(), Duration::from_secs(5));
+        client
+            .request(&Request::ping())
+            .expect("the fixture answers");
+        assert_eq!(
+            client.take_advisory(),
+            Some("the token expires soon".to_owned())
+        );
+        // Read once, and gone — a caller that asks again for the same request
+        // must not see it a second time.
+        assert_eq!(client.take_advisory(), None);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_later_request_with_no_advisory_clears_an_earlier_one() {
+        let path = short_socket_path(std::path::Path::new("ipc-client-advisory-clears"));
+        let _ = std::fs::remove_file(&path);
+        let listener = std::os::unix::net::UnixListener::bind(&path).expect("bind");
+        std::thread::spawn(move || {
+            for advisory in [Some("the token expires soon"), None] {
+                let (stream, _) = listener.accept().expect("accept");
+                let mut reader = std::io::BufReader::new(stream.try_clone().expect("clone"));
+                let _ = crate::ipc::protocol::read_frame(&mut reader);
+                let reply = crate::ipc::protocol::Reply::Absent
+                    .encode_with_advisory(advisory)
+                    .expect("encode");
+                let _ = crate::ipc::protocol::write_frame(&mut &stream, &reply);
+            }
+        });
+
+        let client = Client::new(path.clone(), Duration::from_secs(5));
+        client.request(&Request::ping()).expect("first answer");
+        client.request(&Request::ping()).expect("second answer");
+        assert_eq!(
+            client.take_advisory(),
+            None,
+            "the second, advisory-free reply must retire the first advisory"
+        );
         let _ = std::fs::remove_file(&path);
     }
 

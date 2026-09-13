@@ -137,6 +137,12 @@ pub struct Daemon {
     /// when Proton is disabled or names no `session_dir` — see
     /// [`DaemonConfig::generations`]. See [`Running::spawn`].
     generations: Option<Arc<Generations>>,
+    /// `stores.proton.token_expires`, read once at bind time — see
+    /// [`credential::run_expiry_advisory`] for why every `Op::Resolve` this
+    /// daemon answers is checked against it rather than the CLI reading the
+    /// same file. Config is read once at startup like every other value here,
+    /// so a changed date takes effect on the next restart.
+    token_expires: Option<String>,
 }
 
 /// Where a resolved value came from, for [`Daemon::record`] — [`Answer`]'s
@@ -145,6 +151,26 @@ pub struct Daemon {
 struct Served {
     source: Source,
     age: Option<Duration>,
+}
+
+/// What was decided about a request, and why — [`Daemon::record`]'s fixed
+/// grep-able word and, where one exists, the free-text detail beside it.
+struct Decision<'a> {
+    word: &'a str,
+    reason: Option<&'a str>,
+}
+
+impl<'a> Decision<'a> {
+    fn new(word: &'a str) -> Self {
+        Decision { word, reason: None }
+    }
+
+    fn with_reason(word: &'a str, reason: &'a str) -> Self {
+        Decision {
+            word,
+            reason: Some(reason),
+        }
+    }
 }
 
 impl Daemon {
@@ -203,6 +229,7 @@ impl Daemon {
             idle: config.idle_timeout(),
             live: Arc::new(AtomicUsize::new(0)),
             generations,
+            token_expires: config.stores.proton.token_expires.clone(),
         })
     }
 
@@ -258,6 +285,20 @@ impl Daemon {
             return;
         }
 
+        // Attested here, on the accept loop's own thread, rather than left for
+        // the connection thread below to do once it exists. A freshly spawned
+        // thread's first slice of CPU is scheduled whenever the OS gets to it,
+        // and a legitimate peer that is a short-lived process — `keyless run`
+        // wrapping a command that finishes fast — can exit before that
+        // happens, which turns "identified late" into "unidentifiable" for no
+        // reason connected to who the peer was. The accept loop is already
+        // running, so there is no second thread's scheduling to wait on: this
+        // reads the kernel's facts about the peer as close to connect as any
+        // code in this daemon ever will. Every request after the first is
+        // still attested fresh, in `Connection::serve`, which is what defends
+        // against a peer that `exec`s a different image mid-connection.
+        let first_attestation = attest(stream.as_fd(), &self.policy);
+
         let worker = Connection {
             policy: Arc::clone(&self.policy),
             resolver: Arc::clone(&self.resolver),
@@ -266,11 +307,12 @@ impl Daemon {
             rebuilder: Arc::clone(&self.rebuilder),
             idle: self.idle,
             live: Arc::clone(&self.live),
+            token_expires: self.token_expires.clone(),
         };
         self.live.fetch_add(1, Ordering::Relaxed);
         if thread::Builder::new()
             .name(format!("{NAME}d-conn"))
-            .spawn(move || worker.serve(stream))
+            .spawn(move || worker.serve(stream, first_attestation))
             .is_err()
         {
             self.live.fetch_sub(1, Ordering::Relaxed);
@@ -312,6 +354,8 @@ struct Connection {
     rebuilder: Arc<Rebuilder>,
     idle: Duration,
     live: Arc<AtomicUsize>,
+    /// See [`Daemon::token_expires`].
+    token_expires: Option<String>,
 }
 
 impl Drop for Connection {
@@ -321,7 +365,11 @@ impl Drop for Connection {
 }
 
 impl Connection {
-    fn serve(self, stream: UnixStream) {
+    /// `first_attestation` is the peer's identity as read at accept time, by
+    /// the caller — see [`Daemon::dispatch`] for why that reading is not
+    /// redone here for the connection's first request. Every request after it
+    /// re-attests fresh, in the loop below.
+    fn serve(self, stream: UnixStream, first_attestation: Attestation) {
         // The listener is non-blocking so the accept loop can poll its stop
         // flag, and on BSD an accepted socket INHERITS that flag. Left set, the
         // first read that arrives a moment before its data returns EAGAIN, the
@@ -346,6 +394,7 @@ impl Connection {
             Err(_) => return,
         });
 
+        let mut attestation = Some(first_attestation);
         loop {
             let frame = match read_frame(&mut reader) {
                 Ok(Some(frame)) => frame,
@@ -362,8 +411,16 @@ impl Connection {
                 }
             };
 
-            let reply = self.answer(&stream, &frame);
-            let encoded = match reply.encode() {
+            // The first iteration spends the accept-time reading; every one
+            // after it attests fresh. A process can `exec` a different image
+            // without closing its sockets, so trusting the first reading for a
+            // second request would authorise a program that is no longer
+            // running.
+            let this_attestation = attestation
+                .take()
+                .unwrap_or_else(|| attest(stream.as_fd(), &self.policy));
+            let (reply, advisory) = self.answer(&stream, &frame, &this_attestation);
+            let encoded = match reply.encode_with_advisory(advisory.as_deref()) {
                 Ok(encoded) => encoded,
                 Err(_) => return,
             };
@@ -373,34 +430,39 @@ impl Connection {
         }
     }
 
-    /// Attest, then answer.
+    /// Answer one request against an already-attested peer — see
+    /// [`Daemon::dispatch`] and the loop in [`Connection::serve`] for when
+    /// that attestation was read.
     ///
-    /// Attestation happens here — per request — rather than once when the
-    /// connection was accepted. A process can `exec` a different image without
-    /// closing its sockets, so a per-connection decision would authorise a
-    /// program that is no longer running.
-    fn answer(&self, stream: &UnixStream, frame: &[u8]) -> Reply {
+    /// The advisory alongside the reply is `Some` only down the [`Op::Resolve`]
+    /// path — every `keyless run` request, and no other verb — see
+    /// [`credential::run_expiry_advisory`].
+    fn answer(
+        &self,
+        stream: &UnixStream,
+        frame: &[u8],
+        attestation: &Attestation,
+    ) -> (Reply, Option<String>) {
         let request = match Request::decode(frame) {
             Ok(request) => request,
-            Err(error) => return Reply::Failed(error.to_string()),
+            Err(error) => return (Reply::Failed(error.to_string()), None),
         };
 
-        let attestation = attest(stream.as_fd(), &self.policy);
-
         if let Some(denial) = attestation.denial() {
+            let detail = denial.to_string();
             self.record(
                 &request,
-                &attestation,
-                denial.kind(),
+                attestation,
+                Decision::with_reason(denial.kind(), &detail),
                 State::Degraded,
                 None,
                 None,
             );
-            return Reply::Denied(denial.to_string());
+            return (Reply::Denied(detail), None);
         }
 
         match request.op {
-            Op::Ping => Reply::Info { names: Vec::new() },
+            Op::Ping => (Reply::Info { names: Vec::new() }, None),
             Op::Names => {
                 // A listing over a daemon that has never enumerated answers the
                 // declared set and asks for the rest. The asker gets today's
@@ -411,27 +473,40 @@ impl Connection {
                 if self.catalogue.indexed_at().is_none() {
                     self.rebuilder.queue_full();
                 }
-                Reply::Info {
-                    names: self.catalogue.names(),
-                }
+                (
+                    Reply::Info {
+                        names: self.catalogue.names(),
+                    },
+                    None,
+                )
             }
-            Op::Resolve => self.resolve(stream, &request, &attestation),
+            Op::Resolve => self.resolve(stream, &request, attestation),
         }
     }
 
-    fn resolve(&self, stream: &UnixStream, request: &Request, attestation: &Attestation) -> Reply {
+    fn resolve(
+        &self,
+        stream: &UnixStream,
+        request: &Request,
+        attestation: &Attestation,
+    ) -> (Reply, Option<String>) {
+        let advisory = credential::run_expiry_advisory(self.token_expires.as_deref());
+
         if request.name.is_empty() || request.name.chars().count() > MAX_NAME_CHARS {
             self.record(
                 request,
                 attestation,
-                "bad-name",
+                Decision::new("bad-name"),
                 State::Degraded,
                 None,
                 None,
             );
-            return Reply::Failed(format!(
-                "a name must be between 1 and {MAX_NAME_CHARS} characters"
-            ));
+            return (
+                Reply::Failed(format!(
+                    "a name must be between 1 and {MAX_NAME_CHARS} characters"
+                )),
+                advisory,
+            );
         }
 
         let answer = if request.progress {
@@ -444,12 +519,12 @@ impl Connection {
             age: answer.age,
         });
 
-        match answer.outcome {
+        let reply = match answer.outcome {
             Outcome::Found(secret) => {
                 self.record(
                     request,
                     attestation,
-                    "allow",
+                    Decision::new("allow"),
                     State::Injected,
                     Some(secret.as_ref()),
                     served,
@@ -466,7 +541,7 @@ impl Connection {
                 self.record(
                     request,
                     attestation,
-                    "absent",
+                    Decision::new("absent"),
                     State::Degraded,
                     None,
                     served,
@@ -478,7 +553,7 @@ impl Connection {
                 self.record(
                     request,
                     attestation,
-                    kind.as_str(),
+                    Decision::new(kind.as_str()),
                     State::Degraded,
                     None,
                     served,
@@ -486,7 +561,8 @@ impl Connection {
                 let advice = self.catalogue.advice(&request.name, &route);
                 Reply::Failed(format!("{reason}; {advice}"))
             }
-        }
+        };
+        (reply, advisory)
     }
 
     /// Queue whatever a name that produced no value needs, and hand back what
@@ -602,7 +678,7 @@ impl Connection {
         &self,
         request: &Request,
         attestation: &Attestation,
-        decision: &str,
+        decision: Decision<'_>,
         state: State,
         secret: Option<&Secret>,
         served: Option<Served>,
@@ -629,7 +705,11 @@ impl Connection {
             // directory is `/` and would say nothing.
             .with_cwd(masker.mask_str(&request.cwd))
             .with_unresolved(unresolved)
-            .with_decision(decision);
+            .with_decision(decision.word);
+
+        if let Some(reason) = decision.reason {
+            event = event.with_reason(reason);
+        }
 
         if let Some(served) = served {
             event = event.with_source(served.source.as_str());

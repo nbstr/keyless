@@ -24,7 +24,7 @@ use std::time::{Duration, Instant};
 use keyless::daemon::config::DaemonConfig;
 use keyless::ipc::client::Client;
 use keyless::ipc::protocol::{Reply, Request};
-use keyless::store::{Invocation, Resolution, build};
+use keyless::store::{Invocation, Registry, Resolution, build};
 
 use support::{
     Backend, client_config, daemon_config, policy_allowing_self, scratch, set_catalogue_listing,
@@ -352,6 +352,14 @@ fn two_items_minting_one_name_are_refused_without_asking_any_store() {
     // No `run` was created. `pass-cli.argv` is written by the stub's run branch
     // and by nothing else, so its absence is the assertion — the same shape
     // `tests/daemon_proton.rs` argues for an undeclared name.
+    // Nor is a title spelling that mints the colliding name: it is refused
+    // under that name rather than guessed.
+    let refused = registry.resolve("my-key");
+    assert!(
+        !matches!(refused, Resolution::Found { .. }),
+        "a title spelling of a colliding name must not resolve: {}",
+        arm(&refused)
+    );
     assert!(
         !dir.join("pass-cli.argv").exists(),
         "a colliding name reached the vendor"
@@ -519,6 +527,16 @@ fn a_store_that_cannot_be_enumerated_is_unproven_and_not_a_fault() {
 /// hope.
 const VIEW_LEAK: &str = "decoy-Cat4-never-in-a-listing-0912";
 
+/// One item's field view, carrying [`VIEW_LEAK`] in every value position.
+fn demo_api_key_view() -> String {
+    format!(
+        r#"{{"item":{{"id":"It3mOne","share_id":"ShAr3","state":"Active","revision":2,
+            "content":{{"item_uuid":"UU1D","title":"demo api key",
+              "note":"{VIEW_LEAK}",
+              "extra_fields":[{{"name":"Expiry Date","content":{{"Hidden":"{VIEW_LEAK}"}}}}]}}}}}}"#
+    )
+}
+
 #[test]
 fn a_field_nobody_could_guess_is_named_after_one_miss_and_carries_no_value() {
     // The case with no other route to it: a field whose label nobody would
@@ -530,12 +548,7 @@ fn a_field_nobody_could_guess_is_named_after_one_miss_and_carries_no_value() {
     // repository, and the character classes that make the rule hard are pinned
     // in `tests/catalogue.rs` instead, where nothing is a coordinate.
     let dir = scratch("catalogue-field-view");
-    let view = format!(
-        r#"{{"item":{{"id":"It3mOne","share_id":"ShAr3","state":"Active","revision":2,
-            "content":{{"item_uuid":"UU1D","title":"demo api key",
-              "note":"{VIEW_LEAK}",
-              "extra_fields":[{{"name":"Expiry Date","content":{{"Hidden":"{VIEW_LEAK}"}}}}]}}}}}}"#
-    );
+    let view = demo_api_key_view();
     let vendor = stub_pass_cli_catalogue(
         &dir,
         &Backend::Injects(DECOY),
@@ -584,4 +597,134 @@ fn a_field_nobody_could_guess_is_named_after_one_miss_and_carries_no_value() {
         Resolution::Found { secret, .. } => assert_eq!(secret.expose(), DECOY),
         other => panic!("a derived field name must resolve: {}", arm(&other)),
     }
+}
+
+/// A daemon over one vault holding `titles`, and a session registry speaking to
+/// it, once `ready` is listed.
+fn serving(
+    label: &str,
+    titles: &[&str],
+    view: &str,
+    declare: impl FnOnce(&mut DaemonConfig),
+    ready: &str,
+) -> (std::path::PathBuf, keyless::daemon::Running, Registry) {
+    let dir = scratch(label);
+    let vendor = stub_pass_cli_catalogue(
+        &dir,
+        &Backend::Injects(DECOY),
+        ONE_VAULT,
+        &listing_of(titles),
+        view,
+    );
+    let mut config = daemon_over(&dir, &vendor);
+    declare(&mut config);
+    let running = start_daemon(&config, policy_allowing_self());
+    let registry = build(
+        &client_config(running.socket(), 3_000),
+        &Invocation::default(),
+    )
+    .registry;
+    wait_until_served(running.socket(), ready);
+    (dir, running, registry)
+}
+
+fn assert_serves_decoy(registry: &Registry, name: &str) {
+    match registry.resolve(name) {
+        Resolution::Found { secret, .. } => assert_eq!(secret.expose(), DECOY, "{name}"),
+        other => panic!("`{name}` must resolve: {}", arm(&other)),
+    }
+}
+
+#[test]
+fn an_item_asked_for_by_its_own_title_serves_what_its_minted_name_serves() {
+    let (dir, _running, registry) = serving(
+        "catalogue-title-spelled",
+        &["decoy alpha"],
+        "{}",
+        |_| {},
+        "DECOY_ALPHA",
+    );
+
+    assert_serves_decoy(&registry, "decoy-alpha");
+    assert_serves_decoy(&registry, "DECOY_ALPHA");
+
+    // The audit row carries the name as the caller sent it, not the minted
+    // spelling it was looked up under.
+    let audit = std::fs::read_to_string(dir.join("audit.jsonl")).expect("the daemon wrote a row");
+    let row = audit
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("an audit row is JSON"))
+        .find(|row| {
+            row["names"]
+                .as_array()
+                .is_some_and(|names| names.len() == 1 && names[0].as_str() == Some("decoy-alpha"))
+        })
+        .unwrap_or_else(|| panic!("no audit row names `decoy-alpha` exactly as sent:\n{audit}"));
+    assert_eq!(row["decision"].as_str(), Some("allow"), "{row}");
+}
+
+#[test]
+fn a_declared_name_answers_to_its_items_title() {
+    let (_dir, _running, registry) = serving(
+        "catalogue-declared-title",
+        &["demo login"],
+        "{}",
+        |config| {
+            config.secrets.insert(
+                "DEMO_LOGIN".to_owned(),
+                serde_json::from_str(
+                    r#"{"store":"proton","vault":"personal","item":"demo login","field":"password"}"#,
+                )
+                .expect("valid"),
+            );
+        },
+        "DEMO_LOGIN",
+    );
+    assert_serves_decoy(&registry, "demo-login");
+}
+
+#[test]
+fn a_title_spelled_field_name_resolves_once_the_miss_has_fetched_its_view() {
+    let (_dir, running, registry) = serving(
+        "catalogue-title-field",
+        &["demo api key"],
+        &demo_api_key_view(),
+        |_| {},
+        "DEMO_API_KEY",
+    );
+
+    // The first ask misses, and that miss is what inverts onto `demo api key`
+    // and queues its field view.
+    let first = registry.resolve("demo-api-key__expiry-date");
+    assert!(
+        !matches!(first, Resolution::Found { .. }),
+        "the fixture must start from a genuine miss: {}",
+        arm(&first)
+    );
+    wait_until_served(running.socket(), "DEMO_API_KEY__EXPIRY_DATE");
+
+    assert_serves_decoy(&registry, "demo-api-key__expiry-date");
+}
+
+#[test]
+fn a_name_nothing_mints_degrades_and_names_the_spelling_it_tried() {
+    let (_dir, _running, registry) = serving(
+        "catalogue-title-unknown",
+        &["decoy-token"],
+        "{}",
+        |_| {},
+        "DECOY_TOKEN",
+    );
+
+    let refused = registry.resolve("no-such-item");
+    assert!(
+        matches!(refused, Resolution::Failed(_)),
+        "an unrecognisable name must degrade with an explanation: {}",
+        arm(&refused)
+    );
+    assert!(
+        refused.reason().contains("tried `NO_SUCH_ITEM`"),
+        "{}",
+        refused.reason()
+    );
 }

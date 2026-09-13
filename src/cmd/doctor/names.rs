@@ -29,7 +29,8 @@ use std::io::{self, Write};
 use crate::cmd::run::Binding;
 use crate::cmd::status::{Mark, Style, action, heading, note, row, verbatim};
 use crate::config::Config;
-use crate::store::{self, Registry, Resolution};
+use crate::store::daemon;
+use crate::store::{Registry, Resolution};
 
 use super::stores::StoreRow;
 
@@ -103,11 +104,14 @@ pub(super) fn report_names(
 
     let mut problems = 0;
     for name in config.secrets.keys() {
-        // The store this name would use, by exactly the rule a lookup applies.
-        // A name whose store is already down is not asked: see this module's
-        // documentation for why that is a saving rather than a shortcut.
-        if let Ok(id) = store::choose_store(config, Some(name), None)
-            && let Some(store) = failed.get(id.as_str())
+        // The store the lookup will ask, from the registry that performs it
+        // rather than from the config: the daemon drops a name's own pin, so
+        // the config can name a store nobody asks. A name whose store is
+        // already down is not asked: see this module's documentation for why
+        // that is a saving rather than a shortcut.
+        let asked = registry.asks(name);
+        if let Some(id) = asked
+            && let Some(store) = failed.get(id)
         {
             row(
                 out,
@@ -134,6 +138,24 @@ pub(super) fn report_names(
             // Always `undeclared: false` here: the loop walks `config.secrets`,
             // so every name this arm can see is declared by construction. That
             // is what earns the word `declared` in the detail below.
+            //
+            // `keyless put` writes a LOCAL store, which is exactly what the
+            // daemon exists to route around — `store::manage::manager` refuses
+            // every write once the daemon is enabled, for the same reason. So
+            // a name the daemon just answered "no such name" for is told to
+            // declare itself on the daemon's own side, in `keylessd.json`,
+            // never to run a command that would fail with an unrelated error.
+            Resolution::NotFound { .. } if asked == Some(daemon::DAEMON_STORE_ID) => (
+                Mark::NotSetUp,
+                "absent",
+                "the daemon answered and holds no such name".to_owned(),
+                Some(
+                    "declare it under \"secrets\" in `keylessd.json`, with the vault, item \
+                     and field (or environment) it needs there — this config only lists \
+                     names, it does not say where their values live"
+                        .to_owned(),
+                ),
+            ),
             Resolution::NotFound { .. } => (
                 Mark::NotSetUp,
                 "absent",

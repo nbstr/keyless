@@ -93,6 +93,15 @@ pub trait Store: Send + Sync {
 
     /// Cheap reachability check that reads no secret.
     fn health(&self) -> Result<(), StoreError>;
+
+    /// An operational notice this backend wants surfaced on stderr once, from
+    /// its most recent lookup — never a secret, and never tied to the name
+    /// that was asked for. `None` for every backend but [`daemon::DaemonStore`],
+    /// which relays whatever the daemon's own reply carried; a local backend
+    /// has no daemon reply to relay one from.
+    fn advisory(&self) -> Option<String> {
+        None
+    }
 }
 
 /// What the registry concluded about one name.
@@ -283,22 +292,55 @@ impl Registry {
         }
     }
 
+    /// The one backend a lookup of `name` will ask, or `None` when it would
+    /// ask several backends or none.
+    ///
+    /// For a caller that must know where a lookup goes before making it —
+    /// `doctor` skips a name whose backend is already down. It reads the
+    /// registry rather than the config because [`build`] can drop a name's
+    /// own pin (the daemon does), and the resolvers below take their choice
+    /// from the same helpers, so the answer cannot drift from the lookup.
+    #[must_use]
+    pub fn asks(&self, name: &str) -> Option<&str> {
+        match self.policy {
+            Policy::Explicit => self.chosen_explicit(name),
+            Policy::Ordered => self.pinned(name).or_else(|| self.single_store()),
+        }
+    }
+
+    fn pinned(&self, name: &str) -> Option<&str> {
+        self.routes.get(name).map(String::as_str)
+    }
+
+    fn single_store(&self) -> Option<&str> {
+        match self.stores.as_slice() {
+            [only] => Some(only.id()),
+            _ => None,
+        }
+    }
+
+    /// The pin, else the default, else the only backend. `None` with several
+    /// backends is exactly the case [`Resolution::Ambiguous`] reports.
+    fn chosen_explicit(&self, name: &str) -> Option<&str> {
+        self.pinned(name)
+            .or(self.default_store.as_deref())
+            .or_else(|| self.single_store())
+    }
+
     /// Exactly one backend is eligible, and it is never chosen by ordering.
     fn resolve_explicit(&self, name: &str) -> Resolution {
-        let chosen = self
-            .routes
-            .get(name)
-            .or(self.default_store.as_ref())
-            .map(String::as_str);
-
         let undeclared = self.undeclared(name);
-        let Some(chosen) = chosen else {
-            return match self.stores.as_slice() {
-                [] => Resolution::NotFound { undeclared },
-                [only] => Self::ask(only.as_ref(), name, undeclared),
-                several => Resolution::Ambiguous {
-                    candidates: several.iter().map(|store| store.id().to_owned()).collect(),
-                },
+        let Some(chosen) = self.chosen_explicit(name) else {
+            return if self.stores.is_empty() {
+                Resolution::NotFound { undeclared }
+            } else {
+                Resolution::Ambiguous {
+                    candidates: self
+                        .stores
+                        .iter()
+                        .map(|store| store.id().to_owned())
+                        .collect(),
+                }
             };
         };
 
@@ -316,7 +358,7 @@ impl Registry {
 
     /// Every backend in order, first hit wins. Opt-in; see [`Policy::Ordered`].
     fn resolve_ordered(&self, name: &str) -> Resolution {
-        let pinned = self.routes.get(name).map(String::as_str);
+        let pinned = self.pinned(name);
         let mut errors = Vec::new();
         let mut asked_any = false;
 
@@ -755,7 +797,7 @@ pub fn build(config: &Config, invocation: &Invocation) -> Built {
 
 #[cfg(test)]
 mod tests {
-    use super::{Registry, Resolution, Store};
+    use super::{Registry, Resolution, Store, build, daemon};
     use crate::config::Policy;
     use crate::error::StoreError;
     use crate::secret::Secret;
@@ -1304,5 +1346,62 @@ mod tests {
     fn ordering_never_reports_ambiguity_because_it_never_refuses_to_choose() {
         let registry = Registry::new(two_tenants()).with_policy(Policy::Ordered);
         assert!(registry.resolve("DATABASE_URL").is_found());
+    }
+
+    // -----------------------------------------------------------------------
+    // `asks` — what `doctor` reads before a name is looked up.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn asks_answers_a_names_own_pin() {
+        let registry = Registry::new(two_tenants()).with_routes(
+            [("DATABASE_URL".to_owned(), "personal".to_owned())]
+                .into_iter()
+                .collect(),
+        );
+        assert_eq!(registry.asks("DATABASE_URL"), Some("personal"));
+    }
+
+    #[test]
+    fn asks_answers_the_default_store_when_unpinned() {
+        let registry = Registry::new(two_tenants()).with_default_store(Some("personal".to_owned()));
+        assert_eq!(registry.asks("DATABASE_URL"), Some("personal"));
+    }
+
+    #[test]
+    fn asks_answers_the_single_configured_backend() {
+        let registry = Registry::new(vec![Box::new(Fixed {
+            id: "a",
+            value: Some("decoy"),
+        })]);
+        assert_eq!(registry.asks("X"), Some("a"));
+    }
+
+    #[test]
+    fn asks_answers_none_for_an_unpinned_name_with_several_backends() {
+        // The shape `resolve` reports as `Ambiguous`: there is no single
+        // backend to name, so `doctor` must not invent one either.
+        let registry = Registry::new(two_tenants());
+        assert_eq!(registry.asks("DATABASE_URL"), None);
+    }
+
+    #[test]
+    fn asks_answers_the_daemon_for_a_name_configs_own_pin_names_elsewhere() {
+        // The defect this method exists to close: the config pins the name to
+        // `proton`, but `build` suppresses every local backend and every
+        // per-name pin the moment the daemon is enabled, so the lookup this
+        // registry actually performs reaches the daemon. `asks` must read
+        // that choice off the registry `resolve` will use, not off the
+        // config's own pin.
+        let config: crate::config::Config = serde_json::from_str(
+            r#"{"stores":{"proton":{"enabled":true},"daemon":{"enabled":true}},
+                "secrets":{"DATABASE_URL":{"store":"proton"}}}"#,
+        )
+        .expect("valid config");
+        let built = build(&config, &crate::store::Invocation::default());
+        assert_eq!(
+            built.registry.asks("DATABASE_URL"),
+            Some(daemon::DAEMON_STORE_ID)
+        );
     }
 }

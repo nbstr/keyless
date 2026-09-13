@@ -33,10 +33,11 @@
 //!    a COUNT, never as the titles that collided, for the same reason
 //!    [`crate::store::discover::discoverer`] refuses to enumerate the `daemon`
 //!    store at all.
-//! 3. **Nothing new on the happy request path.** A resolve that produces a value
-//!    never reaches this file. The catalogue is consulted after the resolver has
-//!    failed to produce one, which is why a miss may cost a lock and a scan and
-//!    a hit costs neither.
+//! 3. **Nothing heavy on the happy request path.** A declared name that resolves
+//!    costs a map lookup, and a derived one a lookup under the lock; neither
+//!    allocates a spelling it did not need. The scan behind a suggestion and
+//!    the rebuild behind a stale index are paid on a miss, which is why a miss
+//!    may cost a lock and a scan and a hit costs neither.
 //! 4. **No value, and no value's LENGTH, can cross.** The catalogue reads only
 //!    through `Discover`, whose shape makes a value structurally unavailable —
 //!    see that module for why a length is treated as a value here: "22
@@ -76,9 +77,11 @@
 //! A normalised title can itself contain `__`: `foo (bar)` mints `FOO__BAR_`.
 //! Splitting a missed name at its last `__` is therefore ambiguous on exactly
 //! the titles a caller is least able to guess. Instead every live title is
-//! minted and compared, and the LONGEST matching bare name wins — which is
-//! deterministic and cannot disagree with the minter, because it IS the minter.
+//! minted, the missed name is minted too, the two are compared, and the LONGEST
+//! matching bare name wins — which is deterministic and cannot disagree with the
+//! minter, because it IS the minter.
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -293,6 +296,44 @@ pub fn mint_bare(title: &str) -> Option<String> {
         return None;
     }
     Some(bare)
+}
+
+/// The name a request is looked up under: what its own text mints.
+///
+/// A caller who addresses an item by its title — `nexus-linear`,
+/// `nexus-mission__SECRET_KEY` — is asking for what that title mints, and
+/// running the request through [`normalise`] reproduces the minted form exactly
+/// because it IS the minting rule. Nothing is guessed: a spelling that two
+/// items mint is ambiguous under either spelling alike.
+///
+/// Borrowed when the name is already a fixed point of [`normalise`], which
+/// every minted name is, so a lookup that hits gains no allocation.
+fn spelling(name: &str) -> Cow<'_, str> {
+    let minted = !name.starts_with(|c: char| c.is_ascii_digit())
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_');
+    if minted {
+        Cow::Borrowed(name)
+    } else {
+        Cow::Owned(normalise(name))
+    }
+}
+
+/// What a declared map holds for `name`: under the name as sent, then under the
+/// name it mints.
+///
+/// The one place that order is written. Declared names are the only ones an
+/// operator may spell any way they like, so the caller's own spelling is asked
+/// first and always wins; the minted spelling is asked only on a miss.
+#[must_use]
+pub fn find_declared<'a, V>(map: &'a BTreeMap<String, V>, name: &str) -> Option<&'a V> {
+    declared_under(map, name, &spelling(name))
+}
+
+fn declared_under<'a, V>(map: &'a BTreeMap<String, V>, name: &str, spelt: &str) -> Option<&'a V> {
+    map.get(name)
+        .or_else(|| (spelt != name).then(|| map.get(spelt)).flatten())
 }
 
 /// What one item contributes to the index.
@@ -598,15 +639,21 @@ impl Catalogue {
     /// Declared first, derived second — see [`Catalogue::declared`]. Reads only;
     /// it starts no rebuild and asks no store, which is what lets the miss path
     /// call it while holding nothing.
+    ///
+    /// The derived half is asked under the name's [`spelling`], so an item's own
+    /// title reaches what it mints. The resolver above keys its cache on the
+    /// name as sent, so `nexus-linear` and `NEXUS_LINEAR` are two cache entries
+    /// for one value.
     #[must_use]
     pub fn route(&self, name: &str) -> Route {
-        if let Some(entry) = self.declared.get(name) {
+        let spelt = spelling(name);
+        if let Some(entry) = declared_under(&self.declared, name, &spelt) {
             return Route::Known(Box::new(entry.clone()));
         }
         let inner = self.inner();
-        match mintings(&inner, name) {
+        match mintings(&inner, &spelt) {
             Mintings::None => Route::Unknown {
-                nearest: nearest_to(name, &names_in(&inner)),
+                nearest: nearest_to(&spelt, &names_in(&inner)),
                 indexed_at: inner.index.at.map(|at| at.elapsed()),
             },
             Mintings::Sole(entry) => Route::Known(entry),
@@ -638,6 +685,8 @@ impl Catalogue {
     /// daemon-side only.
     #[must_use]
     pub fn invert(&self, name: &str) -> Option<ItemKey> {
+        let name = spelling(name);
+        let name = name.as_ref();
         let inner = self.inner();
         let mut best: Option<(&ItemKey, &Title)> = None;
         for (item, title) in &inner.index.titles {
@@ -710,6 +759,9 @@ impl Catalogue {
     /// The miss path decides whether to queue a rebuild off that same verdict,
     /// so a [`Catalogue::route`] here walks the index a second time for an
     /// answer already in the caller's hand.
+    ///
+    /// A name looked up under a different [`spelling`] is shown with it, so a
+    /// caller who typed an item's own title sees which minted form was tried.
     #[must_use]
     pub fn advice(&self, name: &str, route: &Route) -> String {
         // `checkout::ago` rather than a ladder of this module's own: it is the
@@ -721,25 +773,29 @@ impl Catalogue {
             || "no index yet".to_owned(),
             |age| format!("indexed {}", crate::checkout::ago(age)),
         );
+        let shown = match spelling(name) {
+            Cow::Owned(spelt) => format!("`{name}` (tried `{spelt}`)"),
+            Cow::Borrowed(_) => format!("`{name}`"),
+        };
         if let Some(item) = self.invert(name) {
             let names = self.item_names(&item);
             if !names.is_empty() {
                 return format!(
-                    "nothing is bound to `{name}`; the item behind that name serves: {} ({age})",
+                    "nothing is bound to {shown}; the item behind that name serves: {} ({age})",
                     names.join(", ")
                 );
             }
         }
         match route {
             Route::Ambiguous { stores, items } => format!(
-                "`{name}` is minted by {items} items across {} ({age}); declare it to say which",
+                "{shown} is minted by {items} items across {} ({age}); declare it to say which",
                 stores.join(", ")
             ),
             Route::Unknown { nearest, .. } if !nearest.is_empty() => format!(
-                "nothing is bound to `{name}`; nearest served names: {} ({age})",
+                "nothing is bound to {shown}; nearest served names: {} ({age})",
                 nearest.join(", ")
             ),
-            _ => format!("nothing is bound to `{name}` ({age})"),
+            _ => format!("nothing is bound to {shown} ({age})"),
         }
     }
 }
@@ -1248,4 +1304,35 @@ impl Engine {
 enum Task {
     Full,
     Fields(ItemKey),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{normalise, spelling};
+    use std::borrow::Cow;
+
+    #[test]
+    fn a_borrowed_spelling_is_exactly_what_normalise_would_have_returned() {
+        // The borrow is a shortcut past `normalise`, so it is only sound where
+        // `normalise` is the identity. Each side of that boundary is here.
+        for name in [
+            "NEXUS_LINEAR",
+            "NEXUS_MISSION__SECRET_KEY",
+            "_1UP",
+            "",
+            "nexus-linear",
+            "Nexus_Linear",
+            "1UP",
+            "A B",
+            "données",
+        ] {
+            let spelt = spelling(name);
+            assert_eq!(spelt, normalise(name), "{name}");
+            assert_eq!(
+                matches!(spelt, Cow::Borrowed(_)),
+                normalise(name) == name,
+                "{name}"
+            );
+        }
+    }
 }

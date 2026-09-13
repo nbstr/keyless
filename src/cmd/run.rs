@@ -374,6 +374,18 @@ pub fn run(request: RunRequest<'_>, notes: &mut dyn Write) -> Result<Outcome, Ru
         }
     }
 
+    // Read after every resolve above has had its turn, never before: a
+    // backend's advisory is the reply to the request this run just made, not
+    // a standing fact it could have been asked for earlier.
+    for advisory in request
+        .registry
+        .stores()
+        .iter()
+        .filter_map(|store| store.advisory())
+    {
+        let _ = writeln!(notes, "{NAME}: warning: {advisory}");
+    }
+
     // Not final: the kernel gets one more say at the spawn, below.
     let mut state = if unresolved.is_empty() {
         State::Injected

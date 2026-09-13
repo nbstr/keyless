@@ -23,7 +23,7 @@
 
 use keyless::config::SecretRoute;
 use keyless::store::catalogue::{
-    Catalogue, IndexBuilder, ItemKey, Mint, ProtonMint, Route, mint, mint_bare,
+    Catalogue, IndexBuilder, ItemKey, Mint, ProtonMint, Provenance, Route, mint, mint_bare,
 };
 use keyless::store::discover::{FieldKind, FieldSummary, ItemSummary};
 use std::collections::BTreeMap;
@@ -175,6 +175,18 @@ fn two_items_that_mint_one_name_leave_it_ambiguous_on_both_sides() {
     let said = advice(&catalogue, "MY_KEY");
     assert!(!said.contains("my-key"), "{said}");
     assert!(!said.contains("My Key"), "{said}");
+
+    // A title spelling that mints the colliding name is refused the same way,
+    // never guessed, and says which name it was refused under.
+    match catalogue.route("my-key") {
+        Route::Ambiguous { items, .. } => assert_eq!(items, 2),
+        other => panic!("a title spelling of a colliding name must not route: {other:?}"),
+    }
+    let said = advice(&catalogue, "my-key");
+    assert!(
+        said.contains("tried `MY_KEY`") && said.contains("is minted by"),
+        "{said}"
+    );
 
     // A non-colliding name from the same listing is unaffected — without this
     // the test would pass on an index that refused everything.
@@ -391,6 +403,95 @@ fn two_live_items_sharing_one_title_clash_rather_than_one_of_them_vanishing() {
     assert!(!catalogue.names().contains(&"DECOY".to_owned()));
     // The control: a title held by one item is unaffected.
     assert!(catalogue.names().contains(&"DEMO_LOGIN".to_owned()));
+}
+
+#[test]
+fn a_title_spelled_name_routes_to_what_its_minted_form_serves() {
+    // A caller who passed the item's own title, not the name it mints.
+    let catalogue = indexed(&BTreeMap::new(), &[item("nexus-linear")]);
+
+    match (
+        catalogue.route("nexus-linear"),
+        catalogue.route("NEXUS_LINEAR"),
+    ) {
+        (Route::Known(by_title), Route::Known(by_minted)) => {
+            assert_eq!(by_title.route.item, by_minted.route.item);
+            assert_eq!(by_title.route.vault, by_minted.route.vault);
+            assert_eq!(by_title.route.field, by_minted.route.field);
+        }
+        other => panic!("both spellings must route to the same entry: {other:?}"),
+    }
+}
+
+#[test]
+fn a_declaration_answers_to_its_title_spelling_and_the_spelling_as_sent_wins() {
+    let mut secrets = BTreeMap::new();
+    for (name, item) in [("DEMO_LOGIN", "demo login"), ("demo-token", "demo token")] {
+        secrets.insert(
+            name.to_owned(),
+            serde_json::from_str::<SecretRoute>(&format!(
+                r#"{{"store":"proton","vault":"personal","item":"{item}","field":"password"}}"#
+            ))
+            .expect("valid"),
+        );
+    }
+    // `DEMO_TOKEN` is also minted by the vault, so an operator's own spelling
+    // has to be asked before the one it normalises to.
+    let catalogue = indexed(&secrets, &[item("demo-token")]);
+
+    match catalogue.route("demo-login") {
+        Route::Known(entry) => {
+            assert_eq!(entry.provenance, Provenance::Declared);
+            assert_eq!(entry.route.item.as_deref(), Some("demo login"));
+        }
+        other => panic!("a declaration must answer to its title spelling: {other:?}"),
+    }
+    match catalogue.route("demo-token") {
+        Route::Known(entry) => assert_eq!(entry.provenance, Provenance::Declared),
+        other => panic!("the spelling as sent must win: {other:?}"),
+    }
+}
+
+#[test]
+fn a_field_qualified_title_spelling_inverts_onto_the_same_item_as_its_minted_form() {
+    let plain = item("demo api key");
+    let catalogue = indexed(&BTreeMap::new(), std::slice::from_ref(&plain));
+    let key = key_of(&plain);
+    catalogue.install_view(
+        &key,
+        &ProtonMint,
+        &plain,
+        &[field("Expiry Date"), field("password")],
+    );
+
+    let by_minted = catalogue
+        .invert("DEMO_API_KEY__EXPIRY_DATE")
+        .expect("the minted spelling inverts");
+    let by_title = catalogue
+        .invert("demo-api-key__expiry-date")
+        .expect("the title spelling must invert onto the same item");
+    assert_eq!(by_minted, by_title);
+
+    assert!(matches!(
+        catalogue.route("demo-api-key__expiry-date"),
+        Route::Known(_)
+    ));
+}
+
+#[test]
+fn a_name_that_normalises_to_nothing_served_degrades_and_names_the_form_it_tried() {
+    let catalogue = indexed(&BTreeMap::new(), &[item("decoy-token")]);
+
+    assert!(matches!(
+        catalogue.route("no-such-item"),
+        Route::Unknown { .. }
+    ));
+    let said = advice(&catalogue, "no-such-item");
+    assert!(said.contains("tried `NO_SUCH_ITEM`"), "{said}");
+
+    // A name looked up as sent gets the sentence it always got.
+    let unchanged = advice(&catalogue, "NO_SUCH_ITEM");
+    assert!(!unchanged.contains("tried"), "{unchanged}");
 }
 
 #[test]

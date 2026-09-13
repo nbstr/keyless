@@ -255,6 +255,10 @@ struct WireReply {
     reason: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     names: Vec<String>,
+    /// An operational notice riding alongside this reply, independent of its
+    /// own status — see [`Reply::encode_with_advisory`]. Never a secret.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    advisory: Option<String>,
 }
 
 impl Reply {
@@ -273,12 +277,27 @@ impl Reply {
 
     /// Serialize to one frame, newline included.
     pub fn encode(&self) -> io::Result<Vec<u8>> {
+        self.encode_with_advisory(None)
+    }
+
+    /// Serialize to one frame, carrying an operational notice alongside it.
+    ///
+    /// The advisory is not part of the reply's own status — a value can
+    /// resolve, or fail to, independently of whether something else about the
+    /// daemon is worth saying — so it rides in its own wire field rather than
+    /// becoming a fifth thing every `Reply` variant would have to carry.
+    /// [`crate::daemon::credential::run_expiry_advisory`] is the one producer
+    /// today; a caller with nothing to add passes `None`, which serialises to
+    /// nothing on the wire and costs an unread build older than this field
+    /// nothing at all.
+    pub fn encode_with_advisory(&self, advisory: Option<&str>) -> io::Result<Vec<u8>> {
         let mut wire = WireReply {
             v: PROTOCOL_VERSION,
             status: self.status().to_owned(),
             value: None,
             reason: None,
             names: Vec::new(),
+            advisory: advisory.map(str::to_owned),
         };
         match self {
             Reply::Value(secret) => wire.value = Some(secret.expose().to_owned()),
@@ -332,6 +351,27 @@ impl Reply {
         };
         Ok(reply)
     }
+}
+
+/// The advisory riding alongside a reply frame, if this daemon attached one.
+///
+/// Split from [`Reply::decode`] rather than folded into it, so every existing
+/// reader of a decoded [`Reply`] — which is most of them, and none of which
+/// asked for this — keeps matching on the same four or five variants it
+/// always has. A frame carrying no `advisory` field, including every one a
+/// build that predates this function ever sent, decodes to `None` here the
+/// same way [`Request::progress`] decodes to `false` for a client that never
+/// heard of it.
+#[must_use]
+pub fn decode_advisory(frame: &[u8]) -> Option<String> {
+    #[derive(Deserialize)]
+    struct Peek {
+        #[serde(default)]
+        advisory: Option<String>,
+    }
+    serde_json::from_slice::<Peek>(frame)
+        .ok()
+        .and_then(|peek| peek.advisory)
 }
 
 /// The wire was not understood.
@@ -484,6 +524,37 @@ mod tests {
             Reply::Denied(reason) => assert_eq!(reason, "unknown-image"),
             other => panic!("expected a denial, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn an_advisory_rides_alongside_any_status_and_never_replaces_it() {
+        let frame = Reply::Value(Secret::new("decoy-value".to_owned()))
+            .encode_with_advisory(Some("the token expires soon"))
+            .expect("encode");
+        assert_eq!(
+            super::decode_advisory(&frame[..frame.len() - 1]),
+            Some("the token expires soon".to_owned())
+        );
+        match Reply::decode(&frame[..frame.len() - 1]).expect("decode") {
+            Reply::Value(secret) => assert_eq!(secret.expose(), "decoy-value"),
+            other => panic!("expected a value, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn no_advisory_means_no_advisory_field_and_no_advisory_read_back() {
+        let frame = Reply::Absent.encode().expect("encode");
+        assert!(
+            !String::from_utf8_lossy(&frame).contains("advisory"),
+            "an absent advisory must not appear on the wire at all"
+        );
+        assert_eq!(super::decode_advisory(&frame[..frame.len() - 1]), None);
+    }
+
+    #[test]
+    fn a_frame_from_a_build_that_predates_advisories_reads_back_none() {
+        let raw = br#"{"v":1,"status":"absent"}"#;
+        assert_eq!(super::decode_advisory(raw), None);
     }
 
     #[test]
