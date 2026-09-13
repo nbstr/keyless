@@ -46,21 +46,33 @@
 //! failure above is reached. This module ADDS three variables and removes
 //! nothing.
 //!
-//! **A deadline on `login` and `info` — never on [`retire`]'s two logouts.**
-//! `stores.proton.timeout_ms` bounds a LOOKUP, where a hung vendor would hold
-//! a session's command open with nobody watching. `login` and `info` run
-//! either with a person at a terminal who can stop them — `keylessd login`
-//! typed by hand — or as the renewal loop's own probe of a generation
-//! nothing is reading yet, and killing either part way is how a session
-//! store ends up half-written — the one damage in this directory that
-//! nothing here can repair. See [`crate::store::proton`]'s note on
-//! interrupted writes. `retire`'s two logouts are the opposite shape: they
-//! run unattended, on the renewal loop's own thread, against a directory
-//! nothing is writing to any more, so a hung one is pure loss with no
-//! half-written store to protect — and a wedge on that thread is the same
-//! outage class this whole change exists to end, reached through a
-//! different door. `retire` bounds them with
-//! [`crate::store::exec::capture`] instead of this module's own `run`.
+//! # Every vendor child this module spawns runs under a deadline
+//!
+//! `stores.proton.timeout_ms` bounds every one of them — `login`, `info` and
+//! `logout` alike — through [`run`], which is built on
+//! [`crate::store::exec::capture`]: past the deadline the child is killed and
+//! reaped, and the caller reads that exactly like an ordinary vendor
+//! refusal, on the same backoff a refusal already drives.
+//!
+//! What a killed verb can damage differs by which directory it was scoped
+//! at, which is what makes killing every one of them safe. `login` and the
+//! `info` that verifies it, in [`establish`], are always scoped at a FRESH
+//! generation nothing is reading yet — a kill there only ever costs a
+//! directory the failure path was already about to discard whole, never a
+//! store anything depends on. `info` against the CURRENT, live generation —
+//! [`already_authenticated_now`] here, and the renewal loop's own liveness
+//! probe — is the same verb against the same directory the read path already
+//! kills at a deadline in
+//! [`crate::store::proton::ProtonStore::info_probe_answers`], so bounding it
+//! here adds no exposure that directory does not already carry. `retire`'s
+//! two logouts run against a directory nothing is writing to any more, so a
+//! kill there is pure loss with no half-written store to protect.
+//!
+//! [`login_deadline`] allows `login` twice [`probe_deadline`]'s budget — a
+//! network login is a heavier round trip than a local liveness probe — and
+//! [`grace`] is built wide enough to absorb a killed login plus the time
+//! `capture` waits for it to be reaped, so a sweep can never retire a fresh
+//! generation a killed login is still writing into.
 //!
 //! **Any judgement about whether a session already exists, made without
 //! asking.** The vendor no longer gets to answer that for a generation this
@@ -143,6 +155,10 @@ pub struct Coordinates {
     /// `keylessd credential`, and asking for two values at one prompt is how
     /// one of them ends up in the wrong file.
     pub extra: BTreeMap<String, String>,
+    /// `stores.proton.timeout_ms`, the one source every deadline this module
+    /// bounds a vendor child by is derived from — see [`login_deadline`] and
+    /// [`probe_deadline`].
+    pub timeout_ms: u64,
 }
 
 /// Why a store other than Proton has no login verb.
@@ -258,6 +274,7 @@ pub fn coordinates(config: &super::config::DaemonConfig) -> Result<Coordinates, 
         credentials_file,
         token_entry,
         extra,
+        timeout_ms: settings.timeout_ms,
     })
 }
 
@@ -625,19 +642,35 @@ pub fn classify(status: ExitStatus, said: &str) -> Outcome {
     Outcome::Failed(said.trim().to_owned())
 }
 
-/// Spawn a built command and return its status with both streams joined.
+/// Spawn a built command, run it to completion or kill it at `deadline`, and
+/// return its status with both streams joined.
+///
+/// Every vendor child this module spawns runs under a deadline: [`establish`]
+/// scopes `login` at [`login_deadline`] and `info` at [`probe_deadline`], and
+/// [`discard_unpublished`]'s plain logout is a probe too. A killed child is
+/// reaped by [`exec::capture`] itself, within [`REAP_GRACE`] of the deadline
+/// — so a hung `pass-cli` is never left running and never leaves this
+/// function waiting on it.
 ///
 /// # Errors
 ///
-/// The spawn itself. `EPERM` is the ordinary answer to running this without
-/// `sudo`, because the child asks to become the daemon's uid before it execs;
-/// the caller turns that into a sentence about privilege rather than an errno.
-pub fn run(mut command: Command) -> Result<(ExitStatus, String), std::io::Error> {
-    let output = command.output()?;
-    let mut said = String::from_utf8_lossy(&output.stderr).into_owned();
+/// [`exec::CaptureError`]. [`exec::CaptureError::Spawn`] is the ordinary
+/// answer to running this without `sudo`, because the child asks to become
+/// the daemon's uid before it execs; the caller turns that into a sentence
+/// about privilege rather than an errno. Every other variant, above all
+/// [`exec::CaptureError::TimedOut`], is the vendor child having been killed
+/// at `deadline` — the caller reports that a verb was killed and that
+/// nothing was made current, and takes the same discard path an ordinary
+/// vendor refusal takes.
+pub fn run(
+    command: Command,
+    deadline: Duration,
+) -> Result<(ExitStatus, String), exec::CaptureError> {
+    let captured = exec::capture(command, deadline)?;
+    let mut said = String::from_utf8_lossy(&captured.stderr).into_owned();
     said.push('\n');
-    said.push_str(&String::from_utf8_lossy(&output.stdout));
-    Ok((output.status, said))
+    said.push_str(&String::from_utf8_lossy(&captured.stdout));
+    Ok((captured.status, said))
 }
 
 /// What to tell an operator on a machine where the daemon's uid is unknown.
@@ -881,13 +914,15 @@ pub fn perform(
 ///    cannot supply one on its own (see the module header).
 /// 2. [`Generations::create`] a fresh, empty, `0700` directory. Nothing reads
 ///    it yet.
-/// 3. `pass-cli login`, scoped at that directory alone. Anything but
-///    [`Outcome::LoggedIn`] discards the directory directly — no grace, no
-///    sweep, because its only possible reader is this call and
-///    `Command::output()` has already returned.
-/// 4. Verify with `pass-cli info` at the same directory. A non-zero answer
-///    means the vendor reported success and then could not be asked anything
-///    — discarded the same way as step 3, after a plain logout first, since
+/// 3. `pass-cli login`, scoped at that directory alone and killed if it is
+///    still running at [`login_deadline`]. Anything but [`Outcome::LoggedIn`]
+///    — a kill included — discards the directory directly — no grace, no
+///    sweep, because its only possible reader is this call and `run` has
+///    already returned.
+/// 4. Verify with `pass-cli info` at the same directory, killed if it is
+///    still running at [`probe_deadline`]. A non-zero answer or a kill means
+///    the vendor reported success and then could not be asked anything —
+///    discarded the same way as step 3, after a plain logout first, since
 ///    the account-side session this time genuinely exists.
 /// 5. [`Generations::publish`]. From this instant every new pass reads the
 ///    new generation. A failure here discards the same way as step 4 — the
@@ -959,13 +994,16 @@ pub fn establish(
         Secret::new(token.expose().to_owned()),
     ));
 
-    let spawned = run(login_command(coordinates, &dir, &login, owner));
+    let spawned = run(
+        login_command(coordinates, &dir, &login, owner),
+        login_deadline(coordinates.timeout_ms),
+    );
     drop(login.pop());
     let extra_only = &login;
 
     let (status, said) = spawned.map_err(|error| {
         let _ = fs::remove_dir_all(&dir);
-        cannot_spawn(coordinates, owner, &error)
+        not_run(coordinates, owner, &dir, "login", &error)
     })?;
 
     let outcome = classify(status, &said);
@@ -988,11 +1026,14 @@ pub fn establish(
     writeln!(out, "login\t{STORE}\t{}", dir.display())
         .map_err(|error| format!("the report could not be written: {error}"))?;
 
-    let (status, said) =
-        run(info_command(coordinates, &dir, extra_only, owner)).map_err(|error| {
-            discard_unpublished(coordinates, &dir, extra_only, owner);
-            cannot_spawn(coordinates, owner, &error)
-        })?;
+    let (status, said) = run(
+        info_command(coordinates, &dir, extra_only, owner),
+        probe_deadline(coordinates.timeout_ms),
+    )
+    .map_err(|error| {
+        discard_unpublished(coordinates, &dir, extra_only, owner);
+        not_run(coordinates, owner, &dir, "info", &error)
+    })?;
     if !status.success() {
         discard_unpublished(coordinates, &dir, extra_only, owner);
         return Err(format!(
@@ -1040,20 +1081,24 @@ fn already_authenticated_now(
     let Ok(pass) = generations.enter() else {
         return false;
     };
-    run(info_command(coordinates, pass.dir(), login, owner))
-        .map(|(status, _)| status.success())
-        .unwrap_or(false)
+    run(
+        info_command(coordinates, pass.dir(), login, owner),
+        probe_deadline(coordinates.timeout_ms),
+    )
+    .map(|(status, _)| status.success())
+    .unwrap_or(false)
 }
 
 /// Log out (best-effort) and delete a generation this call created but will
 /// never publish.
 ///
 /// The one exception to the grace-and-drain retirement [`sweep`] performs: a
-/// generation nobody but THIS call could ever have read, whose
-/// `Command::output()` has already returned, needs neither a grace nor a
-/// drain — there is no reader left to wait for. The logout is attempted
-/// unconditionally; whether the account had anything to end is the vendor's
-/// business, and its answer is not decisive here.
+/// generation nobody but THIS call could ever have read, whose `run` has
+/// already returned, needs neither a grace nor a drain — there is no reader
+/// left to wait for. The logout is attempted unconditionally, bounded by
+/// [`probe_deadline`] like every other logout this module spawns; whether the
+/// account had anything to end, or the child had to be killed to find out, is
+/// the vendor's business and not decisive here.
 ///
 /// `login` carries the same extra credentials [`establish`] holds — a plain
 /// logout builds a client exactly like `info` does, so under
@@ -1065,7 +1110,10 @@ fn discard_unpublished(
     login: &[(String, Secret)],
     owner: Owner,
 ) {
-    let _ = run(logout_command(coordinates, dir, false, login, owner));
+    let _ = run(
+        logout_command(coordinates, dir, false, login, owner),
+        probe_deadline(coordinates.timeout_ms),
+    );
     let _ = fs::remove_dir_all(dir);
 }
 
@@ -1092,6 +1140,33 @@ fn cannot_spawn(coordinates: &Coordinates, owner: Owner, error: &std::io::Error)
          `stores.{STORE}.binary` in the config, and it is worth an absolute path — this runs \
          as the daemon, whose `PATH` is not yours",
         coordinates.binary.display()
+    )
+}
+
+/// What to tell an operator whose vendor child produced no answer to read —
+/// it never started, or [`run`] ended it at its deadline.
+///
+/// A spawn failure is [`cannot_spawn`]'s sentence. Every other
+/// [`exec::CaptureError`] is the deadline, rather than the vendor, ending the
+/// child: its own [`std::fmt::Display`] already says `no answer within N ms`,
+/// so this adds only what that error cannot — which verb, against which
+/// directory, and that nothing was made current because of it.
+fn not_run(
+    coordinates: &Coordinates,
+    owner: Owner,
+    dir: &Path,
+    verb: &str,
+    error: &exec::CaptureError,
+) -> String {
+    if let exec::CaptureError::Spawn(error) = error {
+        return cannot_spawn(coordinates, owner, error);
+    }
+    format!(
+        "`pass-cli {verb}` at {} was stopped: {error}. The child is gone and nothing there was \
+         made current; the next attempt establishes another fresh generation. Nothing was \
+         written to {}",
+        dir.display(),
+        coordinates.credentials_file.display()
     )
 }
 
@@ -1200,6 +1275,33 @@ pub fn logged_in_but_unwritten(coordinates: &Coordinates, dir: &Path, detail: &s
     )
 }
 
+/// The deadline a `pass-cli info` or a `pass-cli logout` child is killed at.
+///
+/// The plain `bounded_timeout(timeout_ms)` every other lookup in this crate is
+/// bounded by — the same read-path budget `stores.proton.timeout_ms`
+/// configures for everything else this daemon spawns against Proton.
+#[must_use]
+pub fn probe_deadline(timeout_ms: u64) -> Duration {
+    bounded_timeout(timeout_ms)
+}
+
+/// The deadline a `pass-cli login` child is killed at.
+///
+/// Twice [`probe_deadline`]: a network login is a heavier round trip than a
+/// local liveness probe, so it is allowed twice the budget rather than being
+/// killed at the same bound a probe is. And twice is the most this may ever
+/// be, because [`grace`] is built to absorb it — see that function's own
+/// `2 × bounded_timeout(timeout_ms)` term, which exists so that a login this
+/// crate has just killed can never still be writing into a directory once a
+/// sweep has decided that directory's grace has cleared. A login allowed
+/// three times the probe would need `grace` widened to match, and nothing
+/// here enforces that the two stay in step except the unit test beside this
+/// function.
+#[must_use]
+pub fn login_deadline(timeout_ms: u64) -> Duration {
+    2 * bounded_timeout(timeout_ms)
+}
+
 /// The grace a retirement candidate must clear before [`sweep`] logs it out.
 ///
 /// `2 × bounded_timeout(timeout_ms) + REAP_GRACE + 1s`. Two `capture`-bounded
@@ -1217,21 +1319,6 @@ pub fn grace(timeout_ms: u64) -> Duration {
     2 * bounded_timeout(timeout_ms) + REAP_GRACE + Duration::from_secs(1)
 }
 
-/// What a `pass-cli` child said, both streams joined the way [`run`]'s own
-/// return value joins them — stderr, a newline, then stdout.
-///
-/// [`exec::capture`] keeps the two streams separate; `retire`'s "already
-/// logged out" check needs them joined the same way `run`'s callers have
-/// always read it, so a stub answering on either stream (the standing
-/// `LogoutAnswer::AlreadyLoggedOut`/`Fails` fixtures write to both) is read
-/// identically whichever function produced it.
-fn captured_said(captured: &exec::Captured) -> String {
-    let mut said = String::from_utf8_lossy(&captured.stderr).into_owned();
-    said.push('\n');
-    said.push_str(&String::from_utf8_lossy(&captured.stdout));
-    said
-}
-
 /// Run the ordered retirement procedure against one candidate.
 ///
 /// Never touches [`Generations::current`] — every step is guarded by
@@ -1241,12 +1328,12 @@ fn captured_said(captured: &exec::Captured) -> String {
 /// 1. [`Generations::drain`] — wait for this process's own readers of the
 ///    candidate to finish, for at most `bound`.
 /// 2. A plain `pass-cli logout`, scoped at the candidate and bounded by
-///    `timeout_ms` — [`exec::capture`], never [`run`], because this child
-///    runs unattended on the renewal loop's own thread; see the module
-///    header. Success, or the vendor's own "already logged out", both mean
-///    the account-side session this candidate held is gone.
-/// 3. On any other outcome — a refusal, a spawn failure, or a timeout alike
-///    — `pass-cli logout --force`, bounded the same way. The vendor's own
+///    [`probe_deadline`] like every other logout this module spawns — see
+///    the module header. Success, or the vendor's own "already logged out",
+///    both mean the account-side session this candidate held is gone; a
+///    killed child is read the same as a refusal.
+/// 3. On any other outcome — a refusal, a spawn failure, or a kill alike —
+///    `pass-cli logout --force`, bounded the same way. The vendor's own
 ///    words describe this as deleting the directory's contents rather than
 ///    ending the session at the account, which is exactly what step 4 is
 ///    about to do anyway, so nothing here relies on it reaching the
@@ -1265,7 +1352,6 @@ pub fn retire(
     generations: &Generations,
     candidate: &Candidate,
     bound: Duration,
-    timeout_ms: u64,
     out: &mut dyn std::io::Write,
 ) -> Result<(), String> {
     let drain_key = candidate.drain_key();
@@ -1284,20 +1370,19 @@ pub fn retire(
     // not wedge over one entry's own misconfiguration.
     let login = extra_credentials(coordinates).unwrap_or_default();
 
-    let timeout = bounded_timeout(timeout_ms);
-    let already_gone = match exec::capture(
+    let timeout = probe_deadline(coordinates.timeout_ms);
+    let already_gone = match run(
         logout_command(coordinates, candidate.scope(), false, &login, owner),
         timeout,
     ) {
-        Ok(captured) => {
-            let said = captured_said(&captured);
-            captured.status.success() || said.to_ascii_lowercase().contains("already logged out")
+        Ok((status, said)) => {
+            status.success() || said.to_ascii_lowercase().contains("already logged out")
         }
-        // A spawn failure or a timeout is read exactly like a refusal:
-        // step 3 runs whatever step 2 did or did not manage to say. See
-        // this function's own doc — dropping the vendor's own `?` here is
-        // what makes that ordering hold for every kind of failure, not
-        // only the ones with an exit status to read.
+        // A spawn failure or a kill is read exactly like a refusal: step 3
+        // runs whatever step 2 did or did not manage to say. See this
+        // function's own doc — dropping the vendor's own `?` here is what
+        // makes that ordering hold for every kind of failure, not only the
+        // ones with an exit status to read.
         Err(_) => false,
     };
     if !already_gone {
@@ -1305,7 +1390,7 @@ pub fn retire(
         // doc. `remove` below is what actually clears the directory. `--force`
         // never needs `login` — see `logout_command`'s own doc — and carries
         // it anyway, for the same reason that doc gives.
-        let _ = exec::capture(
+        let _ = run(
             logout_command(coordinates, candidate.scope(), true, &login, owner),
             timeout,
         );
@@ -1334,11 +1419,9 @@ pub fn retire(
 /// most once per candidate per process, via
 /// [`Generations::mark_failure_reported`].
 ///
-/// `timeout_ms` bounds every vendor child [`retire`] spawns for each
-/// candidate — the same value the store's own reads are bounded by. Passed
-/// through rather than read off `coordinates`, which carries no timeout of
-/// its own: see [`retire`]'s doc for why this loop's two logouts need one at
-/// all.
+/// `coordinates.timeout_ms` bounds every vendor child [`retire`] spawns for
+/// each candidate, through [`probe_deadline`] — the same value the store's
+/// own reads are bounded by.
 ///
 /// # Returns
 ///
@@ -1355,7 +1438,6 @@ pub fn sweep(
     owner: Owner,
     generations: &Generations,
     grace: Duration,
-    timeout_ms: u64,
     stop: Option<&AtomicBool>,
     out: &mut dyn std::io::Write,
 ) -> usize {
@@ -1374,15 +1456,7 @@ pub fn sweep(
         if stop.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
             break;
         }
-        match retire(
-            coordinates,
-            owner,
-            generations,
-            &candidate,
-            grace,
-            timeout_ms,
-            out,
-        ) {
+        match retire(coordinates, owner, generations, &candidate, grace, out) {
             Ok(()) => retired += 1,
             Err(detail) => {
                 if generations.mark_failure_reported(&candidate.label()) {
@@ -1401,6 +1475,40 @@ pub fn sweep(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The property [`grace`]'s own doc relies on: a login this crate killed
+    /// can never still be writing into a fresh generation once a sweep has
+    /// decided that generation's grace has cleared.
+    ///
+    /// `0` and a value above [`crate::config::MAX_TIMEOUT_MS`] are included
+    /// because both are values a real config can hold — `bounded_timeout`
+    /// clamps the second down and leaves the first alone — and the ordering
+    /// this test pins must survive both.
+    #[test]
+    fn a_login_is_allowed_twice_a_probe_and_grace_absorbs_it_plus_the_reap() {
+        for timeout_ms in [0, 1, 100, 10_000, crate::config::MAX_TIMEOUT_MS, 999_999] {
+            let probe = probe_deadline(timeout_ms);
+            let login = login_deadline(timeout_ms);
+            assert!(
+                login > probe || (probe.is_zero() && login.is_zero()),
+                "timeout_ms={timeout_ms}: login_deadline ({login:?}) must exceed \
+                 probe_deadline ({probe:?})"
+            );
+            assert_eq!(
+                login,
+                2 * probe,
+                "timeout_ms={timeout_ms}: login_deadline must be exactly twice probe_deadline"
+            );
+            assert!(
+                login + REAP_GRACE < grace(timeout_ms),
+                "timeout_ms={timeout_ms}: login_deadline + REAP_GRACE ({:?}) must stay inside \
+                 grace ({:?}), or a sweep can retire a generation a killed login is still \
+                 writing into",
+                login + REAP_GRACE,
+                grace(timeout_ms)
+            );
+        }
+    }
 
     /// Every combination of the four inputs, and the one that used to be wrong.
     ///
@@ -1482,6 +1590,7 @@ mod tests {
             credentials_file: PathBuf::from("/var/lib/keyless/proton.json"),
             token_entry: "AGENT_TOKEN".to_owned(),
             extra: BTreeMap::new(),
+            timeout_ms: crate::config::DEFAULT_TIMEOUT_MS,
         };
         let generation = coordinates.session_dir.join("gen-1789012345678-4242");
         let login = key_vector();
@@ -1573,6 +1682,7 @@ mod tests {
             credentials_file: dir.join("proton.json"),
             token_entry: "AGENT_TOKEN".to_owned(),
             extra: BTreeMap::new(),
+            timeout_ms: crate::config::DEFAULT_TIMEOUT_MS,
         };
 
         let answered = already_authenticated_now(&coordinates, owner, &generations, &key_vector());
@@ -1734,6 +1844,7 @@ mod tests {
             credentials_file: dir.join("proton.json"),
             token_entry: "AGENT_TOKEN".to_owned(),
             extra: BTreeMap::new(),
+            timeout_ms: crate::config::DEFAULT_TIMEOUT_MS,
         }
     }
 

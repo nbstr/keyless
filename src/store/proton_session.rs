@@ -400,12 +400,14 @@ pub struct Generations {
     /// The last coalesced session-health probe [`Generations::session_fault`]
     /// actually ran, and what it heard. See that method.
     probe: Mutex<Option<ProbeMemo>>,
-    /// The generation a read last established cannot be used — a missing
-    /// `session.json`, or a probe that could not reach it — consumed by
+    /// What a read last established cannot be trusted — a missing
+    /// `session.json`, a probe that could not reach it, or `current` itself
+    /// failing to name a live generation — consumed by
     /// [`Generations::take_session_fault`]: the renewal loop's own cue to
     /// replace it without waiting out its ordinary interval.
     ///
-    /// # Why it carries the name rather than a bare flag
+    /// # Why a report about a generation carries its name rather than a bare
+    /// # flag
     ///
     /// A read keeps serving from the generation it entered while a
     /// replacement is built beside it, so a pass held on one generation can
@@ -416,8 +418,27 @@ pub struct Generations {
     /// spurious retirement, once per late report. The name is free: the
     /// reporting caller is holding it.
     ///
-    /// See [`Generations::report_session_fault`].
-    session_fault: Mutex<Option<GenerationName>>,
+    /// [`SessionFault::Pointer`] carries no name because there is none to
+    /// carry: `current` itself is what failed to resolve, before any
+    /// generation was entered.
+    ///
+    /// See [`Generations::report_session_fault`] and
+    /// [`Generations::report_pointer_fault`].
+    session_fault: Mutex<Option<SessionFault>>,
+}
+
+/// What a pending session fault is about — read by
+/// [`Generations::take_session_fault`] to decide whether the report still
+/// stands.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SessionFault {
+    /// A specific generation was entered and found unusable —
+    /// [`Generations::report_session_fault`].
+    Generation(GenerationName),
+    /// `current` itself did not name a live generation — one of
+    /// [`CurrentFault`]'s three shapes, none of which ever entered a
+    /// generation to name — [`Generations::report_pointer_fault`].
+    Pointer,
 }
 
 /// What [`Generations::probe_once_per_window`] last asked, and heard, for one
@@ -1035,11 +1056,27 @@ impl Generations {
     /// Idempotent: several callers reporting the same generation before the
     /// loop next wakes cost one report, not one per caller.
     pub(crate) fn report_session_fault(&self, name: &GenerationName) {
+        self.record_fault(SessionFault::Generation(name.clone()));
+    }
+
+    /// Record that `current` itself did not name a live generation — one of
+    /// [`CurrentFault`]'s three shapes reached with no generation entered, so
+    /// there is no name to report against. Same cue as
+    /// [`Generations::report_session_fault`], same idempotency: a burst of
+    /// reads against one broken pointer costs one report, not one per read.
+    pub(crate) fn report_pointer_fault(&self) {
+        self.record_fault(SessionFault::Pointer);
+    }
+
+    /// The write both report methods above make: overwrite whatever is
+    /// pending with this fault. Shared so the poison-recovery choice lives
+    /// once.
+    fn record_fault(&self, fault: SessionFault) {
         let mut reported = self
             .session_fault
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        *reported = Some(name.clone());
+        *reported = Some(fault);
     }
 
     /// Whether a fault is waiting to be acted on, without consuming it —
@@ -1058,10 +1095,18 @@ impl Generations {
     /// that woke the loop early is also what decides that tick is due — a
     /// fault reported after this call waits for the next one.
     ///
-    /// A report is discarded only where it can be PROVEN superseded: the
-    /// `current` pointer resolves, and names a different generation. An
-    /// unreadable pointer proves nothing about the report, and is itself a
-    /// state a replacement fixes, so the fault stands.
+    /// A report about a named generation is discarded only where it can be
+    /// PROVEN superseded: the `current` pointer resolves, and names a
+    /// DIFFERENT generation. An unreadable pointer proves nothing about that
+    /// report, and is itself a state a replacement fixes, so the fault
+    /// stands.
+    ///
+    /// A [`SessionFault::Pointer`] report carries no generation to compare
+    /// against — the proof it asks for is the mirror image: `current`
+    /// resolving AT ALL is what proves the broken pointer this report was
+    /// about has already been replaced, by this loop's own last renewal or
+    /// by an operator's hand. It still failing to resolve is the same
+    /// unreadable-pointer case as above, so the fault stands.
     pub(crate) fn take_session_fault(&self) -> bool {
         let taken = self
             .session_fault
@@ -1071,9 +1116,12 @@ impl Generations {
         let Some(reported) = taken else {
             return false;
         };
-        match self.current() {
-            Ok(current) => current == reported,
-            Err(_) => true,
+        match reported {
+            SessionFault::Generation(reported) => match self.current() {
+                Ok(current) => current == reported,
+                Err(_) => true,
+            },
+            SessionFault::Pointer => self.current().is_err(),
         }
     }
 }
@@ -1793,6 +1841,54 @@ mod tests {
         assert!(
             generations.take_session_fault(),
             "a fault was discarded because `current` could not be read"
+        );
+    }
+
+    #[test]
+    fn a_pointer_fault_stands_while_current_still_fails_to_resolve() {
+        // Reported with no generation entered at all — `current` never
+        // named one — so the mirror of the named-generation case above:
+        // nothing to compare against but `current` itself, still failing.
+        let dir = scratch("pointer-fault-still-broken");
+        let generations = Generations::at(dir);
+        generations.report_pointer_fault();
+
+        assert!(
+            generations.take_session_fault(),
+            "a pointer fault was discarded while `current` still could not resolve"
+        );
+    }
+
+    #[test]
+    fn a_pointer_fault_is_discarded_once_current_resolves() {
+        // CONTROL — the change that makes this fail: treating a pointer
+        // fault as unconditionally standing, the way a named fault does on
+        // an unreadable `current`. Here `current` DOES resolve — a
+        // replacement landed — so the report of the broken pointer it
+        // replaces is exactly the case this discards.
+        let generations = Generations::at(scratch("pointer-fault-fixed"));
+        generations.report_pointer_fault();
+
+        let (name, _) = generations.create(None).expect("mint a generation");
+        generations.publish(&name, None).expect("publish it");
+
+        assert!(
+            !generations.take_session_fault(),
+            "a pointer fault was acted on after `current` resolved cleanly"
+        );
+    }
+
+    #[test]
+    fn a_burst_of_pointer_faults_is_one_report() {
+        let generations = Generations::at(scratch("pointer-fault-burst"));
+        for _ in 0..5 {
+            generations.report_pointer_fault();
+        }
+
+        assert!(generations.take_session_fault(), "the burst filed no fault");
+        assert!(
+            !generations.take_session_fault(),
+            "the burst filed more than one fault"
         );
     }
 

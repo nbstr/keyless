@@ -33,7 +33,7 @@
 
 mod support;
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
 
 use keyless::daemon::config::DaemonConfig;
@@ -1873,6 +1873,193 @@ fn the_renewal_loop_establishes_each_session_in_a_fresh_generation_and_makes_it_
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A `pass-cli` that hangs on its FIRST `login` and never returns, then
+/// behaves normally on every later invocation.
+///
+/// On the first `login` it records its own pid in `<dir>/hung-login.pid`,
+/// then execs `sleep 600`, which no test deadline waits out — so that login
+/// never reaches `recovers` and appears in no verb log. Every other
+/// invocation (a later `login`, any `info`, any `logout`) execs `recovers`,
+/// the ordinary session-verbs stand-in, which logs it as usual.
+fn stub_hangs_once_then_recovers(dir: &Path, recovers: &Path) -> PathBuf {
+    let pidfile = dir.join("hung-login.pid");
+    install_executable(
+        &dir.join("pass-cli-hangs-once"),
+        &format!(
+            "#!/bin/sh\n\
+             if [ \"$1\" = login ] && [ ! -e '{pidfile}' ]; then\n\
+             \x20 echo $$ > '{pidfile}'\n\
+             \x20 exec sleep 600\n\
+             fi\n\
+             exec '{recovers}' \"$@\"\n",
+            pidfile = pidfile.display(),
+            recovers = recovers.display(),
+        ),
+    )
+}
+
+#[test]
+fn a_hung_login_is_killed_and_counted_as_a_failed_attempt_so_the_next_one_still_publishes() {
+    // CONTROL — the change that makes this fail: reverting `login::run` to an
+    // unbounded `Command::output()`. The loop then waits on `sleep 600`
+    // forever, no generation is ever published, and this test times out
+    // against its own 60 s poll deadline rather than seeing a second login.
+    let dir = scratch("daemon-proton-hung-login");
+    let inner = stub_pass_cli_listing(
+        &dir,
+        &Backend::Injects(PROTON_DECOY),
+        &Listing::Json(LISTING),
+    );
+    let recovers = stub_with_session_verbs(
+        &dir,
+        &inner,
+        Duration::ZERO,
+        true,
+        LogoutAnswer::AlreadyLoggedOut,
+        None,
+    );
+    let verbs_log = dir.join("pass-cli.verbs");
+    let vendor = stub_hangs_once_then_recovers(&dir, &recovers);
+
+    // Small enough that the login deadline (2x this, per `login::login_deadline`)
+    // is a few seconds — long enough for a real vendor spawn, short enough
+    // that the sleeping stand-in is killed well inside this test's own poll
+    // deadline.
+    const TIMEOUT_MS: u64 = 1500;
+    let config = daemon_config_with_generations_loop(&dir, &vendor, 0, 1, TIMEOUT_MS);
+    let running = start_daemon(&config, policy_allowing_self());
+
+    let root = session_dir(&dir);
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        if current_generation(&root).is_some() {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "no generation was ever published — a hung login stalled the loop instead of \
+             being killed and counted as a failed attempt"
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
+
+    let verbs = std::fs::read_to_string(&verbs_log).unwrap_or_default();
+    let login_lines = parse_verbs(&verbs)
+        .iter()
+        .filter(|line| line.verb == "login")
+        .count();
+    // The hung login never reaches the logging stand-in, so every `login`
+    // line here is a later attempt — the one the loop made after the kill.
+    assert!(
+        login_lines >= 1,
+        "no login followed the hung one, saw {login_lines}: {verbs}"
+    );
+
+    let hung_pid: i32 = std::fs::read_to_string(dir.join("hung-login.pid"))
+        .expect("the hung child never recorded its own pid")
+        .trim()
+        .parse()
+        .expect("a pid");
+    assert!(
+        nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(hung_pid),
+            None::<nix::sys::signal::Signal>
+        )
+        .is_err(),
+        "the hung pass-cli child (pid {hung_pid}) is still alive — it was never killed and reaped"
+    );
+
+    drop(running);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The daemon's uid is read off the audit log on every renewal attempt, never
+/// once for the life of the loop.
+///
+/// A uid captured at start is right until the file it came from changes, and
+/// then it is wrong for as long as the process lives: a daemon that started
+/// against a misowned audit log spawned every vendor child as that owner and
+/// failed every attempt until somebody restarted it, however promptly the
+/// owner was put back.
+///
+/// Changing a file's owner to another uid needs privilege this suite does not
+/// have, so the source is made wrong the one way an unprivileged test can:
+/// the audit log is taken away. While it is gone no attempt may spawn a vendor
+/// child — there is no uid to run one as, and reusing the last attempt's would
+/// be the stale identity this case exists to rule out. Once it is back, the
+/// next attempt publishes a generation with the same daemon still running.
+///
+/// CONTROL — the change that makes this fail: capture the owner once in
+/// `session::spawn` and hand it to the loop. The loop then keeps logging in
+/// with the uid it read at start while the audit log is absent, and the
+/// "no vendor child while the source is gone" assertion goes red.
+#[test]
+fn the_renewal_loop_rereads_the_daemon_uid_so_a_restored_audit_log_needs_no_restart() {
+    let dir = scratch("daemon-proton-uid-per-attempt");
+    let inner = stub_pass_cli_listing(
+        &dir,
+        &Backend::Injects(PROTON_DECOY),
+        &Listing::Json(LISTING),
+    );
+    let vendor = stub_with_session_verbs(
+        &dir,
+        &inner,
+        Duration::ZERO,
+        true,
+        LogoutAnswer::AlreadyLoggedOut,
+        None,
+    );
+    // Every one-second tick is due, so an attempt that is allowed to run does.
+    let config = daemon_config_with_generations_loop(&dir, &vendor, 0, 1, 60_000);
+    let audit = dir.join("audit.jsonl");
+    let verbs_log = dir.join("pass-cli.verbs");
+    let running = start_daemon(&config, policy_allowing_self());
+
+    let root = session_dir(&dir);
+    let until = |what: &str, done: &dyn Fn() -> bool| {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !done() {
+            assert!(Instant::now() < deadline, "{what}");
+            std::thread::sleep(Duration::from_millis(200));
+        }
+    };
+    until("the loop never published a first generation", &|| {
+        current_generation(&root).is_some()
+    });
+
+    std::fs::remove_file(&audit).expect("take the audit log away");
+    // One tick already past its owner read may still finish its children;
+    // what follows is measured after it has had the time to.
+    std::thread::sleep(Duration::from_millis(2_500));
+    let settled = std::fs::read_to_string(&verbs_log).unwrap_or_default();
+    let during = current_generation(&root);
+    std::thread::sleep(Duration::from_secs(4));
+    let after = std::fs::read_to_string(&verbs_log).unwrap_or_default();
+    let spawned: Vec<_> = parse_verbs(&after[settled.len()..])
+        .into_iter()
+        .map(|line| line.verb)
+        .collect();
+    assert!(
+        spawned.is_empty(),
+        "the loop ran vendor children with no audit log to read a uid off, so it reused an \
+         earlier attempt's: {spawned:?}"
+    );
+    assert_eq!(
+        current_generation(&root),
+        during,
+        "a generation was published while the daemon's uid could not be resolved"
+    );
+
+    std::fs::write(&audit, b"").expect("restore the audit log");
+    until(
+        "no generation was published after the audit log came back, so the loop needs a restart",
+        &|| current_generation(&root) != during,
+    );
+
+    drop(running);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn a_fs_daemon_never_sets_the_local_key_variable_at_all() {
     // CONTROL for the case below: under `fs` no credential names
@@ -3317,6 +3504,51 @@ fn a_session_fault_wakes_the_renewal_loop_inside_min_backoff() {
         );
         std::thread::sleep(Duration::from_millis(100));
     }
+
+    drop(running);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_broken_current_pointer_wakes_the_renewal_loop_inside_min_backoff() {
+    // The pointer-read mirror of `a_session_fault_wakes_the_renewal_loop_inside_min_backoff`
+    // above: there, a read finds the CURRENT generation's own session dead;
+    // here, a read finds `current` itself naming a generation that was never
+    // created — struck from outside the daemon, the way a crash mid-retire or
+    // a hand-edit would leave it. Both must wake the loop inside `min_backoff`
+    // rather than waiting out `probe_interval_seconds`.
+    //
+    // CONTROL — the change that makes this fail: `ProtonStore::enter` filing
+    // no fault on `CurrentFault::Missing` (or `::Malformed`, `::Absent`),
+    // leaving only `generations.take_session_fault()`'s ordinary triggers —
+    // age and `alive()` — neither due here, so the poll below would time out
+    // with `current` still naming the struck generation.
+    let dir = scratch("daemon-proton-pointer-fault-wakes-loop");
+    let inner = stub_pass_cli_listing(&dir, &Backend::Controlled, &Listing::Json(LISTING));
+    let vendor =
+        stub_with_session_verbs(&dir, &inner, Duration::ZERO, true, LogoutAnswer::Ok, None);
+    // `login_after_minutes: 90` and `probe_interval_seconds: 120` put both
+    // ordinary triggers far outside this test's run, so a new generation
+    // published inside the poll below can only be the pointer-fault event.
+    let config = daemon_config_with_generations_loop(&dir, &vendor, 90, 120, 60_000);
+    let running = start_daemon(&config, policy_allowing_self());
+
+    let root = session_dir(&dir);
+    until_a_generation_is_published(&root, Duration::from_secs(30));
+
+    // Struck from outside the daemon: `current` now names a generation this
+    // root never created — `Missing`, one of the three shapes a broken
+    // pointer takes.
+    std::fs::write(root.join("current"), b"gen-1-1\n").expect("plant a broken current pointer");
+
+    let client = client_config(running.socket(), 60_000);
+    let registry = store::build(&client, &Invocation::default()).registry;
+    let _ = registry.resolve(DECLARED);
+
+    // 30s rather than the configured 120s: a new generation replacing the
+    // struck pointer this quickly can only be the pointer-fault event, never
+    // the ordinary probe interval.
+    until_current_moves_past(&root, "gen-1-1", Duration::from_secs(30));
 
     drop(running);
     let _ = std::fs::remove_dir_all(&dir);
