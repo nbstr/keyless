@@ -180,7 +180,7 @@ use crate::config::{Config, SecretRoute};
 use crate::error::StoreError;
 use crate::secret::Secret;
 use crate::store::Store;
-use crate::store::catalogue::{Catalogue, Route as CatalogueRoute};
+use crate::store::catalogue::{Catalogue, Route as CatalogueRoute, find_declared};
 use crate::store::discover::{Discover, FieldKind, FieldSummary, ItemSummary};
 use crate::store::exec::{self, CaptureError, capture, strip_one_newline, summarise};
 use crate::store::proton_session::{self, GenerationName, Generations};
@@ -1881,13 +1881,18 @@ impl Routing {
     /// `None` is the property `tests/daemon_proton.rs` asserts as the absence
     /// of a vendor process: see [`ProtonStore::resolve`], which turns it into
     /// an error before a temporary file is written or a child is created.
+    ///
+    /// A declaration answers to the item's own title as well as to its name —
+    /// `demo-login` reaches a declared `DEMO_LOGIN` — by [`find_declared`]'s
+    /// order, which is also the catalogue's. Here as well as there because a
+    /// session's routing has no catalogue.
     fn route(&self, name: &str) -> Option<Cow<'_, Address>> {
         // Borrowed on the declared path, owned on the derived one. A resolve
         // that produces a value must not gain an allocation it did not have,
         // and a declared `Address::Named` is three `String`s — cloned here, a
         // cold resolve of a declared name would allocate them per lookup where
         // it used to borrow.
-        if let Some(declared) = self.addresses.get(name) {
+        if let Some(declared) = find_declared(&self.addresses, name) {
             return Some(Cow::Borrowed(declared));
         }
         // An ambiguous or unknown name yields nothing here, so it never reaches
