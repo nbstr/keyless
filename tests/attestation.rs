@@ -25,17 +25,22 @@
 
 mod support;
 
+use std::os::fd::AsFd;
+use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use keyless::audit::AuditLog;
+use keyless::daemon::{Daemon, Running};
+use keyless::ipc::client::Client;
 use keyless::ipc::ffi::{live_code_hash, live_process};
-use keyless::ipc::peer::code_hash_of_file;
+use keyless::ipc::peer::{PeerError, code_hash_of_file, identify};
+use keyless::ipc::protocol::Request;
 
 use support::{
     DECOY_VALUE, daemon_config, example_binary, install_executable_copy, own_identity,
-    policy_allowing_self, scratch, start_daemon, write_secrets,
+    policy_allowing_self, scratch, short_socket_path, start_daemon, write_secrets,
 };
 
 /// The SHA-256 of the decoy, which is what an authorised peer reports instead
@@ -385,6 +390,262 @@ fn changing_image_mid_connection_loses_the_authorisation() {
     );
 
     drop(running);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ---------------------------------------------------------------------------
+// Not an attack — a legitimate peer the daemon was too slow to reach
+// ---------------------------------------------------------------------------
+//
+// The daemon audit log held 31 `peer-unreadable` refusals over five days,
+// several against real `keyless run` callers that succeeded seconds later on
+// retry. Every call `identify` makes after the first two asks about the
+// CURRENT state of the peer's pid or socket, so it can only answer for a peer
+// that is still there at the moment it is asked — and, measured directly
+// below, that includes the socket options described elsewhere as "captured at
+// connect and available for the life of the socket": once the peer's own end
+// is fully closed, `LOCAL_PEERPID` and its siblings can themselves answer
+// `ENOTCONN` rather than what the kernel captured. Deferring the asking to a
+// freshly spawned, freshly scheduled connection thread put an unbounded,
+// host-load-dependent wait between "the peer connected" and "the peer was
+// asked about" — long enough, under real contention, for a short-lived caller
+// to finish its own work and exit before the daemon ever looked.
+// `Daemon::dispatch` now asks on the accept loop's own thread, which is
+// already running and never waits to be scheduled for the first time.
+//
+// The three tests below are the two sides of that fix. The first two force
+// the genuinely-unanswerable case — a peer confirmed dead, by `wait()`,
+// before the daemon ever looks — and check that the refusal correctly still
+// happens and now names the call that failed (this is not a bug: nobody is
+// left to serve). The third is the case that WAS a bug: a peer that is alive
+// when it connects and leaves shortly after, which must now be served.
+
+#[test]
+fn a_connection_queued_before_the_peer_died_is_still_refused_and_the_row_says_why() {
+    let dir = scratch("peer-dead-before-accept");
+    let mut config = daemon_config(&dir);
+    config.cache_ttl_seconds = 0;
+    write_secrets(&config.stores.file.path, &[("DECOY", DECOY_VALUE)]);
+
+    let alpha = example_binary("keyless_peer_alpha");
+    let alpha_hash = code_hash_of_file(&alpha).expect("alpha is signed");
+    let me = own_identity();
+    let policy = keyless::attest::Policy::new()
+        .allow_uid(me.uid)
+        .allow_image(alpha_hash);
+
+    // Bound and listening — the kernel now queues a connect — but nothing is
+    // accepting yet, so nothing can race the daemon into looking too soon.
+    let daemon = Daemon::bind(&config, policy).expect("bind");
+    let socket = daemon.socket().to_path_buf();
+
+    let mut child = Command::new(&alpha)
+        .env("KLP_SOCKET", &socket)
+        .env("KLP_NAME", "DECOY")
+        .env("KLP_MODE", "abandon")
+        .env("KLP_ABANDON_MS", "0")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn the peer");
+    let status = child.wait().expect("reap the peer");
+    assert!(
+        status.success(),
+        "the peer did not exit cleanly: {status:?}"
+    );
+
+    // Only now does anything start asking who is on the socket.
+    let running = Running::spawn(daemon, &config).expect("start serving");
+    std::thread::sleep(Duration::from_millis(200));
+    drop(running);
+
+    let raw = std::fs::read_to_string(&config.audit).expect("read the audit log");
+    assert!(
+        raw.contains("\"decision\":\"peer-unreadable\""),
+        "a peer confirmed dead before the daemon ever looked was not refused: {raw}"
+    );
+    assert!(
+        raw.contains("\"reason\":\"") && raw.contains(" failed: "),
+        "the refusal did not name which kernel call could not read the peer: {raw}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_peer_already_gone_when_identified_is_refused_by_the_call_that_found_it() {
+    // The same mechanism as the test above, one layer down: `identify` called
+    // directly against a real, cross-process peer confirmed dead by `wait()`,
+    // with no daemon in between. `a_process_that_has_exited_cannot_be_attested`
+    // proves the two raw kernel calls refuse a reaped pid; this proves the
+    // whole function `keylessd` actually calls does the same, and names which
+    // call it was.
+    //
+    // Which one fires is not fixed to the two live reads: once the peer's own
+    // end of the socket is fully closed, `LOCAL_PEERPID` and its siblings can
+    // themselves answer `ENOTCONN` rather than the value the kernel captured
+    // at connect — measured here rather than assumed from the header comment
+    // in `ipc::ffi`, which describes them as available for the life of the
+    // socket and is a claim about an accepted socket whose PEER has not yet
+    // fully gone.
+    let dir = scratch("identify-gone");
+    let socket = short_socket_path(&dir);
+    let listener = UnixListener::bind(&socket).expect("bind a raw listener");
+
+    let alpha = example_binary("keyless_peer_alpha");
+    let mut child = Command::new(&alpha)
+        .env("KLP_SOCKET", &socket)
+        .env("KLP_NAME", "DECOY")
+        .env("KLP_MODE", "abandon")
+        .env("KLP_ABANDON_MS", "0")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn the peer");
+
+    let (stream, _) = listener.accept().expect("accept the peer's connection");
+    let status = child.wait().expect("reap the peer");
+    assert!(
+        status.success(),
+        "the peer did not exit cleanly: {status:?}"
+    );
+
+    let error = identify(stream.as_fd()).expect_err("a reaped peer must not attest");
+    match error {
+        PeerError::Kernel { call, .. } => {
+            const KNOWN: &[&str] = &[
+                "getpeereid",
+                "LOCAL_PEERCRED",
+                "LOCAL_PEERPID",
+                "LOCAL_PEERTOKEN",
+                "proc_pidinfo",
+                "csops",
+            ];
+            assert!(
+                KNOWN.contains(&call),
+                "the refusal named a call `identify` does not make: {call}"
+            );
+        }
+        other => panic!("expected a kernel-call failure, got {other:?}"),
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn callers_that_leave_moments_after_connecting_are_still_served() {
+    // The bug. Each of these peers is alive and legitimate when it connects,
+    // and gone shortly after — the shape every real `keyless run` caller in
+    // the audit log's burst took, having given up on its own silence deadline
+    // and moved on before the daemon got to it. None of this concurrency is
+    // artificial: the point is that the daemon's own accept loop, not a freshly
+    // spawned thread's own scheduling, is what decides how long that peer has
+    // to still be there.
+    let dir = scratch("abandon-burst");
+    let mut config = daemon_config(&dir);
+    config.cache_ttl_seconds = 0;
+    write_secrets(&config.stores.file.path, &[("DECOY", DECOY_VALUE)]);
+
+    let alpha = example_binary("keyless_peer_alpha");
+    let alpha_hash = code_hash_of_file(&alpha).expect("alpha is signed");
+    let me = own_identity();
+    let policy = keyless::attest::Policy::new()
+        .allow_uid(me.uid)
+        .allow_image(alpha_hash);
+    let running = start_daemon(&config, policy);
+
+    const COUNT: usize = 20; // real concurrency, comfortably under MAX_CONNECTIONS (64)
+    let children: Vec<_> = (0..COUNT)
+        .map(|_| {
+            Command::new(&alpha)
+                .env("KLP_SOCKET", running.socket())
+                .env("KLP_NAME", "DECOY")
+                .env("KLP_MODE", "abandon")
+                // Generous next to the 15ms default: spawning COUNT processes
+                // at once is itself real contention, worse still with other
+                // test functions in this binary doing the same at once, and
+                // the grace has to survive all of that on top of whatever the
+                // daemon takes — the connect failures captured below are what
+                // say whether it did not.
+                .env("KLP_ABANDON_MS", "150")
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("spawn a peer")
+        })
+        .collect();
+    let mut connect_failures: Vec<String> = Vec::new();
+    for child in children {
+        let output = child.wait_with_output().expect("reap a peer");
+        assert!(
+            output.status.success(),
+            "a peer did not exit cleanly: {:?}",
+            output.status
+        );
+        // `abandon` mode reports nothing on the path this test means to
+        // exercise — connect, write, leave — and reports the error and
+        // nothing else if it never got that far. A line here means the
+        // connection never reached the daemon at all, which is a different
+        // failure from the one this test is for.
+        let line = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+        if !line.is_empty() {
+            connect_failures.push(line);
+        }
+    }
+    assert!(
+        connect_failures.is_empty(),
+        "{} of {COUNT} peers never reached the daemon: {connect_failures:?}",
+        connect_failures.len()
+    );
+    // Past the daemon's own read timeout, so a connection still being served
+    // has had every chance to finish before the log is read.
+    std::thread::sleep(Duration::from_millis(200));
+    drop(running);
+
+    let raw = std::fs::read_to_string(&config.audit).expect("read the audit log");
+    let allow = raw.matches("\"decision\":\"allow\"").count();
+    let unreadable = raw.matches("\"decision\":\"peer-unreadable\"").count();
+    assert_eq!(
+        unreadable, 0,
+        "a legitimate caller that left shortly after connecting was refused: {raw}"
+    );
+    assert_eq!(
+        allow, COUNT,
+        "not every legitimate caller was served: {raw}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_thousand_attested_connections_produce_no_false_refusals() {
+    let dir = scratch("thousand");
+    let config = daemon_config(&dir);
+    write_secrets(&config.stores.file.path, &[("DECOY", DECOY_VALUE)]);
+    let running = start_daemon(&config, policy_allowing_self());
+
+    let client = Client::new(running.socket().to_path_buf(), Duration::from_secs(5));
+    for i in 0..1_000 {
+        let reply = client
+            .request(&Request::resolve("DECOY"))
+            .unwrap_or_else(|error| panic!("connection {i} failed: {error}"));
+        assert!(
+            matches!(reply, keyless::ipc::protocol::Reply::Value(_)),
+            "connection {i} did not resolve: {reply:?}"
+        );
+    }
+    drop(running);
+
+    let raw = std::fs::read_to_string(&config.audit).expect("read the audit log");
+    let unreadable = raw.matches("\"decision\":\"peer-unreadable\"").count();
+    assert_eq!(
+        unreadable, 0,
+        "false refusals among 1,000 connections: {raw}"
+    );
+
     let _ = std::fs::remove_dir_all(&dir);
 }
 
