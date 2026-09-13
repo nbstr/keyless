@@ -33,6 +33,11 @@ mod executable;
 #[allow(unused_imports)]
 pub use executable::{install_executable, install_executable_copy};
 
+/// A real pty for a test that must confirm a prompt at a terminal. Its own
+/// file for the same reason as the three above: only the suites that drive a
+/// verb asking a person need it.
+pub mod terminal;
+
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 

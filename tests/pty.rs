@@ -46,7 +46,7 @@
 mod support;
 
 use std::io::{Read, Write};
-use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, OwnedFd};
 use std::os::unix::process::CommandExt;
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
@@ -151,107 +151,11 @@ struct UnderTerminal {
     pristine: Termios,
 }
 
-/// Guards `ptsname`, which answers out of a static buffer libc reuses.
-///
-/// Nothing else in this file needs it, and it is deliberately not a general
-/// "one pty at a time" lock: it is held across a single call that reads a
-/// shared buffer, and released the moment the name has been copied.
-static NAMING: Mutex<()> = Mutex::new(());
-
-/// A terminal whose two descriptors are close-on-exec from the instant they
-/// exist, so no other test's child can inherit them.
-///
-/// # The defect, which is that these tests share one process
-///
-/// Case A's terminal is open while case B forks, so B's `keyless` — and the
-/// shell and the backgrounded grandchild it starts — inherit it. A's master
-/// then never reports end-of-file, because a process A has never heard of is
-/// holding A's slave, and A blocks reading it until that stranger exits. This
-/// file starts grandchildren that deliberately outlive their session by two
-/// minutes, so "until that stranger exits" is longer than any deadline here.
-///
-/// # Why the descriptors are born with the flag rather than given it after
-///
-/// **`openpty` sets `FD_CLOEXEC` on neither descriptor, and a `fcntl` on the
-/// far side of it is far too late.** `openpty` obtains the master first and
-/// then spends the rest of its work — unlocking the pair, opening the slave,
-/// configuring the line discipline — with an inheritable descriptor already
-/// live. The window is not the nanosecond between two calls; it is the whole
-/// body of `openpty`.
-///
-/// That is measured rather than argued: one thread allocating terminals this
-/// way beside several threads spawning children, and **a large fraction of
-/// those children come out holding a terminal they were never given** — at a
-/// rate statistically indistinguishable from a control that never sets the
-/// flag at all. Setting it afterwards buys nothing. Born with `O_CLOEXEC`, not
-/// one child in any arm holds a stray terminal.
-///
-/// So the flag is part of each descriptor's creation. There is no ordering for
-/// a future reader to preserve and no lock for one to forget, which is the
-/// whole reason to spend five calls here — `posix_openpt`, `grantpt`,
-/// `unlockpt`, `ptsname`, `open` — rather than one call to `openpty`. They are
-/// named rather than counted so the next reader checks the list against the
-/// body instead of trusting a number that drifts the moment a call moves.
-///
-/// The three descriptors `keyless` is *meant* to get are unaffected: they are
-/// separate `try_clone`s handed to `Stdio`, and `dup2` onto 0, 1 and 2 clears
-/// the flag on the descriptors it creates.
+/// [`support::terminal::private_pty`], sized — `openpty` took the size as an
+/// argument; without it, it is one ioctl on the master, which is the same
+/// terminal.
 fn terminal_that_stays_private(size: Winsize) -> (OwnedFd, OwnedFd) {
-    // SAFETY: no arguments to get wrong, and the descriptor is owned below.
-    let master = unsafe {
-        nix::libc::posix_openpt(nix::libc::O_RDWR | nix::libc::O_NOCTTY | nix::libc::O_CLOEXEC)
-    };
-    assert_ne!(
-        master,
-        -1,
-        "this platform must provide a pty: {}",
-        std::io::Error::last_os_error()
-    );
-    // SAFETY: a fresh descriptor from `posix_openpt` that nothing else owns.
-    let master = unsafe { OwnedFd::from_raw_fd(master) };
-    // SAFETY (both): a live master this function owns.
-    let granted = unsafe { nix::libc::grantpt(master.as_raw_fd()) };
-    assert_ne!(granted, -1, "grantpt: {}", std::io::Error::last_os_error());
-    let unlocked = unsafe { nix::libc::unlockpt(master.as_raw_fd()) };
-    assert_ne!(
-        unlocked,
-        -1,
-        "unlockpt: {}",
-        std::io::Error::last_os_error()
-    );
-
-    let opened = {
-        let _naming = NAMING.lock().unwrap_or_else(|error| error.into_inner());
-        // SAFETY: a live master, and `_naming` excludes the concurrent call
-        // that would overwrite the buffer before it is copied below.
-        let name = unsafe { nix::libc::ptsname(master.as_raw_fd()) };
-        assert!(
-            !name.is_null(),
-            "ptsname: {}",
-            std::io::Error::last_os_error()
-        );
-        // SAFETY: libc returned a NUL-terminated string valid until the next
-        // call, which the guard still held here excludes.
-        let path = unsafe { std::ffi::CStr::from_ptr(name) }.to_owned();
-        // SAFETY: a NUL-terminated path, and the flags are a valid mode.
-        unsafe {
-            nix::libc::open(
-                path.as_ptr(),
-                nix::libc::O_RDWR | nix::libc::O_NOCTTY | nix::libc::O_CLOEXEC,
-            )
-        }
-    };
-    assert_ne!(
-        opened,
-        -1,
-        "open the pty slave: {}",
-        std::io::Error::last_os_error()
-    );
-    // SAFETY: a fresh descriptor from `open` that nothing else owns.
-    let slave = unsafe { OwnedFd::from_raw_fd(opened) };
-
-    // `openpty` took the size as an argument; without it, it is one ioctl on
-    // the master, which is the same terminal.
+    let (master, slave) = support::terminal::private_pty();
     // SAFETY: a live winsize and a pty master this function owns.
     unsafe { set_winsize(master.as_raw_fd(), &raw const size) }.expect("size the pty");
     (master, slave)

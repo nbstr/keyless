@@ -168,8 +168,9 @@ def _deny_text(target, pattern, names, note, verb):
         "%s\n\n"
         "If this path holds no real secret — a fixture, a template, an example — "
         "add it to `allowed` in ~/.config/keyless/hooks.json and this refusal "
-        "stops for it. An operator can disable the whole pack for a session with "
-        "KEYLESS_HOOKS_DISABLE=1 in the settings file's `env` block. A session "
-        "cannot set its own environment, which is the point. Re-issuing this "
-        "write in another spelling will not produce a different answer."
+        "stops for it. The person running this session can disable the whole "
+        "pack for a session with KEYLESS_HOOKS_DISABLE=1 in the settings "
+        "file's `env` block. A session cannot set its own environment, which "
+        "is the point. Re-issuing this write in another spelling will not "
+        "produce a different answer."
         % (CHECK, target, pattern, verb, inventory, target, remedy))

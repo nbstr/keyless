@@ -40,7 +40,7 @@ mod support;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
-use support::scratch;
+use support::{scratch, terminal};
 
 const BIN: &str = env!("CARGO_BIN_EXE_keyless");
 
@@ -120,6 +120,19 @@ impl Machine {
     /// `python3`, so a `PATH` built from scratch would break a step that has
     /// nothing to do with what the caller is aiming at.
     fn run_with_path(&self, args: &[&str], first: Option<&Path>) -> Output {
+        self.command_with_path(args, first)
+            .output()
+            .expect("the binary must run")
+    }
+
+    /// The command `run`/`run_with_path` build, before it is executed —
+    /// shared with [`Machine::run_under_terminal`], which needs the same
+    /// arguments and environment attached to a pty instead of piped.
+    fn command(&self, args: &[&str]) -> Command {
+        self.command_with_path(args, None)
+    }
+
+    fn command_with_path(&self, args: &[&str], first: Option<&Path>) -> Command {
         let mut command = Command::new(BIN);
         command
             .args(args)
@@ -143,7 +156,24 @@ impl Machine {
             dirs.extend(std::env::split_paths(&inherited));
             command.env("PATH", std::env::join_paths(dirs).expect("join PATH"));
         }
-        command.output().expect("the binary must run")
+        command
+    }
+
+    /// Run `args` attached to a real terminal, so `disable`/`uninstall` reach
+    /// their confirmation prompt instead of refusing for want of one — a
+    /// `Command::output()` run always answers `false` to "is stdout a
+    /// terminal", whatever stdin is, because `output()` pipes it.
+    fn run_under_terminal(&self, args: &[&str]) -> terminal::Terminal {
+        terminal::start(self.command(args))
+    }
+
+    /// The audit log this machine's runs append to.
+    fn audit_log(&self) -> PathBuf {
+        self.root.join("audit.jsonl")
+    }
+
+    fn audit_rows(&self) -> String {
+        std::fs::read_to_string(self.audit_log()).unwrap_or_default()
     }
 
     /// A setup run, with the agent directory and receipt named explicitly.
@@ -164,10 +194,26 @@ impl Machine {
         self.run(&args)
     }
 
-    fn uninstall(&self) -> Output {
+    /// `disable` and `uninstall` both turn every guard off, so both now ask
+    /// at a terminal before running — this drives one under a real pty,
+    /// types the verb's own name back at the prompt, and returns its exit
+    /// code plus everything the terminal received.
+    fn confirm_run(&self, args: &[&str]) -> (i32, String) {
+        let verb = args[0];
+        let term = self.run_under_terminal(args);
+        term.await_output(&format!("Type `{verb}` to continue"));
+        term.type_line(verb);
+        term.finish()
+    }
+
+    fn disable(&self) -> (i32, String) {
+        self.confirm_run(&["disable"])
+    }
+
+    fn uninstall(&self) -> (i32, String) {
         let claude = self.claude();
         let receipt = self.receipt();
-        self.run(&[
+        self.confirm_run(&[
             "uninstall",
             "--claude-dir",
             claude.to_str().expect("utf-8"),
@@ -294,9 +340,8 @@ fn uninstall_removes_what_setup_made_and_keeps_what_the_user_wrote() {
         "nothing was installed, so the removal proves nothing"
     );
 
-    let removed = machine.uninstall();
-    let text = out(&removed);
-    assert!(removed.status.success(), "{text}");
+    let (code, text) = machine.uninstall();
+    assert_eq!(code, 0, "{text}");
 
     let after = machine.settings_json();
     assert!(
@@ -332,7 +377,7 @@ fn uninstall_keeps_the_config_and_says_which_files_it_kept() {
     machine.setup(&[]);
     assert!(machine.config().exists(), "setup wrote no config");
 
-    let text = out(&machine.uninstall());
+    let (_code, text) = machine.uninstall();
     assert!(
         machine.config().exists(),
         "uninstall deleted the user's configuration:\n{text}"
@@ -349,9 +394,8 @@ fn uninstall_with_no_receipt_removes_nothing_and_says_why() {
         r#"{"hooks": {"PreToolUse": [{"hooks": [{"type":"command","command":"python3 /elsewhere/keyless_hook.py"}]}]}}"#,
     );
     let before = std::fs::read_to_string(machine.settings()).expect("read");
-    let output = machine.uninstall();
-    let text = out(&output);
-    assert!(output.status.success(), "{text}");
+    let (code, text) = machine.uninstall();
+    assert_eq!(code, 0, "{text}");
     assert_eq!(
         std::fs::read_to_string(machine.settings()).expect("read"),
         before,
@@ -412,7 +456,7 @@ fn disable_stops_the_guards_and_doctor_says_so_and_enable_undoes_it() {
         "doctor has no guards row:\n{armed}"
     );
 
-    let off = out(&machine.run(&["disable"]));
+    let (_code, off) = machine.disable();
     assert_eq!(state_of(&off, "guards"), "off", "{off}");
     // Nothing was unregistered: the pack is still in the settings file, and the
     // switch is one key in a file `keyless` owns.
@@ -442,8 +486,8 @@ fn disable_works_before_anything_has_been_set_up() {
     // A tilted user has not necessarily run setup, and the off switch that only
     // works on a configured machine is the one that is missing when it matters.
     let machine = Machine::fresh("disable-bare");
-    let output = machine.run(&["disable"]);
-    assert!(output.status.success(), "{}", out(&output));
+    let (code, text) = machine.disable();
+    assert_eq!(code, 0, "{text}");
     let switch = machine.switch();
     assert!(switch.exists(), "no switch file was written");
     let text = std::fs::read_to_string(&switch).expect("read");
@@ -451,6 +495,135 @@ fn disable_works_before_anything_has_been_set_up() {
     // And the pack itself reads exactly that file, so the two agree. Asserted
     // through the pack's own loader rather than by eye.
     assert_eq!(pack_reads(&switch), "disabled", "{text}");
+}
+
+// ---------------------------------------------------------------------------
+// disable and uninstall ask a person first
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_non_terminal_disable_refuses_and_touches_nothing() {
+    // `Command::output()` pipes stdout, so `interactive` reads false whatever
+    // stdin is — exactly the caller this refusal exists to stop.
+    let machine = Machine::fresh("disable-no-terminal");
+    let output = machine.run(&["disable", "--no-audit"]);
+    assert_eq!(
+        output.status.code(),
+        Some(77),
+        "a non-terminal disable did not refuse with the reserved exit code:\n{}",
+        out(&output)
+    );
+    assert!(
+        !machine.switch().exists(),
+        "a refused disable still wrote the switch file"
+    );
+
+    let setup_paths = keyless::paths::SetupPaths {
+        receipt: machine.receipt(),
+        hooks_config: machine.switch(),
+        claude_dir: machine.claude(),
+    };
+    assert_eq!(
+        keyless::cmd::setup::guards(&setup_paths),
+        keyless::cmd::setup::Guards::Armed,
+        "a refused disable left the guards anything but armed"
+    );
+
+    let text = out(&output);
+    assert!(text.contains("asks a person"), "{text}");
+    for named in ["--", "KEYLESS_", "yes |"] {
+        assert!(
+            !text.contains(named),
+            "the refusal names a workaround: {text}"
+        );
+    }
+
+    // `--no-audit` is on the command line above and is ignored: the refusal
+    // is recorded anyway.
+    let rows = machine.audit_rows();
+    assert!(
+        rows.contains("\"decision\":\"refused-no-terminal\""),
+        "no refusal row was written even with --no-audit:\n{rows}"
+    );
+    assert!(
+        rows.contains(&format!("\"exit_code\":{}", 77)),
+        "the refusal row does not carry the exit code:\n{rows}"
+    );
+}
+
+#[test]
+fn a_non_terminal_uninstall_refuses_and_touches_nothing() {
+    let machine = Machine::fresh("uninstall-no-terminal").with_harness("{}");
+    machine.setup(&[]);
+    let before = std::fs::read_to_string(machine.settings()).expect("read");
+
+    let claude = machine.claude();
+    let receipt = machine.receipt();
+    let output = machine.run(&[
+        "uninstall",
+        "--claude-dir",
+        claude.to_str().expect("utf-8"),
+        "--receipt",
+        receipt.to_str().expect("utf-8"),
+    ]);
+    assert_eq!(output.status.code(), Some(77), "{}", out(&output));
+    assert!(
+        machine.receipt().exists(),
+        "a refused uninstall deleted the receipt"
+    );
+    assert_eq!(
+        std::fs::read_to_string(machine.settings()).expect("read"),
+        before,
+        "a refused uninstall edited the settings file"
+    );
+    let rows = machine.audit_rows();
+    assert!(
+        rows.contains("\"decision\":\"refused-no-terminal\""),
+        "{rows}"
+    );
+}
+
+#[test]
+fn at_a_terminal_only_the_verbs_own_name_confirms_disable() {
+    // `yes`, `y` and EOF are exactly what an unattended `yes | keyless disable`
+    // supplies, and each must be refused the same as a non-terminal caller.
+    for (tag, typed) in [
+        ("eof", None),
+        ("y", Some("y")),
+        ("yes", Some("yes")),
+        ("wrong-word", Some("nope")),
+    ] {
+        let machine = Machine::fresh(&format!("disable-declined-{tag}"));
+        let term = machine.run_under_terminal(&["disable", "--no-audit"]);
+        term.await_output("Type `disable` to continue");
+        match typed {
+            Some(word) => term.type_line(word),
+            None => term.type_eof(),
+        }
+        let (code, text) = term.finish();
+        assert_eq!(code, 77, "typing `{tag}` confirmed a disable:\n{text}");
+        assert!(
+            !machine.switch().exists(),
+            "a declined disable still wrote the switch file, for `{tag}`"
+        );
+    }
+}
+
+#[test]
+fn at_a_terminal_the_verbs_own_name_disables_and_is_recorded() {
+    let machine = Machine::fresh("disable-confirmed");
+    let (code, text) = machine.disable();
+    assert_eq!(code, 0, "{text}");
+    assert!(
+        machine.switch().exists(),
+        "a confirmed disable wrote nothing"
+    );
+
+    let rows = machine.audit_rows();
+    assert!(
+        rows.contains("\"decision\":\"guards-off\""),
+        "a confirmed disable is not recorded:\n{rows}"
+    );
 }
 
 /// Ask the hook pack's own config loader which of its three states it is in.
@@ -534,7 +707,7 @@ fn a_guard_registered_by_hand_survives_setup_and_uninstall() {
         "the receipt claimed an event setup did not register\n{installed}"
     );
 
-    let removed = out(&machine.uninstall());
+    let (_code, removed) = machine.uninstall();
     let after = machine.settings_json();
     assert_eq!(
         after["hooks"]["PreToolUse"][0]["hooks"][0]["command"],
@@ -782,7 +955,7 @@ fn uninstall_takes_back_its_own_instructions_and_never_an_edited_copy() {
     // quietly stopped deleting anything at all.
     let ours = Machine::fresh("skill-removed").with_harness("{}");
     ours.setup(&[]);
-    let untouched = out(&ours.uninstall());
+    let (_code, untouched) = ours.uninstall();
     assert!(
         !ours.skill().exists(),
         "uninstall left behind the instructions it installed itself:\n{untouched}"
@@ -793,7 +966,7 @@ fn uninstall_takes_back_its_own_instructions_and_never_an_edited_copy() {
     let edited = "# keyless\n\nEdited after setup wrote it.\n";
     std::fs::write(theirs.skill(), edited).expect("write skill");
 
-    let kept = out(&theirs.uninstall());
+    let (_code, kept) = theirs.uninstall();
     assert_eq!(
         std::fs::read_to_string(theirs.skill()).expect("read"),
         edited,
@@ -863,10 +1036,9 @@ fn the_off_switch_works_on_an_empty_config_file() {
     std::fs::create_dir_all(machine.switch().parent().expect("a parent")).expect("mkdir");
     std::fs::write(machine.switch(), "").expect("write switch");
 
-    let output = machine.run(&["disable"]);
-    let text = out(&output);
-    assert!(
-        output.status.success(),
+    let (code, text) = machine.disable();
+    assert_eq!(
+        code, 0,
         "the off switch failed on an empty config file:\n{text}"
     );
     assert_eq!(state_of(&text, "guards"), "off", "{text}");
@@ -883,7 +1055,7 @@ fn re_enabling_says_whether_anything_actually_changed() {
     // reads "back on" from a command that changed nothing and concludes it had.
     let machine = Machine::fresh("enable-twice");
 
-    machine.run(&["disable"]);
+    machine.disable();
     let back_on = out(&machine.run(&["enable"]));
     assert!(
         back_on.contains("back on"),
@@ -988,7 +1160,7 @@ fn only_the_off_switch_mentions_the_daemon_it_leaves_running() {
     // `enable` it would read as a warning about an action that just undid the
     // thing being warned about.
     let machine = Machine::fresh("switch-note");
-    let off = out(&machine.run(&["disable"]));
+    let (_code, off) = machine.disable();
     assert!(
         off.contains("is also still running"),
         "disable does not say the daemon is left running:\n{off}"

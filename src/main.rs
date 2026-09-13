@@ -52,9 +52,11 @@ use keyless::{NAME, store};
                   — never a refusal from this tool.\n\n\
                   WHAT EACH VERB IS FOR\n\
                   \x20 setup    install everything: config, guards, agent instructions\n\
-                  \x20 disable  stop every guard firing, right now. Nothing is deleted\n\
-                  \x20 enable   arm them again\n\
-                  \x20 uninstall  remove exactly what setup created, and nothing you wrote\n\
+                  \x20 disable  confirm at a terminal, then stop every guard firing. Nothing \
+                  is deleted\n\
+                  \x20 enable   arm them again, no confirmation needed\n\
+                  \x20 uninstall  confirm at a terminal, then remove exactly what setup \
+                  created, and nothing you wrote\n\
                   \x20 init     detect your stores, write a config, and prove one works\n\
                   \x20 doctor   what is proven right now, what is not, and what to do next\n\
                   \x20 ls       the names you have declared, and where each one points\n\
@@ -68,11 +70,11 @@ use keyless::{NAME, store};
                   \x20 keyless doctor                  is anything wrong, and where\n\
                   \x20 keyless run -s NAME -- cmd      the only way a value leaves a store\n\n\
                   IN YOUR WAY?\n\
-                  \x20 keyless disable                 the guards stop firing, instantly. \
-                  Your config and your secrets are untouched, and `keyless enable` is the \
-                  whole of the way back.\n\
-                  \x20 keyless uninstall               removes what setup created, keeps \
-                  what you wrote\n\n\
+                  \x20 keyless disable                 asks you to confirm at a terminal, \
+                  then the guards stop firing. Your config and your secrets are untouched, \
+                  and `keyless enable` is the whole of the way back.\n\
+                  \x20 keyless uninstall               asks the same way, then removes what \
+                  setup created, keeps what you wrote\n\n\
                   Run `keyless <verb> --help` for one verb in full.",
     disable_help_subcommand = true
 )]
@@ -86,6 +88,12 @@ struct Cli {
     audit: Option<PathBuf>,
 
     /// Do not record this invocation.
+    ///
+    /// `disable`, `enable` and `uninstall` ignore this: every switch of the
+    /// guards is recorded whether it ran or was refused, because the record
+    /// is what makes "when did the guards stop firing" answerable later —
+    /// the one question a flag that suppressed it would make unanswerable
+    /// for the person who never asked to skip it.
     #[arg(long, global = true)]
     no_audit: bool,
 
@@ -116,13 +124,15 @@ enum Verb {
     #[command(alias = "install")]
     Setup(SetupArgs),
 
-    /// Stop every guard firing, right now. Nothing is deleted.
+    /// Confirm at a terminal, then stop every guard firing. Nothing is
+    /// deleted.
     Disable(ScopeArgs),
 
-    /// Arm the guards again.
+    /// Arm the guards again. Never asks — there is nothing here to confirm.
     Enable(ScopeArgs),
 
-    /// Remove exactly what `setup` created, and nothing you wrote.
+    /// Confirm at a terminal, then remove exactly what `setup` created, and
+    /// nothing you wrote.
     Uninstall(ScopeArgs),
 
     /// The words people reach for when they want to see a value.
@@ -430,22 +440,94 @@ struct SetupArgs {
 }
 
 /// `disable` and `enable`, which are the same write with the bit flipped.
+/// `disable` confirms at a terminal first and `enable` never asks — the
+/// module doc of [`keyless::cmd::setup`] says why the switch is shaped so.
+fn switch(scope: &ScopeArgs, enable: bool, paths: &Paths) -> i32 {
+    let verb = if enable { "enable" } else { "disable" };
+    let asked = if enable {
+        None
+    } else {
+        confirm_or_refuse(verb, paths)
+    };
+    match asked {
+        Some(code) => code,
+        None => match switch_guards(
+            &setup_paths(scope),
+            Style::detect(io::stdout().is_terminal()),
+            enable,
+            &mut io::stdout(),
+        ) {
+            Ok(code) => {
+                record_switch(
+                    paths,
+                    verb,
+                    if enable { "guards-on" } else { "guards-off" },
+                    code,
+                );
+                code
+            }
+            Err(error) => {
+                eprintln!("{NAME}: {error}");
+                record_switch(paths, verb, "failed", 1);
+                1
+            }
+        },
+    }
+}
+
+/// Ask before `verb` — `disable` or `uninstall` — is allowed to run.
 ///
-/// Deliberately trivial to reach: the moment somebody wants the guards to stop
-/// and cannot find the word, the alternative is that they gut their settings
-/// file by hand — and then the protection is gone for good and silently.
-fn switch(scope: &ScopeArgs, enable: bool) -> i32 {
-    match switch_guards(
-        &setup_paths(scope),
-        Style::detect(io::stdout().is_terminal()),
-        enable,
-        &mut io::stdout(),
-    ) {
-        Ok(code) => code,
-        Err(error) => {
-            eprintln!("{NAME}: {error}");
-            1
+/// `Some(code)` means the caller must stop here: the refusal is already on
+/// stderr and already recorded. `None` means confirmed, and the caller
+/// proceeds exactly as it would have before this existed. `enable` never
+/// calls this at all — there is nothing here for it to confirm.
+fn confirm_or_refuse(verb: &str, paths: &Paths) -> Option<i32> {
+    let interactive = io::stdin().is_terminal() && io::stdout().is_terminal();
+    let stdin = io::stdin();
+    let mut stdin = stdin.lock();
+    let confirmation =
+        match keyless::cmd::setup::confirm_switch(verb, interactive, &mut stdin, &mut io::stdout())
+        {
+            Ok(confirmation) => confirmation,
+            Err(error) => {
+                eprintln!("{NAME}: {error}");
+                return Some(1);
+            }
+        };
+    match confirmation {
+        Ok(()) => None,
+        Err(refusal) => {
+            let _ = keyless::cmd::setup::explain_refusal(verb, refusal, &mut io::stderr());
+            record_switch(
+                paths,
+                verb,
+                refusal.decision(),
+                keyless::cmd::setup::EXIT_REFUSED,
+            );
+            Some(keyless::cmd::setup::EXIT_REFUSED)
         }
+    }
+}
+
+/// Record one switch-verb invocation — confirmed and done, or refused —
+/// ignoring `--no-audit`; see that flag's own doc for why.
+fn record_switch(paths: &Paths, verb: &str, decision: &str, code: i32) {
+    let state = if code == 0 {
+        State::Injected
+    } else {
+        State::Degraded
+    };
+    let event = keyless::audit::Event::new(
+        verb,
+        state,
+        Vec::new(),
+        &std::env::args().collect::<Vec<_>>(),
+        &keyless::mask::Masker::new(),
+    )
+    .with_decision(decision)
+    .with_exit_code(code);
+    if let Err(error) = AuditLog::new(paths.audit.clone()).append(&event) {
+        eprintln!("{NAME}: warning: {error}");
     }
 }
 
@@ -821,35 +903,36 @@ fn dispatch() -> i32 {
             }
         }
 
-        // Two verbs, one write. Both are deliberately trivial to reach: the
-        // moment somebody wants the guards to stop, the alternative to finding
-        // this word is that they gut their settings file by hand and the
-        // protection is gone for good.
-        Verb::Disable(scope) => switch(&scope, false),
-        Verb::Enable(scope) => switch(&scope, true),
+        Verb::Disable(scope) => switch(&scope, false, &paths),
+        Verb::Enable(scope) => switch(&scope, true, &paths),
 
-        Verb::Uninstall(scope) => {
-            let resolved = setup_paths(&scope);
-            let request = SetupRequest {
-                paths: &paths,
-                setup: &resolved,
-                dry_run: false,
-                restore: false,
-                with_daemon: false,
-                with_skill: true,
-                interactive: false,
-                assume_yes: true,
-                only: None,
-                style: Style::detect(io::stdout().is_terminal()),
-            };
-            match uninstall(&request, &mut io::stdout(), &mut io::stderr()) {
-                Ok(code) => code,
-                Err(error) => {
-                    eprintln!("{NAME}: {error}");
-                    1
-                }
+        Verb::Uninstall(scope) => match confirm_or_refuse("uninstall", &paths) {
+            Some(code) => code,
+            None => {
+                let resolved = setup_paths(&scope);
+                let request = SetupRequest {
+                    paths: &paths,
+                    setup: &resolved,
+                    dry_run: false,
+                    restore: false,
+                    with_daemon: false,
+                    with_skill: true,
+                    interactive: false,
+                    assume_yes: true,
+                    only: None,
+                    style: Style::detect(io::stdout().is_terminal()),
+                };
+                let code = match uninstall(&request, &mut io::stdout(), &mut io::stderr()) {
+                    Ok(code) => code,
+                    Err(error) => {
+                        eprintln!("{NAME}: {error}");
+                        1
+                    }
+                };
+                record_switch(&paths, "uninstall", "uninstalled", code);
+                code
             }
-        }
+        },
 
         // Stderr, not stdout. This verb produces no result, and a message on
         // stdout would land in whatever the user piped it into — the one place

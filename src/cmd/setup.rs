@@ -42,10 +42,19 @@
 //! A guard that cannot be turned off gets destroyed instead. Somebody who cannot
 //! find the switch hand-edits a hook, guts their settings file, or works around
 //! the pack permanently — and then the protection is gone silently, which is
-//! strictly worse than it being off on purpose. So `keyless disable` is instant,
-//! loses nothing, is reversed by `keyless enable`, and `keyless doctor` says
-//! plainly that it is off. A disabled install that reports healthy would be the
-//! worst false green in the tool.
+//! strictly worse than it being off on purpose. So `keyless disable` loses
+//! nothing, is reversed by `keyless enable`, and `keyless doctor` says plainly
+//! that it is off. A disabled install that reports healthy would be the worst
+//! false green in the tool.
+//!
+//! It is instant for a PERSON and refused for everyone else. `disable` and
+//! `uninstall` each turn off protection for every command that runs
+//! afterwards, so both ask at a terminal before doing that — one line, and
+//! the only accepted answer is the verb's own name, typed back. A caller
+//! whose stdin and stdout are not both terminals is refused outright: a script, an agent,
+//! or a pipe is exactly the caller this question exists to stop, and no flag
+//! or environment variable is offered to skip it. See
+//! [`confirm_switch`] for the mechanism.
 //!
 //! ⚠️ **The off switch is deliberately NOT advertised in what the guards print
 //! when they refuse a command.** That text is read by the agent, not by the
@@ -310,6 +319,113 @@ pub fn switch_guards(
 }
 
 // ---------------------------------------------------------------------------
+// asking a person before every guard turns off
+// ---------------------------------------------------------------------------
+
+/// Exit code for `disable` and `uninstall` refusing to run at all.
+///
+/// Picked from the same free space [`super::refuse::EXIT_NO_SUCH_VERB`] picks
+/// from `clap`'s — nothing else in this binary returns 77. Nothing unlocks it:
+/// no flag, no environment variable, no workaround, because a flag or a
+/// variable is exactly what an unattended caller would add for itself.
+pub const EXIT_REFUSED: i32 = 77;
+
+/// Why a switch verb did not run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Refusal {
+    /// Stdin and stdout are not both terminals, so there is nobody to ask.
+    NoTerminal,
+    /// A terminal answered with something other than the verb's own name —
+    /// EOF included.
+    Declined,
+}
+
+impl Refusal {
+    /// The audit vocabulary this refusal is recorded under.
+    #[must_use]
+    pub const fn decision(self) -> &'static str {
+        match self {
+            Refusal::NoTerminal => "refused-no-terminal",
+            Refusal::Declined => "refused-unconfirmed",
+        }
+    }
+}
+
+/// Ask a person before `verb` turns every guard off, and read exactly one
+/// answer.
+///
+/// The only accepted answer is `verb` itself, trimmed — never `y`, never
+/// `yes`, and never silence. Those are exactly the words `yes | keyless
+/// disable` supplies to a prompt it never read, and the question exists to
+/// stop precisely that caller.
+///
+/// Takes a `BufRead` and a `Write` rather than reading `stdin`/`stdout`
+/// itself, so this is provable by calling a function rather than by
+/// scraping a real terminal — `main.rs` computes `interactive` and wires the
+/// real streams.
+///
+/// # Errors
+///
+/// A write failure on `prompt`, or a read failure on `stdin` other than EOF.
+pub fn confirm_switch(
+    verb: &str,
+    interactive: bool,
+    stdin: &mut dyn BufRead,
+    prompt: &mut dyn Write,
+) -> io::Result<Result<(), Refusal>> {
+    if !interactive {
+        return Ok(Err(Refusal::NoTerminal));
+    }
+    write!(
+        prompt,
+        "`{} {verb}` turns every guard off, for every command that runs afterwards, until \
+         `{} enable` turns them back on. Type `{verb}` to continue: ",
+        crate::NAME,
+        crate::NAME
+    )?;
+    prompt.flush()?;
+
+    let mut line = String::new();
+    let read = stdin.read_line(&mut line)?;
+    if read > 0 && line.trim() == verb {
+        Ok(Ok(()))
+    } else {
+        Ok(Err(Refusal::Declined))
+    }
+}
+
+/// Say why `verb` did not run, on `err`.
+///
+/// # Errors
+///
+/// A write failure on `err`.
+pub fn explain_refusal(verb: &str, why: Refusal, err: &mut dyn Write) -> io::Result<()> {
+    writeln!(
+        err,
+        "{}: `{verb}` turns every guard off, for every command that runs afterwards, so it \
+         asks a person before it does that.",
+        crate::NAME
+    )?;
+    match why {
+        Refusal::NoTerminal => writeln!(
+            err,
+            "Nothing here is a terminal a person is answering, so nothing changed. A person \
+             runs `{} {verb}` from their own terminal.",
+            crate::NAME
+        )?,
+        Refusal::Declined => writeln!(
+            err,
+            "That was not `{verb}` — nothing changed. Run it again and type `{verb}` at the \
+             prompt."
+        )?,
+    }
+    writeln!(
+        err,
+        "There is no flag, no environment variable, and no other way to skip this."
+    )
+}
+
+// ---------------------------------------------------------------------------
 // setup
 // ---------------------------------------------------------------------------
 
@@ -389,7 +505,7 @@ pub fn setup(
         out,
         style,
         &format!("{} disable", crate::NAME),
-        "the guards stop firing, instantly. Nothing is deleted.",
+        "asks you to confirm at a terminal, then the guards stop firing. Nothing is deleted.",
     )?;
     command(out, style, &format!("{} enable", crate::NAME), "back on")?;
     command(
@@ -1190,9 +1306,10 @@ fn remove_claude(
 
 #[cfg(test)]
 mod tests {
-    use super::{Guards, SKILL, guards, switch_guards};
+    use super::{Guards, Refusal, SKILL, confirm_switch, guards, switch_guards};
     use crate::cmd::status::Style;
     use crate::paths::SetupPaths;
+    use std::io::Cursor;
     use std::path::PathBuf;
 
     fn scratch(tag: &str) -> PathBuf {
@@ -1281,6 +1398,84 @@ mod tests {
         assert!(SKILL.starts_with("---\nname: keyless\n"), "{SKILL}");
         assert!(SKILL.contains("\ndescription:"), "{SKILL}");
         assert!(SKILL.matches("---\n").count() >= 2, "{SKILL}");
+    }
+
+    #[test]
+    fn confirmation_refuses_outright_with_no_terminal() {
+        let mut stdin = Cursor::new(Vec::new());
+        let mut prompt: Vec<u8> = Vec::new();
+        let result = confirm_switch("disable", false, &mut stdin, &mut prompt).expect("call");
+        assert_eq!(result, Err(Refusal::NoTerminal));
+        assert!(
+            prompt.is_empty(),
+            "a non-interactive caller must not even be asked: {:?}",
+            String::from_utf8_lossy(&prompt)
+        );
+    }
+
+    #[test]
+    fn confirmation_proceeds_only_on_the_verbs_own_name() {
+        let mut stdin = Cursor::new(b"disable\n".to_vec());
+        let mut prompt: Vec<u8> = Vec::new();
+        let result = confirm_switch("disable", true, &mut stdin, &mut prompt).expect("call");
+        assert_eq!(result, Ok(()));
+        assert!(
+            String::from_utf8_lossy(&prompt).contains("Type `disable` to continue"),
+            "{}",
+            String::from_utf8_lossy(&prompt)
+        );
+    }
+
+    #[test]
+    fn confirmation_trims_the_typed_line() {
+        let mut stdin = Cursor::new(b"disable   \n".to_vec());
+        let mut prompt: Vec<u8> = Vec::new();
+        let result = confirm_switch("disable", true, &mut stdin, &mut prompt).expect("call");
+        assert_eq!(result, Ok(()));
+    }
+
+    #[test]
+    fn confirmation_refuses_yes_and_y_and_the_wrong_verb() {
+        for typed in ["yes\n", "y\n", "enable\n"] {
+            let mut stdin = Cursor::new(typed.as_bytes().to_vec());
+            let mut prompt: Vec<u8> = Vec::new();
+            let result = confirm_switch("disable", true, &mut stdin, &mut prompt).expect("call");
+            assert_eq!(
+                result,
+                Err(Refusal::Declined),
+                "`{typed}` must not confirm a disable"
+            );
+        }
+    }
+
+    #[test]
+    fn confirmation_refuses_eof_exactly_as_a_wrong_answer() {
+        // Nobody typed anything and stdin closed — `yes | keyless disable` and
+        // an unattended EOF both land here, and both must be refused.
+        let mut stdin = Cursor::new(Vec::new());
+        let mut prompt: Vec<u8> = Vec::new();
+        let result = confirm_switch("disable", true, &mut stdin, &mut prompt).expect("call");
+        assert_eq!(result, Err(Refusal::Declined));
+    }
+
+    #[test]
+    fn the_refusal_names_no_flag_env_var_or_workaround() {
+        let mut err: Vec<u8> = Vec::new();
+        super::explain_refusal("disable", Refusal::NoTerminal, &mut err).expect("write");
+        let text = String::from_utf8_lossy(&err);
+        assert!(text.contains("turns every guard off"), "{text}");
+        assert!(text.contains("asks a person"), "{text}");
+        assert!(
+            text.contains("no flag") || text.contains("No flag"),
+            "{text}"
+        );
+        assert!(text.contains("environment variable"), "{text}");
+        for named in ["--", "KEYLESS_", "yes |"] {
+            assert!(
+                !text.contains(named),
+                "the refusal names a workaround: {text}"
+            );
+        }
     }
 
     #[test]

@@ -170,7 +170,7 @@ pub fn doctor(request: &DoctorRequest<'_>, out: &mut dyn Write) -> io::Result<i3
 
     header(paths, load, style, out)?;
     if let Some(setup) = setup {
-        guards(setup, style, out)?;
+        guards(setup, audit, style, out)?;
     }
     problems += report_build(freshness, checkout, style, out)?;
 
@@ -257,7 +257,12 @@ fn header(paths: &Paths, load: &ConfigLoad, style: Style, out: &mut dyn Write) -
 /// turned the guards off meant to, and a health command that goes red over a
 /// choice is a health command people stop running — which is how the switch
 /// stops being an honest alternative to gutting the settings file by hand.
-fn guards(setup: &crate::paths::SetupPaths, style: Style, out: &mut dyn Write) -> io::Result<()> {
+fn guards(
+    setup: &crate::paths::SetupPaths,
+    audit: &AuditLog,
+    style: Style,
+    out: &mut dyn Write,
+) -> io::Result<()> {
     use crate::cmd::setup::Guards;
 
     heading(out, style, "GUARDS")?;
@@ -309,6 +314,23 @@ fn guards(setup: &crate::paths::SetupPaths, style: Style, out: &mut dyn Write) -
                     setup.hooks_config.display()
                 ),
             )?;
+            match audit.last_switch_off() {
+                Ok(Some(ts)) => note(out, style, &format!("switched off at {ts}"))?,
+                Ok(None) => note(
+                    out,
+                    style,
+                    &format!(
+                        "no `{} disable` is recorded in {}, so the config was changed \
+                         directly",
+                        crate::NAME,
+                        audit.path().display()
+                    ),
+                )?,
+                // The chain itself is reported by the AUDIT section below; this
+                // row's own job is only ever "on" or "off", never "and here is
+                // why the log could not be read".
+                Err(_) => {}
+            }
             action(
                 out,
                 style,
@@ -1037,5 +1059,98 @@ mod tests {
             flat(&spoken).contains("the daemon is serving every name"),
             "{spoken}"
         );
+    }
+
+    /// A report with a guards row, over the audit log the case builds.
+    fn report_with_switch(audit: &AuditLog, setup: &crate::paths::SetupPaths) -> (String, i32) {
+        let load = loaded(r#"{"secrets":{}}"#);
+        let paths = Paths::under(Path::new("/nonexistent/keyless-doctor"));
+        let registry = Registry::new(vec![]);
+        let mut out: Vec<u8> = Vec::new();
+        let code = doctor(
+            &super::DoctorRequest {
+                paths: &paths,
+                load: &load,
+                registry: &registry,
+                audit,
+                setup: Some(setup),
+                notes: &[],
+                probe: false,
+                freshness: &Freshness::Current,
+                checkout: &Checkout::NotBehind {
+                    upstream: String::new(),
+                    ahead: 0,
+                    fetched_ago: None,
+                },
+                style: Style::PLAIN,
+            },
+            &mut out,
+        )
+        .expect("write");
+        (String::from_utf8(out).expect("utf-8"), code)
+    }
+
+    /// A fresh scratch directory for one case, under this process's own temp
+    /// dir — mirrors the pattern `cmd::setup`'s own tests use.
+    fn scratch(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "keyless-doctor-{}-{tag}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        dir
+    }
+
+    #[test]
+    fn a_disabled_install_names_when_it_was_switched_off() {
+        use crate::audit::Event;
+        use crate::paths::SetupPaths;
+
+        let dir = scratch("switch-timestamp");
+        let setup = SetupPaths::under(&dir);
+        std::fs::write(&setup.hooks_config, r#"{"enabled": false}"#).expect("write switch");
+        let audit = AuditLog::new(dir.join("audit.jsonl"));
+        let masker = crate::mask::Masker::new();
+        audit
+            .append(
+                &Event::new(
+                    "disable",
+                    crate::State::Degraded,
+                    vec![],
+                    &["keyless"],
+                    &masker,
+                )
+                .with_decision("guards-off"),
+            )
+            .expect("append");
+
+        let (text, _) = report_with_switch(&audit, &setup);
+        assert!(
+            flat(&text).contains("switched off at"),
+            "the guards row does not name when disable ran:\n{text}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_disabled_install_says_so_when_nothing_records_a_disable() {
+        use crate::paths::SetupPaths;
+
+        // The config was edited by hand — `enabled: false` with no matching
+        // `disable` row anywhere in the log.
+        let dir = scratch("switch-unrecorded");
+        let setup = SetupPaths::under(&dir);
+        std::fs::write(&setup.hooks_config, r#"{"enabled": false}"#).expect("write switch");
+        let audit = AuditLog::new(dir.join("audit.jsonl"));
+
+        let (text, _) = report_with_switch(&audit, &setup);
+        assert!(
+            flat(&text).contains("no `keyless disable` is recorded"),
+            "{text}"
+        );
+        assert!(flat(&text).contains("changed directly"), "{text}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

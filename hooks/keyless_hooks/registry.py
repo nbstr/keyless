@@ -28,7 +28,7 @@ def _table():
     # engine from loading the others: the import cost is paid once per process
     # either way, and the failure mode differs.
     from .checks import (dest_write, env_dump, file_read, heredoc_write,
-                         literal_write, shell_assign, vault_cli)
+                         literal_write, shell_assign, switch, vault_cli)
 
     return [
         # id                event          tier      handler
@@ -78,6 +78,29 @@ def _table():
         # host takes on the way through, into ~/.claude/file-history/, which no
         # later gate can redact and which outlives the file itself.
         ("KL-DEST",   "PreToolUse", BLOCK,   dest_write.run),
+        # BLOCK rather than OBSERVE, for two reasons, and the second is the one
+        # no replay could supply.
+        #
+        # It was replayed before it was registered, over a large body of real
+        # agent tool calls on the machine that wrote it — sessions that had
+        # spent weeks configuring this very tool. It refused about one call in
+        # four thousand. A third of those were an agent rewriting config.json
+        # or hooks.json, which is the act this row exists to take away. The
+        # rest were one-line scripts handed the config path only to read it;
+        # a script that names the file is refused because it COULD write it,
+        # and the refusal points that reader at the doors that are not refused.
+        #
+        # And OBSERVE cannot do its job here. OBSERVE records what a call WOULD have done
+        # and lets the pack keep running, which only works when the call
+        # under test leaves the pack able to record the next one. A switch
+        # that succeeds does the opposite: the first agent session that
+        # disables the pack, or rewrites its config, silences every check —
+        # this one included — for every call after it. A record-only rollout
+        # would show one row for the switch that got flipped and nothing at
+        # all for what ran once it was off, which is exactly the state an
+        # operator promoting the check from its rows would be unable to tell
+        # apart from "nothing happened since".
+        ("KL-SWITCH", "PreToolUse", BLOCK,   switch.run),
         ("KL-SEEN",   "PostToolUse", WARN,   literal_write.run_post),
     ]
 

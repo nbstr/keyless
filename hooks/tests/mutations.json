@@ -656,5 +656,103 @@
     "file": "keyless_hooks/checks/vault_cli.py",
     "find": "    texts = [cmd] + interpreter_payloads(cmd, cfg.interpreters) + substitution_payloads(cmd)",
     "replace": "    texts = [cmd] + interpreter_payloads(cmd, cfg.interpreters)"
+  },
+  {
+    "id": "M95-switch-gate-unregistered",
+    "why": "KL-SWITCH, entirely unregistered. A table with no discovery means a row removed is a gate removed, and nothing else reports it — `keyless disable` runs unrefused.",
+    "file": "keyless_hooks/registry.py",
+    "find": "        (\"KL-SWITCH\", \"PreToolUse\", BLOCK,   switch.run),\n",
+    "replace": ""
+  },
+  {
+    "id": "M96-switch-tier-is-observe",
+    "why": "KL-SWITCH demoted to OBSERVE. The check still runs and still logs, but the engine records the verdict instead of returning it, and `keyless disable` succeeds — silencing every check that would have recorded the calls after it.",
+    "file": "keyless_hooks/registry.py",
+    "find": "        (\"KL-SWITCH\", \"PreToolUse\", BLOCK,   switch.run),",
+    "replace": "        (\"KL-SWITCH\", \"PreToolUse\", OBSERVE, switch.run),"
+  },
+  {
+    "id": "M97-disable-verb-not-matched",
+    "why": "Drops `disable` from the verb table. `keyless disable` walks past the check exactly like any other keyless verb, which is the one call this check exists to stop.",
+    "file": "keyless_hooks/checks/switch.py",
+    "find": "    return _collapse(_keyless_verb(rest)) in (\"disable\", \"uninstall\")",
+    "replace": "    return _collapse(_keyless_verb(rest)) in (\"uninstall\",)"
+  },
+  {
+    "id": "M98-uninstall-script-suffix-widened-to-basename",
+    "why": "Matches any script named `uninstall.sh` rather than the pack's own `hooks/uninstall.sh` — the predicate this check ships with is precise, and loosening it here only proves the test suite would catch the loosening.",
+    "file": "keyless_hooks/checks/switch.py",
+    "find": "    if target.endswith(\"hooks/uninstall.sh\"):",
+    "replace": "    if target.endswith(\"uninstall.sh\"):"
+  },
+  {
+    "id": "M99-guard-targets-empty",
+    "why": "The default hooks.json/config.json locations are dropped from the guard set. Every write to `~/.config/keyless/hooks.json` then matches nothing, and the switch's own config is wide open from a session that never has to touch the CLI at all.",
+    "file": "keyless_hooks/checks/switch.py",
+    "find": "    home = os.path.expanduser(\"~\")\n    targets = set()\n    if home:",
+    "replace": "    home = os.path.expanduser(\"~\")\n    targets = set()\n    if False:"
+  },
+  {
+    "id": "M100-tee-admitted-as-a-reader",
+    "why": "Admits `tee` to the closed reader set. `tee ~/.config/keyless/hooks.json <<< '{}'` then reads as a permitted read of the guard file instead of the write it is, which is exactly the KL-FILE non-reader trap this check reuses the shape of.",
+    "file": "keyless_hooks/checks/switch.py",
+    "find": "\"egrep\", \"fgrep\", \"rg\",",
+    "replace": "\"egrep\", \"fgrep\", \"tee\","
+  },
+  {
+    "id": "M101-project-layer-can-still-disable",
+    "why": "The project-committed `.keyless-hooks.json` keeps its `enabled`/`observe` keys instead of having them stripped before the merge — so a file that ships in the repo, read by every agent that checks it out, can turn the pack off or into record-only mode for all of them.",
+    "file": "keyless_hooks/config.py",
+    "find": "        patch2.pop(\"enabled\", None)\n        patch2.pop(\"observe\", None)\n        for k, v in patch2.items():",
+    "replace": "        for k, v in patch2.items():"
+  },
+  {
+    "id": "M102-cd-not-followed",
+    "why": "Stops following `cd`/`pushd` through the command, so `cd ~/.config/keyless && echo '{}' > hooks.json` resolves `hooks.json` against the payload's own cwd and the write to the live guard file passes.",
+    "file": "keyless_hooks/checks/switch.py",
+    "find": "        if moved is not None:\n            cwd = moved\n            continue",
+    "replace": "        if moved is not None:\n            continue"
+  },
+  {
+    "id": "M103-guard-directory-ignored",
+    "why": "Drops the directory rule, so a recursive copy into `~/.config/keyless/`, a rename of it or a recursive delete of it rewrites every guard file without ever naming one.",
+    "file": "keyless_hooks/checks/switch.py",
+    "find": "    dirs = {os.path.dirname(target) for target in targets}",
+    "replace": "    dirs = set()"
+  },
+  {
+    "id": "M104-fed-heredoc-not-read",
+    "why": "Stops reading here-document bodies fed to an interpreter, so `bash <<EOF` with `keyless disable` on a line of its own runs the off-switch past the check.",
+    "file": "keyless_hooks/checks/switch.py",
+    "find": "    texts += _fed_bodies(docs, cfg)\n",
+    "replace": ""
+  },
+  {
+    "id": "M105-single-quotes-read-as-executed",
+    "why": "Leaves single-quoted text visible to the substitution scan, so markdown prose naming `keyless disable` inside single quotes is refused as if the shell ran it — the false positive that made up every verb refusal in the replay.",
+    "file": "keyless_hooks/checks/switch.py",
+    "find": "            for k in range(i, min(close + 1, n)):\n                out[k] = \" \"\n",
+    "replace": ""
+  },
+  {
+    "id": "M106-find-always-a-reader",
+    "why": "Treats `find` as a reader even with `-delete` or `-exec`, so a find over the guard directory deletes every guard file unrefused.",
+    "file": "keyless_hooks/checks/switch.py",
+    "find": "        return \"-delete\" not in tokens(stmt) and not delegated_head(stmt)",
+    "replace": "        return True"
+  },
+  {
+    "id": "M107-script-file-read-as-head",
+    "why": "Stops skipping `script`'s log-file positional, so `script -q /dev/null keyless disable` is a statement headed `null` and both KL-SWITCH and KL-VAULT go silent behind one wrapper.",
+    "file": "keyless_hooks/shellview.py",
+    "find": "            script_file = name == \"script\"\n",
+    "replace": ""
+  },
+  {
+    "id": "M108-script-command-string-unread",
+    "why": "Stops handing `script -c \"...\"` payloads back as commands, so the util-linux spelling runs the off-switch or a vault print verb past every head-based check.",
+    "file": "keyless_hooks/shellview.py",
+    "find": "        scripted = _script_command(stmt)\n",
+    "replace": "        scripted = \"\"\n"
   }
 ]

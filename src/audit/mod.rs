@@ -536,6 +536,60 @@ impl AuditLog {
 
         Ok(count)
     }
+
+    /// The timestamp of the most recent `guards-off` row with no `guards-on`
+    /// row after it, or `None` when there is none.
+    ///
+    /// Reads raw lines rather than [`AuditLog::verify`]'s chain: this answers
+    /// "when did a person last switch the guards off", and a row written by a
+    /// schema this build does not recognise is skipped rather than stopping
+    /// the scan — `doctor` reports the chain itself as its own row.
+    ///
+    /// A missing file reads as `None`, the same as a file whose rows never
+    /// mention a switch: both mean "no `disable` is recorded", which is the
+    /// caller's cue to say the config was changed directly.
+    ///
+    /// # Errors
+    ///
+    /// A read failure other than the file not existing yet.
+    pub fn last_switch_off(&self) -> Result<Option<String>, AuditError> {
+        let raw = match fs::read_to_string(&self.path) {
+            Ok(raw) => raw,
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(source) => {
+                return Err(AuditError::Io {
+                    path: self.path.clone(),
+                    source,
+                });
+            }
+        };
+
+        let mut off = None;
+        for line in raw.lines() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            let Ok(decision) = serde_json::from_str::<DecisionRow>(line) else {
+                continue;
+            };
+            match decision.decision.as_deref() {
+                Some("guards-off") => off = Some(decision.ts),
+                Some("guards-on") => off = None,
+                _ => {}
+            }
+        }
+        Ok(off)
+    }
+}
+
+/// One row's timestamp and decision, and nothing else — what
+/// [`AuditLog::last_switch_off`] needs, read leniently so a row from a
+/// different schema version is skipped rather than a parse failure.
+#[derive(serde::Deserialize)]
+struct DecisionRow {
+    ts: String,
+    #[serde(default)]
+    decision: Option<String>,
 }
 
 /// Enough of a chain hash to identify a row in a message, and no more.
@@ -638,6 +692,7 @@ mod tests {
     use crate::State;
     use crate::mask::Masker;
     use crate::secret::Secret;
+    use std::io::Write;
     use std::path::PathBuf;
 
     fn temp_path(tag: &str) -> PathBuf {
@@ -702,6 +757,64 @@ mod tests {
             log.append(&event).expect("append");
         }
         assert_eq!(log.verify().expect("verify"), 25);
+    }
+
+    #[test]
+    fn last_switch_off_is_none_on_a_log_that_does_not_exist() {
+        let path = temp_path("switch-absent");
+        let log = AuditLog::new(path);
+        assert_eq!(log.last_switch_off().expect("read"), None);
+    }
+
+    #[test]
+    fn last_switch_off_finds_the_newest_off_with_no_later_on() {
+        let path = temp_path("switch-off");
+        let log = AuditLog::new(path);
+        let masker = Masker::new();
+        let row = |verb: &str, decision: &str| {
+            Event::new(verb, State::Degraded, vec![], &["keyless", verb], &masker)
+                .with_decision(decision)
+        };
+        log.append(&row("disable", "guards-off")).expect("append");
+        assert!(
+            log.last_switch_off().expect("read").is_some(),
+            "the one row recorded is off"
+        );
+
+        log.append(&row("enable", "guards-on")).expect("append");
+        assert_eq!(
+            log.last_switch_off().expect("read"),
+            None,
+            "an `enable` after the `disable` means the guards are back on"
+        );
+
+        log.append(&row("disable", "guards-off")).expect("append");
+        assert!(
+            log.last_switch_off().expect("read").is_some(),
+            "a second `disable` after the `enable` is off again"
+        );
+    }
+
+    #[test]
+    fn last_switch_off_skips_a_row_it_cannot_parse() {
+        // A schema this build does not recognise must not stop the scan — the
+        // whole point is answering "when was it last switched off" even when
+        // an older or newer row sits in between.
+        let path = temp_path("switch-unparseable");
+        let log = AuditLog::new(path.clone());
+        let masker = Masker::new();
+        log.append(
+            &Event::new("disable", State::Degraded, vec![], &["keyless"], &masker)
+                .with_decision("guards-off"),
+        )
+        .expect("append");
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .expect("open")
+            .write_all(b"not json at all\n")
+            .expect("append garbage");
+        assert!(log.last_switch_off().expect("read").is_some());
     }
 
     #[test]

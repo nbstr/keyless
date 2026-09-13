@@ -27,7 +27,7 @@ __all__ = [
     "interpreter_payloads", "rest_after_head", "first_positional",
     "positional_span", "delegated_head",
     "flatten_substitutions", "substitution_payloads",
-    "assignment_split", "is_wrapper",
+    "assignment_split", "is_wrapper", "unquote", "tokens",
 ]
 
 # Wrapper words that TAKE a command as their argument. The head of
@@ -330,10 +330,15 @@ def words(text):
     return out
 
 
-def _unquote(tok):
+def unquote(tok):
     if len(tok) >= 2 and tok[0] == tok[-1] and tok[0] in ("'", '"'):
         return tok[1:-1]
     return tok
+
+
+def tokens(text):
+    """The shell words of `text`, each with its enclosing quotes removed."""
+    return [unquote(text[a:b]) for a, b in words(text)]
 
 
 def assignment_split(token, declared=False):
@@ -398,6 +403,10 @@ def is_wrapper(name):
 # walked past the vault gate while the bare form was blocked.
 _WRAPPER_ARG = re.compile(r"^\d+(?:\.\d+)?[smhd]?$")
 
+# `script`'s flag naming the command to run: util-linux `-c`, clustered as
+# `-qc`, or `--command`. BSD `script` takes the command as trailing words.
+_SCRIPT_COMMAND_FLAG = re.compile(r"^(?:--command|-[A-Za-z]*c)$")
+
 
 def _walk_head(stmt):
     """(name, end_offset, last_wrapper) — the shared head walk.
@@ -408,6 +417,7 @@ def _walk_head(stmt):
     """
     last_wrapper = ("", -1)
     skip_next = False
+    script_file = False
     for start, end in words(stmt):
         tok = stmt[start:end]
         if not tok:
@@ -428,8 +438,18 @@ def _walk_head(stmt):
         if tok.startswith("-"):
             # A flag belonging to a wrapper already absorbed. A statement that
             # starts with a flag has no head we can name.
+            if last_wrapper[0] == "script" and _SCRIPT_COMMAND_FLAG.match(tok):
+                # util-linux `script -c "cmd" file`: the command is a string,
+                # which `interpreter_payloads` hands back to be scanned whole.
+                skip_next = True
             continue
-        name = _unquote(tok)
+        if script_file:
+            # `script [-q] FILE [command …]` — the first positional is the file
+            # the session is logged to, never the command. Read as the head,
+            # `script -q /dev/null op read …` was a statement headed `null`.
+            script_file = False
+            continue
+        name = unquote(tok)
         # A line continuation is deleted before the shell tokenizes, so it joins
         # rather than separates: `ca\<newline>t` invokes `cat`. Removing the pair
         # here is what keeps the head a NAME after the separator scan stopped
@@ -446,9 +466,33 @@ def _walk_head(stmt):
             continue
         if name in _WRAPPERS:
             last_wrapper = (name, end)
+            script_file = name == "script"
             continue
         return name, end, last_wrapper
     return "", -1, last_wrapper
+
+
+def _script_command(stmt):
+    """The command string a statement hands `script -c`, or "" for none."""
+    past_script = False
+    take = False
+    for start, end in words(stmt):
+        tok = stmt[start:end]
+        if take:
+            return unquote(tok)
+        if not past_script:
+            name = unquote(tok).rsplit("/", 1)[-1]
+            if name == "script":
+                past_script = True
+            elif not (_ASSIGN_PREFIX.match(tok) or tok.startswith("-")
+                      or name in _WRAPPERS or _WRAPPER_ARG.match(name)):
+                return ""
+            continue
+        if tok.startswith("--command="):
+            return unquote(tok[len("--command="):])
+        if _SCRIPT_COMMAND_FLAG.match(tok):
+            take = True
+    return ""
 
 
 def head_of(stmt):
@@ -657,6 +701,11 @@ def interpreter_payloads(cmd, interpreters, depth=2):
     if not cmd or depth <= 0:
         return out
     for stmt in statements(cmd):
+        scripted = _script_command(stmt)
+        if scripted.strip():
+            out.append(scripted)
+            out.extend(interpreter_payloads(scripted, interpreters, depth - 1))
+            continue
         if head_of(stmt) not in interpreters:
             continue
         for start, end in words(stmt):
@@ -721,7 +770,7 @@ def positional_span(stmt, index=0):
         if tok.startswith("-") or _ASSIGN_PREFIX.match(tok) or _REDIRECT_TOKEN.match(tok):
             continue
         if seen == index:
-            return _unquote(tok), offset + start
+            return unquote(tok), offset + start
         seen += 1
     return "", -1
 
@@ -754,7 +803,7 @@ def delegated_head(stmt):
     for start, end in words(stmt):
         tok = stmt[start:end]
         if take:
-            name = _unquote(tok)
+            name = unquote(tok)
             if "/" in name:
                 name = name.rsplit("/", 1)[-1]
             if not name or name in _WRAPPERS:
@@ -815,5 +864,5 @@ def expand_local_assignments(cmd, limit=64):
         for start, end in words(stmt):
             m = _SIMPLE_ASSIGN.match(stmt[start:end])
             if m and len(env) < limit:
-                env[m.group(1)] = _unquote(m.group(2))
+                env[m.group(1)] = unquote(m.group(2))
     return "\n".join(out)

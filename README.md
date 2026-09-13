@@ -101,9 +101,9 @@ it twice is safe and says so.
 Nothing here is one-way:
 
 ```console
-keyless disable      the guards stop firing, instantly. Nothing is deleted
+keyless disable      asks you to confirm at a terminal, then no check fires. Nothing is deleted
 keyless enable       back on
-keyless uninstall    removes what setup created, keeps what you wrote
+keyless uninstall    asks the same way, then removes what setup created and keeps what you wrote
 ```
 
 **The repository is private, and the clone is the step that tells you so
@@ -273,16 +273,24 @@ names `KEYLESS_PACK_DIR`, which points at the directory holding `hooks/` and
 `install/`.
 
 **If the guards are ever in your way, there is a switch and you should use it
-rather than working around them.**
+rather than working around them.** `disable` turns off protection for every
+command that runs afterwards, so it asks you to confirm at a terminal —
+type the word `disable` back — before anything changes. There is no flag to
+skip that question: a flag is exactly what an unattended caller would add.
 
 ```console
-$ keyless disable      no check fires. Your config, your secrets and the
-                       registration are all untouched
-$ keyless enable       back on
+$ keyless disable
+keyless disable turns every guard off, for every command that runs
+afterwards, until keyless enable turns them back on. Type disable to
+continue: disable
+no check fires. Your config, your secrets and the registration are all
+untouched
+$ keyless enable       back on, no confirmation needed
 ```
 
-`keyless doctor` says `SWITCHED OFF` for as long as they are off. A disabled
-install that reported healthy would be the worst false green in the tool.
+`keyless doctor` says `SWITCHED OFF` for as long as they are off, and names
+when it was switched off. A disabled install that reported healthy would be
+the worst false green in the tool.
 
 Add the name by hand, so `~/.config/keyless/config.json` reads:
 
