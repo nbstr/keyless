@@ -507,7 +507,9 @@ def claims_in_message(body):
 # refuses to run at all when it is missing, so the gap no longer has to be
 # discovered the way this list's own entries were: run `scripts/install-hooks.sh`
 # once per clone, before the first commit.
-KNOWN_UNSCRUBBED = []
+KNOWN_UNSCRUBBED = [
+    "208f29f8da35a406fb40383d1fdc12b804a5f0d0",
+]
 
 # One planted message per shape that was really written into this history.
 # Invented magnitudes, for the reason PLANTS gives above.
