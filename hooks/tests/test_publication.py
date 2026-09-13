@@ -500,14 +500,13 @@ def claims_in_message(body):
 # list is never emptied ahead of the fix — which would forgive nothing that is
 # gone and guard nothing that is left.
 #
-# 🔴 A MESSAGE CAN STILL REACH THIS LIST, BECAUSE THE MECHANISM THAT LET THE
-# EXISTING ENTRIES IN IS STILL IN PLACE. `install/commit-msg.sh` is the same
-# grammar as a hook that fires BEFORE the message is written, and it is
-# installed by hand or not at all — a clone's `.git/hooks/` starts empty, so the
-# default posture of this repository is a gate that can only speak once the
-# message is unrewritable. Install it in every clone that commits:
-#
-#     ln -sf ../../install/commit-msg.sh .git/hooks/commit-msg
+# A MESSAGE CAN STILL REACH THIS LIST if the mechanism that let the existing
+# entries in is not wired. `install/commit-msg.sh` is the same grammar as a
+# hook that fires BEFORE the message is written, and it is installed by hand or
+# not at all — a clone's git hooks directory starts empty. `scripts/verify.sh`
+# refuses to run at all when it is missing, so the gap no longer has to be
+# discovered the way this list's own entries were: run `scripts/install-hooks.sh`
+# once per clone, before the first commit.
 KNOWN_UNSCRUBBED = []
 
 # One planted message per shape that was really written into this history.
