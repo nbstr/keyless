@@ -320,6 +320,90 @@ pub fn report(config: &super::config::DaemonConfig, out: &mut dyn io::Write) -> 
     Ok(sound)
 }
 
+/// How close to the agent token's expiry `keyless run` starts saying so on
+/// every request the daemon serves.
+///
+/// Tighter than [`EXPIRY_WARNING_DAYS`] on purpose. That window is for
+/// `keylessd check`, whose only reader is a person who chose to run it and may
+/// not run it again for weeks. This one reaches whoever is running commands
+/// right now, so it opens closer to the deadline rather than further from it —
+/// wide enough to still act on, narrow enough that it says something has to
+/// happen soon rather than becoming background noise on every invocation for a
+/// month.
+const RUN_EXPIRY_WARNING_DAYS: i64 = 14;
+
+/// The stderr line `keyless run` should carry on every request while the
+/// Proton agent token is inside its warning window — `None` outside it, and
+/// `None` when no date was ever declared.
+///
+/// Reads only the date an operator wrote into `stores.proton.token_expires`;
+/// the token's own value never passes through here.
+#[must_use]
+pub(crate) fn run_expiry_advisory(token_expires: Option<&str>) -> Option<String> {
+    let date = token_expires?;
+    let days = crate::time::days_until_utc(date).ok()?;
+    if days > RUN_EXPIRY_WARNING_DAYS {
+        return None;
+    }
+    if days < 0 {
+        Some(format!(
+            "the Proton agent token EXPIRED on {date}, {} day(s) ago; every Proton name is \
+             degrading",
+            -days
+        ))
+    } else {
+        Some(format!(
+            "the Proton agent token expires on {date}, in {days} day(s)"
+        ))
+    }
+}
+
+#[cfg(test)]
+mod run_expiry_advisory_tests {
+    use super::run_expiry_advisory;
+
+    #[test]
+    fn no_date_says_nothing() {
+        assert_eq!(run_expiry_advisory(None), None);
+    }
+
+    #[test]
+    fn a_date_far_out_says_nothing() {
+        assert_eq!(run_expiry_advisory(Some("2099-01-01")), None);
+    }
+
+    #[test]
+    fn inside_the_window_says_so() {
+        let soon = in_days(RUN_EXPIRY_DAYS_UNDER_TEST);
+        let said = run_expiry_advisory(Some(&soon)).expect("inside the window");
+        assert!(said.contains(&soon), "{said}");
+        assert!(said.contains("expires"), "{said}");
+    }
+
+    #[test]
+    fn an_expired_date_says_so() {
+        let gone = in_days(-3);
+        let said = run_expiry_advisory(Some(&gone)).expect("expired is inside the window");
+        assert!(said.contains("EXPIRED"), "{said}");
+    }
+
+    #[test]
+    fn an_unparseable_date_says_nothing_rather_than_guessing() {
+        assert_eq!(run_expiry_advisory(Some("not-a-date")), None);
+    }
+
+    /// A day count safely inside the window, used so the fixture below has one
+    /// number to change if the window ever does.
+    const RUN_EXPIRY_DAYS_UNDER_TEST: i64 = super::RUN_EXPIRY_WARNING_DAYS - 1;
+
+    /// `YYYY-MM-DD` for `offset` days from today, built the same way
+    /// [`crate::time`]'s own tests build a fixed date.
+    fn in_days(offset: i64) -> String {
+        let millis = crate::time::now_unix_millis() as i64 + offset * 86_400_000;
+        crate::time::rfc3339_utc(millis as u128)[..10].to_owned()
+    }
+}
+
 /// How many days before an agent token stops working that `check` starts
 /// saying so.
 ///

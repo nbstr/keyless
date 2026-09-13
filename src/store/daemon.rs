@@ -151,6 +151,16 @@ impl Store for DaemonStore {
             Err(error) => Err(self.transport_error(&error)),
         }
     }
+
+    /// Whatever advisory rode with this store's most recent reply.
+    ///
+    /// Read this only after a `resolve` on this same store — it is the reply
+    /// to THAT request, not a poll of the daemon's current state, and reading
+    /// it a second time without another request in between returns nothing:
+    /// see [`crate::ipc::client::Client::take_advisory`].
+    fn advisory(&self) -> Option<String> {
+        self.client.take_advisory()
+    }
 }
 
 #[cfg(test)]
