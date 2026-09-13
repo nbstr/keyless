@@ -176,10 +176,11 @@ def _deny_text(target, pattern, names, note, how):
         "%s\n"
         "There is no verb that prints a value, so re-issuing this read in "
         "another spelling will not produce one.\n\n"
-        "An operator can exempt a path by adding it to `allowed` in "
-        "~/.config/keyless/hooks.json, or disable this pack for a session by "
-        "setting KEYLESS_HOOKS_DISABLE=1 in the settings file's `env` block. "
-        "A session cannot set its own environment, which is the point."
+        "The person running this session can exempt a path by adding it to "
+        "`allowed` in ~/.config/keyless/hooks.json, or disable this pack for a "
+        "session by setting KEYLESS_HOOKS_DISABLE=1 in the settings file's "
+        "`env` block. A session cannot set its own environment, which is the "
+        "point."
         % (CHECK, target, pattern, how, listed, more, remedy))
 
 

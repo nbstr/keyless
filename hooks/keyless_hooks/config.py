@@ -378,6 +378,14 @@ def load(cwd=""):
     patch = _read(user_path, errors)
     if cwd and os.path.isdir(cwd):
         patch2 = _read(os.path.join(cwd, ".keyless-hooks.json"), errors)
+        # Whether the pack runs at all, or only records what it would have
+        # done, is not this file's to set. A project-committed file is read by
+        # every agent that checks out the repo, so letting it flip `enabled`
+        # or `observe` would hand the switch to whoever writes the next
+        # commit rather than to the person running the session. The list keys
+        # below are unaffected — a project may still extend what it protects.
+        patch2.pop("enabled", None)
+        patch2.pop("observe", None)
         for k, v in patch2.items():
             patch[k] = v
 

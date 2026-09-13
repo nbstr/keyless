@@ -178,8 +178,8 @@ def _message(binary, path, alternative):
         "`keyless ls` lists the names it can resolve. This store's own safe verb "
         "is `%s`; that one is not blocked.\n\n"
         "There is no flag on this gate and no spelling of the print verb that "
-        "passes. An operator can drop the rule by editing `vault_verbs` in "
-        "~/.config/keyless/hooks.json, or disable the pack for a session with "
-        "KEYLESS_HOOKS_DISABLE=1 in the settings file's `env` block — a session "
-        "cannot set its own environment, which is the point."
+        "passes. The person running this session can drop the rule by editing "
+        "`vault_verbs` in ~/.config/keyless/hooks.json, or disable the pack for "
+        "a session with KEYLESS_HOOKS_DISABLE=1 in the settings file's `env` "
+        "block — a session cannot set its own environment, which is the point."
         % (CHECK, binary, shown, alternative))

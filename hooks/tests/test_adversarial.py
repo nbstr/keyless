@@ -94,6 +94,10 @@ ATTACKS = [
     ("vault_sudo",       "sudo op read op://a/b",          "a wrapper before a vault CLI"),
     ("vault_timeout",    "timeout 5 op read op://a/b",     "a wrapper WITH an argument"),
     ("vault_env",        "env op read op://a/b",           "a wrapper before a vault CLI"),
+    # `script`'s first positional is the file it logs to, and until the head
+    # walk skipped it the head of this statement was `null`.
+    ("vault_script",     "script -q /dev/null op read op://a/b", "a wrapper whose first positional is a FILE"),
+    ("vault_script_c",   "script -qc 'op read op://a/b' /dev/null", "a wrapper handed the command as a string"),
     ("vault_then",       "if true; then op read op://a/b; fi", "a shell keyword before the verb"),
     ("vault_do",         "for i in 1 2; do op read op://a/b; done", "a loop body"),
     ("env_sudo_env",     "sudo env printenv",              "two wrappers before a dump"),
