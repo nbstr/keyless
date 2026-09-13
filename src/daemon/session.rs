@@ -153,11 +153,16 @@ impl Drop for Keeper {
 ///
 /// # Errors
 ///
-/// A config that asks for the loop and cannot support one, in the same
-/// sentences [`login::coordinates`] uses for the interactive verb. Returned
-/// rather than warned about: an operator who wrote `auto_login: true` has said
-/// the session matters, and starting anyway would leave them with the exact
+/// A config that asks for the loop and cannot support one at all, in the same
+/// sentences [`login::coordinates`] uses for the interactive verb — a missing
+/// or relative `session_dir`, an unset token credential. Returned rather than
+/// warned about: an operator who wrote `auto_login: true` has said the
+/// session matters, and starting anyway would leave them with the exact
 /// silent outage this module exists to end.
+///
+/// An audit log that does not exist yet is not one of these: the loop starts
+/// and resolves the owner it needs to spawn under on its own first tick,
+/// through [`owner_for_attempt`], the same call every later tick makes.
 ///
 /// `generations` being `None` here while the loop was asked for is a wiring
 /// bug rather than a config problem — [`login::coordinates`] above already
@@ -180,11 +185,14 @@ pub fn spawn(
     // key and no way back until a person restarts it, which is the state this
     // machine reached on 2026-09-11.
     let for_key = config.clone();
-    // Checked here and not kept: the loop reads the owner again on every
-    // attempt, through `owner_for_attempt`.
-    if super::credential::daemon_owner(&config.audit).is_none() {
-        return Err(login::no_daemon_uid(&config.audit));
-    }
+    // No owner check here: an audit log that does not exist yet is not a
+    // config this loop "cannot support" — it is the ordinary state of a fresh
+    // or rotated install, before this same daemon's own first append creates
+    // the file under its own euid/egid. `owner_for_attempt` re-reads the
+    // owner on every tick and already degrades a tick it cannot resolve
+    // without stopping the loop; failing here instead would take four other
+    // stores down with a login that has not even been attempted yet, which is
+    // the outage the module-level doc above says this loop exists to end.
     let Some(generations) = generations else {
         return Err(format!(
             "`stores.{}.session_dir` names a directory to renew, but no `Generations` was \
@@ -1050,6 +1058,50 @@ mod tests {
              saw {seen:?}"
         );
 
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn spawn_starts_the_loop_with_no_audit_log_on_disk() {
+        // CONTROL — the change that makes this fail: `spawn` re-adding a
+        // boot-time `daemon_owner` check that returns `Err` before the
+        // accept thread this daemon's other stores depend on ever starts.
+        // The audit log is created lazily on first append (see
+        // `AuditLog::new`), so a fresh or rotated install always reaches
+        // this function with none on disk — the ordinary case, not an edge
+        // one.
+        let dir = scratch_generations_root("spawn-without-audit-log");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("scratch");
+
+        let audit = dir.join("audit.log");
+        let session_dir = dir.join("session");
+        let credentials_file = dir.join("proton-credentials.json");
+
+        let config: DaemonConfig = serde_json::from_str(&format!(
+            r#"{{"audit":{audit:?},
+                 "stores":{{"proton":{{"enabled":true,
+                     "session_dir":{session_dir:?},
+                     "credentials_file":{credentials_file:?},
+                     "credentials":{{"PROTON_PASS_PERSONAL_ACCESS_TOKEN":"AGENT_TOKEN"}},
+                     "session":{{"auto_login":true}}}}}}}}"#,
+            audit = audit,
+            session_dir = session_dir,
+            credentials_file = credentials_file,
+        ))
+        .expect("a config naming everything `login::coordinates` needs");
+
+        assert!(
+            !audit.exists(),
+            "the fixture must start with no audit log, which is the state under test"
+        );
+
+        let generations = Arc::new(Generations::at(dir.join("gen-root")));
+        let keeper = spawn(&config, Some(&generations))
+            .expect("an absent audit log must not refuse to start the loop")
+            .expect("auto_login is true, so a loop must be returned");
+
+        drop(keeper);
         let _ = fs::remove_dir_all(&dir);
     }
 
