@@ -120,10 +120,15 @@ fn keyless_run_warns_on_stderr_while_the_agent_token_is_inside_its_window() {
     .expect("run");
 
     assert_eq!(outcome.state, State::Injected);
+    assert_eq!(outcome.exit_code, 0);
     assert_eq!(witnessed(&marker), DECOY_VALUE);
     let said = String::from_utf8_lossy(&notes);
     assert!(said.contains(&soon), "{said}");
     assert!(said.contains("expires"), "{said}");
+    assert!(
+        !said.contains(DECOY_VALUE),
+        "the advisory line carried the secret: {said}"
+    );
 
     drop(running);
     let _ = std::fs::remove_dir_all(&dir);
