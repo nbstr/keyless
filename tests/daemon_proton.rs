@@ -3510,6 +3510,51 @@ fn a_session_fault_wakes_the_renewal_loop_inside_min_backoff() {
 }
 
 #[test]
+fn a_broken_current_pointer_wakes_the_renewal_loop_inside_min_backoff() {
+    // The pointer-read mirror of `a_session_fault_wakes_the_renewal_loop_inside_min_backoff`
+    // above: there, a read finds the CURRENT generation's own session dead;
+    // here, a read finds `current` itself naming a generation that was never
+    // created — struck from outside the daemon, the way a crash mid-retire or
+    // a hand-edit would leave it. Both must wake the loop inside `min_backoff`
+    // rather than waiting out `probe_interval_seconds`.
+    //
+    // CONTROL — the change that makes this fail: `ProtonStore::enter` filing
+    // no fault on `CurrentFault::Missing` (or `::Malformed`, `::Absent`),
+    // leaving only `generations.take_session_fault()`'s ordinary triggers —
+    // age and `alive()` — neither due here, so the poll below would time out
+    // with `current` still naming the struck generation.
+    let dir = scratch("daemon-proton-pointer-fault-wakes-loop");
+    let inner = stub_pass_cli_listing(&dir, &Backend::Controlled, &Listing::Json(LISTING));
+    let vendor =
+        stub_with_session_verbs(&dir, &inner, Duration::ZERO, true, LogoutAnswer::Ok, None);
+    // `login_after_minutes: 90` and `probe_interval_seconds: 120` put both
+    // ordinary triggers far outside this test's run, so a new generation
+    // published inside the poll below can only be the pointer-fault event.
+    let config = daemon_config_with_generations_loop(&dir, &vendor, 90, 120, 60_000);
+    let running = start_daemon(&config, policy_allowing_self());
+
+    let root = session_dir(&dir);
+    until_a_generation_is_published(&root, Duration::from_secs(30));
+
+    // Struck from outside the daemon: `current` now names a generation this
+    // root never created — `Missing`, one of the three shapes a broken
+    // pointer takes.
+    std::fs::write(root.join("current"), b"gen-1-1\n").expect("plant a broken current pointer");
+
+    let client = client_config(running.socket(), 60_000);
+    let registry = store::build(&client, &Invocation::default()).registry;
+    let _ = registry.resolve(DECLARED);
+
+    // 30s rather than the configured 120s: a new generation replacing the
+    // struck pointer this quickly can only be the pointer-fault event, never
+    // the ordinary probe interval.
+    until_current_moves_past(&root, "gen-1-1", Duration::from_secs(30));
+
+    drop(running);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn the_same_vendor_sentence_evicts_with_a_healthy_session_and_keeps_the_value_without_one() {
     // CONTROL — the change this whole slice exists to rule out: classifying
     // by matching `SESSION_FAULT_SENTENCE`, or any fixed wording, into the

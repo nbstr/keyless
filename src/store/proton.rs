@@ -2267,7 +2267,11 @@ impl ProtonStore {
     /// pointer a renewal has not caught up with, produces instead is
     /// [`StoreError::Unavailable`] with the fault named — a degraded read the
     /// cache keeps what it holds against, exactly as an unreachable backend
-    /// does.
+    /// does. On every one of [`proton_session::CurrentFault`]'s three shapes
+    /// that reaches this branch, the read also files a
+    /// [`proton_session::Generations::report_pointer_fault`] before it
+    /// returns, so the renewal loop replaces the broken pointer within its
+    /// fault backoff rather than waiting out its next ordinary probe.
     ///
     /// On the session side, which carries no [`Generations`] at all, this
     /// returns a pass over [`ProtonStore::session_dir`] directly, holding no
@@ -2314,23 +2318,29 @@ impl ProtonStore {
         match &self.generations {
             Some(generations) => match generations.enter() {
                 Ok(pass) => Ok(pass),
-                Err(fault @ proton_session::CurrentFault::Absent) => match generations
+                Err(fault @ proton_session::CurrentFault::Absent) => generations
                     .enter_legacy()
-                {
-                    Some(pass) => Ok(pass),
-                    None => Err(self
-                        .unavailable(format!("{fault} (root {})", generations.root().display()))),
-                },
-                Err(fault) => {
-                    Err(self
-                        .unavailable(format!("{fault} (root {})", generations.root().display())))
-                }
+                    .map_or_else(|| Err(self.pointer_fault(generations, fault)), Ok),
+                Err(fault) => Err(self.pointer_fault(generations, fault)),
             },
             None => {
                 let dir = self.session_dir()?.to_path_buf();
                 Ok(proton_session::Pass::without_generation(dir))
             }
         }
+    }
+
+    /// File a [`proton_session::Generations::report_pointer_fault`] and build
+    /// the [`StoreError::Unavailable`] both `enter` error arms return —
+    /// carried once so the two arms cannot drift out of the reporting `enter`
+    /// itself promises in its own doc.
+    fn pointer_fault(
+        &self,
+        generations: &proton_session::Generations,
+        fault: proton_session::CurrentFault,
+    ) -> StoreError {
+        generations.report_pointer_fault();
+        self.unavailable(format!("{fault} (root {})", generations.root().display()))
     }
 
     /// What a vendor child's failure says about the item.
@@ -4912,6 +4922,70 @@ mod tests {
         assert!(
             took < Duration::from_secs(1),
             "a fresh root made a read wait out something instead of degrading at once: {took:?}"
+        );
+        assert!(
+            generations.session_fault_pending(),
+            "an absent `current`, with no legacy directory to fall back to, degraded the \
+             read without filing a fault — the renewal loop waits out its next ordinary \
+             probe instead of replacing it within the fault backoff"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A store and its `Generations`, over a fresh root whose `current` holds
+    /// `contents` verbatim — the shape every broken-pointer test below reads
+    /// `enter()` against.
+    fn store_over_current(
+        tag: &str,
+        contents: &str,
+    ) -> (std::path::PathBuf, Arc<Generations>, ProtonStore) {
+        let dir = scratch(tag);
+        std::fs::write(dir.join("current"), contents).expect("write current");
+        let generations = Arc::new(Generations::at(dir.clone()));
+        let store = parts_store()
+            .in_session_dir(Some(dir.clone()))
+            .with_generations(Some(Arc::clone(&generations)))
+            .with_timeout(60_000);
+        (dir, generations, store)
+    }
+
+    #[test]
+    fn a_read_against_a_malformed_current_degrades_and_files_a_fault() {
+        let (dir, generations, store) =
+            store_over_current("read-malformed-current", "not a generation name\nmore\n");
+
+        let error = store
+            .enter()
+            .expect_err("a malformed current must degrade the read");
+
+        assert!(
+            matches!(error, StoreError::Unavailable { .. }),
+            "a malformed pointer was reported as a verdict on the item: {error}"
+        );
+        assert!(
+            generations.session_fault_pending(),
+            "a malformed `current` degraded the read without filing a fault"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_read_naming_a_generation_that_is_not_there_degrades_and_files_a_fault() {
+        let (dir, generations, store) = store_over_current("read-missing-generation", "gen-1-1\n");
+
+        let error = store
+            .enter()
+            .expect_err("current naming an absent generation must degrade the read");
+
+        assert!(
+            matches!(error, StoreError::Unavailable { .. }),
+            "a pointer naming an absent generation was reported as a verdict on the item: {error}"
+        );
+        assert!(
+            generations.session_fault_pending(),
+            "current naming a missing generation degraded the read without filing a fault"
         );
 
         let _ = std::fs::remove_dir_all(&dir);
