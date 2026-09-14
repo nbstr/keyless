@@ -69,7 +69,7 @@ use crate::store::proton_session::Generations;
 use crate::{NAME, State};
 
 use self::config::DaemonConfig;
-use self::resolver::{Answer, FailureKind, Outcome, Refresher, Resolver, Source};
+use self::resolver::{Outcome, Refresher, Resolver, Source};
 
 /// Socket mode: owner and group may connect, nobody else.
 ///
@@ -99,13 +99,15 @@ const MAX_NAME_CHARS: usize = 128;
 /// How often the accept loop checks whether it has been told to stop.
 const ACCEPT_POLL: Duration = Duration::from_millis(5);
 
-/// How often a resolve in flight tells the client it is still there.
+/// How often a request in flight tells the client it is still there — from
+/// the moment its frame is decoded to the moment its reply is written, see
+/// `Heartbeat`.
 ///
 /// Sized against the thing it has to stay inside: the client's silence
 /// deadline, which defaults to three seconds. Half a second leaves five missed
 /// heartbeats of margin before a working daemon is mistaken for a wedged one,
-/// and costs one short line on a socket per tick of a lookup that was going to
-/// take seconds anyway.
+/// and costs one short line on a socket per tick of a request that was going
+/// to take seconds anyway.
 ///
 /// It is deliberately not derived from that deadline. The two ends are
 /// configured separately and by different people, and a heartbeat that shrank
@@ -145,7 +147,7 @@ pub struct Daemon {
     token_expires: Option<String>,
 }
 
-/// Where a resolved value came from, for [`Daemon::record`] — [`Answer`]'s
+/// Where a resolved value came from, for [`Daemon::record`] — [`resolver::Answer`]'s
 /// `source` and `age` carried together, since neither reaches a row without
 /// the other and a call that has one always has both.
 struct Served {
@@ -419,11 +421,37 @@ impl Connection {
             let this_attestation = attestation
                 .take()
                 .unwrap_or_else(|| attest(stream.as_fd(), &self.policy));
-            let (reply, advisory) = self.answer(&stream, &frame, &this_attestation);
+
+            let request = match Request::decode(&frame) {
+                Ok(request) => request,
+                Err(error) => {
+                    let _ = write_frame(
+                        &mut &stream,
+                        &Reply::Failed(error.to_string())
+                            .encode()
+                            .unwrap_or_default(),
+                    );
+                    continue;
+                }
+            };
+
+            // Taken here, before anything is decided about the request, and
+            // held until the reply exists — see [`Heartbeat`] for why the
+            // guard lives on this thread for the whole request rather than
+            // around whichever step is slow today.
+            let heartbeat = request
+                .progress
+                .then(|| Heartbeat::start(&stream))
+                .flatten();
+            let (reply, advisory) = self.answer(&request, &this_attestation);
             let encoded = match reply.encode_with_advisory(advisory.as_deref()) {
                 Ok(encoded) => encoded,
                 Err(_) => return,
             };
+            // The join is the handover between the two writers: the beat
+            // thread writes only whole frames, and it has written its last
+            // before the reply frame starts, so the bytes never interleave.
+            drop(heartbeat);
             if write_frame(&mut &stream, &encoded).is_err() {
                 return;
             }
@@ -437,21 +465,11 @@ impl Connection {
     /// The advisory alongside the reply is `Some` only down the [`Op::Resolve`]
     /// path — every `keyless run` request, and no other verb — see
     /// [`credential::run_expiry_advisory`].
-    fn answer(
-        &self,
-        stream: &UnixStream,
-        frame: &[u8],
-        attestation: &Attestation,
-    ) -> (Reply, Option<String>) {
-        let request = match Request::decode(frame) {
-            Ok(request) => request,
-            Err(error) => return (Reply::Failed(error.to_string()), None),
-        };
-
+    fn answer(&self, request: &Request, attestation: &Attestation) -> (Reply, Option<String>) {
         if let Some(denial) = attestation.denial() {
             let detail = denial.to_string();
             self.record(
-                &request,
+                request,
                 attestation,
                 Decision::with_reason(denial.kind(), &detail),
                 State::Degraded,
@@ -480,16 +498,11 @@ impl Connection {
                     None,
                 )
             }
-            Op::Resolve => self.resolve(stream, &request, attestation),
+            Op::Resolve => self.resolve(request, attestation),
         }
     }
 
-    fn resolve(
-        &self,
-        stream: &UnixStream,
-        request: &Request,
-        attestation: &Attestation,
-    ) -> (Reply, Option<String>) {
+    fn resolve(&self, request: &Request, attestation: &Attestation) -> (Reply, Option<String>) {
         let advisory = credential::run_expiry_advisory(self.token_expires.as_deref());
 
         if request.name.is_empty() || request.name.chars().count() > MAX_NAME_CHARS {
@@ -509,11 +522,7 @@ impl Connection {
             );
         }
 
-        let answer = if request.progress {
-            self.resolve_aloud(stream, &request.name)
-        } else {
-            self.resolver.resolve(&request.name)
-        };
+        let answer = self.resolver.resolve(&request.name);
         let served = Some(Served {
             source: answer.source,
             age: answer.age,
@@ -592,75 +601,6 @@ impl Connection {
         route
     }
 
-    /// Resolve on a worker thread, saying so on the socket every
-    /// [`HEARTBEAT`] until it finishes.
-    ///
-    /// # Why the work moves off this thread
-    ///
-    /// A resolve is a vendor CLI and a network round trip, and this thread is
-    /// the only one that may write to this connection. Doing both here means
-    /// the client hears nothing until the answer exists, which is the silence
-    /// it cannot tell apart from a wedge.
-    ///
-    /// # What happens when the client has already gone
-    ///
-    /// The heartbeat write fails, and this keeps waiting anyway. The lookup is
-    /// already paid for; letting it finish records the audit row the request
-    /// earned and leaves the value in the resolver's cache, so the retry the
-    /// caller is about to make is answered from memory. Abandoning it here
-    /// would throw away the work and make the next attempt pay for it again —
-    /// which, on a store that is slow enough to have reached this code, is how
-    /// a client ends up unable to resolve a name it asks for repeatedly.
-    fn resolve_aloud(&self, stream: &UnixStream, name: &str) -> Answer {
-        let resolver = Arc::clone(&self.resolver);
-        let asked = name.to_owned();
-        let (sender, receiver) = std::sync::mpsc::channel();
-        if thread::Builder::new()
-            .name(format!("{NAME}d-lookup"))
-            .spawn(move || {
-                let _ = sender.send(resolver.resolve(&asked));
-            })
-            .is_err()
-        {
-            // No thread to be had. Answering late is better than not answering,
-            // and late is exactly what this daemon did before it could speak.
-            return self.resolver.resolve(name);
-        }
-
-        let mut heard = true;
-        loop {
-            match receiver.recv_timeout(HEARTBEAT) {
-                Ok(answer) => return answer,
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                    if heard {
-                        heard = write_frame(
-                            &mut &*stream,
-                            &Reply::Working.encode().unwrap_or_default(),
-                        )
-                        .is_ok();
-                    }
-                }
-                // The worker ended without sending, which a panic under
-                // `panic = "unwind"` is the only way to reach. Under the
-                // release profile's `abort` the daemon is already gone. Never
-                // a store's own silence — no store was even asked by this
-                // thread — but the same audit word applies: nothing was
-                // decided about the name, so a cached value would still
-                // stand had one existed.
-                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                    return Answer {
-                        outcome: Outcome::Failed {
-                            reason: "the lookup ended without a result".to_owned(),
-                            kind: FailureKind::Silent,
-                        },
-                        source: Source::Store,
-                        age: None,
-                    };
-                }
-            }
-        }
-    }
-
     /// Write one audit row.
     ///
     /// `secret` is passed so the claimed argv can be masked with it: a caller
@@ -734,6 +674,104 @@ impl Connection {
             // stop answering: the alternative is that a full disk takes the
             // whole fleet's secrets away.
             let _ = writeln!(io::stderr(), "{NAME}d: audit: {error}");
+        }
+    }
+}
+
+/// The connection saying "still here" on the socket every [`HEARTBEAT`], for
+/// as long as this is held.
+///
+/// # Why the guard is the connection thread's, for the life of the request
+///
+/// The heartbeat once wrapped the lookup alone, because the lookup was the
+/// step known to be slow: a vendor CLI and a network round trip. Everything
+/// else on the request path ran on the connection thread in silence — and
+/// one of those steps is this daemon's own slow one. An audit append takes an
+/// exclusive lock on a log every connection thread shares, reads its tail,
+/// and writes an anchor through a full `fsync`, so under a busy log or a slow
+/// disk the append alone outlasts what the lookup left of the client's
+/// deadline. Five degrades on a live install had that shape: the client gave
+/// up, and the daemon then recorded `allow` for the same name a few seconds
+/// later. A denial and a malformed name write rows on the same lock and were
+/// never under the heartbeat at all, so a refused client on a held log read
+/// as a wedge rather than a refusal.
+///
+/// The client's deadline bounds SILENCE, and it cannot know which step it is
+/// waiting on. So the guard is taken by the connection thread the moment the
+/// request is decoded and dropped only when the reply exists, and coverage is
+/// a property of the request path rather than of any step on it: a step added
+/// later — another audit row, a catalogue walk — is under the heartbeat
+/// without anyone remembering to put it there.
+///
+/// # Two writers, one socket, and why the bytes never interleave
+///
+/// While this is held there are two threads that may write to the
+/// connection, and the frame writer is whole-frame: the beat thread writes
+/// nothing but complete `Working` frames, and the connection thread writes
+/// nothing at all until it has dropped this, which joins the beat thread.
+/// That join is the handover between the two writers, so the reply frame
+/// starts only after the last heartbeat frame has ended.
+///
+/// # What happens when the client has already gone
+///
+/// The heartbeat write fails, the beating stops, and the request goes on
+/// being answered anyway. The lookup is already paid for; letting it finish
+/// records the audit row the request earned and leaves the value in the
+/// resolver's cache, so the retry the caller is about to make is answered
+/// from memory. Abandoning it would throw away the work and make the next
+/// attempt pay for it again — which, on a store that is slow enough to have
+/// reached this code, is how a client ends up unable to resolve a name it
+/// asks for repeatedly.
+struct Heartbeat {
+    /// Dropped to tell the beat thread to stop; the thread sees it as the
+    /// channel disconnecting.
+    stop: Option<std::sync::mpsc::Sender<()>>,
+    thread: Option<thread::JoinHandle<()>>,
+}
+
+impl Heartbeat {
+    /// Start beating on `stream`.
+    ///
+    /// `None` when there is no descriptor or no thread to be had, and the
+    /// request is then answered in silence — which is late, and late is
+    /// exactly what this daemon did before it could speak.
+    fn start(stream: &UnixStream) -> Option<Self> {
+        let stream = stream.try_clone().ok()?;
+        let (stop, stopped) = std::sync::mpsc::channel::<()>();
+        let thread = thread::Builder::new()
+            .name(format!("{NAME}d-heartbeat"))
+            .spawn(move || {
+                let mut heard = true;
+                loop {
+                    match stopped.recv_timeout(HEARTBEAT) {
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                            if heard {
+                                heard = write_frame(
+                                    &mut &stream,
+                                    &Reply::Working.encode().unwrap_or_default(),
+                                )
+                                .is_ok();
+                            }
+                        }
+                        // Nothing is ever sent; the sender dropping is the
+                        // only thing this can receive.
+                        Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
+                    }
+                }
+            })
+            .ok()?;
+        Some(Heartbeat {
+            stop: Some(stop),
+            thread: Some(thread),
+        })
+    }
+}
+
+impl Drop for Heartbeat {
+    fn drop(&mut self) {
+        drop(self.stop.take());
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
         }
     }
 }
@@ -921,6 +959,83 @@ mod tests {
         // The inode is still there; binding again must work.
         let second = Daemon::bind(&config, Policy::new()).expect("second bind over a stale socket");
         drop(second);
+        let _ = std::fs::remove_file(&socket);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_denied_request_still_hears_the_daemon_while_its_audit_row_waits_on_the_lock() {
+        // A denial's audit row is written under the same exclusive lock as an
+        // allow's, and a heartbeat scoped to the lookup never covered it: a
+        // refused client waiting on a busy log heard nothing and reported a
+        // wedge, not a refusal. Held from outside for longer than the
+        // deadline, the lock stands in for any other connection thread inside
+        // a slow append.
+        use crate::ipc::client::Client;
+        use crate::ipc::protocol::{Reply, Request};
+        use std::time::Duration;
+
+        let dir = scratch("denied-under-held-lock");
+        let socket = short_socket_path(&dir);
+        let config = DaemonConfig {
+            socket: socket.clone().into(),
+            audit: dir.join("audit.jsonl").into(),
+            idle_timeout_seconds: 5,
+            stores: crate::daemon::config::DaemonStores {
+                file: crate::daemon::config::FileStoreConfig {
+                    enabled: true,
+                    path: dir.join("secrets.json").into(),
+                },
+                ..Default::default()
+            },
+            ..DaemonConfig::default()
+        };
+        std::fs::write(&*config.stores.file.path, b"{}").expect("write secrets");
+        // Nothing pinned, so this process is refused, and refused BEFORE any
+        // store is asked: the only slow step on this path is the daemon's own
+        // audit append.
+        let daemon = Daemon::bind(&config, Policy::new()).expect("bind");
+        let running = super::Running::spawn(daemon, &config).expect("start the accept loop");
+
+        let silence = Duration::from_secs(1);
+        let client = Client::new(running.socket().to_path_buf(), silence);
+
+        // The control: an unheld log answers the refusal at once.
+        match client.request(&Request::resolve("DECOY")) {
+            Ok(Reply::Denied(_)) => {}
+            other => panic!("an unpinned daemon must refuse at once, got {other:?}"),
+        }
+
+        let hold = Duration::from_millis(2_500);
+        let log = std::fs::OpenOptions::new()
+            .read(true)
+            .append(true)
+            .open(&config.audit)
+            .expect("open the daemon's audit log");
+        log.lock().expect("hold the audit log's lock");
+        let holder = std::thread::spawn(move || {
+            std::thread::sleep(hold);
+            log.unlock().expect("release the audit log's lock");
+        });
+
+        let started = std::time::Instant::now();
+        let reply = client.request(&Request::resolve("DECOY"));
+        holder.join().expect("the lock holder");
+        assert!(
+            started.elapsed() >= hold - Duration::from_millis(100),
+            "the reply came back before the lock was released, so the denial row was \
+             never behind it and this proves nothing: {:?}",
+            started.elapsed()
+        );
+        match reply {
+            Ok(Reply::Denied(_)) => {}
+            other => panic!(
+                "a daemon that has refused and is waiting on its own log must keep the \
+                 client waiting with it, got {other:?}"
+            ),
+        }
+
+        drop(running);
         let _ = std::fs::remove_file(&socket);
         let _ = std::fs::remove_dir_all(&dir);
     }

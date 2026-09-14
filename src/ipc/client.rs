@@ -40,10 +40,11 @@
 //! non-blocking connect written in `unsafe`, and this boundary already carries
 //! all the `unsafe` it needs.
 //!
-//! The worker also reports the connect itself, so the wait above starts being
-//! fed as soon as there is anything to feed it. Without that the connect and
-//! the answer would share one deadline again, and a slow connect would spend
-//! the budget the answer needed.
+//! The worker also reports its own start and then the connect, so the wait
+//! above starts being fed as soon as there is anything to feed it. Each of
+//! those is a budget boundary: the spawn, the connect and the answer are three
+//! phases, and each gets the silence deadline to itself rather than sharing
+//! one, so time spent in an earlier phase is never charged to the answer.
 //!
 //! # Scrubbing
 //!
@@ -113,10 +114,14 @@ pub struct Client {
 
 /// What the worker thread tells the waiting caller.
 ///
-/// Both signs of life reset the silence deadline. They are kept apart because
-/// only one of them says the daemon is WORKING: a connect proves a listener is
+/// Every sign of life resets the silence deadline. They are kept apart because
+/// only one of them says the daemon is WORKING: a start proves the worker was
+/// scheduled and nothing about the socket, a connect proves a listener is
 /// there and nothing about whether it will ever answer.
 enum Event {
+    /// The worker is running. Sent before anything is asked of the kernel, so
+    /// the spawn's own scheduling delay is measured by nothing but itself.
+    Started,
     /// The connect returned.
     Connected,
     /// A heartbeat arrived: the daemon has the request and has not finished.
@@ -252,7 +257,7 @@ impl Client {
             };
             match receiver.recv_timeout(silence.min(left)) {
                 Ok(Event::Done(result)) => return result,
-                Ok(Event::Connected) => {}
+                Ok(Event::Started | Event::Connected) => {}
                 Ok(Event::Working) => working = true,
                 Err(mpsc::RecvTimeoutError::Timeout) => {
                     return Err(gave_up(working, left <= silence, silence));
@@ -307,6 +312,12 @@ fn exchange(
     silence: Duration,
     report: impl Fn(Event) -> bool,
 ) -> Result<(Reply, Option<String>), ClientError> {
+    // Reported first, before the connect can block: the caller has been
+    // waiting since before this thread was scheduled, and that wait should not
+    // count against the connect.
+    if !report(Event::Started) {
+        return Err(abandoned());
+    }
     let stream = UnixStream::connect(socket).map_err(ClientError::Unreachable)?;
     // The connect returning is itself evidence, and it is the only evidence
     // there will be until the daemon has read the request.
@@ -599,6 +610,51 @@ mod tests {
         assert!(
             daemon.join().expect("the daemon thread"),
             "the daemon never saw the client hang up"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn the_worker_reports_its_start_before_it_connects() {
+        // Three budgets, in the order the events reset them: the spawn's own
+        // scheduling, the connect, then the daemon's answer. A worker whose
+        // first word is the connect folds the first two into one.
+        let path = short_socket_path(std::path::Path::new("ipc-client-started"));
+        let _ = std::fs::remove_file(&path);
+        let listener = std::os::unix::net::UnixListener::bind(&path).expect("bind");
+        std::thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accept");
+            let mut reader = std::io::BufReader::new(stream.try_clone().expect("clone"));
+            let _ = crate::ipc::protocol::read_frame(&mut reader);
+            let beat = crate::ipc::protocol::Reply::Working
+                .encode()
+                .expect("encode");
+            let _ = crate::ipc::protocol::write_frame(&mut &stream, &beat);
+            let reply = crate::ipc::protocol::Reply::Absent
+                .encode()
+                .expect("encode");
+            let _ = crate::ipc::protocol::write_frame(&mut &stream, &reply);
+        });
+
+        let frame = Request::resolve("DECOY").encode().expect("encode");
+        let seen = std::cell::RefCell::new(Vec::new());
+        let result = super::exchange(&path, &frame, Duration::from_secs(5), |event| {
+            seen.borrow_mut().push(match event {
+                super::Event::Started => "started",
+                super::Event::Connected => "connected",
+                super::Event::Working => "working",
+                super::Event::Done(_) => "done",
+            });
+            true
+        });
+        assert!(
+            matches!(result, Ok((crate::ipc::protocol::Reply::Absent, None))),
+            "the fixture answers Absent"
+        );
+        assert_eq!(
+            seen.into_inner(),
+            vec!["started", "connected", "working"],
+            "the spawn is reported before the connect, and the connect before the first heartbeat"
         );
         let _ = std::fs::remove_file(&path);
     }

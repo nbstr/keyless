@@ -570,6 +570,133 @@ fn a_lookup_slower_than_the_clients_deadline_still_reaches_the_caller() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+#[test]
+fn a_run_survives_the_audit_lock_being_held_past_the_silence_deadline() {
+    // Five degrades in 36 hours on a live install, each followed by the
+    // daemon's own `allow` row for the same name, stamped 0–14 seconds after
+    // the client had already given up. The daemon heartbeats only while its
+    // lookup thread runs; everything after the lookup — the audit append under
+    // the log's exclusive lock, the anchor's full fsync — is silence, and a
+    // silence longer than the client's deadline is what the client calls a
+    // wedge. This holds that lock from outside for longer than the deadline,
+    // which is what any other connection thread inside a slow append does.
+    let dir = scratch("daemon-audit-lock-held");
+    let config = daemon_config(&dir);
+    write_secrets(&config.stores.file.path, &[("DECOY", DECOY_VALUE)]);
+    let running = start_daemon(&config, policy_allowing_self());
+
+    let silence = Duration::from_secs(1);
+    let client = Client::new(running.socket().to_path_buf(), silence);
+
+    // The control: nothing holds the lock, and the value is back well inside
+    // the deadline. A red below is then about the lock and nothing else.
+    match client.request(&Request::resolve("DECOY")) {
+        Ok(Reply::Value(secret)) => assert_eq!(secret.expose(), DECOY_VALUE),
+        other => panic!("an unheld log must answer at once, got {other:?}"),
+    }
+
+    let hold = Duration::from_millis(2_500);
+    let log = std::fs::OpenOptions::new()
+        .read(true)
+        .append(true)
+        .open(&config.audit)
+        .expect("open the daemon's audit log");
+    log.lock().expect("hold the audit log's lock");
+    let holder = std::thread::spawn(move || {
+        std::thread::sleep(hold);
+        log.unlock().expect("release the audit log's lock");
+    });
+
+    let started = std::time::Instant::now();
+    let reply = client.request(&Request::resolve("DECOY"));
+    holder.join().expect("the lock holder");
+    assert!(
+        started.elapsed() >= hold - Duration::from_millis(100),
+        "the reply came back before the lock was released, so the append was never \
+         behind it and this proves nothing: {:?}",
+        started.elapsed()
+    );
+    match reply {
+        Ok(Reply::Value(secret)) => assert_eq!(secret.expose(), DECOY_VALUE),
+        other => panic!(
+            "a daemon that has the value and is waiting on its own log must keep the \
+             client waiting with it, got {other:?}"
+        ),
+    }
+
+    drop(running);
+    let rows = std::fs::read_to_string(&config.audit).expect("read the audit log");
+    let named = rows_for(&rows, "DECOY");
+    assert_eq!(named.len(), 2, "rows naming DECOY in:\n{rows}");
+    assert_eq!(
+        named[1]["decision"].as_str(),
+        Some("allow"),
+        "{:?}",
+        named[1]
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn four_callers_polling_a_stale_served_name_never_degrade() {
+    // The shape the live degrades had: several sessions asking for one name
+    // the daemon already holds, each answered from its stale window while a
+    // slow refresh runs behind them, each answer earning an audit row under
+    // the log's one lock. Every reply here is a value the daemon has in
+    // memory; a degrade can only be the daemon going silent on the way to
+    // saying so.
+    //
+    // The arithmetic that bounds it: past freshness a read joins the refresh
+    // in flight and waits its one-second grace before settling for the older
+    // value — the stub sleeps three seconds, so a read that waits spends the
+    // grace in full — and the four threads spend their graces concurrently,
+    // so ten reads a thread is at most ten seconds, plus the warm-up and the
+    // sleep that puts the entry past freshness. Measured at under five: each
+    // landed refresh opens a one-second fresh window that answers from memory.
+    let dir = scratch("daemon-stale-polling");
+    let mut config = daemon_config(&dir);
+    config.stores.file.enabled = false;
+    config.stores.keychain.enabled = true;
+    config.stores.keychain.binary = slow_after_first_store_stub(&dir, DECOY_VALUE, 3).into();
+    config.cache_ttl_seconds = 1;
+    config.cache_stale_seconds = 60;
+
+    let running = start_daemon(&config, policy_allowing_self());
+    let store = DaemonStore::new(running.socket().to_path_buf(), Duration::from_secs(3));
+
+    let warmed = store
+        .resolve("POLLED")
+        .expect("resolve")
+        .expect("the first read warms the cache");
+    assert_eq!(warmed.expose(), DECOY_VALUE);
+    std::thread::sleep(Duration::from_millis(1200));
+
+    const CALLERS: usize = 4;
+    const READS_PER_CALLER: usize = 10;
+    let gate = Barrier::new(CALLERS);
+    std::thread::scope(|scope| {
+        for caller in 0..CALLERS {
+            let store = &store;
+            let gate = &gate;
+            scope.spawn(move || {
+                gate.wait();
+                for read in 0..READS_PER_CALLER {
+                    match store.resolve("POLLED") {
+                        Ok(Some(value)) => assert_eq!(value.expose(), DECOY_VALUE),
+                        other => panic!(
+                            "caller {caller}, read {read}: a name the daemon holds must \
+                             never degrade, got {other:?}"
+                        ),
+                    }
+                }
+            });
+        }
+    });
+
+    drop(running);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 // ---------------------------------------------------------------------------
 // Which of the daemon's own stores answers a name.
 //
