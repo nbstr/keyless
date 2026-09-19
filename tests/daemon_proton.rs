@@ -367,6 +367,43 @@ fn daemon_config_with_a_failing_renewal(dir: &Path, vendor: &Path) -> DaemonConf
 /// vendor refuses every login, the loop is spinning through failures at a
 /// one-second backoff, and a name belonging to another store still has to
 /// resolve over the same socket.
+///
+/// # Why the control is waited FOR, and waited for FIRST
+///
+/// The control below — the vendor was spawned, and spawned for a login — is
+/// what stops this case passing against a loop that never started. A loop that
+/// died at birth leaves the file store answering too, so without it the two
+/// resolve assertions are satisfied by a daemon running no Proton machinery at
+/// all.
+///
+/// It used to be a fixed `sleep(4s)` followed by one read of the argv file, and
+/// that is a race rather than a wait: the interval between `start_daemon` and
+/// the vendor child's first write is not a duration this crate promises, it is
+/// however long the machine takes to get there. **Measured 2026-09-19 over five
+/// runs of this file at cargo's default parallelism: +4.913 s, +5.249 s,
+/// +7.321 s, +7.410 s, +7.913 s from the scratch directory's creation** — past
+/// the 4 s budget in every one, so the read found no file and the case reported
+/// that the loop had never reached the vendor. It had; the file arrived
+/// seconds later. The same test alone spawns at +0.254 s and passes, which is
+/// what made this read as load-sensitive flake rather than as a bound that is
+/// simply too short. It is not load: `--test-threads=1` passes on the same
+/// busy machine, so the variable is how many of this binary's own tests are
+/// spawning children at once, not what else the box is doing.
+///
+/// So the control waits for its own EVENT and returns the moment it lands —
+/// typically a quarter of a second. The 30 s below is a failure bound and
+/// never a success-path dependency: nothing waits it out when the loop is
+/// healthy, and it matches every other bounded wait in this file. **Its
+/// ceiling is roughly four times the worst figure above.** It stops being
+/// enough if this file grows enough concurrent daemon fixtures to push the
+/// first spawn past 30 s, and the symptom would be this exact assertion firing
+/// with an empty `argv` — at which point the number to change is the
+/// parallelism, not this bound.
+///
+/// Waiting for the CONTENT rather than for the file to exist is not
+/// fastidiousness: `>` creates the file before `printf` writes into it, so a
+/// test that woke on existence alone could read an empty string and fail the
+/// `contains` check it had just waited for.
 #[test]
 fn a_proton_login_that_keeps_failing_leaves_the_other_stores_answering() {
     let dir = scratch("daemon-proton-latches");
@@ -377,10 +414,30 @@ fn a_proton_login_that_keeps_failing_leaves_the_other_stores_answering() {
     let config = daemon_config_with_a_failing_renewal(&dir, &vendor);
     let running = start_daemon(&config, policy_allowing_self());
 
-    // Long enough for several ticks at a one-second interval, so the assertion
-    // is made against a loop that has already failed repeatedly rather than one
-    // that has not started.
-    std::thread::sleep(std::time::Duration::from_secs(4));
+    // The control, established BEFORE the property rather than after it. The
+    // old order asserted the property first and only then checked whether the
+    // loop had started, so the two resolves below ran against a daemon whose
+    // Proton state nothing had pinned down yet.
+    //
+    // The vendor always refuses, so once the first attempt has failed the loop
+    // is latched: `established` is back to `None` and every later tick fails
+    // the same way. That is the state the property is about, and reaching it
+    // once is what the old "several ticks" sleep was reaching for.
+    let argv_path = vendor_argv(&dir);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let argv = std::fs::read_to_string(&argv_path).unwrap_or_default();
+        if argv.contains("login") || argv.contains("logout") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the renewal loop never reached the vendor, so nothing was latching. \
+             {} holds {argv:?}",
+            argv_path.display()
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
 
     let client = client_config(running.socket(), 3_000);
     let registry = store::build(&client, &Invocation::default()).registry;
@@ -402,17 +459,6 @@ fn a_proton_login_that_keeps_failing_leaves_the_other_stores_answering() {
     assert!(
         matches!(registry.resolve(NEIGHBOUR), Resolution::Found { .. }),
         "the daemon stopped answering while its Proton loop was failing"
-    );
-
-    // The control, and without it this case passes for the wrong reason. A
-    // loop that never STARTED — a config the spawn declined, a thread that
-    // died at birth — leaves the file store answering too, and the assertions
-    // above cannot tell that apart from a loop that is failing and latching.
-    // So the vendor must have been spawned, and spawned for a login.
-    let argv = support::recorded(&dir.join("pass-cli.argv"));
-    assert!(
-        argv.contains("login") || argv.contains("logout"),
-        "the renewal loop never reached the vendor, so nothing was latching: {argv:?}"
     );
 
     drop(running);
