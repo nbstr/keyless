@@ -872,6 +872,80 @@ WRITE_SOURCE_NEAR_MISSES = [
     ("a docstring about keys", "# Set STRIPE_KEY in the environment before running\n"),
 ]
 
+# ── KL-WRITE: a NAME-keyed guess must never silently EDIT a file ────────────
+#
+# `fingerprint._ASSIGN` fires on an identifier that ENDS in a credential word
+# followed by a quoted value of 12+ characters. It never reads that value for
+# credential SHAPE, so `CB_TOKEN="<a public URL>"` and `CB_TOKEN="<a real
+# token>"` are the same three tokens in the same order — the residual class
+# `fingerprint._is_reference` documents and does not claim to have closed.
+#
+# Until this was fixed the verdict for that guess was decided by the FILE rather
+# than by the evidence: a rewritable destination got a SILENT substitution and an
+# opaque one got a warning, on identical evidence. A file's reader can say
+# whether a substitution would PARSE; it cannot say whether the value is a
+# SECRET, and the check let it decide both. Two corruptions followed, and both
+# are driven below as whole files.
+#
+#   1. a shell script's `readonly CB_TOKEN="<public token-endpoint URL>"` became
+#      `readonly CB_TOKEN="${CB_TOKEN}"` — the substituted name is the
+#      assignment's OWN key, so the line reads its own unset variable. Top-level
+#      code under `set -u`, so every invocation died, `--help` included, and
+#      `bash -n` passed throughout.
+#   2. a markdown handoff describing (1) spelled BOTH halves of the sentence, and
+#      the BEFORE half was rewritten into the AFTER half — so a sentence saying
+#      "X was replaced by Y" arrived on disk with X and Y identical. It destroyed
+#      its own meaning, and nothing in the file looked wrong.
+#
+# Spelled in fragments for the reason this file already gives above: a row that
+# arrives on disk substituted asserts the opposite of what it was written to
+# assert, with the suite still green.
+_SELFREF_VAR = "CB_" + "TOK" + "EN"
+_SELFREF_URL = "https://api.example.com/oauth2/access" + "-" + "tok" + "en"
+_SELFREF_LINE = "readonly " + _SELFREF_VAR + '="' + _SELFREF_URL + '"'
+_SELFREF_SUB = "readonly " + _SELFREF_VAR + '="${' + _SELFREF_VAR + '}"'
+
+WRITE_NAME_KEYED_UNTOUCHED = [
+    ("instance 1: a public token endpoint in a shell script",
+     "deploy.sh", "#!/bin/bash\nset -euo pipefail\n" + _SELFREF_LINE + "\n"),
+    ("the same line in a dotenv, whose reader DOES expand",
+     "deploy.env", _SELFREF_LINE + "\n"),
+    ("the same key in a workflow, separated by a colon",
+     ".github/workflows/kw.yml",
+     "env:\n  " + _SELFREF_VAR + ': "' + _SELFREF_URL + '"\n'),
+    ("a value that is not a URL at all — the shape is never read",
+     "notes.sh", _SELFREF_VAR + '="the quick brown fox jumps ok"\n'),
+    ("prose in a markdown file quoting the shell line",
+     "HANDOFF.md", "We set `" + _SELFREF_LINE + "` at the top.\n"),
+]
+
+# Instance 2, driven for the property that was actually destroyed: the two halves
+# of the sentence must stay DISTINCT. Asserting "the content is unchanged" alone
+# would pass on a check that stopped reading markdown; asserting the AFTER half
+# appears exactly ONCE fails specifically on the collapse, because the defect
+# turns the BEFORE half into a second copy of the AFTER half. The AFTER half is
+# itself immune — it already holds `${`, which `_is_placeholder` clears — so the
+# count moves from 1 to 2 and from nothing else.
+WRITE_COLLAPSE_DOC = ("HANDOFF.md",
+                      "The hook rewrote `" + _SELFREF_LINE + "` into `"
+                      + _SELFREF_SUB + "`, which is circular under `set -u`.\n")
+
+# The control the two lists above cannot supply. Same rewritable destinations,
+# evidence that does NOT come from a name: a VENDOR prefix, and the two
+# POSITIONAL shapes where the grammar around the value — URL userinfo, an
+# `Authorization` header — says the slot holds a credential whatever it is
+# called. These must STILL be substituted. Without them, a change that simply
+# stopped substituting in rewritable files would keep every row above green.
+WRITE_EVIDENCE_CONTROLS = [
+    ("vendor shape, shell script", "deploy.sh", 'readonly K="%s"\n', "aws_key"),
+    ("vendor shape, markdown", "HANDOFF.md", "The key was %s and it leaked.\n",
+     "github_pat"),
+    ("positional bearer, shell script", "deploy.sh",
+     'curl -H "Authorization: Bearer %s" https://api.example.com\n', "generic"),
+    ("positional url password, dotenv", "deploy.env",
+     "DATABASE_URL=postgres://admin:%s@db.example.com/prod\n", "generic"),
+]
+
 # ── here-documents that must stay silent ────────────────────────────────────
 #
 # KL-HEREDOC reads a body that every other check blanks, so its false-positive
@@ -964,17 +1038,31 @@ EXPECTED_CHECKS = (len(SAFE) + len(PREFIX_REFUSES) + 1 + 3 * len(HELP_CONTROL)
                    + len(ASSIGN_FALSE_POSITIVES) + len(ASSIGN_FALSE_POSITIVES_ARGV)
                    + len(ASSIGN_TRUE_POSITIVES)
                    + 2 * len(ASSIGN_VALUE_CONTROL) + 2 * len(ASSIGN_POSITION_CONTROL)
-                   + 2 * len(WRITE_REFERENCE_FALSE_POSITIVES) + 3
+                   # references: silent + unchanged per row, then the residual
+                   # shape — warn and untouched in source, the scanner
+                   # reachability control, then warn and untouched where a
+                   # reference would have resolved
+                   + 2 * len(WRITE_REFERENCE_FALSE_POSITIVES) + 5
                    # rewritable destinations: silent + unchanged + same lines per
                    # row, then 3 per reachability control, then the quoted-head
                    # limit and its control, then 3 `_line_preserved` units
                    + 3 * len(WRITE_REWRITABLE_FALSE_POSITIVES)
                    + 3 * len(WRITE_REWRITABLE_TRUE_POSITIVES) + 2 + 3
-                   # each net alone: 2 per pattern gap, then 3 `_one_line` units
-                   + 2 * len(NEWLINE_SPAN) + 3
+                   # each net alone: 2 per pattern gap, then 3 `_one_line` units,
+                   # then the unsound canary: verdict + reason on each of four
+                   # destinations, two of them controls
+                   + 2 * len(NEWLINE_SPAN) + 3 + 8
                    + 2 * len(ASSIGN_NAME_COLLAPSE)
                    # source near-misses: silent, plus one reachability control
                    + len(WRITE_SOURCE_NEAR_MISSES) + 2
+                   # a name-keyed guess never edits: verdict + bytes per row,
+                   # then 3 for the collapsing paragraph, then verdict + literal
+                   # per evidence control
+                   + 2 * len(WRITE_NAME_KEYED_UNTOUCHED) + 3
+                   + 2 * len(WRITE_EVIDENCE_CONTROLS)
+                   # both classes in one file: verdict, the half that goes, the
+                   # half that stays
+                   + 3
                    # here-documents: silent rows, then the reachability controls
                    + len(HEREDOC_FALSE_POSITIVES) + 2 * len(HEREDOC_TRUE_POSITIVES)
                    # bulk edits: silent AND unchanged, per row
@@ -1142,11 +1230,27 @@ def run():
     s.check("KL-WRITE reports the residual shape in source: %s" % label,
             v.kind, "warn")
     s.check("KL-WRITE leaves the source file untouched", v.updated, None)
-    # ...and the same text where a reference DOES resolve is still substituted,
-    # so the row above is about the destination and not about the pattern.
+    # The reachability control, asserted on the SCANNER rather than on a
+    # substitution. It used to be driven by writing the same text into a `.env`
+    # and requiring the rewrite to happen there — which asserted the defect this
+    # file now documents: `password: E2E_LOGIN_PASSWORD` became
+    # `password: ${PASSWORD}`, destroying an identifier and replacing it with a
+    # reference to a DIFFERENT name, because the destination was allowed to
+    # decide something only the evidence can decide.
+    #
+    # Asking `scan` directly is strictly stronger for the purpose: the old form
+    # could not separate "the pattern still matches" from "the pattern matches
+    # AND we edit on it", and only the first is what the warn above needs.
+    from keyless_hooks import fingerprint as _fp
+    s.check("KL-WRITE control: the residual shape still MATCHES",
+            [f.kind for f in _fp.scan(content)], [_fp.NAME_KEYED])
+    # ...and the same text in a destination whose reader DOES expand is now left
+    # alone too, because the evidence is the same in both files.
     v = drive(write(os.path.join(root, "residual.env"), content))
-    s.check("KL-WRITE control: the residual shape still rewrites where it resolves",
-            "${" + "PASSWORD}" in (v.updated or {}).get("content", ""), True)
+    s.check("KL-WRITE reports rather than edits where a reference would resolve",
+            v.kind, "warn")
+    s.check("KL-WRITE leaves that destination untouched too",
+            (v.updated or {}).get("content", content), content)
 
     from keyless_hooks import fingerprint
     from keyless_hooks.checks import literal_write
@@ -1236,6 +1340,55 @@ def run():
     s.check("line-preserved: one that adds a line is not",
             literal_write._line_preserved("a: X\n", "a: ${A}\n\n"), False)
 
+    # ── and the canary is CONSULTED for every destination, not just editable ──
+    #
+    # `_line_preserved` guards a SCANNER defect: a finding whose span ran past
+    # the end of its own line, whose substitution then replaced a key NAME with
+    # a reference to a different variable. The guard can only be consulted where
+    # a substitution is actually computed, so scoping that computation to the
+    # destinations this check edits would silently stop asking the question for
+    # every source file — a live narrowing of a scanner's coverage, in the one
+    # direction that reads as fine because every verdict stays plausible.
+    #
+    # Driven with a stubbed `apply`, because the real scanner cannot produce a
+    # cross-line finding — `_one_line` drops one at source. That is the point:
+    # this is about the WIRING, and a real caller reaches it only when the
+    # scanner is already broken, which is the condition the canary exists for.
+    #
+    # The first two rows are the control. They are destinations this check
+    # edits, so they consult the canary however the computation is scoped, and
+    # they fail only if the canary stops working altogether.
+    import json as _json
+
+    from keyless_hooks import config as _klconfig
+    from keyless_hooks import payload as _payload
+
+    _cfg = _klconfig.load(root)
+
+    def _unsound_verdict(relpath):
+        raw = _json.dumps(
+            {"hook_event_name": "PreToolUse", "tool_name": "Write",
+             "tool_input": {"file_path": os.path.join(root, relpath),
+                            "content": "K=%s\n" % DECOY["aws_key"]},
+             "cwd": root})
+        real = fingerprint.apply
+        fingerprint.apply = lambda text, found: real(text, found) + "\n"
+        try:
+            return literal_write.run(_payload.parse(raw), _cfg) or ("", "", {})
+        finally:
+            fingerprint.apply = real
+
+    for relpath, why in (("canary.env", "CONTROL — a reader that expands"),
+                         ("canary.md", "CONTROL — prose"),
+                         ("canary.ts", "a program"),
+                         ("canary.unknownext", "an unknown reader")):
+        verdict = _unsound_verdict(relpath)
+        s.check("an unsound substitution is refused in %s (%s)" % (relpath, why),
+                verdict[0], "deny")
+        s.check("...and it is refused AS a scanner defect in %s" % relpath,
+                (verdict[2] or {}).get("reason"),
+                "rewrite_would_not_preserve_lines")
+
     # ── the refusal must not reach ordinary source ──────────────────────────
     for label, content in WRITE_SOURCE_NEAR_MISSES:
         s.check("KL-WRITE does not refuse source: %s" % label,
@@ -1248,6 +1401,51 @@ def run():
             v.kind, "deny")
     s.check_in("KL-WRITE control: and the refusal is this check's",
                "[KL-WRITE]", v.message)
+
+    # ── a NAME-keyed guess never silently EDITS, whatever the destination ────
+    #
+    # The content reaching disk is asserted, not `updated is None`: the property
+    # that matters is what the file ends up holding, and it stays true however
+    # the engine spells "unchanged".
+    for label, relpath, content in WRITE_NAME_KEYED_UNTOUCHED:
+        v = drive(write(os.path.join(root, relpath), content))
+        s.check("KL-WRITE warns rather than editing: %s" % label, v.kind, "warn")
+        s.check("KL-WRITE leaves the bytes alone: %s" % label,
+                (v.updated or {}).get("content", content), content)
+
+    # Instance 2, by the property that was destroyed rather than by "unchanged".
+    _collapse_path, _collapse_doc = WRITE_COLLAPSE_DOC
+    v = drive(write(os.path.join(root, _collapse_path), _collapse_doc))
+    s.check("KL-WRITE warns on the handoff paragraph", v.kind, "warn")
+    s.check("KL-WRITE leaves the handoff paragraph byte-identical",
+            (v.updated or {}).get("content", _collapse_doc), _collapse_doc)
+    s.check("the sentence's two halves stay DISTINCT (the AFTER half appears once)",
+            (v.updated or {}).get("content", _collapse_doc).count(_SELFREF_SUB), 1)
+
+    # ...and the control: evidence that does not come from a NAME still edits.
+    for label, relpath, template, decoy in WRITE_EVIDENCE_CONTROLS:
+        literal = DECOY[decoy]
+        content = template % literal
+        v = drive(write(os.path.join(root, relpath), content))
+        s.check("KL-WRITE control: still substitutes on %s" % label, v.kind, "rewrite")
+        s.check("KL-WRITE control: and the literal is gone from %s" % label,
+                literal in (v.updated or {}).get("content", literal), False)
+
+    # ── both classes in ONE file: the partition is per FINDING, not per file ──
+    #
+    # The case the two lists above cannot reach between them. Neither "rewrite
+    # everything" nor "rewrite nothing" is right here: the vendor literal is a
+    # proven secret and must go, and the name-keyed line beside it must survive
+    # untouched. A check that decided per FILE would get exactly one of the two
+    # arms below, whichever way it decided.
+    _mixed = ('#!/bin/bash\nreadonly AWS_KEY="%s"\n%s\n'
+              % (DECOY["aws_key"], _SELFREF_LINE))
+    v = drive(write(os.path.join(root, "mixed.sh"), _mixed))
+    s.check("KL-WRITE substitutes the proven half of a mixed write", v.kind, "rewrite")
+    s.check("KL-WRITE removes the vendor literal from a mixed write",
+            DECOY["aws_key"] in (v.updated or {}).get("content", ""), False)
+    s.check("KL-WRITE leaves the name-keyed line of a mixed write intact",
+            _SELFREF_LINE in (v.updated or {}).get("content", ""), True)
 
     # ── here-documents: prose, scripts and references stay silent ───────────
     for label, cmd in HEREDOC_FALSE_POSITIVES:

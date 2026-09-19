@@ -16,7 +16,9 @@ caller logs them, and the decision log has no field they would fit in.
 
 import re
 
-__all__ = ["scan", "redact", "Finding", "VENDOR_KINDS", "is_vendor"]
+__all__ = ["scan", "redact", "apply", "Finding", "VENDOR_KINDS", "is_vendor",
+           "POSITIONAL_KINDS", "SUBSTITUTABLE_KINDS", "may_substitute",
+           "NAME_KEYED"]
 
 
 class Finding(object):
@@ -160,6 +162,61 @@ _ASSIGN = re.compile(
 #
 # `_one_line` below is the same rule again, enforced on the FINDING rather than
 # in the pattern, so a future pattern edit cannot reopen the class quietly.
+
+# ── may this finding be SUBSTITUTED without asking anyone? ──────────────────
+#
+# A substitution edits a file the author did not ask to have edited, so the bar
+# for making one silently is EVIDENCE THAT DOES NOT COME FROM A NAME THE AUTHOR
+# CHOSE. Two rule families clear it and one does not:
+#
+#   VENDOR      the SHAPE is proof. Nothing but an AWS key is spelled `AKIA`
+#               plus sixteen upper alphanumerics.
+#   POSITIONAL  the GRAMMAR AROUND the value is proof. The userinfo password of
+#               a URL, the argument of `Authorization: Bearer`, the argument of
+#               `--password` — each is a slot that holds a credential whatever
+#               the surrounding identifiers are called.
+#   NAME-KEYED  `_ASSIGN`. The author picks the identifier, so the identifier is
+#               not evidence about the value. `CB_TOKEN="<a public URL>"` and
+#               `CB_TOKEN="<a real token>"` are the same three tokens in the
+#               same order, and `_is_reference` documents this residual class as
+#               one it does not claim to have closed.
+#
+# So a name-keyed finding is REPORTED and never substituted. That is the rule
+# `literal_write` already applied to files whose reader expands nothing; it is
+# applied to every destination here, because a file's reader can say whether a
+# substitution would PARSE and can say nothing at all about whether the value is
+# a secret.
+#
+# The kinds are read off the same objects that PRODUCE them, for the reason
+# `VENDOR_KINDS` gives: a set maintained by hand answers "no" for the newest
+# pattern, which is the one least likely to be reviewed. `_POSITIONAL` is the
+# tuple `scan` itself iterates, so a rule added there joins this set with no
+# second edit.
+_POSITIONAL = (
+    (_URL_AUTH, "url_password"),
+    (_BEARER, "bearer_token"),
+    (_FLAG, "credential_flag"),
+)
+
+POSITIONAL_KINDS = frozenset(kind for _rx, kind in _POSITIONAL)
+
+# The one kind `_ASSIGN` produces, and the only kind outside the set below.
+NAME_KEYED = "named_credential"
+
+SUBSTITUTABLE_KINDS = VENDOR_KINDS | POSITIONAL_KINDS
+
+
+def may_substitute(kind):
+    """True when a finding of this kind may be rewritten without being asked.
+
+    An UNKNOWN kind answers False, and that direction is the point: a rule added
+    later without a decision about it costs a MESSAGE instead of a substitution,
+    which is the same way `targets.reader_class` treats an extension it does not
+    recognise. The expensive failure in this module has always been editing a
+    file on evidence that did not support it.
+    """
+    return kind in SUBSTITUTABLE_KINDS
+
 
 # Values that are shaped like a credential and are not one. Checked before any
 # finding is reported, because a scanner that rewrites `${DB_PASSWORD}` into
@@ -427,8 +484,7 @@ def scan(text, limit=64):
         if len(raw) >= limit:
             break
 
-    for rx, kind in ((_URL_AUTH, "url_password"), (_BEARER, "bearer_token"),
-                     (_FLAG, "credential_flag")):
+    for rx, kind in _POSITIONAL:
         for m in rx.finditer(text):
             value = m.group(1)
             if _is_placeholder(value) or _too_plain(value):
@@ -448,7 +504,7 @@ def scan(text, limit=64):
             continue
         if _is_reference(text, m.start(gi), m.end(gi)):
             continue
-        raw.append((m.start(gi), m.end(gi), "named_credential",
+        raw.append((m.start(gi), m.end(gi), NAME_KEYED,
                     _name_left_of(text, m.start("kw"), m.end("kw"))))
         if len(raw) >= limit:
             break
@@ -470,17 +526,50 @@ def scan(text, limit=64):
 
 
 def redact(text):
-    """(rewritten_text, findings). The literal becomes `${NAME}`.
+    """(rewritten_text, findings). Every literal becomes `${NAME}`.
 
     A rewrite rather than a refusal: the write proceeds, the file simply does not
     carry the secret. `${NAME}` is chosen over a fixed marker because it is the
     form the file's own reader — a shell, a compose file, a CI config — already
     knows how to resolve, so the corrected file is one `keyless run` away from
     working rather than being a dead end.
+
+    Substitutes EVERY finding, including the name-keyed ones. A caller deciding
+    what a file is allowed to have edited wants `apply` with the subset it has
+    licensed; this is the whole-text form, kept because a caller that genuinely
+    wants all of them should not have to spell the filter.
+
+    debt: this has no production caller. `literal_write` was the only one, and it
+          now scans and licenses a subset itself, so what remains is a documented
+          convenience exercised by `tests/test_contract.py` - which is why the
+          class-4 mutation moved to `apply`, where the live path is.
+          Ceiling: `redact` is not on any path a hook takes, so nothing about a
+          tool call depends on it. It is two lines over `scan` and `apply` and
+          cannot drift from them.
+          Upgrade trigger: it goes when the naming arms in `test_contract` are
+          re-pointed at `apply`, or the moment a second production caller would
+          otherwise be written against it. The same pass takes `_name_left_of`,
+          whose result now reaches nothing: it names NAME_KEYED findings only,
+          and those are never substituted.
     """
     findings = scan(text)
+    return apply(text, findings), findings
+
+
+def apply(text, findings):
+    """`text` with exactly `findings` substituted. Never re-scans.
+
+    Split out of `redact` so a caller can substitute one CLASS of finding and
+    leave another in place — which is what `literal_write` does with the
+    name-keyed class it is not licensed to edit. Taking the findings rather than
+    a predicate keeps the decision at the call site, where the file's own class
+    is known.
+
+    `findings` must be non-overlapping and in ascending order, which is what
+    `scan` returns and what its overlap resolution guarantees.
+    """
     if not findings:
-        return text, []
+        return text
 
     used = {}
     pieces = []
@@ -494,4 +583,4 @@ def redact(text):
         pieces.append("${%s}" % label)
         cursor = f.end
     pieces.append(text[cursor:])
-    return "".join(pieces), findings
+    return "".join(pieces)

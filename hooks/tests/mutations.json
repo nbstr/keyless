@@ -1,758 +1,800 @@
 [
-  {
-    "id": "M1-cat-is-a-non-reader",
-    "why": "KL-FILE's whole gate is the non-reader allowlist sitting on the closed side. Admitting `cat` to it opens every plain read.",
-    "file": "keyless_hooks/config.py",
-    "find": "    \"ls\", \"stat\", \"test\", \"[\", \"[[\", \"touch\", \"mkdir\", \"rm\", \"rmdir\",",
-    "replace": "    \"cat\", \"head\", \"awk\", \"test\", \"[\", \"[[\", \"touch\", \"mkdir\", \"rm\", \"rmdir\","
-  },
-  {
-    "id": "M2-no-substitution-flattening",
-    "why": "Removes the view that catches `cat $(echo .env)`, where the path lives in a statement headed by a command that cannot read.",
-    "file": "keyless_hooks/checks/file_read.py",
-    "find": "flatten_substitutions(base)]\n    texts.extend(substitution_payloads(base))",
-    "replace": "]"
-  },
-  {
-    "id": "M3-no-quote-collapse",
-    "why": "Removes the token-level quote collapse, which is the only thing that sees `.en''v` as `.env`.",
-    "file": "keyless_hooks/shellview.py",
-    "find": "            if collapsed and not any(c.isspace() for c in collapsed):\n                out.extend(candidate_operands(collapsed))",
-    "replace": "            pass"
-  },
-  {
-    "id": "M4-vault-subcommand-never-matches",
-    "why": "KL-VAULT reads the subcommand. Anchoring the pattern on a string no CLI emits makes every print verb pass while the table still looks populated.",
-    "file": "keyless_hooks/config.py",
-    "find": "    [\"op\", r\"^(read|inject)\\b\", \"op run -- <cmd>\", None],",
-    "replace": "    [\"op\", r\"^zzz-never-matches\\b\", \"op run -- <cmd>\", None],"
-  },
-  {
-    "id": "M5-env-dump-never-bare",
-    "why": "`bare` is the discrimination between `set` (a dump) and `set -e` (every script). Forcing it false disables KL-ENV without touching its trigger.",
-    "file": "keyless_hooks/checks/env_dump.py",
-    "find": "    return verb, bare, redirect",
-    "replace": "    return verb, False, redirect"
-  },
-  {
-    "id": "M6-no-secret-name-segments",
-    "why": "KL-ENVVAR's advisory rests entirely on the segment list. An empty one is a check that runs and can never fire.",
-    "file": "keyless_hooks/config.py",
-    "find": "DEFAULT_SECRET_SEGMENTS = [\n    \"token\", \"secret\", \"password\", \"passwd\", \"apikey\", \"credential\",",
-    "replace": "DEFAULT_SECRET_SEGMENTS = [\n    \"zzz-never\", \"passwd\", \"apikey\", \"credential\","
-  },
-  {
-    "id": "M7-redact-is-a-no-op",
-    "why": "The class-4 rewrite. Returning the text unchanged is the failure that looks most like success: the write proceeds and the secret is in it.",
-    "file": "keyless_hooks/fingerprint.py",
-    "find": "    findings = scan(text)\n    if not findings:\n        return text, []",
-    "replace": "    findings = scan(text)\n    return text, []"
-  },
-  {
-    "id": "M8-everything-is-a-placeholder",
-    "why": "The placeholder filter is the scanner's precision. Making it total silences every shape at once while the patterns still compile.",
-    "file": "keyless_hooks/fingerprint.py",
-    "find": "def _is_placeholder(value):\n    v = value.strip()",
-    "replace": "def _is_placeholder(value):\n    return True\n    v = value.strip()"
-  },
-  {
-    "id": "M9-nothing-is-protected",
-    "why": "The path matcher. Returning None for everything disables KL-FILE entirely, on every tool, in one line.",
-    "file": "keyless_hooks/secretpaths.py",
-    "find": "    forms = expansions(candidate, cwd, expand_globs)\n    if not forms:\n        return None",
-    "replace": "    forms = expansions(candidate, cwd, expand_globs)\n    return None"
-  },
-  {
-    "id": "M10-deny-is-downgraded-to-silence",
-    "why": "The engine's deny path. Dropping the reason turns every block in the pack into a no-op that still writes a decision row saying it blocked.",
-    "file": "keyless_hooks/engine.py",
-    "find": "            return message, None, advisories",
-    "replace": "            return None, None, advisories"
-  },
-  {
-    "id": "M11-payload-coercion-removed",
-    "why": "The fail-open boundary. Returning a wrongly-typed field raw is exactly the defect that crashed nearly every script in an audited hook layer on VALID JSON.",
-    "file": "keyless_hooks/payload.py",
-    "find": "    v = obj.get(key)\n    return v if isinstance(v, str) else default",
-    "replace": "    return obj.get(key, default)"
-  },
-  {
-    "id": "M12-names-view-copies-lines",
-    "why": "The one place bytes from a secret file reach output. Copying the whole line instead of the validated key turns the protective view into the leak it exists to prevent.",
-    "file": "keyless_hooks/checks/file_read.py",
-    "find": "        body = [\"%s=[keyless:redacted]\" % n for n in names]",
-    "replace": "        body = [\"%s=%s\" % (n, open(path).read().strip()) for n in names]"
-  },
-  {
-    "id": "M13-wrappers-not-absorbed",
-    "why": "`sudo`, `env` and `timeout` in front of a reader. Not absorbing them makes the head the wrapper, and one prefix word walks past every gate.",
-    "file": "keyless_hooks/shellview.py",
-    "find": "        if name in _WRAPPERS:\n            last_wrapper = (name, end)\n            continue\n        return name, end, last_wrapper",
-    "replace": "        return name, end, last_wrapper"
-  },
-  {
-    "id": "M14-keywords-are-not-command-positions",
-    "why": "`for f in *; do cat .env; done` puts the verb after `do`. Dropping the keyword positions is the classic enumeration gap.",
-    "file": "keyless_hooks/shellview.py",
-    "find": "    for m in re.finditer(r\"(?:^|[\\s;&|(){}\\n])(%s)(?=[\\s\\n])\" % \"|\".join(_KEYWORDS), view):\n        pos.append(m.end(1))",
-    "replace": "    pass"
-  },
-  {
-    "id": "M15-symlinks-not-resolved",
-    "why": "A checkout where most `.env` paths are symlinks onto a handful of real files is an ordinary layout. Matching only the requested path leaves every link open.",
-    "file": "keyless_hooks/secretpaths.py",
-    "find": "            real = os.path.realpath(absolute)\n            if real not in out:\n                out.append(real)\n        elif _GLOB_CHARS.search(cand) and expand_globs:",
-    "replace": "            pass\n        elif _GLOB_CHARS.search(cand) and expand_globs:"
-  },
-  {
-    "id": "M16-verb-path-is-the-raw-arguments",
-    "why": "Restores prefix matching: the row is tested against `secrets folders get --env=prod` instead of the verb path. This is the exact defect that refused `infisical secrets folders get` twice in one session.",
-    "file": "keyless_hooks/checks/vault_cli.py",
-    "find": "            path = verb_path(rest)",
-    "replace": "            path = rest"
-  },
-  {
-    "id": "M17-flags-never-truncate-the-path",
-    "why": "A bare `-f` may consume the next word. Skipping it instead of ending the path lets a flag VALUE be read as a subcommand, so `infisical secrets --env prod get X` collapses to a path no row matches and the bare-secrets row goes silent on a full dump.",
-    "file": "keyless_hooks/checks/vault_cli.py",
-    "find": "        if tok.startswith(\"-\"):\n            if \"=\" in tok:\n                continue\n            break",
-    "replace": "        if tok.startswith(\"-\"):\n            continue"
-  },
-  {
-    "id": "M18-help-is-never-detected",
-    "why": "The help exemption is the only thing that lets `infisical secrets --help` through, because that spelling truncates the verb path back onto the bare-secrets row. Inverting it turns every documentation read in the table into a refusal.",
-    "file": "keyless_hooks/checks/vault_cli.py",
-    "find": "    toks = _tokens(rest)\n    for tok in toks:\n        if tok in _HELP_FLAGS:\n            return True",
-    "replace": "    toks = _tokens(rest)\n    for tok in toks:\n        if tok in _HELP_FLAGS:\n            return False"
-  },
-  {
-    "id": "M19-help-exemption-swallows-everything",
-    "why": "The opposite direction of M18, and the more dangerous one: an exemption that always fires disables all fourteen stores at once while the table still looks populated and every row still compiles.",
-    "file": "keyless_hooks/checks/vault_cli.py",
-    "find": "            if is_help(rest):",
-    "replace": "            if True or is_help(rest):"
-  },
-  {
-    "id": "M20-refusal-echoes-the-arguments",
-    "why": "`pass-cli totp generate <base32-seed>` carries the secret as a positional argument. Echoing the raw arguments puts that credential in the refusal message, so the hook leaks the value it exists to protect.",
-    "file": "keyless_hooks/checks/vault_cli.py",
-    "find": "    shown = \" \".join(path.split()[:2])",
-    "replace": "    shown = path"
-  },
-  {
-    "id": "M21-bare-pass-is-a-print-verb",
-    "why": "`pass` and `gopass` are the one negation left in the table, so an empty verb path matches it. Dropping the trailing `\\S` refuses bare `pass`, which prints the store's tree of NAMES and no value.",
-    "file": "keyless_hooks/config.py",
-    "find": "             r\"grep|help|version|--)\\b)\\S\", \"pass ls lists names\", None],",
-    "replace": "             r\"grep|help|version|--)\\b)\", \"pass ls lists names\", None],"
-  },
-  {
-    "id": "M22-kubectl-name-format-backtracks",
-    "why": "An optional `[= ]?` group lets the regex backtrack around the `name` exclusion, so `--output=name` matches by consuming nothing. The safe format becomes a block — a false positive introduced while closing the `-ojson` false negative.",
-    "file": "keyless_hooks/config.py",
-    "find": "     r\"(?:^|\\s)(?:--output|-o)(?:[= ]\\s*|(?=[a-z]))(?!name\\b)\"],",
-    "replace": "     r\"(?:^|\\s)(?:--output|-o)(?:[= ]\\s*)?(?!name\\b)\"],"
-  },
-  {
-    "id": "M23-keychain-flag-must-end-the-cluster",
-    "why": "`security` clusters short flags: `-ws NAME` parses as `-w -s NAME` and was measured searching the keychain. Requiring `w` to END the cluster makes the password flag invisible in the spelling most likely to be typed.",
-    "file": "keyless_hooks/config.py",
-    "find": "     r\"(?:^|\\s)-[A-Za-z]*[wg][A-Za-z]*(?=\\s|$)\"],",
-    "replace": "     r\"(?:^|\\s)-[A-Za-z]*[wg](?:\\s|$)\"],"
-  },
-  {
-    "id": "M24-pattern-arguments-are-paths",
-    "why": "Restores filesystem expansion of a regex handed to grep. This is the measured defect: `.*` expanded against a real directory matched every dotfile there, and was most of this check's organic false positives on its own.",
-    "file": "keyless_hooks/checks/file_read.py",
-    "find": "        skip_glob = first_positional(stmt) if head in cfg.pattern_tools else \"\"",
-    "replace": "        skip_glob = \"\""
-  },
-  {
-    "id": "M25-the-exemption-covers-every-operand",
-    "why": "The exemption belongs to the pattern ARGUMENT alone. Widening it to the whole statement makes `grep TOKEN prod.*` a read nothing notices, which is a leak introduced while closing a false positive.",
-    "file": "keyless_hooks/checks/file_read.py",
-    "find": "                                   expand_globs=(not in_code and cand != skip_glob))",
-    "replace": "                                   expand_globs=(not in_code and not skip_glob))"
-  },
-  {
-    "id": "M24b-interpreter-code-is-glob-expanded",
-    "why": "`python3 -c \"re.findall('.*', s)\"` hands the interpreter that string verbatim; no shell expanded it. Expanding it against the real directory refuses a regex as a read of every dotfile, and the code arrives as a flag value so the positional rule cannot reach it.",
-    "file": "keyless_hooks/checks/file_read.py",
-    "find": "        in_code = head in cfg.interpreters",
-    "replace": "        in_code = False"
-  },
-  {
-    "id": "M25b-a-flag-supplied-pattern-still-skips",
-    "why": "`grep -f patterns.txt prod.env` reads BOTH files. Ignoring the flag that supplies the pattern makes the first positional look like a regex and drops a real read.",
-    "file": "keyless_hooks/shellview.py",
-    "find": "    if not rest or _PATTERN_FROM_FLAG.search(rest):\n        return \"\"",
-    "replace": "    if not rest:\n        return \"\""
-  },
-  {
-    "id": "M26-jq-filters-are-paths",
-    "why": "`==` is what separates a jq filter ending in `.env` from a filename. Removing the test refuses a filter as a credential file.",
-    "file": "keyless_hooks/secretpaths.py",
-    "find": "    if any(mark in cand for mark in _NOT_A_PATH):\n        return []",
-    "replace": "    if False:\n        return []"
-  },
-  {
-    "id": "M27-trailing-slash-is-a-file",
-    "why": "`.env/` names a directory and cannot open the file `.env` — the kernel answers ENOTDIR. Treating it as that file refuses a read that never existed.",
-    "file": "keyless_hooks/secretpaths.py",
-    "find": "    if cand.endswith(\"/\"):",
-    "replace": "    if False and cand.endswith(\"/\"):"
-  },
-  {
-    "id": "M28-language-idioms-are-paths",
-    "why": "`*.env` matches any word ending in `.env`, so the JS idiom `process.env` reads as a credential file and `grep -rn 'process.env' src/` is refused. The exclusion is the whole fix, and it must not be reachable past a broader protected glob.",
-    "file": "keyless_hooks/config.py",
-    "find": "    \"process.env\",\n    \"import.meta.env\",",
-    "replace": "    \"never-matches-anything.example\","
-  },
-  {
-    "id": "M29-comparisons-split-like-flags",
-    "why": "The flag-attached operand split exists for `dd if=.env`. Applied to `==` it carves `staging.env` out of a jq comparison and refuses the filter as a credential file — a second route to the same false positive, reached even when the whole token is correctly rejected.",
-    "file": "keyless_hooks/shellview.py",
-    "find": "        if past_head and \"=\" in collapsed and \"==\" not in collapsed:",
-    "replace": "        if past_head and \"=\" in collapsed:"
-  },
-  {
-    "id": "M30-heredoc-bodies-are-commands",
-    "why": "A heredoc body is blanked for act detection. Scanning the RAW command for operands reads the body as statements, because strip_heredocs leaves the newlines and statements() then cuts at every prose line. A commit message quoting `.env` becomes a refused read.",
-    "file": "keyless_hooks/checks/file_read.py",
-    "find": "    base = strip_heredocs(cmd)\n    texts = [base, expand_local_assignments(base), flatten_substitutions(base)]\n    texts.extend(substitution_payloads(base))",
-    "replace": "    texts = [cmd, expand_local_assignments(cmd), flatten_substitutions(cmd)]\n    texts.extend(substitution_payloads(cmd))"
-  },
-  {
-    "id": "M31-arguments-count-as-assignments",
-    "why": "KL-ASSIGN's precision IS the position rule: the same word is a shell assignment before the statement's head and an argument after it. Dropping the test makes `make BUILD=<key>` and `--token=<key>` denials, which is a false positive on the tool sessions use most.",
-    "file": "keyless_hooks/checks/shell_assign.py",
-    "find": "        if pair is not None:\n            if decl or not past_head:\n                out.append(pair)\n            continue",
-    "replace": "        if pair is not None:\n            out.append(pair)\n            continue"
-  },
-  {
-    "id": "M32-expansions-are-literals",
-    "why": "A value built at run time was never typed and cannot be in the transcript. Scanning it verbatim refuses `export AUTH_TOKEN=\"$(cat ~/.token)\"` — a command that leaks nothing and is the very shape the pack asks people to move toward.",
-    "file": "keyless_hooks/checks/shell_assign.py",
-    "find": "    spelled = _EXPANSION.sub(\" \", raw_value)",
-    "replace": "    spelled = raw_value"
-  },
-  {
-    "id": "M33-quote-and-backslash-splicing-survives",
-    "why": "`gh''p_<literal>` and `gh\\p_<literal>` are one word to the shell and several fragments to any tokenizer. The shell removes both marks before the value exists, so leaving them in place makes the value invisible and the bypass six characters long.",
-    "file": "keyless_hooks/checks/shell_assign.py",
-    "find": "    return spelled.replace(\"'\", \"\").replace('\"', \"\").replace(\"\\\\\", \"\")",
-    "replace": "    return spelled"
-  },
-  {
-    "id": "M34-prose-is-a-credential",
-    "why": "The generic NAME=<opaque> rule is name-keyed, and `password:` followed by twelve word characters satisfies it inside an ordinary sentence. Without the whitespace test the check denies `export BANNER=\"db password: ...\"`, and a gate that refuses a sentence is a gate that gets uninstalled.",
-    "file": "keyless_hooks/checks/shell_assign.py",
-    "find": "    if any(c.isspace() for c in literal.strip()):\n        return [f for f in found if f.kind not in _NAME_KEYED]",
-    "replace": "    if False:\n        return [f for f in found if f.kind not in _NAME_KEYED]"
-  },
-  {
-    "id": "M35-declaration-verbs-are-heads",
-    "why": "`export` and `declare` are not commands taking arguments, they are the words after which everything is an assignment. Reading `export` as the head puts every assignment past it and silences the check on its single most common spelling.",
-    "file": "keyless_hooks/checks/shell_assign.py",
-    "find": "        if not past_head and word in _DECLARE:\n            decl = True\n            continue",
-    "replace": "        if False:\n            decl = True\n            continue"
-  },
-  {
-    "id": "M36-wrappers-end-the-assignment-prefix",
-    "why": "`env FOO=<key> cmd` puts the assignment AFTER the wrapper. Treating `env` as the head reads the assignment as its argument, and one prefix word walks past the gate — the same defect `head_of` already absorbs wrappers to prevent.",
-    "file": "keyless_hooks/checks/shell_assign.py",
-    "find": "        if not past_head and is_wrapper(word):",
-    "replace": "        if False and is_wrapper(word):"
-  },
-  {
-    "id": "M37-remediation-teaches-a-broken-form",
-    "why": "`keyless run -s NAME -- cmd \"$NAME\"` is expanded by the CALLING shell where the name is unset, so it sends an EMPTY credential and the failure is a 401 at exit 0. A refusal that hands back that spelling is worse than one that hands back nothing, because it looks like it worked.",
-    "file": "keyless_hooks/checks/shell_assign.py",
-    "find": "        \"    keyless run -s %s -- sh -c '<the command you were going to run>'\\n\\n\"",
-    "replace": "        \"    keyless run -s %s -- <the command you were going to run>\\n\\n\""
-  },
-  {
-    "id": "M38-the-refusal-echoes-the-command",
-    "why": "The command being refused CONTAINS the credential — that is the whole reason it is refused. Quoting it back puts the value in the block message, so the hook publishes the secret it exists to protect. Same shape as M20, on the check where the value is guaranteed to be present.",
-    "file": "keyless_hooks/checks/shell_assign.py",
-    "find": "    return (\"deny\", _message(names, shapes),",
-    "replace": "    return (\"deny\", cmd + \"\\n\" + _message(names, shapes),"
-  },
-  {
-    "id": "M30-lower-case-names-are-credentials",
-    "why": "Every organic KL-ENVVAR warn before the case test fired on a lower-case `pat` in a session writing regular expressions — a PATTERN variable. Dropping the case test brings that whole class back.",
-    "file": "keyless_hooks/checks/env_dump.py",
-    "find": "    if name != name.upper():\n        return False",
-    "replace": "    if False:\n        return False"
-  },
-  {
-    "id": "M39-a-qualified-key-is-not-a-credential",
-    "why": "`SECRET_KEY` is Django's and Flask's own credential and the name-keyed rule could not see it: the keyword has to be followed immediately by `=`, and `SECRET` is followed by `_KEY`. Removing the qualified spellings restores that blindness while every vendor pattern still matches, so `STRIPE_SECRET_KEY=<a Stripe key>` stays green and only a value with no vendor shape goes red.",
-    "file": "keyless_hooks/fingerprint.py",
-    "find": "    r\"(?P<kw>token|secret_key|secret-key|secret|pgpassword|password|passwd|apikey|\"\n    r\"api_key|api-key|access_key|access-key|private_key|private-key|signing_key|\"\n    r\"signing-key|encryption_key|encryption-key|credentials?|auth_token|auth-token)\"",
-    "replace": "    r\"(?P<kw>token|secret|pgpassword|password|passwd|apikey|\"\n    r\"api_key|api-key|access_key|access-key|private_key|private-key|\"\n    r\"credentials?|auth_token|auth-token)\""
-  },
-  {
-    "id": "M40-pgpassword-is-two-words",
-    "why": "The lookbehind refuses a keyword glued to a preceding word, which is right for `nextPageToken` and `attributeKey` and wrong for exactly one name: libpq's PGPASSWORD, where every other glued spelling that turned up in real commands was code. Dropping the literal reopens it, and nothing else in the pack covers `PGPASSWORD=<literal> psql`.",
-    "file": "keyless_hooks/fingerprint.py",
-    "find": "    r\"(?P<kw>token|secret_key|secret-key|secret|pgpassword|password|passwd|apikey|\"",
-    "replace": "    r\"(?P<kw>token|secret_key|secret-key|secret|password|passwd|apikey|\""
-  },
-  {
-    "id": "M41-any-suffix-is-still-a-credential",
-    "why": "The mutation that widens instead of narrowing, and the false-positive layer is the only thing that can catch it. Letting any bounded identifier follow the keyword is the obvious way to reach SECRET_KEY, and over real commands it also admits AWS_ACCESS_KEY_ID (the public half of the pair), apiKeyConnectionId, secretRef and secretsManager — a large new class, almost none of it a secret. A gate that denies those gets uninstalled, so silence on them has to be an assertion and not an accident.",
-    "file": "keyless_hooks/fingerprint.py",
-    "find": "    r\"[\\\"']?\\s*[:=]\\s*\"\n    r\"(?:\\\"([^\\\"\\n]{12,256})\\\"",
-    "replace": "    r\"[A-Za-z0-9_-]{0,32}[\\\"']?\\s*[:=]\\s*\"\n    r\"(?:\\\"([^\\\"\\n]{12,256})\\\""
-  },
-  {
-    "id": "M42-key-alone-is-a-credential-word",
-    "why": "The other way to reach SECRET_KEY without enumerating a tail, and the cheaper-looking one: make `key` a keyword on its own. Real traffic refuses it — bare `key=` carrying an opaque value is ordinary configuration, as are cacheKey, sortKey, objectKey, partitionKey and idempotency keys. This is the mutation the silence fixtures for those names exist to catch; without it they assert nothing.",
-    "file": "keyless_hooks/fingerprint.py",
-    "find": "    r\"(?P<kw>token|secret_key|",
-    "replace": "    r\"(?P<kw>token|key|secret_key|"
-  },
-  {
-    "id": "M46-no-code-terminator",
-    "why": "Half the VALUE/REFERENCE discriminator. Emptying the set makes `credentials: PushConfig,` and `token = getToken(` literals again, which is the deployed defect: about half of the measured corrupting rewrites came back through this door alone. Only the false-positive layer can see it, because every contract assertion stays green when the check finds MORE.",
-    "file": "keyless_hooks/fingerprint.py",
-    "find": "_CODE_END = frozenset([\"(\", \",\", \")\"])",
-    "replace": "_CODE_END = frozenset([])"
-  },
-  {
-    "id": "M47-no-member-path",
-    "why": "The other half. `process.env.SECRET` and `credentials.value.password` are the single largest corrupting class measured, and most of them end on whitespace or on end of line, where the terminator test cannot reach and this rule is the only thing withholding them.",
-    "file": "keyless_hooks/fingerprint.py",
-    "find": "    if \".\" not in value:\n        return False",
-    "replace": "    if True:\n        return False"
-  },
-  {
-    "id": "M48-a-substitution-is-a-literal",
-    "why": "`AUTH_TOKEN=\"$(cat ~/.token)\"` is the remediation this pack prints in its own refusal message, and it was being rewritten into a self-reference that expands to nothing. Removing the test restores that, and no other filter covers it: `${VAR}` and a bare `$VAR` are placeholders, `$(` is neither.",
-    "file": "keyless_hooks/fingerprint.py",
-    "find": "    if \"$(\" in value or \"`\" in value:",
-    "replace": "    if False and (\"$(\" in value or \"`\" in value):"
-  },
-  {
-    "id": "M49-a-colon-is-code-punctuation",
-    "why": "The mutation that WIDENS the exemption, and the contract layer is the only thing that can catch it. `:` looks like C-family punctuation and reads as an obvious addition to the set; it sits inside composite tokens — `<token>::<scope>` in the corpus and `<digits>:<body>` in every Telegram bot token — and adding it dropped a real credential when it was tried.",
-    "file": "keyless_hooks/fingerprint.py",
-    "find": "_CODE_END = frozenset([\"(\", \",\", \")\"])",
-    "replace": "_CODE_END = frozenset([\"(\", \",\", \")\", \":\"])"
-  },
-  {
-    "id": "M50-a-quoted-value-can-be-a-reference",
-    "why": "The quote guard is what keeps `TOKEN = \"a.b.c\"` — a JWT — out of the member-path exemption. Dropping it makes every quoted dotted literal a reference, which is the exact bypass this exemption was designed not to open, and again only a contract assertion notices.",
-    "file": "keyless_hooks/fingerprint.py",
-    "find": "    if start > 0 and text[start - 1] in \"\\\"'`\":\n        return False",
-    "replace": "    if False:\n        return False"
-  },
-  {
-    "id": "M51-a-spliced-name-is-not-an-assignment",
-    "why": "The bypass this closed, and it was published as unfixed. A quote inside the NAME defeats the prefix regex, so `export SECRET''_KEY=<literal>` reached no check at all while `gh''p_<literal>` — the same three marks in the VALUE — was already caught. Reverting to the bare prefix restores the asymmetry, and four adversarial rows go red.",
-    "file": "keyless_hooks/checks/shell_assign.py",
-    "find": "        pair = assignment_split(tok, declared=decl or wrapped)",
-    "replace": "        pair = assignment_split(tok)"
-  },
-  {
-    "id": "M52-collapse-a-name-everywhere",
-    "why": "The widening half, and the one a reader is most likely to think is a simplification. Collapsing the name in assignment-PREFIX position too invents an assignment no shell makes: measured on bash, zsh and sh, `FOO\"\"_BAR=hello` standing alone is a command name and leaves FOO_BAR unset. Only the paired positional assertion can see this; every deny case stays green.",
-    "file": "keyless_hooks/shellview.py",
-    "find": "    if not declared:\n        return None",
-    "replace": "    if False:\n        return None"
-  },
-  {
-    "id": "M53-a-copy-is-a-dump",
-    "why": "Removes the assignment exemption, which is the whole of job 2a. `env = dict(os.environ)` and `env = os.environ.copy()` are how every language builds an environment for a CHILD process, and this gate denied them on every call while nothing was printed. Only the false-positive layer can see this one: every contract assertion stays green when a block check denies MORE.",
-    "file": "keyless_hooks/checks/env_dump.py",
-    "find": "            lhs = _COPY_LHS.search(seg[:m.start()])",
-    "replace": "            lhs = None"
-  },
-  {
-    "id": "M54-a-sink-in-front-does-not-count",
-    "why": "The sink test that runs BEFORE the assignment exemption. Without it `const s = JSON.stringify(process.env)` reads as an ordinary copy — the match really is an assignment's right-hand side — and a full serialisation of the environment walks out under the exemption. This is the mutation that proves the ORDER of the two tests is load-bearing, not just their presence.",
-    "file": "keyless_hooks/checks/env_dump.py",
-    "find": "            if _has_sink(seg[:m.start()], lang):\n                return m.group(0)",
-    "replace": "            if False:\n                return m.group(0)"
-  },
-  {
-    "id": "M55-no-one-hop-dataflow",
-    "why": "Deletes the single hop of dataflow. `e = dict(os.environ); print(e)` is a dump written in two statements, and it is the obvious bypass the moment the assignment exemption is documented in a public repository. Nothing else in the pack reaches it.",
-    "file": "keyless_hooks/checks/env_dump.py",
-    "find": "    for name, after, expr in copies:",
-    "replace": "    for name, after, expr in []:"
-  },
-  {
-    "id": "M56-an-option-key-is-not-a-binding",
-    "why": "Drops `:` from the copy grammar. The JavaScript idiom binds the copy to an option KEY rather than to a variable — `spawn(cmd, { env: { ...process.env } })` — so a rule that knows only `=` refuses the exact call the exemption exists to allow, in the language where the shape is most common.",
-    "file": "keyless_hooks/checks/env_dump.py",
-    "find": "    r\"([A-Za-z_$][A-Za-z0-9_$]*)\\s*[=:]\\s*(?![=~:])[^;&\\n]*$\")",
-    "replace": "    r\"([A-Za-z_$][A-Za-z0-9_$]*)\\s*[=]\\s*(?![=~:])[^;&\\n]*$\")"
-  },
-  {
-    "id": "M57-a-tilde-is-a-directory-named-tilde",
-    "why": "Restores the literal join. `~/.cckeys.json` becomes `<cwd>/~/.cckeys.json`, which no filesystem test can ever find — so `isfile` says no and the Read rewrite and the Grep deny both read that as 'nothing to protect' and ALLOW the read. This is a lost block, not a lost courtesy, and it is the defect job 2b was filed as half of.",
-    "file": "keyless_hooks/secretpaths.py",
-    "find": "    if cand.startswith(\"~\"):\n        if not cand.startswith(\"~/\") and cand != \"~\":\n            # `~user/...`. Refused, never guessed.\n            return None\n        home = os.environ.get(\"HOME\") or \"\"\n        if not home:\n            return None\n        cand = home if cand == \"~\" else os.path.join(home, cand[2:])",
-    "replace": "    if cand.startswith(\"~\"):\n        pass"
-  },
-  {
-    "id": "M58-unresolvable-means-absent",
-    "why": "Turns a failure to RESOLVE back into a failure to BLOCK. A path holding an unexpanded substitution cannot be resolved by a hook that holds no model of shell state, and reporting that as 'the file is not there' allows the read. 'I could not look' and 'there is nothing here' are the same empty answer from a filesystem test and only one of them is safe.",
-    "file": "keyless_hooks/checks/file_read.py",
-    "find": "        return (\"deny\", _deny_text(path, pattern, [], \"unresolvable path\", \"Read\"),\n                {\"path\": path[:120], \"pattern\": pattern, \"names\": 0})",
-    "replace": "        return None"
-  },
-  {
-    "id": "M59-braces-are-content",
-    "why": "Counts a JSON document's structure lines against its key/value ratio. A nested `.json` runs about one brace line to every two key lines, which drags it under the threshold on punctuation alone — so every `.json` in the protected list reported `names: 0`, which is most of that list. The PEM property the ratio exists for is unaffected either way: a private key's body is base64, not punctuation.",
-    "file": "keyless_hooks/secretpaths.py",
-    "find": "               and not _STRUCTURE_ONLY.match(ln)]",
-    "replace": "               ]"
-  },
-  {
-    "id": "M60-one-name-per-line",
-    "why": "Reverts to reading a single key per line. A credential store written on ONE line declares many names and the single-key reader saw only the first, so the refusal named one service and stayed silent about the rest. The safety property is untouched by either spelling: both validate a whole bounded identifier taken from the left of a separator.",
-    "file": "keyless_hooks/secretpaths.py",
-    "find": "        found = _keys_of(ln)",
-    "replace": "        found = [_key_of(ln)] if _key_of(ln) is not None else []"
-  },
-  {
-    "id": "M61-a-spread-is-a-path",
-    "why": "Removes the object-spread exclusions. `{ ...process.env }` reaches the path matcher as the operand `...process.env`, which `*.env` matches and the exact `process.env` entry does not cover — so KL-FILE refused the standard Node idiom for building a child's environment while KL-ENV was being blamed for it. The spelling without spaces never matched, which is why this hid.",
-    "file": "keyless_hooks/config.py",
-    "find": "    \"...process.env\",\n    \"...import.meta.env\",",
-    "replace": ""
-  },
-  {
-    "id": "M62-prose-is-read-by-regex",
-    "why": "Puts back the regex prose extractor the tokenizer replaced. Folding `\\n\\s*#` into a space and keeping the lines that start with `#` drops every comment block that FOLLOWS a line of code, because the fold moves the block's first line onto the code line and the paragraph no longer starts with a `#`. It read about a fifth of this pack's prose and reported the tree clean — a scanner that under-reads and a clean tree are the same empty list. It also destroys the comment-paragraph unit, so a claim wrapped across two comment lines stops being one sentence.",
-    "file": "tests/test_publication.py",
-    "find": "    units = []\n    last_line = None\n    try:\n        for tok in tokenize.generate_tokens(io.StringIO(text).readline):\n            if tok.type == tokenize.COMMENT:\n                body = tok.string.lstrip(\"#\")\n                # Rejoin comments on CONSECUTIVE lines into one paragraph. A\n                # sentence wrapped across a comment block is one sentence, and\n                # reading it as two is how `read on this` / `# machine` survived\n                # two separate sweeps of this pack.\n                if last_line is not None and tok.start[0] == last_line + 1 and units:\n                    units[-1] += \" \" + body\n                else:\n                    units.append(body)\n                last_line = tok.start[0]\n            elif tok.type == tokenize.STRING:\n                units.append(tok.string)\n                last_line = None\n    except (tokenize.TokenError, IndentationError, SyntaxError):\n        # A file this tokenizer cannot read is not a file this guard may pass in\n        # silence. Fall back to the whole text: noisier, never blinder.\n        return [text]\n\n    return units",
-    "replace": "    if True:\n        body = re.sub(r\"\\n\\s*#\\s?\", \" \", text)\n        return [ln.strip().lstrip(\"#\") for ln in body.split(\"\\n\")\n                if ln.strip().startswith(\"#\")]\n"
-  },
-  {
-    "id": "M63-no-provenance-vocabulary",
-    "why": "Empties the word list that turns a number into an observation. The guard then reports every tree clean, including one carrying the exact sentences that were scrubbed out of this pack by hand.",
-    "file": "tests/test_publication.py",
-    "find": "    \"corpus\", \"organic\", \"transcript\", \"transcripts\", \"estate\", \"estates\",",
-    "replace": "    \"zzz-no-such-word\","
-  },
-  {
-    "id": "M64-a-ratio-is-not-a-claim",
-    "why": "Drops the rule that a ratio written in figures is a census claim on its own. One real site described its mechanism well enough that no provenance word appeared in the sentence at all, and only the ratio rule sees that shape.",
-    "file": "tests/test_publication.py",
-    "find": "    for m in _RATIO.finditer(text) if ratios else []:\n        if not _is_exempt(m):\n            found.append((m.group(0), \"a ratio in figures\"))",
-    "replace": "    pass"
-  },
-  {
-    "id": "M66-the-ratio-rule-is-forced-on-for-commit-messages",
-    "why": "Ignores the `ratios=False` argument that commit-message scanning passes, so the bare-ratio rule runs over commit bodies as well. That rule is right for hooks/ prose and wrong for a commit body, which naturally reports what a change did to a test suite as a ratio of two product counts: measured over this history it fired five times and every one was a product count. The mutation is caught by the message-exemption control, which is the only assertion that distinguishes a gate people keep from one they delete.",
-    "file": "tests/test_publication.py",
-    "find": "    return claims_in(body.split(\"\\n\\n\"), ratios=False)",
-    "replace": "    return claims_in(body.split(\"\\n\\n\"), ratios=True)"
-  },
-  {
-    "id": "M66b-a-commit-body-is-read-as-one-paragraph",
-    "why": "Joins a whole commit body into one search scope instead of paragraph by paragraph. A number in the subject line then stands within the window of a provenance word four paragraphs below, and the gate reports a claim nobody wrote. This is the same failure `prose_of` documents for source files, and a gate that invents refusals is one that gets removed.",
-    "file": "tests/test_publication.py",
-    "find": "    return claims_in(body.split(\"\\n\\n\"), ratios=False)",
-    "replace": "    return claims_in([body], ratios=False)"
-  },
-  {
-    "id": "M65-a-qualifier-does-not-save-a-corpus",
-    "why": "Removes the product-qualifier exemption. The guard then refuses `the 87 attacks in the attack corpus`, which is a true statement about this repository's own test table — and a gate that refuses correct writing gets removed, taking every other guarantee with it. The exemption is asserted in BOTH directions so it cannot quietly swallow the rule instead.",
-    "file": "tests/test_publication.py",
-    "find": "            before = low[max(0, i - 14):i].strip().split()\n            if before and before[-1].rstrip(\"s\") in PRODUCT_QUALIFIERS:\n                start = i + 1\n                continue",
-    "replace": "            pass"
-  },
-  {
-    "id": "M67-the-two-hosts-do-not-hold-the-pack-equal",
-    "why": "Breaks the construction the latency control rests on. The two host samples are only evidence because the PACK's own cost is identical in both and only the interpreter start moves; a linux sample with a different pack cost would make the ratio's failure prove nothing about the ratio.",
-    "file": "tests/test_latency.py",
-    "find": "    \"linux\":  {\"base\": 0.0040, \"floor\": 0.0097, \"small\": 0.0094, \"big\": 0.0368},",
-    "replace": "    \"linux\":  {\"base\": 0.0040, \"floor\": 0.0130, \"small\": 0.0094, \"big\": 0.0368},"
-  },
-  {
-    "id": "M68-code-spans-stripped-across-units",
-    "why": "Strips inline code spans from the CONCATENATION of every human-written unit instead of from each one, and collapses the units into a single search scope at the same time. `_INLINE`'s class excludes newlines, so in raw text a span cannot run past a line; collapsing whitespace first removes that guard and a backtick near the top of a file pairs with one hundreds of lines below. Measured on the guard's own file: 12,664 characters of prose became 9,926 and the deleted middle held the planted census sentences, so the guard read its own plants as absent and reported the tree clean.",
-    "file": "tests/test_publication.py",
-    "find": "    return [re.sub(r\"\\s+\", \" \", _INLINE.sub(\" \", u)) for u in units]",
-    "replace": "    return [_INLINE.sub(\" \", re.sub(r\"\\s+\", \" \", \" \".join(units)))]"
-  },
-  {
-    "id": "M69-a-file-type-is-silently-exempt",
-    "why": "Drops shell scripts from the scanned extensions. A guard that scans a subset reports the unscanned part clean, which is indistinguishable from having no guard for those files — and it is the failure the Rust scanner next door still has, since its walk filters on `.rs`. The extension list is asserted against what the directory actually holds so a new file type fails loudly instead of being skipped.",
-    "file": "tests/test_publication.py",
-    "find": "_EXTS = (\".py\", \".json\", \".md\", \".sh\")",
-    "replace": "_EXTS = (\".py\", \".json\", \".md\")"
-  },
-  {
-    "id": "M70-a-language-scoped-printer-is-not-a-sink",
-    "why": "Empties the per-language sink table. Ruby's `p` is a full dump — `p env` prints the object — and re-aiming this gate from the EXPRESSION to the ACT reopened `ruby -e \"env = ENV.to_h; p env\"`, which the old mention-based rule refused. Found by an adversarial sweep of the loosened gate rather than by review, which is the only thing that finds a hole this shape. Listing `p` globally is not the fix: it would refuse an inert Python line that happens to bind a variable called `p`, and the false-positive layer asserts exactly that.",
-    "file": "keyless_hooks/checks/env_dump.py",
-    "find": "_SINKS_BY_LANGUAGE = {\n    \"ruby\": frozenset([\"p\"]),\n    \"irb\": frozenset([\"p\"]),\n    \"perl\": frozenset([\"say\"]),\n}",
-    "replace": "_SINKS_BY_LANGUAGE = {}"
-  },
-  {
-    "id": "M71-an-interpreter-in-a-shell-is-invisible",
-    "why": "Stops re-scanning interpreter payloads. `bash -c 'python3 -c \"print(os.environ)\"'` has an outer head of `bash`, which this gate does not read, so the whole dump sits inside one opaque word. KL-VAULT and KL-ASSIGN have re-scanned those payloads from the start and this check never did — measured silent on the pack as it stood before this branch, so it is a hole being closed rather than one introduced.",
-    "file": "keyless_hooks/checks/env_dump.py",
-    "find": "    texts = [cmd] + interpreter_payloads(cmd, cfg.interpreters)",
-    "replace": "    texts = [cmd]"
-  },
-  {
-    "id": "M72-php-is-an-interpreter-with-nothing-to-match",
-    "why": "Removes the PHP whole-environment forms. `php` sat in the interpreter head list from the start with no pattern behind it, so the head was recognised and then nothing looked for the act — every PHP environment dump passed. `getenv()` bare is the whole environment; `getenv(\"NAME\")` is the single-key read this gate ignores on purpose, and the false-positive layer holds that boundary.",
-    "file": "keyless_hooks/checks/env_dump.py",
-    "find": "    r\"|\\$_ENV\\b\"\n    r\"|\\bgetenv\\(\\s*\\)\"",
-    "replace": ""
-  },
-  {
-    "id": "M73-every-reader-expands",
-    "why": "The whole tier table rests on what the destination's reader does with a reference. Declaring every file rewritable restores the behaviour this change removed: a substitution into source, which is a syntax error presented as a repair.",
-    "file": "keyless_hooks/targets.py",
-    "find": "    return reader_class(path) in (EXPANDS, INERT)",
-    "replace": "    return True"
-  },
-  {
-    "id": "M74-no-shape-is-self-evident",
-    "why": "The refusal fires only on a VENDOR shape, which is the one class that proves itself. Emptying the set collapses every deny into a warn and lets a live vendor credential reach disk.",
-    "file": "keyless_hooks/fingerprint.py",
-    "find": "VENDOR_KINDS = frozenset(_VENDOR.groupindex)",
-    "replace": "VENDOR_KINDS = frozenset()"
-  },
-  {
-    "id": "M75-a-bulk-edit-carries-no-text",
-    "why": "MultiEdit keeps its text in a LIST. Stopping the walk at the top level restores the original defect exactly: a tool named in the check's tool set, scanning nothing, indistinguishable from cover.",
-    "file": "keyless_hooks/payload.py",
-    "find": "        edits = self.tool_input.get(\"edits\")\n        if not isinstance(edits, list):\n            return out",
-    "replace": "        edits = None\n        if not isinstance(edits, list):\n            return out"
-  },
-  {
-    "id": "M76-a-rewrite-drops-untouched-entries",
-    "why": "The rewrite must return the SAME list. Dropping the entries it did not change is the corruption a rewrite into a nested structure is feared for — the edit list still parses, and half the edits are gone.",
-    "file": "keyless_hooks/payload.py",
-    "find": "                    else:\n                        rebuilt.append(entry)",
-    "replace": "                    else:\n                        continue"
-  },
-  {
-    "id": "M77-a-heredoc-never-names-a-file",
-    "why": "The destination test is what separates a file write from a body fed to an interpreter. Blinding it turns every refusal into an advisory and lets `cat > .env <<EOF` through.",
-    "file": "keyless_hooks/checks/heredoc_write.py",
-    "find": "        match = _REDIRECT_TOKEN.match(token)",
-    "replace": "        match = None"
-  },
-  {
-    "id": "M78-a-heredoc-body-is-empty",
-    "why": "The body is the file's content. Accumulating none leaves the blanking intact — so every other check still passes — while this one silently judges an empty string.",
-    "file": "keyless_hooks/shellview.py",
-    "find": "                current.body.append(line)",
-    "replace": "                pass"
-  },
-  {
-    "id": "M79-the-allow-list-is-decorative",
-    "why": "The refusal names `allowed` as its escape hatch. This restores the state the message was already in before this change: a remedy printed, and a remedy that does nothing.",
-    "file": "keyless_hooks/checks/literal_write.py",
-    "find": "        allowed = secretpaths.is_allowed(target, payload.cwd, cfg)",
-    "replace": "        allowed = None"
-  },
-  {
-    "id": "M80-a-refusal-degraded-to-advice",
-    "why": "The tier IS the decision. A REWRITE-tier check returning `deny` is downgraded to an advisory by the engine, which is correct treatment of a registry error and silent loss of the gate.",
-    "file": "keyless_hooks/registry.py",
-    "find": "        (\"KL-WRITE\",  \"PreToolUse\", BLOCK,   literal_write.run),",
-    "replace": "        (\"KL-WRITE\",  \"PreToolUse\", REWRITE, literal_write.run),"
-  },
-  {
-    "id": "M81-old-string-is-rewritten-too",
-    "why": "`old_string` must keep matching what is on disk. Rewriting it makes every edit that touches a credential fail to apply — a refusal wearing the face of a repair.",
-    "file": "keyless_hooks/checks/literal_write.py",
-    "find": "        if _slot_key(addr) == \"old_string\":",
-    "replace": "        if False:"
-  },
-  {
-    "id": "M82-a-heredoc-gate-that-never-runs",
-    "why": "The whole check, unregistered. A table with no discovery means a row removed is a gate removed, and nothing else reports it.",
-    "file": "keyless_hooks/registry.py",
-    "find": "        (\"KL-HEREDOC\", \"PreToolUse\", BLOCK,  heredoc_write.run),",
-    "replace": ""
-  },
-  {
-    "id": "M83-a-nested-entry-is-assumed-to-be-a-mapping",
-    "why": "The bulk-edit walk indexes into structures the SENDER controls. Dropping the entry-type guard makes it raise on a hostile list — and a check that raises is isolated by the engine, so the process still exits 0 and prints nothing. Only the decision log tells that apart from a correct silence.",
-    "file": "keyless_hooks/payload.py",
-    "find": "            if not isinstance(entry, dict):\n                continue",
-    "replace": "            if False:\n                continue"
-  },
-  {
-    "id": "M84-dest-existence-inverted",
-    "why": "KL-DEST fires exactly where a copy is taken: the destination already exists. Inverting the test makes it silent on every real capture and noisy on the one case KL-WRITE repairs — a write CREATING the file, where the rewrite is the useful outcome and a deny above it throws that rewrite away.",
-    "file": "keyless_hooks/checks/dest_write.py",
-    "find": "    if not exists:",
-    "replace": "    if exists:"
-  },
-  {
-    "id": "M85-dest-only-two-tools",
-    "why": "The copy is taken by MultiEdit and NotebookEdit exactly as by Edit. A tool set naming two of the four is a gate with two doors open and a name that says otherwise — the shape a matcher audit catches and a unit test never does.",
-    "file": "keyless_hooks/checks/dest_write.py",
-    "find": "_TOOLS = frozenset([\"Write\", \"Edit\", \"MultiEdit\", \"NotebookEdit\"])",
-    "replace": "_TOOLS = frozenset([\"Write\", \"Edit\"])"
-  },
-  {
-    "id": "M86-dest-unresolvable-means-absent",
-    "why": "`I could not look` and `there is nothing there` are the same empty answer from a filesystem test, and only one of them is safe. This is the tilde defect that already cost file_read a whole block, arriving in the new check by the same road.",
-    "file": "keyless_hooks/checks/dest_write.py",
-    "find": "    resolved = resolve(path, payload.cwd)\n    if resolved is None:",
-    "replace": "    resolved = resolve(path, payload.cwd) or path\n    if resolved is None and False:"
-  },
-  {
-    "id": "M87-dest-tier-is-advice",
-    "why": "A BLOCK check demoted to WARN still runs, still logs and still returns `deny`; the engine degrades every one of them to a note and the tool call proceeds. The registry is the only place that fact lives, so nothing about the check's own code changes and it keeps reading as enforcing.",
-    "file": "keyless_hooks/registry.py",
-    "find": "        (\"KL-DEST\",   \"PreToolUse\", BLOCK,   dest_write.run),",
-    "replace": "        (\"KL-DEST\",   \"PreToolUse\", WARN,   dest_write.run),"
-  },
-  {
-    "id": "M89-assign-gap-matches-a-newline",
-    "why": "The gap between a key's separator and its value must not cross a line. With `\\s` there, a key with an EMPTY value takes the NEXT line's key as its value; in a file this pack rewrites, the substitution then replaces a key NAME with a reference to a different variable, silently, under a message announcing a repair. Reproduced through the live hook on a .github/workflows/*.yml, a .env.example and a reusable workflow's secrets block on 2026-08-29.",
-    "file": "keyless_hooks/fingerprint.py",
-    "find": "    r\"[\\\"']?[^\\S\\n]*[:=][^\\S\\n]*\"",
-    "replace": "    r\"[\\\"']?\\s*[:=]\\s*\""
-  },
-  {
-    "id": "M90-one-line-guard-removed",
-    "why": "`_one_line` is the same rule as M89's gap, enforced on the FINDING rather than in the pattern so a later pattern edit cannot reopen the class quietly. Disarming it has to be visible on its own, or it is a comment with a function around it.",
-    "file": "keyless_hooks/fingerprint.py",
-    "find": "    if \"\\n\" in text[value_start:value_end]:\n        return False\n    if keyword_start is None:\n        return True\n    return \"\\n\" not in text[keyword_start:value_start]",
-    "replace": "    return True  # M90: the one-line invariant, disarmed"
-  },
-  {
-    "id": "M91-quote-defeats-the-member-path-exemption",
-    "why": "A quote gates the TERMINATOR test only. Gating the member-path test on it inverts the check: an unquoted reference is left alone and the SAME reference in quotes is rewritten. That is how `token: \"secrets.GITHUB_TOKEN\"` became `token: \"${TOKEN}\"` in a workflow while the unquoted spelling beside it survived.",
-    "file": "keyless_hooks/fingerprint.py",
-    "find": "    if not _is_member_path(value):\n        return False\n    if not quoted:\n        return True",
-    "replace": "    if quoted:\n        return False\n    if not _is_member_path(value):\n        return False"
-  },
-  {
-    "id": "M92-quoted-head-list-opened",
-    "why": "The quoted member-path exemption is a CLOSED head list. Opening it to any head makes `TOKEN = \"abcdefgh.ijklmnop.qrstuvwx\"` — a dotted opaque literal — read as a reference. That is the adversarial row that caught this exemption the first time it was written without a list.",
-    "file": "keyless_hooks/fingerprint.py",
-    "find": "    return value.split(\".\", 1)[0].lower() in _QUOTED_REF_HEADS",
-    "replace": "    return True  # M92: any head clears a quoted dotted value"
-  },
-  {
-    "id": "M93-rewrite-may-reshape-the-file",
-    "why": "`_line_preserved` is the last net under the two in `fingerprint`: a rewrite replaces a VALUE and may never change the shape of the file. Making it constant-true lets a scanner defect through as a silent edit instead of a refusal, which is the failure this section exists to make impossible.",
-    "file": "keyless_hooks/checks/literal_write.py",
-    "find": "    return before.count(\"\\n\") == after.count(\"\\n\")",
-    "replace": "    return True  # M93: the line-structure invariant, disarmed"
-  },
-  {
-    "id": "M94-vault-blind-to-quoted-substitution",
-    "why": "Removes the substitution view from KL-VAULT. `echo \"$(op read …)\"` then reads as one quoted word and renders no verdict — the one spelling of a vault read that reaches a print verb unrefused, while the unquoted spelling still denies.",
-    "file": "keyless_hooks/checks/vault_cli.py",
-    "find": "    texts = [cmd] + interpreter_payloads(cmd, cfg.interpreters) + substitution_payloads(cmd)",
-    "replace": "    texts = [cmd] + interpreter_payloads(cmd, cfg.interpreters)"
-  },
-  {
-    "id": "M95-switch-gate-unregistered",
-    "why": "KL-SWITCH, entirely unregistered. A table with no discovery means a row removed is a gate removed, and nothing else reports it — `keyless disable` runs unrefused.",
-    "file": "keyless_hooks/registry.py",
-    "find": "        (\"KL-SWITCH\", \"PreToolUse\", BLOCK,   switch.run),\n",
-    "replace": ""
-  },
-  {
-    "id": "M96-switch-tier-is-observe",
-    "why": "KL-SWITCH demoted to OBSERVE. The check still runs and still logs, but the engine records the verdict instead of returning it, and `keyless disable` succeeds — silencing every check that would have recorded the calls after it.",
-    "file": "keyless_hooks/registry.py",
-    "find": "        (\"KL-SWITCH\", \"PreToolUse\", BLOCK,   switch.run),",
-    "replace": "        (\"KL-SWITCH\", \"PreToolUse\", OBSERVE, switch.run),"
-  },
-  {
-    "id": "M97-disable-verb-not-matched",
-    "why": "Drops `disable` from the verb table. `keyless disable` walks past the check exactly like any other keyless verb, which is the one call this check exists to stop.",
-    "file": "keyless_hooks/checks/switch.py",
-    "find": "    return _collapse(_keyless_verb(rest)) in (\"disable\", \"uninstall\")",
-    "replace": "    return _collapse(_keyless_verb(rest)) in (\"uninstall\",)"
-  },
-  {
-    "id": "M98-uninstall-script-suffix-widened-to-basename",
-    "why": "Matches any script named `uninstall.sh` rather than the pack's own `hooks/uninstall.sh` — the predicate this check ships with is precise, and loosening it here only proves the test suite would catch the loosening.",
-    "file": "keyless_hooks/checks/switch.py",
-    "find": "    if target.endswith(\"hooks/uninstall.sh\"):",
-    "replace": "    if target.endswith(\"uninstall.sh\"):"
-  },
-  {
-    "id": "M99-guard-targets-empty",
-    "why": "The default hooks.json/config.json locations are dropped from the guard set. Every write to `~/.config/keyless/hooks.json` then matches nothing, and the switch's own config is wide open from a session that never has to touch the CLI at all.",
-    "file": "keyless_hooks/checks/switch.py",
-    "find": "    home = os.path.expanduser(\"~\")\n    targets = set()\n    if home:",
-    "replace": "    home = os.path.expanduser(\"~\")\n    targets = set()\n    if False:"
-  },
-  {
-    "id": "M100-tee-admitted-as-a-reader",
-    "why": "Admits `tee` to the closed reader set. `tee ~/.config/keyless/hooks.json <<< '{}'` then reads as a permitted read of the guard file instead of the write it is, which is exactly the KL-FILE non-reader trap this check reuses the shape of.",
-    "file": "keyless_hooks/checks/switch.py",
-    "find": "\"egrep\", \"fgrep\", \"rg\",",
-    "replace": "\"egrep\", \"fgrep\", \"tee\","
-  },
-  {
-    "id": "M101-project-layer-can-still-disable",
-    "why": "The project-committed `.keyless-hooks.json` keeps its `enabled`/`observe` keys instead of having them stripped before the merge — so a file that ships in the repo, read by every agent that checks it out, can turn the pack off or into record-only mode for all of them.",
-    "file": "keyless_hooks/config.py",
-    "find": "        patch2.pop(\"enabled\", None)\n        patch2.pop(\"observe\", None)\n        for k, v in patch2.items():",
-    "replace": "        for k, v in patch2.items():"
-  },
-  {
-    "id": "M102-cd-not-followed",
-    "why": "Stops following `cd`/`pushd` through the command, so `cd ~/.config/keyless && echo '{}' > hooks.json` resolves `hooks.json` against the payload's own cwd and the write to the live guard file passes.",
-    "file": "keyless_hooks/checks/switch.py",
-    "find": "        if moved is not None:\n            cwd = moved\n            continue",
-    "replace": "        if moved is not None:\n            continue"
-  },
-  {
-    "id": "M103-guard-directory-ignored",
-    "why": "Drops the directory rule, so a recursive copy into `~/.config/keyless/`, a rename of it or a recursive delete of it rewrites every guard file without ever naming one.",
-    "file": "keyless_hooks/checks/switch.py",
-    "find": "    dirs = {os.path.dirname(target) for target in targets}",
-    "replace": "    dirs = set()"
-  },
-  {
-    "id": "M104-fed-heredoc-not-read",
-    "why": "Stops reading here-document bodies fed to an interpreter, so `bash <<EOF` with `keyless disable` on a line of its own runs the off-switch past the check.",
-    "file": "keyless_hooks/checks/switch.py",
-    "find": "    texts += _fed_bodies(docs, cfg)\n",
-    "replace": ""
-  },
-  {
-    "id": "M105-single-quotes-read-as-executed",
-    "why": "Leaves single-quoted text visible to the substitution scan, so markdown prose naming `keyless disable` inside single quotes is refused as if the shell ran it — the false positive that made up every verb refusal in the replay.",
-    "file": "keyless_hooks/checks/switch.py",
-    "find": "            for k in range(i, min(close + 1, n)):\n                out[k] = \" \"\n",
-    "replace": ""
-  },
-  {
-    "id": "M106-find-always-a-reader",
-    "why": "Treats `find` as a reader even with `-delete` or `-exec`, so a find over the guard directory deletes every guard file unrefused.",
-    "file": "keyless_hooks/checks/switch.py",
-    "find": "        return \"-delete\" not in tokens(stmt) and not delegated_head(stmt)",
-    "replace": "        return True"
-  },
-  {
-    "id": "M107-script-file-read-as-head",
-    "why": "Stops skipping `script`'s log-file positional, so `script -q /dev/null keyless disable` is a statement headed `null` and both KL-SWITCH and KL-VAULT go silent behind one wrapper.",
-    "file": "keyless_hooks/shellview.py",
-    "find": "            script_file = name == \"script\"\n",
-    "replace": ""
-  },
-  {
-    "id": "M108-script-command-string-unread",
-    "why": "Stops handing `script -c \"...\"` payloads back as commands, so the util-linux spelling runs the off-switch or a vault print verb past every head-based check.",
-    "file": "keyless_hooks/shellview.py",
-    "find": "        scripted = _script_command(stmt)\n",
-    "replace": "        scripted = \"\"\n"
-  }
+ {
+  "id": "M1-cat-is-a-non-reader",
+  "why": "KL-FILE's whole gate is the non-reader allowlist sitting on the closed side. Admitting `cat` to it opens every plain read.",
+  "file": "keyless_hooks/config.py",
+  "find": "    \"ls\", \"stat\", \"test\", \"[\", \"[[\", \"touch\", \"mkdir\", \"rm\", \"rmdir\",",
+  "replace": "    \"cat\", \"head\", \"awk\", \"test\", \"[\", \"[[\", \"touch\", \"mkdir\", \"rm\", \"rmdir\","
+ },
+ {
+  "id": "M2-no-substitution-flattening",
+  "why": "Removes the view that catches `cat $(echo .env)`, where the path lives in a statement headed by a command that cannot read.",
+  "file": "keyless_hooks/checks/file_read.py",
+  "find": "flatten_substitutions(base)]\n    texts.extend(substitution_payloads(base))",
+  "replace": "]"
+ },
+ {
+  "id": "M3-no-quote-collapse",
+  "why": "Removes the token-level quote collapse, which is the only thing that sees `.en''v` as `.env`.",
+  "file": "keyless_hooks/shellview.py",
+  "find": "            if collapsed and not any(c.isspace() for c in collapsed):\n                out.extend(candidate_operands(collapsed))",
+  "replace": "            pass"
+ },
+ {
+  "id": "M4-vault-subcommand-never-matches",
+  "why": "KL-VAULT reads the subcommand. Anchoring the pattern on a string no CLI emits makes every print verb pass while the table still looks populated.",
+  "file": "keyless_hooks/config.py",
+  "find": "    [\"op\", r\"^(read|inject)\\b\", \"op run -- <cmd>\", None],",
+  "replace": "    [\"op\", r\"^zzz-never-matches\\b\", \"op run -- <cmd>\", None],"
+ },
+ {
+  "id": "M5-env-dump-never-bare",
+  "why": "`bare` is the discrimination between `set` (a dump) and `set -e` (every script). Forcing it false disables KL-ENV without touching its trigger.",
+  "file": "keyless_hooks/checks/env_dump.py",
+  "find": "    return verb, bare, redirect",
+  "replace": "    return verb, False, redirect"
+ },
+ {
+  "id": "M6-no-secret-name-segments",
+  "why": "KL-ENVVAR's advisory rests entirely on the segment list. An empty one is a check that runs and can never fire.",
+  "file": "keyless_hooks/config.py",
+  "find": "DEFAULT_SECRET_SEGMENTS = [\n    \"token\", \"secret\", \"password\", \"passwd\", \"apikey\", \"credential\",",
+  "replace": "DEFAULT_SECRET_SEGMENTS = [\n    \"zzz-never\", \"passwd\", \"apikey\", \"credential\","
+ },
+ {
+  "id": "M7-substitution-is-a-no-op",
+  "why": "The class-4 rewrite. Returning the text unchanged is the failure that looks most like success: the write proceeds and the secret is in it. Aimed at `apply`, which is the live substitution path - `redact` scans and delegates here, and mutating a helper production does not call would be scored by tests of that helper alone.",
+  "file": "keyless_hooks/fingerprint.py",
+  "find": "    pieces.append(text[cursor:])\n    return \"\".join(pieces)",
+  "replace": "    pieces.append(text[cursor:])\n    return text"
+ },
+ {
+  "id": "M8-everything-is-a-placeholder",
+  "why": "The placeholder filter is the scanner's precision. Making it total silences every shape at once while the patterns still compile.",
+  "file": "keyless_hooks/fingerprint.py",
+  "find": "def _is_placeholder(value):\n    v = value.strip()",
+  "replace": "def _is_placeholder(value):\n    return True\n    v = value.strip()"
+ },
+ {
+  "id": "M9-nothing-is-protected",
+  "why": "The path matcher. Returning None for everything disables KL-FILE entirely, on every tool, in one line.",
+  "file": "keyless_hooks/secretpaths.py",
+  "find": "    forms = expansions(candidate, cwd, expand_globs)\n    if not forms:\n        return None",
+  "replace": "    forms = expansions(candidate, cwd, expand_globs)\n    return None"
+ },
+ {
+  "id": "M10-deny-is-downgraded-to-silence",
+  "why": "The engine's deny path. Dropping the reason turns every block in the pack into a no-op that still writes a decision row saying it blocked.",
+  "file": "keyless_hooks/engine.py",
+  "find": "            return message, None, advisories",
+  "replace": "            return None, None, advisories"
+ },
+ {
+  "id": "M11-payload-coercion-removed",
+  "why": "The fail-open boundary. Returning a wrongly-typed field raw is exactly the defect that crashed nearly every script in an audited hook layer on VALID JSON.",
+  "file": "keyless_hooks/payload.py",
+  "find": "    v = obj.get(key)\n    return v if isinstance(v, str) else default",
+  "replace": "    return obj.get(key, default)"
+ },
+ {
+  "id": "M12-names-view-copies-lines",
+  "why": "The one place bytes from a secret file reach output. Copying the whole line instead of the validated key turns the protective view into the leak it exists to prevent.",
+  "file": "keyless_hooks/checks/file_read.py",
+  "find": "        body = [\"%s=[keyless:redacted]\" % n for n in names]",
+  "replace": "        body = [\"%s=%s\" % (n, open(path).read().strip()) for n in names]"
+ },
+ {
+  "id": "M13-wrappers-not-absorbed",
+  "why": "`sudo`, `env` and `timeout` in front of a reader. Not absorbing them makes the head the wrapper, and one prefix word walks past every gate.",
+  "file": "keyless_hooks/shellview.py",
+  "find": "        if name in _WRAPPERS:\n            last_wrapper = (name, end)\n            continue\n        return name, end, last_wrapper",
+  "replace": "        return name, end, last_wrapper"
+ },
+ {
+  "id": "M14-keywords-are-not-command-positions",
+  "why": "`for f in *; do cat .env; done` puts the verb after `do`. Dropping the keyword positions is the classic enumeration gap.",
+  "file": "keyless_hooks/shellview.py",
+  "find": "    for m in re.finditer(r\"(?:^|[\\s;&|(){}\\n])(%s)(?=[\\s\\n])\" % \"|\".join(_KEYWORDS), view):\n        pos.append(m.end(1))",
+  "replace": "    pass"
+ },
+ {
+  "id": "M15-symlinks-not-resolved",
+  "why": "A checkout where most `.env` paths are symlinks onto a handful of real files is an ordinary layout. Matching only the requested path leaves every link open.",
+  "file": "keyless_hooks/secretpaths.py",
+  "find": "            real = os.path.realpath(absolute)\n            if real not in out:\n                out.append(real)\n        elif _GLOB_CHARS.search(cand) and expand_globs:",
+  "replace": "            pass\n        elif _GLOB_CHARS.search(cand) and expand_globs:"
+ },
+ {
+  "id": "M16-verb-path-is-the-raw-arguments",
+  "why": "Restores prefix matching: the row is tested against `secrets folders get --env=prod` instead of the verb path. This is the exact defect that refused `infisical secrets folders get` twice in one session.",
+  "file": "keyless_hooks/checks/vault_cli.py",
+  "find": "            path = verb_path(rest)",
+  "replace": "            path = rest"
+ },
+ {
+  "id": "M17-flags-never-truncate-the-path",
+  "why": "A bare `-f` may consume the next word. Skipping it instead of ending the path lets a flag VALUE be read as a subcommand, so `infisical secrets --env prod get X` collapses to a path no row matches and the bare-secrets row goes silent on a full dump.",
+  "file": "keyless_hooks/checks/vault_cli.py",
+  "find": "        if tok.startswith(\"-\"):\n            if \"=\" in tok:\n                continue\n            break",
+  "replace": "        if tok.startswith(\"-\"):\n            continue"
+ },
+ {
+  "id": "M18-help-is-never-detected",
+  "why": "The help exemption is the only thing that lets `infisical secrets --help` through, because that spelling truncates the verb path back onto the bare-secrets row. Inverting it turns every documentation read in the table into a refusal.",
+  "file": "keyless_hooks/checks/vault_cli.py",
+  "find": "    toks = _tokens(rest)\n    for tok in toks:\n        if tok in _HELP_FLAGS:\n            return True",
+  "replace": "    toks = _tokens(rest)\n    for tok in toks:\n        if tok in _HELP_FLAGS:\n            return False"
+ },
+ {
+  "id": "M19-help-exemption-swallows-everything",
+  "why": "The opposite direction of M18, and the more dangerous one: an exemption that always fires disables all fourteen stores at once while the table still looks populated and every row still compiles.",
+  "file": "keyless_hooks/checks/vault_cli.py",
+  "find": "            if is_help(rest):",
+  "replace": "            if True or is_help(rest):"
+ },
+ {
+  "id": "M20-refusal-echoes-the-arguments",
+  "why": "`pass-cli totp generate <base32-seed>` carries the secret as a positional argument. Echoing the raw arguments puts that credential in the refusal message, so the hook leaks the value it exists to protect.",
+  "file": "keyless_hooks/checks/vault_cli.py",
+  "find": "    shown = \" \".join(path.split()[:2])",
+  "replace": "    shown = path"
+ },
+ {
+  "id": "M21-bare-pass-is-a-print-verb",
+  "why": "`pass` and `gopass` are the one negation left in the table, so an empty verb path matches it. Dropping the trailing `\\S` refuses bare `pass`, which prints the store's tree of NAMES and no value.",
+  "file": "keyless_hooks/config.py",
+  "find": "             r\"grep|help|version|--)\\b)\\S\", \"pass ls lists names\", None],",
+  "replace": "             r\"grep|help|version|--)\\b)\", \"pass ls lists names\", None],"
+ },
+ {
+  "id": "M22-kubectl-name-format-backtracks",
+  "why": "An optional `[= ]?` group lets the regex backtrack around the `name` exclusion, so `--output=name` matches by consuming nothing. The safe format becomes a block \u2014 a false positive introduced while closing the `-ojson` false negative.",
+  "file": "keyless_hooks/config.py",
+  "find": "     r\"(?:^|\\s)(?:--output|-o)(?:[= ]\\s*|(?=[a-z]))(?!name\\b)\"],",
+  "replace": "     r\"(?:^|\\s)(?:--output|-o)(?:[= ]\\s*)?(?!name\\b)\"],"
+ },
+ {
+  "id": "M23-keychain-flag-must-end-the-cluster",
+  "why": "`security` clusters short flags: `-ws NAME` parses as `-w -s NAME` and was measured searching the keychain. Requiring `w` to END the cluster makes the password flag invisible in the spelling most likely to be typed.",
+  "file": "keyless_hooks/config.py",
+  "find": "     r\"(?:^|\\s)-[A-Za-z]*[wg][A-Za-z]*(?=\\s|$)\"],",
+  "replace": "     r\"(?:^|\\s)-[A-Za-z]*[wg](?:\\s|$)\"],"
+ },
+ {
+  "id": "M24-pattern-arguments-are-paths",
+  "why": "Restores filesystem expansion of a regex handed to grep. This is the measured defect: `.*` expanded against a real directory matched every dotfile there, and was most of this check's organic false positives on its own.",
+  "file": "keyless_hooks/checks/file_read.py",
+  "find": "        skip_glob = first_positional(stmt) if head in cfg.pattern_tools else \"\"",
+  "replace": "        skip_glob = \"\""
+ },
+ {
+  "id": "M25-the-exemption-covers-every-operand",
+  "why": "The exemption belongs to the pattern ARGUMENT alone. Widening it to the whole statement makes `grep TOKEN prod.*` a read nothing notices, which is a leak introduced while closing a false positive.",
+  "file": "keyless_hooks/checks/file_read.py",
+  "find": "                                   expand_globs=(not in_code and cand != skip_glob))",
+  "replace": "                                   expand_globs=(not in_code and not skip_glob))"
+ },
+ {
+  "id": "M24b-interpreter-code-is-glob-expanded",
+  "why": "`python3 -c \"re.findall('.*', s)\"` hands the interpreter that string verbatim; no shell expanded it. Expanding it against the real directory refuses a regex as a read of every dotfile, and the code arrives as a flag value so the positional rule cannot reach it.",
+  "file": "keyless_hooks/checks/file_read.py",
+  "find": "        in_code = head in cfg.interpreters",
+  "replace": "        in_code = False"
+ },
+ {
+  "id": "M25b-a-flag-supplied-pattern-still-skips",
+  "why": "`grep -f patterns.txt prod.env` reads BOTH files. Ignoring the flag that supplies the pattern makes the first positional look like a regex and drops a real read.",
+  "file": "keyless_hooks/shellview.py",
+  "find": "    if not rest or _PATTERN_FROM_FLAG.search(rest):\n        return \"\"",
+  "replace": "    if not rest:\n        return \"\""
+ },
+ {
+  "id": "M26-jq-filters-are-paths",
+  "why": "`==` is what separates a jq filter ending in `.env` from a filename. Removing the test refuses a filter as a credential file.",
+  "file": "keyless_hooks/secretpaths.py",
+  "find": "    if any(mark in cand for mark in _NOT_A_PATH):\n        return []",
+  "replace": "    if False:\n        return []"
+ },
+ {
+  "id": "M27-trailing-slash-is-a-file",
+  "why": "`.env/` names a directory and cannot open the file `.env` \u2014 the kernel answers ENOTDIR. Treating it as that file refuses a read that never existed.",
+  "file": "keyless_hooks/secretpaths.py",
+  "find": "    if cand.endswith(\"/\"):",
+  "replace": "    if False and cand.endswith(\"/\"):"
+ },
+ {
+  "id": "M28-language-idioms-are-paths",
+  "why": "`*.env` matches any word ending in `.env`, so the JS idiom `process.env` reads as a credential file and `grep -rn 'process.env' src/` is refused. The exclusion is the whole fix, and it must not be reachable past a broader protected glob.",
+  "file": "keyless_hooks/config.py",
+  "find": "    \"process.env\",\n    \"import.meta.env\",",
+  "replace": "    \"never-matches-anything.example\","
+ },
+ {
+  "id": "M29-comparisons-split-like-flags",
+  "why": "The flag-attached operand split exists for `dd if=.env`. Applied to `==` it carves `staging.env` out of a jq comparison and refuses the filter as a credential file \u2014 a second route to the same false positive, reached even when the whole token is correctly rejected.",
+  "file": "keyless_hooks/shellview.py",
+  "find": "        if past_head and \"=\" in collapsed and \"==\" not in collapsed:",
+  "replace": "        if past_head and \"=\" in collapsed:"
+ },
+ {
+  "id": "M30-heredoc-bodies-are-commands",
+  "why": "A heredoc body is blanked for act detection. Scanning the RAW command for operands reads the body as statements, because strip_heredocs leaves the newlines and statements() then cuts at every prose line. A commit message quoting `.env` becomes a refused read.",
+  "file": "keyless_hooks/checks/file_read.py",
+  "find": "    base = strip_heredocs(cmd)\n    texts = [base, expand_local_assignments(base), flatten_substitutions(base)]\n    texts.extend(substitution_payloads(base))",
+  "replace": "    texts = [cmd, expand_local_assignments(cmd), flatten_substitutions(cmd)]\n    texts.extend(substitution_payloads(cmd))"
+ },
+ {
+  "id": "M31-arguments-count-as-assignments",
+  "why": "KL-ASSIGN's precision IS the position rule: the same word is a shell assignment before the statement's head and an argument after it. Dropping the test makes `make BUILD=<key>` and `--token=<key>` denials, which is a false positive on the tool sessions use most.",
+  "file": "keyless_hooks/checks/shell_assign.py",
+  "find": "        if pair is not None:\n            if decl or not past_head:\n                out.append(pair)\n            continue",
+  "replace": "        if pair is not None:\n            out.append(pair)\n            continue"
+ },
+ {
+  "id": "M32-expansions-are-literals",
+  "why": "A value built at run time was never typed and cannot be in the transcript. Scanning it verbatim refuses `export AUTH_TOKEN=\"$(cat ~/.token)\"` \u2014 a command that leaks nothing and is the very shape the pack asks people to move toward.",
+  "file": "keyless_hooks/checks/shell_assign.py",
+  "find": "    spelled = _EXPANSION.sub(\" \", raw_value)",
+  "replace": "    spelled = raw_value"
+ },
+ {
+  "id": "M33-quote-and-backslash-splicing-survives",
+  "why": "`gh''p_<literal>` and `gh\\p_<literal>` are one word to the shell and several fragments to any tokenizer. The shell removes both marks before the value exists, so leaving them in place makes the value invisible and the bypass six characters long.",
+  "file": "keyless_hooks/checks/shell_assign.py",
+  "find": "    return spelled.replace(\"'\", \"\").replace('\"', \"\").replace(\"\\\\\", \"\")",
+  "replace": "    return spelled"
+ },
+ {
+  "id": "M34-prose-is-a-credential",
+  "why": "The generic NAME=<opaque> rule is name-keyed, and `password:` followed by twelve word characters satisfies it inside an ordinary sentence. Without the whitespace test the check denies `export BANNER=\"db password: ...\"`, and a gate that refuses a sentence is a gate that gets uninstalled.",
+  "file": "keyless_hooks/checks/shell_assign.py",
+  "find": "    if any(c.isspace() for c in literal.strip()):\n        return [f for f in found if f.kind not in _NAME_KEYED]",
+  "replace": "    if False:\n        return [f for f in found if f.kind not in _NAME_KEYED]"
+ },
+ {
+  "id": "M35-declaration-verbs-are-heads",
+  "why": "`export` and `declare` are not commands taking arguments, they are the words after which everything is an assignment. Reading `export` as the head puts every assignment past it and silences the check on its single most common spelling.",
+  "file": "keyless_hooks/checks/shell_assign.py",
+  "find": "        if not past_head and word in _DECLARE:\n            decl = True\n            continue",
+  "replace": "        if False:\n            decl = True\n            continue"
+ },
+ {
+  "id": "M36-wrappers-end-the-assignment-prefix",
+  "why": "`env FOO=<key> cmd` puts the assignment AFTER the wrapper. Treating `env` as the head reads the assignment as its argument, and one prefix word walks past the gate \u2014 the same defect `head_of` already absorbs wrappers to prevent.",
+  "file": "keyless_hooks/checks/shell_assign.py",
+  "find": "        if not past_head and is_wrapper(word):",
+  "replace": "        if False and is_wrapper(word):"
+ },
+ {
+  "id": "M37-remediation-teaches-a-broken-form",
+  "why": "`keyless run -s NAME -- cmd \"$NAME\"` is expanded by the CALLING shell where the name is unset, so it sends an EMPTY credential and the failure is a 401 at exit 0. A refusal that hands back that spelling is worse than one that hands back nothing, because it looks like it worked.",
+  "file": "keyless_hooks/checks/shell_assign.py",
+  "find": "        \"    keyless run -s %s -- sh -c '<the command you were going to run>'\\n\\n\"",
+  "replace": "        \"    keyless run -s %s -- <the command you were going to run>\\n\\n\""
+ },
+ {
+  "id": "M38-the-refusal-echoes-the-command",
+  "why": "The command being refused CONTAINS the credential \u2014 that is the whole reason it is refused. Quoting it back puts the value in the block message, so the hook publishes the secret it exists to protect. Same shape as M20, on the check where the value is guaranteed to be present.",
+  "file": "keyless_hooks/checks/shell_assign.py",
+  "find": "    return (\"deny\", _message(names, shapes),",
+  "replace": "    return (\"deny\", cmd + \"\\n\" + _message(names, shapes),"
+ },
+ {
+  "id": "M30-lower-case-names-are-credentials",
+  "why": "Every organic KL-ENVVAR warn before the case test fired on a lower-case `pat` in a session writing regular expressions \u2014 a PATTERN variable. Dropping the case test brings that whole class back.",
+  "file": "keyless_hooks/checks/env_dump.py",
+  "find": "    if name != name.upper():\n        return False",
+  "replace": "    if False:\n        return False"
+ },
+ {
+  "id": "M39-a-qualified-key-is-not-a-credential",
+  "why": "`SECRET_KEY` is Django's and Flask's own credential and the name-keyed rule could not see it: the keyword has to be followed immediately by `=`, and `SECRET` is followed by `_KEY`. Removing the qualified spellings restores that blindness while every vendor pattern still matches, so `STRIPE_SECRET_KEY=<a Stripe key>` stays green and only a value with no vendor shape goes red.",
+  "file": "keyless_hooks/fingerprint.py",
+  "find": "    r\"(?P<kw>token|secret_key|secret-key|secret|pgpassword|password|passwd|apikey|\"\n    r\"api_key|api-key|access_key|access-key|private_key|private-key|signing_key|\"\n    r\"signing-key|encryption_key|encryption-key|credentials?|auth_token|auth-token)\"",
+  "replace": "    r\"(?P<kw>token|secret|pgpassword|password|passwd|apikey|\"\n    r\"api_key|api-key|access_key|access-key|private_key|private-key|\"\n    r\"credentials?|auth_token|auth-token)\""
+ },
+ {
+  "id": "M40-pgpassword-is-two-words",
+  "why": "The lookbehind refuses a keyword glued to a preceding word, which is right for `nextPageToken` and `attributeKey` and wrong for exactly one name: libpq's PGPASSWORD, where every other glued spelling that turned up in real commands was code. Dropping the literal reopens it, and nothing else in the pack covers `PGPASSWORD=<literal> psql`.",
+  "file": "keyless_hooks/fingerprint.py",
+  "find": "    r\"(?P<kw>token|secret_key|secret-key|secret|pgpassword|password|passwd|apikey|\"",
+  "replace": "    r\"(?P<kw>token|secret_key|secret-key|secret|password|passwd|apikey|\""
+ },
+ {
+  "id": "M41-any-suffix-is-still-a-credential",
+  "why": "The mutation that widens instead of narrowing, and the false-positive layer is the only thing that can catch it. Letting any bounded identifier follow the keyword is the obvious way to reach SECRET_KEY, and over real commands it also admits AWS_ACCESS_KEY_ID (the public half of the pair), apiKeyConnectionId, secretRef and secretsManager \u2014 a large new class, almost none of it a secret. A gate that denies those gets uninstalled, so silence on them has to be an assertion and not an accident.",
+  "file": "keyless_hooks/fingerprint.py",
+  "find": "    r\"[\\\"']?\\s*[:=]\\s*\"\n    r\"(?:\\\"([^\\\"\\n]{12,256})\\\"",
+  "replace": "    r\"[A-Za-z0-9_-]{0,32}[\\\"']?\\s*[:=]\\s*\"\n    r\"(?:\\\"([^\\\"\\n]{12,256})\\\""
+ },
+ {
+  "id": "M42-key-alone-is-a-credential-word",
+  "why": "The other way to reach SECRET_KEY without enumerating a tail, and the cheaper-looking one: make `key` a keyword on its own. Real traffic refuses it \u2014 bare `key=` carrying an opaque value is ordinary configuration, as are cacheKey, sortKey, objectKey, partitionKey and idempotency keys. This is the mutation the silence fixtures for those names exist to catch; without it they assert nothing.",
+  "file": "keyless_hooks/fingerprint.py",
+  "find": "    r\"(?P<kw>token|secret_key|",
+  "replace": "    r\"(?P<kw>token|key|secret_key|"
+ },
+ {
+  "id": "M46-no-code-terminator",
+  "why": "Half the VALUE/REFERENCE discriminator. Emptying the set makes `credentials: PushConfig,` and `token = getToken(` literals again, which is the deployed defect: about half of the measured corrupting rewrites came back through this door alone. Only the false-positive layer can see it, because every contract assertion stays green when the check finds MORE.",
+  "file": "keyless_hooks/fingerprint.py",
+  "find": "_CODE_END = frozenset([\"(\", \",\", \")\"])",
+  "replace": "_CODE_END = frozenset([])"
+ },
+ {
+  "id": "M47-no-member-path",
+  "why": "The other half. `process.env.SECRET` and `credentials.value.password` are the single largest corrupting class measured, and most of them end on whitespace or on end of line, where the terminator test cannot reach and this rule is the only thing withholding them.",
+  "file": "keyless_hooks/fingerprint.py",
+  "find": "    if \".\" not in value:\n        return False",
+  "replace": "    if True:\n        return False"
+ },
+ {
+  "id": "M48-a-substitution-is-a-literal",
+  "why": "`AUTH_TOKEN=\"$(cat ~/.token)\"` is the remediation this pack prints in its own refusal message, and it was being rewritten into a self-reference that expands to nothing. Removing the test restores that, and no other filter covers it: `${VAR}` and a bare `$VAR` are placeholders, `$(` is neither.",
+  "file": "keyless_hooks/fingerprint.py",
+  "find": "    if \"$(\" in value or \"`\" in value:",
+  "replace": "    if False and (\"$(\" in value or \"`\" in value):"
+ },
+ {
+  "id": "M49-a-colon-is-code-punctuation",
+  "why": "The mutation that WIDENS the exemption, and the contract layer is the only thing that can catch it. `:` looks like C-family punctuation and reads as an obvious addition to the set; it sits inside composite tokens \u2014 `<token>::<scope>` in the corpus and `<digits>:<body>` in every Telegram bot token \u2014 and adding it dropped a real credential when it was tried.",
+  "file": "keyless_hooks/fingerprint.py",
+  "find": "_CODE_END = frozenset([\"(\", \",\", \")\"])",
+  "replace": "_CODE_END = frozenset([\"(\", \",\", \")\", \":\"])"
+ },
+ {
+  "id": "M50-a-quoted-value-can-be-a-reference",
+  "why": "The quote guard is what keeps `TOKEN = \"a.b.c\"` \u2014 a JWT \u2014 out of the member-path exemption. Dropping it makes every quoted dotted literal a reference, which is the exact bypass this exemption was designed not to open, and again only a contract assertion notices.",
+  "file": "keyless_hooks/fingerprint.py",
+  "find": "    if start > 0 and text[start - 1] in \"\\\"'`\":\n        return False",
+  "replace": "    if False:\n        return False"
+ },
+ {
+  "id": "M51-a-spliced-name-is-not-an-assignment",
+  "why": "The bypass this closed, and it was published as unfixed. A quote inside the NAME defeats the prefix regex, so `export SECRET''_KEY=<literal>` reached no check at all while `gh''p_<literal>` \u2014 the same three marks in the VALUE \u2014 was already caught. Reverting to the bare prefix restores the asymmetry, and four adversarial rows go red.",
+  "file": "keyless_hooks/checks/shell_assign.py",
+  "find": "        pair = assignment_split(tok, declared=decl or wrapped)",
+  "replace": "        pair = assignment_split(tok)"
+ },
+ {
+  "id": "M52-collapse-a-name-everywhere",
+  "why": "The widening half, and the one a reader is most likely to think is a simplification. Collapsing the name in assignment-PREFIX position too invents an assignment no shell makes: measured on bash, zsh and sh, `FOO\"\"_BAR=hello` standing alone is a command name and leaves FOO_BAR unset. Only the paired positional assertion can see this; every deny case stays green.",
+  "file": "keyless_hooks/shellview.py",
+  "find": "    if not declared:\n        return None",
+  "replace": "    if False:\n        return None"
+ },
+ {
+  "id": "M53-a-copy-is-a-dump",
+  "why": "Removes the assignment exemption, which is the whole of job 2a. `env = dict(os.environ)` and `env = os.environ.copy()` are how every language builds an environment for a CHILD process, and this gate denied them on every call while nothing was printed. Only the false-positive layer can see this one: every contract assertion stays green when a block check denies MORE.",
+  "file": "keyless_hooks/checks/env_dump.py",
+  "find": "            lhs = _COPY_LHS.search(seg[:m.start()])",
+  "replace": "            lhs = None"
+ },
+ {
+  "id": "M54-a-sink-in-front-does-not-count",
+  "why": "The sink test that runs BEFORE the assignment exemption. Without it `const s = JSON.stringify(process.env)` reads as an ordinary copy \u2014 the match really is an assignment's right-hand side \u2014 and a full serialisation of the environment walks out under the exemption. This is the mutation that proves the ORDER of the two tests is load-bearing, not just their presence.",
+  "file": "keyless_hooks/checks/env_dump.py",
+  "find": "            if _has_sink(seg[:m.start()], lang):\n                return m.group(0)",
+  "replace": "            if False:\n                return m.group(0)"
+ },
+ {
+  "id": "M55-no-one-hop-dataflow",
+  "why": "Deletes the single hop of dataflow. `e = dict(os.environ); print(e)` is a dump written in two statements, and it is the obvious bypass the moment the assignment exemption is documented in a public repository. Nothing else in the pack reaches it.",
+  "file": "keyless_hooks/checks/env_dump.py",
+  "find": "    for name, after, expr in copies:",
+  "replace": "    for name, after, expr in []:"
+ },
+ {
+  "id": "M56-an-option-key-is-not-a-binding",
+  "why": "Drops `:` from the copy grammar. The JavaScript idiom binds the copy to an option KEY rather than to a variable \u2014 `spawn(cmd, { env: { ...process.env } })` \u2014 so a rule that knows only `=` refuses the exact call the exemption exists to allow, in the language where the shape is most common.",
+  "file": "keyless_hooks/checks/env_dump.py",
+  "find": "    r\"([A-Za-z_$][A-Za-z0-9_$]*)\\s*[=:]\\s*(?![=~:])[^;&\\n]*$\")",
+  "replace": "    r\"([A-Za-z_$][A-Za-z0-9_$]*)\\s*[=]\\s*(?![=~:])[^;&\\n]*$\")"
+ },
+ {
+  "id": "M57-a-tilde-is-a-directory-named-tilde",
+  "why": "Restores the literal join. `~/.cckeys.json` becomes `<cwd>/~/.cckeys.json`, which no filesystem test can ever find \u2014 so `isfile` says no and the Read rewrite and the Grep deny both read that as 'nothing to protect' and ALLOW the read. This is a lost block, not a lost courtesy, and it is the defect job 2b was filed as half of.",
+  "file": "keyless_hooks/secretpaths.py",
+  "find": "    if cand.startswith(\"~\"):\n        if not cand.startswith(\"~/\") and cand != \"~\":\n            # `~user/...`. Refused, never guessed.\n            return None\n        home = os.environ.get(\"HOME\") or \"\"\n        if not home:\n            return None\n        cand = home if cand == \"~\" else os.path.join(home, cand[2:])",
+  "replace": "    if cand.startswith(\"~\"):\n        pass"
+ },
+ {
+  "id": "M58-unresolvable-means-absent",
+  "why": "Turns a failure to RESOLVE back into a failure to BLOCK. A path holding an unexpanded substitution cannot be resolved by a hook that holds no model of shell state, and reporting that as 'the file is not there' allows the read. 'I could not look' and 'there is nothing here' are the same empty answer from a filesystem test and only one of them is safe.",
+  "file": "keyless_hooks/checks/file_read.py",
+  "find": "        return (\"deny\", _deny_text(path, pattern, [], \"unresolvable path\", \"Read\"),\n                {\"path\": path[:120], \"pattern\": pattern, \"names\": 0})",
+  "replace": "        return None"
+ },
+ {
+  "id": "M59-braces-are-content",
+  "why": "Counts a JSON document's structure lines against its key/value ratio. A nested `.json` runs about one brace line to every two key lines, which drags it under the threshold on punctuation alone \u2014 so every `.json` in the protected list reported `names: 0`, which is most of that list. The PEM property the ratio exists for is unaffected either way: a private key's body is base64, not punctuation.",
+  "file": "keyless_hooks/secretpaths.py",
+  "find": "               and not _STRUCTURE_ONLY.match(ln)]",
+  "replace": "               ]"
+ },
+ {
+  "id": "M60-one-name-per-line",
+  "why": "Reverts to reading a single key per line. A credential store written on ONE line declares many names and the single-key reader saw only the first, so the refusal named one service and stayed silent about the rest. The safety property is untouched by either spelling: both validate a whole bounded identifier taken from the left of a separator.",
+  "file": "keyless_hooks/secretpaths.py",
+  "find": "        found = _keys_of(ln)",
+  "replace": "        found = [_key_of(ln)] if _key_of(ln) is not None else []"
+ },
+ {
+  "id": "M61-a-spread-is-a-path",
+  "why": "Removes the object-spread exclusions. `{ ...process.env }` reaches the path matcher as the operand `...process.env`, which `*.env` matches and the exact `process.env` entry does not cover \u2014 so KL-FILE refused the standard Node idiom for building a child's environment while KL-ENV was being blamed for it. The spelling without spaces never matched, which is why this hid.",
+  "file": "keyless_hooks/config.py",
+  "find": "    \"...process.env\",\n    \"...import.meta.env\",",
+  "replace": ""
+ },
+ {
+  "id": "M62-prose-is-read-by-regex",
+  "why": "Puts back the regex prose extractor the tokenizer replaced. Folding `\\n\\s*#` into a space and keeping the lines that start with `#` drops every comment block that FOLLOWS a line of code, because the fold moves the block's first line onto the code line and the paragraph no longer starts with a `#`. It read about a fifth of this pack's prose and reported the tree clean \u2014 a scanner that under-reads and a clean tree are the same empty list. It also destroys the comment-paragraph unit, so a claim wrapped across two comment lines stops being one sentence.",
+  "file": "tests/test_publication.py",
+  "find": "    units = []\n    last_line = None\n    try:\n        for tok in tokenize.generate_tokens(io.StringIO(text).readline):\n            if tok.type == tokenize.COMMENT:\n                body = tok.string.lstrip(\"#\")\n                # Rejoin comments on CONSECUTIVE lines into one paragraph. A\n                # sentence wrapped across a comment block is one sentence, and\n                # reading it as two is how `read on this` / `# machine` survived\n                # two separate sweeps of this pack.\n                if last_line is not None and tok.start[0] == last_line + 1 and units:\n                    units[-1] += \" \" + body\n                else:\n                    units.append(body)\n                last_line = tok.start[0]\n            elif tok.type == tokenize.STRING:\n                units.append(tok.string)\n                last_line = None\n    except (tokenize.TokenError, IndentationError, SyntaxError):\n        # A file this tokenizer cannot read is not a file this guard may pass in\n        # silence. Fall back to the whole text: noisier, never blinder.\n        return [text]\n\n    return units",
+  "replace": "    if True:\n        body = re.sub(r\"\\n\\s*#\\s?\", \" \", text)\n        return [ln.strip().lstrip(\"#\") for ln in body.split(\"\\n\")\n                if ln.strip().startswith(\"#\")]\n"
+ },
+ {
+  "id": "M63-no-provenance-vocabulary",
+  "why": "Empties the word list that turns a number into an observation. The guard then reports every tree clean, including one carrying the exact sentences that were scrubbed out of this pack by hand.",
+  "file": "tests/test_publication.py",
+  "find": "    \"corpus\", \"organic\", \"transcript\", \"transcripts\", \"estate\", \"estates\",",
+  "replace": "    \"zzz-no-such-word\","
+ },
+ {
+  "id": "M64-a-ratio-is-not-a-claim",
+  "why": "Drops the rule that a ratio written in figures is a census claim on its own. One real site described its mechanism well enough that no provenance word appeared in the sentence at all, and only the ratio rule sees that shape.",
+  "file": "tests/test_publication.py",
+  "find": "    for m in _RATIO.finditer(text) if ratios else []:\n        if not _is_exempt(m):\n            found.append((m.group(0), \"a ratio in figures\"))",
+  "replace": "    pass"
+ },
+ {
+  "id": "M66-the-ratio-rule-is-forced-on-for-commit-messages",
+  "why": "Ignores the `ratios=False` argument that commit-message scanning passes, so the bare-ratio rule runs over commit bodies as well. That rule is right for hooks/ prose and wrong for a commit body, which naturally reports what a change did to a test suite as a ratio of two product counts: measured over this history it fired five times and every one was a product count. The mutation is caught by the message-exemption control, which is the only assertion that distinguishes a gate people keep from one they delete.",
+  "file": "tests/test_publication.py",
+  "find": "    return claims_in(body.split(\"\\n\\n\"), ratios=False)",
+  "replace": "    return claims_in(body.split(\"\\n\\n\"), ratios=True)"
+ },
+ {
+  "id": "M66b-a-commit-body-is-read-as-one-paragraph",
+  "why": "Joins a whole commit body into one search scope instead of paragraph by paragraph. A number in the subject line then stands within the window of a provenance word four paragraphs below, and the gate reports a claim nobody wrote. This is the same failure `prose_of` documents for source files, and a gate that invents refusals is one that gets removed.",
+  "file": "tests/test_publication.py",
+  "find": "    return claims_in(body.split(\"\\n\\n\"), ratios=False)",
+  "replace": "    return claims_in([body], ratios=False)"
+ },
+ {
+  "id": "M65-a-qualifier-does-not-save-a-corpus",
+  "why": "Removes the product-qualifier exemption. The guard then refuses `the 87 attacks in the attack corpus`, which is a true statement about this repository's own test table \u2014 and a gate that refuses correct writing gets removed, taking every other guarantee with it. The exemption is asserted in BOTH directions so it cannot quietly swallow the rule instead.",
+  "file": "tests/test_publication.py",
+  "find": "            before = low[max(0, i - 14):i].strip().split()\n            if before and before[-1].rstrip(\"s\") in PRODUCT_QUALIFIERS:\n                start = i + 1\n                continue",
+  "replace": "            pass"
+ },
+ {
+  "id": "M67-the-two-hosts-do-not-hold-the-pack-equal",
+  "why": "Breaks the construction the latency control rests on. The two host samples are only evidence because the PACK's own cost is identical in both and only the interpreter start moves; a linux sample with a different pack cost would make the ratio's failure prove nothing about the ratio.",
+  "file": "tests/test_latency.py",
+  "find": "    \"linux\":  {\"base\": 0.0040, \"floor\": 0.0097, \"small\": 0.0094, \"big\": 0.0368},",
+  "replace": "    \"linux\":  {\"base\": 0.0040, \"floor\": 0.0130, \"small\": 0.0094, \"big\": 0.0368},"
+ },
+ {
+  "id": "M68-code-spans-stripped-across-units",
+  "why": "Strips inline code spans from the CONCATENATION of every human-written unit instead of from each one, and collapses the units into a single search scope at the same time. `_INLINE`'s class excludes newlines, so in raw text a span cannot run past a line; collapsing whitespace first removes that guard and a backtick near the top of a file pairs with one hundreds of lines below. Measured on the guard's own file: 12,664 characters of prose became 9,926 and the deleted middle held the planted census sentences, so the guard read its own plants as absent and reported the tree clean.",
+  "file": "tests/test_publication.py",
+  "find": "    return [re.sub(r\"\\s+\", \" \", _INLINE.sub(\" \", u)) for u in units]",
+  "replace": "    return [_INLINE.sub(\" \", re.sub(r\"\\s+\", \" \", \" \".join(units)))]"
+ },
+ {
+  "id": "M69-a-file-type-is-silently-exempt",
+  "why": "Drops shell scripts from the scanned extensions. A guard that scans a subset reports the unscanned part clean, which is indistinguishable from having no guard for those files \u2014 and it is the failure the Rust scanner next door still has, since its walk filters on `.rs`. The extension list is asserted against what the directory actually holds so a new file type fails loudly instead of being skipped.",
+  "file": "tests/test_publication.py",
+  "find": "_EXTS = (\".py\", \".json\", \".md\", \".sh\")",
+  "replace": "_EXTS = (\".py\", \".json\", \".md\")"
+ },
+ {
+  "id": "M70-a-language-scoped-printer-is-not-a-sink",
+  "why": "Empties the per-language sink table. Ruby's `p` is a full dump \u2014 `p env` prints the object \u2014 and re-aiming this gate from the EXPRESSION to the ACT reopened `ruby -e \"env = ENV.to_h; p env\"`, which the old mention-based rule refused. Found by an adversarial sweep of the loosened gate rather than by review, which is the only thing that finds a hole this shape. Listing `p` globally is not the fix: it would refuse an inert Python line that happens to bind a variable called `p`, and the false-positive layer asserts exactly that.",
+  "file": "keyless_hooks/checks/env_dump.py",
+  "find": "_SINKS_BY_LANGUAGE = {\n    \"ruby\": frozenset([\"p\"]),\n    \"irb\": frozenset([\"p\"]),\n    \"perl\": frozenset([\"say\"]),\n}",
+  "replace": "_SINKS_BY_LANGUAGE = {}"
+ },
+ {
+  "id": "M71-an-interpreter-in-a-shell-is-invisible",
+  "why": "Stops re-scanning interpreter payloads. `bash -c 'python3 -c \"print(os.environ)\"'` has an outer head of `bash`, which this gate does not read, so the whole dump sits inside one opaque word. KL-VAULT and KL-ASSIGN have re-scanned those payloads from the start and this check never did \u2014 measured silent on the pack as it stood before this branch, so it is a hole being closed rather than one introduced.",
+  "file": "keyless_hooks/checks/env_dump.py",
+  "find": "    texts = [cmd] + interpreter_payloads(cmd, cfg.interpreters)",
+  "replace": "    texts = [cmd]"
+ },
+ {
+  "id": "M72-php-is-an-interpreter-with-nothing-to-match",
+  "why": "Removes the PHP whole-environment forms. `php` sat in the interpreter head list from the start with no pattern behind it, so the head was recognised and then nothing looked for the act \u2014 every PHP environment dump passed. `getenv()` bare is the whole environment; `getenv(\"NAME\")` is the single-key read this gate ignores on purpose, and the false-positive layer holds that boundary.",
+  "file": "keyless_hooks/checks/env_dump.py",
+  "find": "    r\"|\\$_ENV\\b\"\n    r\"|\\bgetenv\\(\\s*\\)\"",
+  "replace": ""
+ },
+ {
+  "id": "M73-every-reader-expands",
+  "why": "The whole tier table rests on what the destination's reader does with a reference. Declaring every file rewritable restores the behaviour this change removed: a substitution into source, which is a syntax error presented as a repair.",
+  "file": "keyless_hooks/targets.py",
+  "find": "    return reader_class(path) in (EXPANDS, INERT)",
+  "replace": "    return True"
+ },
+ {
+  "id": "M74-no-shape-is-self-evident",
+  "why": "The refusal fires only on a VENDOR shape, which is the one class that proves itself. Emptying the set collapses every deny into a warn and lets a live vendor credential reach disk.",
+  "file": "keyless_hooks/fingerprint.py",
+  "find": "VENDOR_KINDS = frozenset(_VENDOR.groupindex)",
+  "replace": "VENDOR_KINDS = frozenset()"
+ },
+ {
+  "id": "M75-a-bulk-edit-carries-no-text",
+  "why": "MultiEdit keeps its text in a LIST. Stopping the walk at the top level restores the original defect exactly: a tool named in the check's tool set, scanning nothing, indistinguishable from cover.",
+  "file": "keyless_hooks/payload.py",
+  "find": "        edits = self.tool_input.get(\"edits\")\n        if not isinstance(edits, list):\n            return out",
+  "replace": "        edits = None\n        if not isinstance(edits, list):\n            return out"
+ },
+ {
+  "id": "M76-a-rewrite-drops-untouched-entries",
+  "why": "The rewrite must return the SAME list. Dropping the entries it did not change is the corruption a rewrite into a nested structure is feared for \u2014 the edit list still parses, and half the edits are gone.",
+  "file": "keyless_hooks/payload.py",
+  "find": "                    else:\n                        rebuilt.append(entry)",
+  "replace": "                    else:\n                        continue"
+ },
+ {
+  "id": "M77-a-heredoc-never-names-a-file",
+  "why": "The destination test is what separates a file write from a body fed to an interpreter. Blinding it turns every refusal into an advisory and lets `cat > .env <<EOF` through.",
+  "file": "keyless_hooks/checks/heredoc_write.py",
+  "find": "        match = _REDIRECT_TOKEN.match(token)",
+  "replace": "        match = None"
+ },
+ {
+  "id": "M78-a-heredoc-body-is-empty",
+  "why": "The body is the file's content. Accumulating none leaves the blanking intact \u2014 so every other check still passes \u2014 while this one silently judges an empty string.",
+  "file": "keyless_hooks/shellview.py",
+  "find": "                current.body.append(line)",
+  "replace": "                pass"
+ },
+ {
+  "id": "M79-the-allow-list-is-decorative",
+  "why": "The refusal names `allowed` as its escape hatch. This restores the state the message was already in before this change: a remedy printed, and a remedy that does nothing.",
+  "file": "keyless_hooks/checks/literal_write.py",
+  "find": "        allowed = secretpaths.is_allowed(target, payload.cwd, cfg)",
+  "replace": "        allowed = None"
+ },
+ {
+  "id": "M80-a-refusal-degraded-to-advice",
+  "why": "The tier IS the decision. A REWRITE-tier check returning `deny` is downgraded to an advisory by the engine, which is correct treatment of a registry error and silent loss of the gate.",
+  "file": "keyless_hooks/registry.py",
+  "find": "        (\"KL-WRITE\",  \"PreToolUse\", BLOCK,   literal_write.run),",
+  "replace": "        (\"KL-WRITE\",  \"PreToolUse\", REWRITE, literal_write.run),"
+ },
+ {
+  "id": "M81-old-string-is-rewritten-too",
+  "why": "`old_string` must keep matching what is on disk. Rewriting it makes every edit that touches a credential fail to apply \u2014 a refusal wearing the face of a repair.",
+  "file": "keyless_hooks/checks/literal_write.py",
+  "find": "        if _slot_key(addr) == \"old_string\":",
+  "replace": "        if False:"
+ },
+ {
+  "id": "M82-a-heredoc-gate-that-never-runs",
+  "why": "The whole check, unregistered. A table with no discovery means a row removed is a gate removed, and nothing else reports it.",
+  "file": "keyless_hooks/registry.py",
+  "find": "        (\"KL-HEREDOC\", \"PreToolUse\", BLOCK,  heredoc_write.run),",
+  "replace": ""
+ },
+ {
+  "id": "M83-a-nested-entry-is-assumed-to-be-a-mapping",
+  "why": "The bulk-edit walk indexes into structures the SENDER controls. Dropping the entry-type guard makes it raise on a hostile list \u2014 and a check that raises is isolated by the engine, so the process still exits 0 and prints nothing. Only the decision log tells that apart from a correct silence.",
+  "file": "keyless_hooks/payload.py",
+  "find": "            if not isinstance(entry, dict):\n                continue",
+  "replace": "            if False:\n                continue"
+ },
+ {
+  "id": "M84-dest-existence-inverted",
+  "why": "KL-DEST fires exactly where a copy is taken: the destination already exists. Inverting the test makes it silent on every real capture and noisy on the one case KL-WRITE repairs \u2014 a write CREATING the file, where the rewrite is the useful outcome and a deny above it throws that rewrite away.",
+  "file": "keyless_hooks/checks/dest_write.py",
+  "find": "    if not exists:",
+  "replace": "    if exists:"
+ },
+ {
+  "id": "M85-dest-only-two-tools",
+  "why": "The copy is taken by MultiEdit and NotebookEdit exactly as by Edit. A tool set naming two of the four is a gate with two doors open and a name that says otherwise \u2014 the shape a matcher audit catches and a unit test never does.",
+  "file": "keyless_hooks/checks/dest_write.py",
+  "find": "_TOOLS = frozenset([\"Write\", \"Edit\", \"MultiEdit\", \"NotebookEdit\"])",
+  "replace": "_TOOLS = frozenset([\"Write\", \"Edit\"])"
+ },
+ {
+  "id": "M86-dest-unresolvable-means-absent",
+  "why": "`I could not look` and `there is nothing there` are the same empty answer from a filesystem test, and only one of them is safe. This is the tilde defect that already cost file_read a whole block, arriving in the new check by the same road.",
+  "file": "keyless_hooks/checks/dest_write.py",
+  "find": "    resolved = resolve(path, payload.cwd)\n    if resolved is None:",
+  "replace": "    resolved = resolve(path, payload.cwd) or path\n    if resolved is None and False:"
+ },
+ {
+  "id": "M87-dest-tier-is-advice",
+  "why": "A BLOCK check demoted to WARN still runs, still logs and still returns `deny`; the engine degrades every one of them to a note and the tool call proceeds. The registry is the only place that fact lives, so nothing about the check's own code changes and it keeps reading as enforcing.",
+  "file": "keyless_hooks/registry.py",
+  "find": "        (\"KL-DEST\",   \"PreToolUse\", BLOCK,   dest_write.run),",
+  "replace": "        (\"KL-DEST\",   \"PreToolUse\", WARN,   dest_write.run),"
+ },
+ {
+  "id": "M89-assign-gap-matches-a-newline",
+  "why": "The gap between a key's separator and its value must not cross a line. With `\\s` there, a key with an EMPTY value takes the NEXT line's key as its value; in a file this pack rewrites, the substitution then replaces a key NAME with a reference to a different variable, silently, under a message announcing a repair. Reproduced through the live hook on a .github/workflows/*.yml, a .env.example and a reusable workflow's secrets block on 2026-08-29.",
+  "file": "keyless_hooks/fingerprint.py",
+  "find": "    r\"[\\\"']?[^\\S\\n]*[:=][^\\S\\n]*\"",
+  "replace": "    r\"[\\\"']?\\s*[:=]\\s*\""
+ },
+ {
+  "id": "M90-one-line-guard-removed",
+  "why": "`_one_line` is the same rule as M89's gap, enforced on the FINDING rather than in the pattern so a later pattern edit cannot reopen the class quietly. Disarming it has to be visible on its own, or it is a comment with a function around it.",
+  "file": "keyless_hooks/fingerprint.py",
+  "find": "    if \"\\n\" in text[value_start:value_end]:\n        return False\n    if keyword_start is None:\n        return True\n    return \"\\n\" not in text[keyword_start:value_start]",
+  "replace": "    return True  # M90: the one-line invariant, disarmed"
+ },
+ {
+  "id": "M91-quote-defeats-the-member-path-exemption",
+  "why": "A quote gates the TERMINATOR test only. Gating the member-path test on it inverts the check: an unquoted reference is left alone and the SAME reference in quotes is rewritten. That is how `token: \"secrets.GITHUB_TOKEN\"` became `token: \"${TOKEN}\"` in a workflow while the unquoted spelling beside it survived.",
+  "file": "keyless_hooks/fingerprint.py",
+  "find": "    if not _is_member_path(value):\n        return False\n    if not quoted:\n        return True",
+  "replace": "    if quoted:\n        return False\n    if not _is_member_path(value):\n        return False"
+ },
+ {
+  "id": "M92-quoted-head-list-opened",
+  "why": "The quoted member-path exemption is a CLOSED head list. Opening it to any head makes `TOKEN = \"abcdefgh.ijklmnop.qrstuvwx\"` \u2014 a dotted opaque literal \u2014 read as a reference. That is the adversarial row that caught this exemption the first time it was written without a list.",
+  "file": "keyless_hooks/fingerprint.py",
+  "find": "    return value.split(\".\", 1)[0].lower() in _QUOTED_REF_HEADS",
+  "replace": "    return True  # M92: any head clears a quoted dotted value"
+ },
+ {
+  "id": "M93-rewrite-may-reshape-the-file",
+  "why": "`_line_preserved` is the last net under the two in `fingerprint`: a rewrite replaces a VALUE and may never change the shape of the file. Making it constant-true lets a scanner defect through as a silent edit instead of a refusal, which is the failure this section exists to make impossible.",
+  "file": "keyless_hooks/checks/literal_write.py",
+  "find": "    return before.count(\"\\n\") == after.count(\"\\n\")",
+  "replace": "    return True  # M93: the line-structure invariant, disarmed"
+ },
+ {
+  "id": "M94-vault-blind-to-quoted-substitution",
+  "why": "Removes the substitution view from KL-VAULT. `echo \"$(op read \u2026)\"` then reads as one quoted word and renders no verdict \u2014 the one spelling of a vault read that reaches a print verb unrefused, while the unquoted spelling still denies.",
+  "file": "keyless_hooks/checks/vault_cli.py",
+  "find": "    texts = [cmd] + interpreter_payloads(cmd, cfg.interpreters) + substitution_payloads(cmd)",
+  "replace": "    texts = [cmd] + interpreter_payloads(cmd, cfg.interpreters)"
+ },
+ {
+  "id": "M95-switch-gate-unregistered",
+  "why": "KL-SWITCH, entirely unregistered. A table with no discovery means a row removed is a gate removed, and nothing else reports it \u2014 `keyless disable` runs unrefused.",
+  "file": "keyless_hooks/registry.py",
+  "find": "        (\"KL-SWITCH\", \"PreToolUse\", BLOCK,   switch.run),\n",
+  "replace": ""
+ },
+ {
+  "id": "M96-switch-tier-is-observe",
+  "why": "KL-SWITCH demoted to OBSERVE. The check still runs and still logs, but the engine records the verdict instead of returning it, and `keyless disable` succeeds \u2014 silencing every check that would have recorded the calls after it.",
+  "file": "keyless_hooks/registry.py",
+  "find": "        (\"KL-SWITCH\", \"PreToolUse\", BLOCK,   switch.run),",
+  "replace": "        (\"KL-SWITCH\", \"PreToolUse\", OBSERVE, switch.run),"
+ },
+ {
+  "id": "M97-disable-verb-not-matched",
+  "why": "Drops `disable` from the verb table. `keyless disable` walks past the check exactly like any other keyless verb, which is the one call this check exists to stop.",
+  "file": "keyless_hooks/checks/switch.py",
+  "find": "    return _collapse(_keyless_verb(rest)) in (\"disable\", \"uninstall\")",
+  "replace": "    return _collapse(_keyless_verb(rest)) in (\"uninstall\",)"
+ },
+ {
+  "id": "M98-uninstall-script-suffix-widened-to-basename",
+  "why": "Matches any script named `uninstall.sh` rather than the pack's own `hooks/uninstall.sh` \u2014 the predicate this check ships with is precise, and loosening it here only proves the test suite would catch the loosening.",
+  "file": "keyless_hooks/checks/switch.py",
+  "find": "    if target.endswith(\"hooks/uninstall.sh\"):",
+  "replace": "    if target.endswith(\"uninstall.sh\"):"
+ },
+ {
+  "id": "M99-guard-targets-empty",
+  "why": "The default hooks.json/config.json locations are dropped from the guard set. Every write to `~/.config/keyless/hooks.json` then matches nothing, and the switch's own config is wide open from a session that never has to touch the CLI at all.",
+  "file": "keyless_hooks/checks/switch.py",
+  "find": "    home = os.path.expanduser(\"~\")\n    targets = set()\n    if home:",
+  "replace": "    home = os.path.expanduser(\"~\")\n    targets = set()\n    if False:"
+ },
+ {
+  "id": "M100-tee-admitted-as-a-reader",
+  "why": "Admits `tee` to the closed reader set. `tee ~/.config/keyless/hooks.json <<< '{}'` then reads as a permitted read of the guard file instead of the write it is, which is exactly the KL-FILE non-reader trap this check reuses the shape of.",
+  "file": "keyless_hooks/checks/switch.py",
+  "find": "\"egrep\", \"fgrep\", \"rg\",",
+  "replace": "\"egrep\", \"fgrep\", \"tee\","
+ },
+ {
+  "id": "M101-project-layer-can-still-disable",
+  "why": "The project-committed `.keyless-hooks.json` keeps its `enabled`/`observe` keys instead of having them stripped before the merge \u2014 so a file that ships in the repo, read by every agent that checks it out, can turn the pack off or into record-only mode for all of them.",
+  "file": "keyless_hooks/config.py",
+  "find": "        patch2.pop(\"enabled\", None)\n        patch2.pop(\"observe\", None)\n        for k, v in patch2.items():",
+  "replace": "        for k, v in patch2.items():"
+ },
+ {
+  "id": "M102-cd-not-followed",
+  "why": "Stops following `cd`/`pushd` through the command, so `cd ~/.config/keyless && echo '{}' > hooks.json` resolves `hooks.json` against the payload's own cwd and the write to the live guard file passes.",
+  "file": "keyless_hooks/checks/switch.py",
+  "find": "        if moved is not None:\n            cwd = moved\n            continue",
+  "replace": "        if moved is not None:\n            continue"
+ },
+ {
+  "id": "M103-guard-directory-ignored",
+  "why": "Drops the directory rule, so a recursive copy into `~/.config/keyless/`, a rename of it or a recursive delete of it rewrites every guard file without ever naming one.",
+  "file": "keyless_hooks/checks/switch.py",
+  "find": "    dirs = {os.path.dirname(target) for target in targets}",
+  "replace": "    dirs = set()"
+ },
+ {
+  "id": "M104-fed-heredoc-not-read",
+  "why": "Stops reading here-document bodies fed to an interpreter, so `bash <<EOF` with `keyless disable` on a line of its own runs the off-switch past the check.",
+  "file": "keyless_hooks/checks/switch.py",
+  "find": "    texts += _fed_bodies(docs, cfg)\n",
+  "replace": ""
+ },
+ {
+  "id": "M105-single-quotes-read-as-executed",
+  "why": "Leaves single-quoted text visible to the substitution scan, so markdown prose naming `keyless disable` inside single quotes is refused as if the shell ran it \u2014 the false positive that made up every verb refusal in the replay.",
+  "file": "keyless_hooks/checks/switch.py",
+  "find": "            for k in range(i, min(close + 1, n)):\n                out[k] = \" \"\n",
+  "replace": ""
+ },
+ {
+  "id": "M106-find-always-a-reader",
+  "why": "Treats `find` as a reader even with `-delete` or `-exec`, so a find over the guard directory deletes every guard file unrefused.",
+  "file": "keyless_hooks/checks/switch.py",
+  "find": "        return \"-delete\" not in tokens(stmt) and not delegated_head(stmt)",
+  "replace": "        return True"
+ },
+ {
+  "id": "M107-script-file-read-as-head",
+  "why": "Stops skipping `script`'s log-file positional, so `script -q /dev/null keyless disable` is a statement headed `null` and both KL-SWITCH and KL-VAULT go silent behind one wrapper.",
+  "file": "keyless_hooks/shellview.py",
+  "find": "            script_file = name == \"script\"\n",
+  "replace": ""
+ },
+ {
+  "id": "M108-script-command-string-unread",
+  "why": "Stops handing `script -c \"...\"` payloads back as commands, so the util-linux spelling runs the off-switch or a vault print verb past every head-based check.",
+  "file": "keyless_hooks/shellview.py",
+  "find": "        scripted = _script_command(stmt)\n",
+  "replace": "        scripted = \"\"\n"
+ },
+ {
+  "id": "N1-name-keyed-regains-the-edit",
+  "why": "The defect itself. Licensing every kind to substitute puts a NAME-keyed guess back in charge of editing a file, which wrote a variable's own key over a public URL in a shell script and collapsed a documentation sentence into saying a string was replaced by itself.",
+  "file": "keyless_hooks/fingerprint.py",
+  "find": "    return kind in SUBSTITUTABLE_KINDS",
+  "replace": "    return True"
+ },
+ {
+  "id": "N2-nothing-may-substitute",
+  "why": "The opposite error, and the one the fix's own author had no reason to write. If this ESCAPES, the evidence controls are vacuous and the check could have stopped substituting altogether without a single test noticing.",
+  "file": "keyless_hooks/fingerprint.py",
+  "find": "    return kind in SUBSTITUTABLE_KINDS",
+  "replace": "    return False"
+ },
+ {
+  "id": "N3-positional-loses-the-edit",
+  "why": "Narrower than N2 and aimed at one class: a URL userinfo password and an Authorization header argument are proof from the GRAMMAR around the value, not from a name. Only the positional controls can catch this, so it is what proves they carry their own weight rather than riding on the vendor rows.",
+  "file": "keyless_hooks/fingerprint.py",
+  "find": "SUBSTITUTABLE_KINDS = VENDOR_KINDS | POSITIONAL_KINDS",
+  "replace": "SUBSTITUTABLE_KINDS = VENDOR_KINDS"
+ },
+ {
+  "id": "N4-partition-ignored-at-the-apply",
+  "why": "The classification is right and the call site ignores it: substituting every finding rather than the licensed subset. Only a write carrying BOTH classes can catch this, because a name-keyed-only write never reaches the apply at all.",
+  "file": "keyless_hooks/checks/literal_write.py",
+  "find": "        new_value = fingerprint.apply(value, proof)",
+  "replace": "        new_value = fingerprint.apply(value, findings)"
+ },
+ {
+  "id": "N5-canary-scoped-to-editable-destinations",
+  "why": "`_line_preserved` is a canary for a SCANNER defect, not a property of the file. Computing the candidate only where the check edits stops asking the question for every source file - which is most of what a write check sees - while every verdict stays plausible. Only the non-editable rows of the unsound-canary block can catch this.",
+  "file": "keyless_hooks/checks/literal_write.py",
+  "find": "        if not proof:\n            continue",
+  "replace": "        if not (may_edit and proof):\n            continue"
+ },
+ {
+  "id": "N6-name-keyed-added-to-the-substitutable-set",
+  "why": "The realistic regression, and deliberately NOT the one the name-keyed arms were written against. N1 licenses EVERY kind and is the defect restored wholesale; this widens the set by one entry, which is what someone closing a perceived coverage gap would actually write. Without it, 16 arms reproducing the two corruptions are scored by a single mutant - a diagonal, which proves each arm reacts to the change its author already had in mind and nothing more.",
+  "file": "keyless_hooks/fingerprint.py",
+  "find": "SUBSTITUTABLE_KINDS = VENDOR_KINDS | POSITIONAL_KINDS",
+  "replace": "SUBSTITUTABLE_KINDS = frozenset([NAME_KEYED]) | VENDOR_KINDS | POSITIONAL_KINDS"
+ }
 ]

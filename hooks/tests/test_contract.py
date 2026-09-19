@@ -463,10 +463,31 @@ def run():
     s.check("KL-WRITE warns on a name-keyed match in source", v.kind, "warn")
     s.check("KL-WRITE warn substitutes nothing", v.updated, None)
 
-    # ...and the same literal in a file that DOES expand is still rewritten, so
-    # the row above is the destination's doing and not the value's.
+    # The reachability control for the two rows above. It used to be spelled as
+    # "the same literal in a file that DOES expand is still rewritten, so the row
+    # above is the destination's doing" — and that was the defect stated as a
+    # property: a NAME-keyed guess got a silent substitution in a `.env`, a `.sh`
+    # or a `.md` and a warning in a `.ts`, on identical evidence.
+    #
+    # The evidence decides the edit now, so the control is asserted where the
+    # evidence lives. This is also strictly stronger than the old form, which
+    # could not tell "the pattern still matches" from "the pattern matches AND we
+    # edit on it".
+    from keyless_hooks import fingerprint as _fp
+    s.check("KL-WRITE control: that value still MATCHES, as a name-keyed finding",
+            [f.kind for f in _fp.scan(warned)], [_fp.NAME_KEYED])
+    # The policy itself, stated directly rather than inferred from a verdict. The
+    # arm above compares `scan`'s output against the same constant `scan` uses,
+    # so it proves the pattern is REACHABLE and deliberately proves nothing about
+    # what that class is licensed to do. This is that half.
+    s.check("a name-keyed finding is never licensed to substitute",
+            _fp.may_substitute(_fp.NAME_KEYED), False)
+    s.check("...and a vendor shape always is",
+            sorted(k for k in _fp.VENDOR_KINDS if not _fp.may_substitute(k)), [])
     v = drive(write(os.path.join(root, "w.env"), warned))
-    s.check("KL-WRITE control: the same value rewrites in a .env", v.kind, "rewrite")
+    s.check("KL-WRITE reports rather than edits in a .env too", v.kind, "warn")
+    s.check("KL-WRITE leaves the .env bytes alone",
+            (v.updated or {}).get("content", warned), warned)
 
     # ── the allow list is real, and it downgrades rather than silences ───────
     #

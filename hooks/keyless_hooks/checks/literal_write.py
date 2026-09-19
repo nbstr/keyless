@@ -21,25 +21,58 @@ majority of what this check acts on, so the substitution was wrong far more ofte
 than it was right. A check that is wrong most of the time gets uninstalled, and
 then the writes it was right about flow too.
 
-So there are three instruments, and `targets.py` decides which applies:
+── TWO questions, asked in this order, and never conflated ────────────────────
+**The EVIDENCE decides whether anything may be edited. The FILE decides only
+what to do when it may not be.** Asking them the other way round is the defect
+this check shipped with, and it corrupted two files before it was caught.
 
-    the reader expands `${NAME}`, or the file is prose   ->  REWRITE
-    it does not, and a VENDOR shape matched              ->  DENY
-    it does not, and only a NAME-keyed rule matched      ->  WARN
+    evidence is VENDOR or POSITIONAL   the reader expands, or it is prose -> REWRITE
+                                       it does not                       -> DENY
+    evidence is NAME-KEYED             any destination at all             -> WARN
 
-**Why the vendor split decides the refusal.** A vendor prefix is proof on its
-own; nothing but an AWS key is spelled `AKIA` plus sixteen upper alphanumerics.
-The name-keyed rule is the one `fingerprint` documents as unable to separate a
-literal from an identifier that merely looks opaque — `password`:
-`E2E_LOGIN_PASSWORD` — so refusing on it would refuse ordinary source edits, and
-rewriting on it would corrupt them. Telling the author is the only act that is
-right whichever of the two it was.
+**Why the evidence decides the edit.** A vendor prefix is proof on its own;
+nothing but an AWS key is spelled `AKIA` plus sixteen upper alphanumerics. A
+positional match is proof from the grammar AROUND the value — URL userinfo, an
+`Authorization: Bearer` argument — which no identifier can fake. The name-keyed
+rule is the one `fingerprint` documents as unable to separate a literal from an
+identifier that merely looks opaque — `password`: `E2E_LOGIN_PASSWORD` — so
+refusing on it would refuse ordinary source edits, and rewriting on it corrupts
+them. Telling the author is the only act that is right whichever it was.
 
-**Why WARN and not a quieter rewrite.** The alternative for that class is to keep
-substituting, which is what this check used to do everywhere: it removed the
-secret AND broke the file, silently, including in a test fixture — where a decoy
-turned into `${NAME}` is a control that no longer controls anything and still
-looks like one.
+**Why a file's reader may not decide this.** `targets.py` answers exactly one
+question — would `${NAME}` PARSE here — and that is worth knowing and is not
+evidence about the value. This check used to let it stand in for both: a
+name-keyed guess got a silent substitution in a `.sh`, a `.env`, a `.yml` or a
+`.md`, and the same guess on the same bytes got a warning in a `.ts`. Two
+measured corruptions followed, and the substituted name makes both worse than a
+plain bad edit, because `_name_left_of` inserts the assignment's OWN key:
+
+    readonly CB_TOKEN="https://…/access-token"   ->   readonly CB_TOKEN="${CB_TOKEN}"
+
+Top-level code under `set -u`, so every invocation of that script died on an
+unbound variable, `--help` included — and `bash -n` passed throughout, because
+the file was syntactically perfect and semantically destroyed. The same
+substitution in a markdown handoff rewrote a sentence's BEFORE half into its
+AFTER half, so a paragraph explaining the bug arrived on disk claiming a string
+had been replaced by itself.
+
+**Why WARN and not DENY for the name-keyed class.** `X_TOKEN="<12+ chars>"` is an
+ordinary line in an ordinary file, and refusing it would refuse ordinary work in
+every shell script and every document that quotes one. A gate that refuses
+correct work gets switched off, and then the vendor coverage goes with it.
+
+debt: a name-keyed match in a file whose reader expands is no longer substituted,
+      so a real secret sitting behind such a name now reaches disk with a warning
+      instead of being removed. That is the coverage this trade gives up, and it
+      is given up knowingly: the same rule could not be trusted to edit, and an
+      edit made on untrustworthy evidence is the larger failure.
+      Ceiling: only the NAME-keyed rule loses the edit. Vendor and positional
+      findings are substituted exactly as before, in every destination.
+      Upgrade trigger: a `verdict=warn` KL-WRITE row now carries `reader` in its
+      detail, so the name-keyed-in-a-rewritable-file population is countable for
+      the first time. Should those rows turn out to be predominantly real
+      secrets, the answer is a stronger EVIDENCE rule for that class — not a
+      return to editing on the name.
 
 ── the allow list is the escape hatch, and it is now real ──────────────────────
 The refusal names `allowed`, and consults it. It did not before: the message
@@ -92,10 +125,19 @@ def run(payload, cfg):
     if payload.event != "PreToolUse" or payload.tool not in _TOOLS:
         return None
 
+    target = payload.file_path
+    # The file's reader decides whether a substitution would PARSE. It is asked
+    # nothing else — in particular it is never asked whether a value is a secret,
+    # which is the conflation that let a name-keyed guess edit a shell script.
+    may_edit = targets.rewritable(target)
+
     changes = {}
-    kinds = []
+    proof_kinds = []    # evidence that does not come from a name: may be edited
+    guess_kinds = []    # name-keyed: reported, never edited
     sites = []
+    guess_sites = []
     unsafe = []
+    seen_fields = []    # slots that carried a finding — never every slot walked
     for addr, value in payload.text_slots():
         if _slot_key(addr) == "old_string":
             # `old_string` must keep matching what is on disk. Rewriting it makes
@@ -105,50 +147,93 @@ def run(payload, cfg):
             # and in the transcript, so refusing the edit that REMOVES it would
             # refuse the repair.
             continue
-        new_value, findings = fingerprint.redact(value)
+        findings = fingerprint.scan(value)
         if not findings:
             continue
+        seen_fields.append(_slot_key(addr))
+        proof = [f for f in findings if fingerprint.may_substitute(f.kind)]
+        guess = [f for f in findings if not fingerprint.may_substitute(f.kind)]
+        proof_kinds.extend(f.kind for f in proof)
+        guess_kinds.extend(f.kind for f in guess)
+        for f in guess:
+            guess_sites.append(_site(addr, value, f))
+        if not proof:
+            continue
+        # The candidate is computed for EVERY destination, and only USED where
+        # this check edits. `_line_preserved` is a canary for a defect in the
+        # scanner rather than a property of the file, so a canary consulted only
+        # where a substitution gets applied would quietly stop asking the
+        # question for every source file — which is most of what a write check
+        # sees. Refused there too: a cross-line finding means the scanner is
+        # producing spans it cannot be trusted to have matched, and that is
+        # worth a refusal wherever it shows up.
+        new_value = fingerprint.apply(value, proof)
         if not _line_preserved(value, new_value):
             unsafe.append(_slot_key(addr))
             continue
+        if not may_edit:
+            continue
         changes[addr] = new_value
-        kinds.extend(f.kind for f in findings)
-        for f in findings:
-            sites.append("%s line %d" % (_slot_key(addr),
-                                         value.count("\n", 0, f.start) + 1))
+        for f in proof:
+            sites.append(_site(addr, value, f))
 
     if unsafe:
-        return ("deny", _unsound_message(payload.file_path, sorted(set(unsafe))),
+        return ("deny", _unsound_message(target, sorted(set(unsafe))),
                 {"reason": "rewrite_would_not_preserve_lines",
                  "fields": sorted(set(unsafe))})
 
-    if not changes:
+    if not proof_kinds and not guess_kinds:
         return None
 
-    target = payload.file_path
-    fields = sorted(set(_slot_key(a) for a in changes))
-    shapes = sorted(set(kinds))
+    detail = {"fields": sorted(set(seen_fields)),
+              "reader": targets.reader_class(target)}
 
-    if targets.rewritable(target):
-        return ("rewrite", _rewrite_message(target, kinds, shapes, fields, sites),
+    if changes:
+        detail["shapes"] = sorted(set(proof_kinds))[:8]
+        if guess_kinds:
+            detail["reported_unedited"] = sorted(set(guess_kinds))
+        # The fields that were CHANGED, which is narrower than the fields that
+        # carried a finding whenever a name-keyed match was left in place.
+        edited = sorted(set(_slot_key(a) for a in changes))
+        return ("rewrite",
+                _rewrite_message(target, proof_kinds, detail["shapes"],
+                                 edited, sites, guess_sites),
                 payload.rebuild(changes))
 
-    detail = {"shapes": shapes[:8], "fields": fields,
-              "reader": targets.reader_class(target)}
-    if any(fingerprint.is_vendor(k) for k in kinds):
+    if proof_kinds:
+        # Proof, and the destination cannot carry a reference — so neither
+        # letting it through nor substituting is right, and it is refused.
+        detail["shapes"] = sorted(set(proof_kinds))[:8]
         allowed = secretpaths.is_allowed(target, payload.cwd, cfg)
         if allowed is None:
-            return ("deny", _deny_message(target, kinds, shapes), detail)
+            return ("deny", _deny_message(target, proof_kinds, detail["shapes"]),
+                    detail)
         detail["allowed_by"] = allowed
-        return ("warn", _allowed_message(target, shapes, allowed), detail)
-    return ("warn", _warn_message(target, kinds, shapes), detail)
+        return ("warn", _allowed_message(target, detail["shapes"], allowed), detail)
+
+    detail["shapes"] = sorted(set(guess_kinds))[:8]
+    return ("warn", _warn_message(target, guess_kinds, guess_sites), detail)
+
+
+def _site(addr, value, finding):
+    return "%s line %d" % (_slot_key(addr),
+                           value.count("\n", 0, finding.start) + 1)
 
 
 def _named(target):
     return target or "the file being written"
 
 
-def _rewrite_message(target, kinds, shapes, fields, sites):
+def _rewrite_message(target, kinds, shapes, fields, sites, guess_sites=()):
+    tail = ""
+    if guess_sites:
+        tail = (
+            "\n\nAlso reported and NOT changed: %d value(s) matched only because "
+            "the field NAME reads like a credential. That rule cannot tell a "
+            "literal from an identifier, so those bytes were left exactly as you "
+            "wrote them — at %s. If one of them IS a credential, it is on disk "
+            "now.\n"
+            % (len(guess_sites), "; ".join(guess_sites)))
     return (
         "[%s] This write was CHANGED before it reached disk: %d credential-shaped "
         "literal(s) were replaced with `${NAME}` references. You did not ask for "
@@ -165,8 +250,10 @@ def _rewrite_message(target, kinds, shapes, fields, sites):
         "on disk is now wrong. Re-write it with that value spelled so it is not "
         "credential-shaped, or add its path to `allowed` in "
         "~/.config/keyless/hooks.json, which stops the substitution for that file."
+        "%s"
         % (CHECK, len(kinds), _named(target), ", ".join(shapes), ", ".join(fields),
-           "; ".join(sites) if sites else "unknown", _named(target), _RUN_LINE))
+           "; ".join(sites) if sites else "unknown", _named(target), _RUN_LINE,
+           tail))
 
 
 def _unsound_message(target, fields):
@@ -218,21 +305,31 @@ def _deny_message(target, kinds, shapes):
         % (CHECK, len(kinds), _named(target), ", ".join(shapes), _RUN_LINE))
 
 
-def _warn_message(target, kinds, shapes):
+def _warn_message(target, kinds, sites):
     return (
-        "[%s] %d value(s) in this write are credential-shaped, and %s does not "
-        "expand `${NAME}`. Shape(s) matched: %s. The write proceeded UNCHANGED.\n\n"
-        "Nothing was substituted, deliberately: a reference nothing resolves would "
-        "break a file that has to parse. Nothing was refused either, because this "
-        "match came from the value's NAME rather than from its shape, and that "
-        "rule cannot tell a literal from an identifier that merely looks opaque.\n\n"
-        "So this is a question rather than a verdict. If it IS a credential, it is "
-        "now on disk and in this transcript: remove it from the file, read it at "
-        "run time instead, and rotate it. Supply it with\n"
+        "[%s] %d value(s) in this write sit behind a field NAME that reads like a "
+        "credential. The write proceeded UNCHANGED — nothing was substituted and "
+        "nothing was refused.\n\n"
+        "  file      %s\n"
+        "  at        %s\n\n"
+        "This is a question rather than a verdict, and the reason is the EVIDENCE "
+        "rather than the file type. The match came from the name on the left of "
+        "the assignment, which you chose, so it says nothing about the value on "
+        "the right: `X_TOKEN=\"<a public URL>\"` and `X_TOKEN=\"<a real token>\"` "
+        "are the same three tokens in the same order.\n\n"
+        "Substituting on that evidence is how this check once wrote "
+        "`X_TOKEN=\"${X_TOKEN}\"` over a public URL in a shell script — the name "
+        "it inserts is the assignment's OWN key, so the line came to read its own "
+        "unset variable and the script died on every invocation while still "
+        "parsing cleanly. It will not do that again, in any file type.\n\n"
+        "If the value IS a credential, it is now on disk and in this transcript: "
+        "remove it from the file, read it at run time instead, and rotate it. "
+        "Supply it with\n"
         "%s\n\n"
-        "If it is a variable name, a fixture or a public identifier, nothing needs "
-        "doing."
-        % (CHECK, len(kinds), _named(target), ", ".join(shapes), _RUN_LINE))
+        "If it is a URL, a variable name, a fixture or a public identifier, "
+        "nothing needs doing."
+        % (CHECK, len(kinds), _named(target),
+           "; ".join(sites) if sites else "unknown", _RUN_LINE))
 
 
 def _allowed_message(target, shapes, allowed):

@@ -75,21 +75,56 @@ a decoy silently turned into `${NAME}` is a control that no longer controls
 anything and still looks like one.
 
 Source files are the large majority of what a write check sees, so `KL-WRITE`
-reads the destination and picks its instrument:
+asks two questions, in this order, and never conflates them. **The EVIDENCE
+decides whether anything may be edited. The DESTINATION decides only what to do
+when it may not be.**
 
-| the destination | the finding | what happens |
+Evidence comes in three kinds, and only two of them license an edit:
+
+| the evidence | what makes it proof |
+|---|---|
+| **vendor** — `AKIA…`, `ghp_…`, a private-key header | the SHAPE. Nothing but an AWS key is spelled `AKIA` plus sixteen upper alphanumerics |
+| **positional** — a URL's userinfo password, an `Authorization: Bearer` argument, a `--password` argument | the GRAMMAR AROUND the value. The slot holds a credential whatever the identifiers near it are called |
+| **name-keyed** — `password: <opaque>`, `X_TOKEN="<opaque>"` | nothing. The author chose the identifier, so the identifier says nothing about the value |
+
+| the finding | the destination | what happens |
 |---|---|---|
-| its reader expands `${NAME}` — `.env`, `.sh`, `.yml`, `.conf`, `.toml`, a `Dockerfile` | any | **rewrite** — the write proceeds without the secret |
-| prose or plain data — `.md`, `.txt`, `.csv` | any | **rewrite** — there is no grammar to break |
-| anything else — a program, a manifest, a data document, an unknown type | a **vendor** shape (`AKIA…`, `ghp_…`, a private-key header) | **deny** — the shape is proof on its own |
-| anything else | only a **name-keyed** match (`password: <opaque>`) | **warn**, and the write goes through UNTOUCHED |
+| vendor or positional | its reader expands `${NAME}` — `.env`, `.sh`, `.yml`, `.conf`, `.toml`, a `Dockerfile` | **rewrite** — the write proceeds without the secret |
+| vendor or positional | prose or plain data — `.md`, `.txt`, `.csv` | **rewrite** — there is no grammar to break |
+| vendor or positional | anything else — a program, a manifest, a data document, an unknown type | **deny** — the shape is proof, and the destination cannot carry a reference |
+| **name-keyed** | **any destination at all** | **warn**, and the write goes through UNTOUCHED |
 | any | a substitution that would not preserve the file's LINE STRUCTURE | **deny** — see below |
 
-The name-keyed row is the one worth defending. That rule cannot separate a
-literal from an identifier that merely looks opaque — `password`:
-`E2E_LOGIN_PASSWORD` — so refusing would refuse ordinary source edits and
-substituting would corrupt them. Reporting it is the only act that is right
-whichever of the two it was.
+The name-keyed row is the one worth defending, and it is why the two questions
+are kept apart. That rule cannot separate a literal from an identifier that
+merely looks opaque — `password`: `E2E_LOGIN_PASSWORD` — so refusing would
+refuse ordinary source edits and substituting corrupts them. Reporting it is the
+only act that is right whichever of the two it was.
+
+A destination's reader answers exactly one question — would `${NAME}` PARSE here
+— and that is worth knowing and is not evidence about the value. Letting it
+stand in for both is how a name-keyed guess came to edit a shell script:
+
+```
+readonly CB_TOKEN="https://…/access-token"   ->   readonly CB_TOKEN="${CB_TOKEN}"
+```
+
+The value is a public endpoint and is never examined for credential shape; the
+identifier's suffix is the whole trigger, so a dull URL and a line of English
+fire identically. The substituted name is the assignment's OWN key, so the line
+comes to read its own unset variable — top-level code under `set -u`, so every
+invocation of that script dies, `--help` included, while `bash -n` passes: the
+file is syntactically perfect and semantically destroyed. The same substitution
+in a document rewrites a sentence's BEFORE half into its AFTER half, so a
+paragraph explaining the bug arrives claiming a string was replaced by itself.
+
+The partition is per FINDING, not per file. A write carrying a proven vendor
+literal beside a name-keyed line has the first removed and the second left
+exactly as it was written, and the message names both.
+
+An unrecognised kind is not substitutable. A rule added later costs a message
+rather than an edit — the same direction `targets.reader_class` takes for an
+extension it does not recognise.
 
 **A rewrite replaces a VALUE. It may never reshape a file, and the last row is
 that rule with a refusal behind it.** The substitution is checked against the
@@ -599,17 +634,27 @@ Measured on Claude Code 2.1.223, not inferred:
 
 ### Known limits
 
-- **`KL-WRITE` still rewrites one shape of credential REFERENCE**, and it is the
-  only one left: a bare identifier that ends on whitespace or on end of line —
-  `password`: `E2E_LOGIN_PASSWORD`. A member path, a call, an expression ending
-  on `(`, `,` or `)`, and a run-time `$( … )` are all withheld now, each with a
-  false-positive row driving it in `tests/test_false_positive.py`. The residual
-  shape has a row of its own asserting that it IS still rewritten, so a change
-  to it is a decision rather than a side effect. Nothing separates it from a
-  literal but the value's own randomness, and the three discriminators that
-  reach it — an entropy floor, a `:` versus `=` separator, "the same word
-  appears elsewhere in this file" — were each measured dropping a real
-  credential.
+- **`KL-WRITE` REPORTS a name-keyed match rather than removing it, in every
+  destination.** That is the coverage the evidence split gives up: a real secret
+  written behind a credential-shaped identifier — `PGPASSWORD=<a literal>` — now
+  reaches disk with a warning instead of being substituted away. It is given up
+  knowingly. The same rule cannot separate that from `password`:
+  `E2E_LOGIN_PASSWORD`, and the three discriminators that reach the ambiguity —
+  an entropy floor, a `:` versus `=` separator, "the same word appears elsewhere
+  in this file" — were each measured dropping a real credential. An edit made on
+  evidence that cannot support it is the larger failure: it corrupted a shell
+  script and a document before the split existed, and announced both as repairs.
+  A member path, a call, an expression ending on `(`, `,` or `)`, and a run-time
+  `$( … )` are withheld before that point, each with a false-positive row
+  driving it in `tests/test_false_positive.py`.
+
+  The marker is at the head of `checks/literal_write.py` with its ceiling — only
+  the name-keyed rule loses the edit, vendor and positional findings are
+  substituted exactly as before — and its upgrade trigger: a `warn` row now
+  carries the destination's `reader` class, so the name-keyed-in-a-rewritable-
+  file population is countable for the first time. Should those rows prove to be
+  predominantly real secrets, the answer is a stronger EVIDENCE rule for that
+  class, not a return to editing on the name.
 - **A QUOTED dotted value is read as a reference only behind a listed head.**
   `token: "secrets.GITHUB_TOKEN"` used to be rewritten while the unquoted
   spelling beside it was left alone, because the quote gated the member-path

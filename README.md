@@ -1856,7 +1856,13 @@ It refuses a vault CLI's print verb across 16 stores, refuses a shell command
 that reads a credential file, and **rewrites rather than refuses wherever a
 rewrite exists**: a `Read` of a `.env` is redirected to a names-only view, a
 bare `env` is masked with its pipeline intact, and a credential literal in a
-file being written becomes `${NAME}` while the write proceeds.
+file being written becomes `${NAME}` while the write proceeds — where the value
+is proved a credential by its own SHAPE, or by the grammar around it, and the
+destination's reader resolves the reference. A value flagged only because the
+identifier beside it reads like a credential is REPORTED and never edited, in
+any destination: that rule cannot tell `PGPASSWORD=<a literal>` from
+`password`: `E2E_LOGIN_PASSWORD`, and a file edited on evidence that weak is
+handed back broken and called repaired.
 
 Same two rules as the binary. Every hook fails open — a crash, a timeout, an
 unparseable payload or a missing interpreter allows the call — and no hook
