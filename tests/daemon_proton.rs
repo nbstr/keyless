@@ -544,6 +544,39 @@ fn the_renewal_loop_runs_only_where_proton_asked_for_it() {
 /// So shutdown waits for the renewal loop and then stops waiting. The child is
 /// left to finish rather than killed, which keeps the half-write reasoning
 /// intact; what is given up is the join, not the process.
+///
+/// # Why the hung child is waited FOR
+///
+/// Everything above is only tested while a vendor child is actually parked. A
+/// shutdown measured before the loop's first tick reached the vendor is the
+/// shutdown of an idle daemon: fast, green, and a statement about nothing.
+///
+/// This used to sleep a fixed two seconds for that. Run alone or under
+/// `--test-threads=1` the child is there in well under a second and the case
+/// is genuine; **at cargo's default parallelism, measured 2026-09-19, the
+/// child was spawned at +3.218 s** — a second and a fifth AFTER the daemon had
+/// already been dropped. On that run the shutdown clock was started against a
+/// loop that had not yet reached the vendor at all, so the case proved nothing
+/// and said so nowhere.
+///
+/// It is the same defect its sibling
+/// `a_proton_login_that_keeps_failing_leaves_the_other_stores_answering`
+/// carried, in the direction that stays GREEN rather than going red — which is
+/// why that one was found the day it started failing and this one was not.
+///
+/// **A log line is not attribution, and it was nearly read as one here.**
+/// `shutting down without it rather than holding the process open` appears
+/// once in a parallel run of this file whether or not this case reached the
+/// vendor, because a renewal thread that is merely SLOW to spawn is just as
+/// unjoinable as one parked on a hung child — shutdown abandons it either way,
+/// and the child then turns up afterwards. Only the child's own timestamp
+/// separates the two, which is what the wait below replaces it with.
+///
+/// The argv file is the right signal and not merely a convenient one:
+/// `vendor_run_tail` writes it as the stub's first act and `Backend::Hangs`
+/// sleeps afterwards, so the file existing means the child exists — and the
+/// renewal thread is parked in `exec::capture` on its pipes from that instant,
+/// which is exactly the state shutdown has to survive.
 #[test]
 fn a_vendor_that_stopped_answering_does_not_wedge_shutdown() {
     let dir = scratch("daemon-proton-shutdown");
@@ -553,8 +586,23 @@ fn a_vendor_that_stopped_answering_does_not_wedge_shutdown() {
     let config = daemon_config_with_a_failing_renewal(&dir, &vendor);
     let running = start_daemon(&config, policy_allowing_self());
 
-    // Long enough for the loop's first tick to be inside the vendor call.
-    std::thread::sleep(std::time::Duration::from_secs(2));
+    // The loop's first tick must be INSIDE the vendor call before the clock
+    // below starts. Waited for, never slept past — see this case's own doc.
+    let argv_path = vendor_argv(&dir);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let argv = std::fs::read_to_string(&argv_path).unwrap_or_default();
+        if argv.contains("login") || argv.contains("logout") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the renewal loop never reached the hung vendor, so the shutdown below \
+             would have been measured against an idle daemon. {} holds {argv:?}",
+            argv_path.display()
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
 
     let began = std::time::Instant::now();
     drop(running);
