@@ -60,8 +60,10 @@ from harness import DECOY, Suite, bash, drive, read, write
 # Deliberately absent, because asserting them PASSES would assert they are safe
 # and they are not: `vault login`, `infisical login`, `pass-cli login`,
 # `pass-cli agent create`, `pass-cli agent renew`, `bw unlock`. Each prints a
-# token. They stay unblocked because they are a store's own bootstrap path — the
-# same reason `op run` is unblocked — and that is a named gap, not a safe verb.
+# token. They stay unblocked because they are a store's own bootstrap path, and
+# that is a named gap, not a safe verb. The stores' runners are absent for the
+# opposite reason: KL-RUNNER refuses them, and test_no_value_reaches_a_transcript
+# holds those arms.
 SAFE = [
     # ── Infisical 0.43.114 — measured ───────────────────────────────────────
     # The first entry is the exact command that was refused twice.
@@ -76,7 +78,6 @@ SAFE = [
     "infisical help secrets",
     "infisical secrets set FOO=bar",
     "infisical secrets agent-proxy",
-    "infisical run -- npm start",
     "infisical init",
     "infisical scan",
     "infisical ssh connect myhost",
@@ -87,8 +88,6 @@ SAFE = [
     "op vault list",
     "op vault get company --format json",
     "op user list",
-    "op run -- ./deploy.sh",
-    "op run --no-masking -- printenv KEYLESS_PROBE",
     "op signin",
     "op item get --help",
     # The write forms that keep the value off the command line: a template on
@@ -100,9 +99,6 @@ SAFE = [
     "op item template get Password",
     "op whoami",
     # ── Proton Pass CLI 2.2.5 — measured ────────────────────────────────────
-    # `pass-cli run` is the store's own sanctioned verb and keyless itself calls
-    # it; refusing it would break the tool this pack recommends.
-    "pass-cli run -- npm start",
     "pass-cli item list",
     "pass-cli vault list",
     "pass-cli share list",
@@ -137,7 +133,6 @@ SAFE = [
     # ── Doppler — documented ────────────────────────────────────────────────
     "doppler secrets set FOO=bar",
     "doppler secrets delete FOO",
-    "doppler run -- npm start",
     "doppler setup",
     "doppler secrets --help",
     # ── AWS — verb list measured, output shapes documented ──────────────────
@@ -185,7 +180,6 @@ SAFE = [
     "kubectl get pods -o yaml",
     # ── Railway — documented ────────────────────────────────────────────────
     "railway variables --help",
-    "railway run -- npm start",
     "railway status",
     "railway logs",
     # ── mentions, not acts ──────────────────────────────────────────────────
@@ -198,8 +192,8 @@ SAFE = [
 # control, not a record: it must refuse the commands below, or the case list has
 # drifted somewhere harmless and every assertion in this file is vacuous.
 PREFIX_RULES = [
-    ["infisical", r"^secrets\b(?!\s+set)", "infisical run -- <cmd>", None],
-    ["railway", r"^variables\b(?!\s+set)", "railway run -- <cmd>", None],
+    ["infisical", r"^secrets\b(?!\s+set)", "", None],
+    ["railway", r"^variables\b(?!\s+set)", "", None],
     ["pass", r"^(?!(?:insert|generate|git|init|ls|list|find|search|rm|edit|cp|mv|"
              r"grep|help|version|--)\b)", "pass is a print verb", None],
 ]

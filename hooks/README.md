@@ -43,7 +43,7 @@ from in here.
 
 ## What it does
 
-Ten checks, one process per event. Each names the working alternative in the
+Eleven checks, one process per event. Each names the working alternative in the
 same breath as the refusal, so the agent's next action is the right one rather
 than a retry or a question.
 
@@ -51,6 +51,7 @@ than a retry or a question.
 |---|---|---|
 | `KL-FILE` | a file whose content is a credential — `.env`, `~/.aws/credentials`, `~/.ssh/id_*`, `.npmrc`, `.claude.json`, … | **rewrite** on `Read`, **deny** on `Bash`/`Grep` |
 | `KL-VAULT` | a vault CLI verb that prints plaintext, across 16 stores | **deny** |
+| `KL-RUNNER` | a vendor runner — `infisical run`, `op run`, `pass-cli run`, `doppler run`, `railway run` — which hands the store's values to a child whose output nothing filters | **deny** |
 | `KL-ENV` | an environment dump — `env`, `printenv`, `set`, `export -p`, and the whole-environment object reaching a printer or serialiser inside an interpreter | **rewrite** when bare, **deny** when it captures |
 | `KL-ENVVAR` | a credential-named variable being echoed | **warn** |
 | `KL-ASSIGN` | a credential literal typed into a shell assignment — `export X=…`, `X=… cmd` | **deny** |
@@ -413,14 +414,23 @@ both, so dropping one default does not mean restating the other twenty. A config
 that will not parse leaves the defaults standing; it never disables the pack, and
 a single row whose regex will not compile disables that row and nothing else.
 
-`vault_verbs` rows are `[binary, verb-path-regex, the safe alternative,
-flag-regex]`. The pattern is matched against the VERB PATH — the leading
+`vault_verbs` rows are `[binary, verb-path-regex, alternative, flag-regex]`,
+where the alternative is a different verb that prints no value, or `""`. The pattern is matched against the VERB PATH — the leading
 flag-free run of words — so `secrets folders get --env=prod --path=/` is tested
 as `secrets folders get`. The subcommand is read, never just the binary: every
-store in the table has a harmless sibling one word away (`op run` beside
-`op read`, `doppler secrets set` beside `doppler secrets`, `infisical secrets
+store in the table has a harmless sibling one word away (`op item list` beside
+`op item get`, `doppler secrets set` beside `doppler secrets`, `infisical secrets
 folders get` beside `infisical secrets get`), and a gate that blocks the working
 path gets uninstalled. `--help`, a bare `-h` and a leading `help` clear every row.
+
+A store's runner is NOT such a sibling. It prints nothing itself and hands the
+value to a child whose output reaches the transcript unfiltered — a presence
+check spelled `${VAR:-unset}` prints the value. `vendor_runners` rows are
+`[binary, verb-path-regex]`, matched the same way, and refused by `KL-RUNNER`.
+Every refusal from either gate names `keyless run`, which masks both streams,
+and hands over the recipes that check presence and compare two environments
+without printing a value. An alternative a user row supplies is dropped from the
+message when `KL-RUNNER` would refuse it.
 
 The fourth element is a second condition on the RAW arguments, for a subcommand
 that prints metadata or a value depending on one flag — `security

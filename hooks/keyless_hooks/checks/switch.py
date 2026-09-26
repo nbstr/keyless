@@ -40,9 +40,10 @@ import os
 import re
 
 from .. import secretpaths
+from ..executed import command_texts
 from ..shellview import (delegated_head, expand_local_assignments,
                          file_operands_spanned, flatten_substitutions, head_of,
-                         head_or_wrapper, heredocs, interpreter_payloads,
+                         head_or_wrapper,
                          positional_span, rest_after_head, statements,
                          strip_heredocs, substitution_payloads, tokens, unquote,
                          words)
@@ -116,11 +117,10 @@ def run(payload, cfg):
     flat = _collapse(cmd)
     targets = _guard_targets()
     dirs = {os.path.dirname(target) for target in targets}
-    docs = heredocs(cmd)
     base = strip_heredocs(cmd)
 
     if "keyless" in flat or "uninstall" in flat:
-        hit = _scan_disable_and_uninstall(cmd, base, docs, cfg)
+        hit = _scan_disable_and_uninstall(cmd, base, cfg)
         if hit:
             return hit
     needles = {os.path.basename(path) for path in targets | dirs}
@@ -222,73 +222,13 @@ def _uninstaller_hit(stmt, head, cfg):
     return False
 
 
-def _executed_view(cmd, docs):
-    """The command with every span the shell will NOT execute blanked: single-
-    quoted strings, and the bodies of here-documents opened with a quoted
-    delimiter. Length is preserved.
-
-    Only this view is searched for `$( … )` and backticks. Prose written into a
-    file — a report, an issue body, a prompt — spells the verb as markdown code,
-    `` `keyless disable` ``, and inside single quotes or a quoted heredoc those
-    backticks are characters. Replayed over real sessions, that was the whole of
-    this check's false positives on the verb. Inside double quotes, and inside
-    an unquoted heredoc body, the same backticks DO run, so those stay visible —
-    and quote characters inside an unquoted body are literal text, so no quote
-    tracking happens there.
-    """
-    out = list(cmd)
-    literal_body = set()
-    live_body = set()
-    for doc in docs:
-        for start, end in doc.spans:
-            (literal_body if doc.quoted else live_body).update(range(start, end))
-    for k in literal_body:
-        out[k] = " "
-    n = len(cmd)
-    i = 0
-    in_double = False
-    while i < n:
-        if i in literal_body or i in live_body:
-            i += 1
-            continue
-        c = cmd[i]
-        if c == "\\":
-            i += 2
-            continue
-        if c == '"':
-            in_double = not in_double
-        elif c == "'" and not in_double:
-            close = cmd.find("'", i + 1)
-            close = n if close < 0 else close
-            for k in range(i, min(close + 1, n)):
-                out[k] = " "
-            i = close + 1
-            continue
-        i += 1
-    return "".join(out)
-
-
-def _fed_bodies(docs, cfg):
-    """Here-document bodies handed to a program that runs them as code —
-    `bash <<EOF`, `ssh host <<EOF`. Every line there is a command."""
-    out = []
-    for doc in docs:
-        if any(head_of(stmt) in cfg.interpreters for stmt in statements(doc.opener)):
-            out.append(doc.body)
-    return out
-
-
-def _scan_disable_and_uninstall(cmd, base, docs, cfg):
+def _scan_disable_and_uninstall(cmd, base, cfg):
     # `bash -c "…"`, `$(…)` and backticks are re-parsed as their own commands,
-    # the way KL-VAULT already reads a subcommand handed to an interpreter —
-    # a statement-level act, not an operand, so it needs its own head rather
-    # than a candidate string pulled out of the payload. Heredoc bodies are
-    # blanked for the statement scan, as KL-FILE blanks them, and read back in
-    # only where the body is fed to something that executes it.
-    texts = [base, expand_local_assignments(base)]
-    texts += interpreter_payloads(base, cfg.interpreters)
-    texts += substitution_payloads(_executed_view(cmd, docs))
-    texts += _fed_bodies(docs, cfg)
+    # the way KL-VAULT reads a subcommand handed to an interpreter — a
+    # statement-level act, not an operand, so it needs its own head rather than
+    # a candidate string pulled out of the payload. `executed.command_texts` is
+    # the one answer both gates share for which texts the shell will run.
+    texts = [base, expand_local_assignments(base)] + command_texts(cmd, cfg.interpreters)
     for text in texts:
         for stmt in statements(text):
             if _keyless_disable_hit(stmt):

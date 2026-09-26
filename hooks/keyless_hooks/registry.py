@@ -28,12 +28,21 @@ def _table():
     # engine from loading the others: the import cost is paid once per process
     # either way, and the failure mode differs.
     from .checks import (dest_write, env_dump, file_read, heredoc_write,
-                         literal_write, shell_assign, switch, vault_cli)
+                         literal_write, shell_assign, switch, vault_cli,
+                         vendor_runner)
 
     return [
         # id                event          tier      handler
         ("KL-FILE",   "PreToolUse", BLOCK,   file_read.run),
         ("KL-VAULT",  "PreToolUse", BLOCK,   vault_cli.run),
+        # BLOCK rather than OBSERVE. The rung exists to gather rows before a
+        # predicate is trusted, and this predicate is KL-VAULT's own verb-path
+        # match with a second table. What OBSERVE would record is already
+        # measured: on 2026-09-26 a session refused a print verb was told the
+        # store's runner was "not blocked", used it for a presence check, and
+        # printed four live keys into its transcript. A record-only rung would
+        # have written a row for that call and let it run.
+        ("KL-RUNNER", "PreToolUse", BLOCK,   vendor_runner.run),
         ("KL-ENV",    "PreToolUse", BLOCK,   env_dump.run),
         ("KL-ENVVAR", "PreToolUse", WARN,    env_dump.run_named_var),
         # BLOCK rather than OBSERVE, against this file's own rollout rung. The

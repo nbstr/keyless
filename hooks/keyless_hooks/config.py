@@ -173,10 +173,16 @@ DEFAULT_INTERPRETERS = [
 # flag. Measured: `security find-generic-password` with no flags prints the item
 # attributes and no password blob; `-w` prints the password.
 #
-# Sibling verbs that USE a secret without printing it — `op run`, `infisical
-# run`, `doppler run`, `pass-cli run`, `vault kv put`, `doppler secrets set` —
-# are absent by design. A gate that also blocks the working path gets
-# uninstalled, and what comes back is the plaintext literal on the command line.
+# The third element is a DIFFERENT verb that does the adjacent job and prints no
+# value — `claude mcp list` beside `claude mcp get`, `pass ls` beside `pass
+# <name>` — or "" when there is none. It is never a vendor runner: the refusal
+# already names `keyless run`, and a vendor runner is itself refused by
+# DEFAULT_VENDOR_RUNNERS below. `checks/vault_cli` drops any alternative that
+# KL-RUNNER would refuse, so a user row cannot put one back into a message.
+#
+# Write verbs that never print — `vault kv put`, `doppler secrets set` — are
+# absent by design. A gate that also blocks the working path gets uninstalled,
+# and what comes back is the plaintext literal on the command line.
 #
 # `measured` below means the tool's own `--help` was read, at the version named.
 # `documented` means the vendor's documentation, with no local binary to check.
@@ -186,21 +192,21 @@ DEFAULT_VAULT_VERBS = [
     # help lists `infisical secrets` as the example and offers `--plain`, "print
     # values without formatting, one per line". `secrets folders {get,create,
     # delete}` is navigation over folder NAMES and prints no value.
-    ["infisical", r"^secrets$", "infisical run -- <cmd>", None],
-    ["infisical", r"^secrets\s+get\b", "infisical run -- <cmd>", None],
+    ["infisical", r"^secrets$", "", None],
+    ["infisical", r"^secrets\s+get\b", "", None],
     # `secrets delete` and `generate-example-env` both carry flags that render
     # secrets (`-o`, and a fetch token), and neither is a verb an agent reaches
     # for. Kept blocked: the false-positive argument is weighted by how often a
     # verb is actually run, and refusing a verb nobody types costs no
     # credibility while allowing one wrongly dumps an environment.
-    ["infisical", r"^secrets\s+delete\b", "infisical run -- <cmd>", None],
-    ["infisical", r"^secrets\s+generate-example-env\b", "infisical run -- <cmd>", None],
-    ["infisical", r"^export\b", "infisical run -- <cmd>", None],
-    ["infisical", r"^dynamic-secrets$", "infisical run -- <cmd>", None],
-    ["infisical", r"^dynamic-secrets\s+lease\s+create\b", "infisical run -- <cmd>", None],
-    ["infisical", r"^ssh\s+issue-credentials\b", "keyless run -s <NAME> -- <cmd>", None],
-    ["infisical", r"^token\s+renew\b", "keyless run -s <NAME> -- <cmd>", None],
-    ["infisical", r"^service-token\s+create\b", "keyless run -s <NAME> -- <cmd>", None],
+    ["infisical", r"^secrets\s+delete\b", "", None],
+    ["infisical", r"^secrets\s+generate-example-env\b", "", None],
+    ["infisical", r"^export\b", "", None],
+    ["infisical", r"^dynamic-secrets$", "", None],
+    ["infisical", r"^dynamic-secrets\s+lease\s+create\b", "", None],
+    ["infisical", r"^ssh\s+issue-credentials\b", "", None],
+    ["infisical", r"^token\s+renew\b", "", None],
+    ["infisical", r"^service-token\s+create\b", "", None],
     # ── 1Password 2.39.0 — measured ─────────────────────────────────────────
     # `read`, `item get` and `document get` print a value; `inject` renders a
     # template to stdout. `item create` and `item edit` print the item they
@@ -213,25 +219,25 @@ DEFAULT_VAULT_VERBS = [
     # off and is left open as the store's own bootstrap — a named gap, see
     # `tests/test_false_positive.py`. `item list`, `vault list`, `vault get`
     # and `run` print no value.
-    ["op", r"^(read|inject)\b", "op run -- <cmd>", None],
-    ["op", r"^item\s+get\b", "op run -- <cmd>", None],
-    ["op", r"^document\s+get\b", "op run -- <cmd>", None],
-    ["op", r"^item\s+(create|edit)\b", "op item create --vault <V> - (template on stdin)",
+    ["op", r"^(read|inject)\b", "", None],
+    ["op", r"^item\s+get\b", "", None],
+    ["op", r"^document\s+get\b", "", None],
+    ["op", r"^item\s+(create|edit)\b", "op item create --vault <V> -",
      r"(?:^|\s)--reveal(?=\s|$)"],
-    ["op", r"^service-account\s+create\b", "keyless run -s <NAME> -- <cmd>", None],
-    ["op", r"^connect\s+token\s+create\b", "keyless run -s <NAME> -- <cmd>", None],
+    ["op", r"^service-account\s+create\b", "", None],
+    ["op", r"^connect\s+token\s+create\b", "", None],
     # ── Proton Pass CLI 2.2.5 — measured ────────────────────────────────────
     # `item view` prints the item. `item totp` and `totp generate` print a
     # one-time code, which is a credential. `inject` writes the rendered
     # template to STDOUT unless `--out-file` is given. Everything else in this
     # CLI is metadata or the sanctioned `run`: `item list`, `vault list`,
     # `share list`, `info`, `password generate|score`, `session *`, `agent *`.
-    ["pass-cli", r"^item\s+view\b", "pass-cli run -- <cmd>", None],
-    ["pass-cli", r"^item\s+totp\b", "pass-cli run -- <cmd>", None],
-    ["pass-cli", r"^totp\s+generate\b", "pass-cli run -- <cmd>", None],
-    ["pass-cli", r"^inject$", "pass-cli run -- <cmd>", None],
+    ["pass-cli", r"^item\s+view\b", "", None],
+    ["pass-cli", r"^item\s+totp\b", "", None],
+    ["pass-cli", r"^totp\s+generate\b", "", None],
+    ["pass-cli", r"^inject$", "", None],
     ["pass-cli", r"^personal-access-token\s+(create|renew)\b",
-     "pass-cli run -- <cmd>", None],
+     "", None],
     # ── Claude Code CLI — measured 2026-08-13 ───────────────────────────────
     # `claude mcp get <name>` prints the server's stored env block verbatim, and
     # an MCP server is registered with `--env NAME=<token>` by nearly every
@@ -249,39 +255,39 @@ DEFAULT_VAULT_VERBS = [
     # the store's tree of NAMES, and without it an empty verb path matched the
     # negation and refused a listing.
     ["pass", r"^(?!(?:insert|generate|git|init|ls|list|find|search|rm|edit|cp|mv|"
-             r"grep|help|version|--)\b)\S", "pass ls lists names", None],
+             r"grep|help|version|--)\b)\S", "pass ls", None],
     ["gopass", r"^(?!(?:insert|generate|git|init|ls|list|find|search|rm|edit|cp|mv|"
-               r"grep|help|version|sync|--)\b)\S", "gopass ls lists names", None],
+               r"grep|help|version|sync|--)\b)\S", "gopass ls", None],
     # ── HashiCorp Vault — documented ────────────────────────────────────────
     # `kv list` and `kv metadata get` are metadata and never match.
-    ["vault", r"^(read|kv\s+get)\b", "vault agent templating, or keyless run", None],
-    ["vault", r"^print\s+token\b", "keyless run -s <NAME> -- <cmd>", None],
+    ["vault", r"^(read|kv\s+get)\b", "", None],
+    ["vault", r"^print\s+token\b", "", None],
     # ── Doppler — documented ────────────────────────────────────────────────
-    ["doppler", r"^secrets$", "doppler run -- <cmd>", None],
-    ["doppler", r"^secrets\s+(get|download|substitute)\b", "doppler run -- <cmd>", None],
+    ["doppler", r"^secrets$", "", None],
+    ["doppler", r"^secrets\s+(get|download|substitute)\b", "", None],
     # ── AWS — verb list measured, output shapes documented ──────────────────
     ["aws", r"^secretsmanager\s+(batch-)?get-secret-value\b",
-     "keyless run -s <NAME> -- <cmd>", None],
-    ["aws", r"^ssm\s+get-parameters?\b", "keyless run -s <NAME> -- <cmd>",
+     "", None],
+    ["aws", r"^ssm\s+get-parameters?\b", "",
      r"--with-decryption"],
     # ── GCP / Azure — documented ────────────────────────────────────────────
-    ["gcloud", r"^secrets\s+versions\s+access\b", "keyless run -s <NAME> -- <cmd>", None],
-    ["az", r"^keyvault\s+secret\s+show\b", "keyless run -s <NAME> -- <cmd>", None],
+    ["gcloud", r"^secrets\s+versions\s+access\b", "", None],
+    ["az", r"^keyvault\s+secret\s+show\b", "", None],
     # ── macOS keychain — measured ───────────────────────────────────────────
     # The flag pattern allows letters on BOTH sides of `w`/`g`, because `security`
     # clusters short flags: `-ws NAME` parses as `-w -s NAME` and was measured
     # searching the keychain, while the old pattern required `w` to end the
     # cluster and so missed it. The leading `(?:^|\s)` is what keeps a value like
     # `-s my-widget` from matching on its own `-widget`.
-    ["security", r"^find-(generic|internet)-password\b", "keyless run -s <NAME> -- <cmd>",
+    ["security", r"^find-(generic|internet)-password\b", "",
      r"(?:^|\s)-[A-Za-z]*[wg][A-Za-z]*(?=\s|$)"],
-    ["security", r"^dump-keychain\b", "keyless run -s <NAME> -- <cmd>",
+    ["security", r"^dump-keychain\b", "",
      r"(?:^|\s)-[A-Za-z]*d[A-Za-z]*(?=\s|$)"],
     # ── Bitwarden / python-keyring / Heroku — documented ────────────────────
-    ["bw", r"^(get|list\s+items)\b", "bw run, or keyless run -s <NAME> -- <cmd>", None],
-    ["keyring", r"^get\b", "keyless run -s <NAME> -- <cmd>", None],
-    ["heroku", r"^config$", "heroku run, or keyless run -s <NAME> -- <cmd>", None],
-    ["heroku", r"^config:get\b", "heroku run, or keyless run -s <NAME> -- <cmd>", None],
+    ["bw", r"^(get|list\s+items)\b", "", None],
+    ["keyring", r"^get\b", "", None],
+    ["heroku", r"^config$", "", None],
+    ["heroku", r"^config:get\b", "", None],
     # ── Kubernetes — verb list measured, format behaviour documented ────────
     # Any output format other than `name` can render the `.data` map, and a
     # `.data` map is plaintext with extra steps — base64 is an encoding, not a
@@ -299,12 +305,46 @@ DEFAULT_VAULT_VERBS = [
     # group, so `--output=name` cannot match by backtracking around the `name`
     # exclusion — an optional `[= ]?` did exactly that and turned the safe
     # format into a block.
-    ["kubectl", r"^get\s+secret", "keyless run -s <NAME> -- <cmd>",
+    ["kubectl", r"^get\s+secret", "",
      r"(?:^|\s)(?:--output|-o)(?:[= ]\s*|(?=[a-z]))(?!name\b)"],
     # ── Railway — documented ────────────────────────────────────────────────
     # Every spelling of `railway variables` renders the value table, `--set`
     # included, so there is no metadata sibling to carve out here.
-    ["railway", r"^variables$", "railway run -- <cmd>", None],
+    ["railway", r"^variables$", "", None],
+]
+
+# Vendor runners: a verb that fetches a store's values and spawns a command with
+# them in its environment, passing the command's output straight back to the
+# caller.
+#
+#   [binary, verb-path-regex]
+#
+# These were once listed as the SAFE siblings of the print verbs, and the vault
+# refusal named each one as "not blocked". That advice leaked four live keys on
+# 2026-09-26: an agent refused `infisical secrets get` did exactly as told, ran
+# `infisical run -- sh -c '…${VAR:-ABSENT}…'` as a presence check, and the
+# expansion printed every value into the transcript. A runner does not print a
+# value itself; it hands the value to a child whose output nothing filters. Some
+# vendors mask the exact value in that output (`op run`, `pass-cli run`) and one
+# flag turns it off; none masks an encoding of it. `keyless run` masks both
+# streams, the value's encodings, and a value split across writes, which is why
+# it is the one spawn a session is pointed at.
+#
+# Matched on the verb path like every row above, so `--help` stays open.
+#
+# debt: the table names the runners of the stores the vault table knows. A
+#       runner it does not name — `bws run`, `aws-vault exec`, `chamber exec`,
+#       `sops exec-env`, `teller run` — passes, and so does any runner a script,
+#       a Makefile target or a package.json script invokes, because this reads
+#       the tool call's command text and nothing it goes on to execute.
+#       Upgrade trigger: a transcript scan finds a store value in the output of
+#       a call whose command text names no runner in this table.
+DEFAULT_VENDOR_RUNNERS = [
+    ["infisical", r"^run\b"],
+    ["op", r"^run\b"],
+    ["pass-cli", r"^run\b"],
+    ["doppler", r"^run\b"],
+    ["railway", r"^run\b"],
 ]
 
 # Env-var name segments that mark a value as credential-shaped. Split on _ and -
@@ -324,6 +364,7 @@ DEFAULT_SECRET_SEGMENT_PAIRS = [
 
 class Config(object):
     __slots__ = ("protected", "allowed", "non_readers", "interpreters", "vault_verbs",
+                 "vendor_runners",
                  "pattern_tools", "pattern_subcommands", "secret_segments",
                  "secret_pairs", "enabled", "observe", "errors")
 
@@ -336,6 +377,7 @@ class Config(object):
         self.pattern_subcommands = frozenset(
             kw.get("pattern_subcommands", DEFAULT_PATTERN_SUBCOMMANDS))
         self.vault_verbs = kw.get("vault_verbs", list(DEFAULT_VAULT_VERBS))
+        self.vendor_runners = kw.get("vendor_runners", list(DEFAULT_VENDOR_RUNNERS))
         self.secret_segments = frozenset(kw.get("secret_segments", DEFAULT_SECRET_SEGMENTS))
         self.secret_pairs = kw.get("secret_pairs", list(DEFAULT_SECRET_SEGMENT_PAIRS))
         self.enabled = kw.get("enabled", True)
@@ -398,6 +440,7 @@ def load(cwd=""):
         pattern_subcommands=_merge_list(DEFAULT_PATTERN_SUBCOMMANDS, patch,
                                         "pattern_subcommands"),
         vault_verbs=_merge_list(DEFAULT_VAULT_VERBS, patch, "vault_verbs"),
+        vendor_runners=_merge_list(DEFAULT_VENDOR_RUNNERS, patch, "vendor_runners"),
         secret_segments=_merge_list(DEFAULT_SECRET_SEGMENTS, patch, "secret_segments"),
         secret_pairs=DEFAULT_SECRET_SEGMENT_PAIRS,
         enabled=patch.get("enabled", True) is not False,

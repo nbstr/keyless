@@ -355,6 +355,21 @@ mod sealed {
 
 use sealed::Sealed;
 
+// debt: one writer per stream, so a value is caught whole on stdout or whole on
+//       stderr and NOT when a child writes part of it to each. Whoever merges the
+//       two streams afterwards — a terminal, an agent's Bash tool — reassembles
+//       it. Measured: 17 bytes to stdout and the rest to stderr pass unmasked;
+//       `tests/transcript_leak.rs` pins it. A shared carry cannot close this,
+//       because the merge order is decided downstream of this process.
+//       Upgrade trigger: a transcript scan finds a keyless-injected value that
+//       arrived split across the two streams of one `keyless run`.
+//
+// debt: a needle is a WHOLE value or a whole encoding of one, so a proper
+//       fragment passes: `${V:0:20}` prints twenty bytes of the value unmasked.
+//       Masking every fragment would mask every short string the value shares
+//       with ordinary output, which is the noise MIN_NEEDLE_LEN exists to stop.
+//       Upgrade trigger: a leak report whose evidence is a fragment of a value
+//       shorter than the whole, printed under `keyless run`.
 /// A `Write` that redacts on the way through, holding back a suffix so a value
 /// split across writes is still caught.
 pub struct MaskingWriter<W: Write> {
