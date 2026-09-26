@@ -194,18 +194,23 @@ def _user_row_cannot_recommend_a_runner(s):
     from keyless_hooks.checks import vault_cli
     import json
 
-    def verdict(alternative):
-        cfg = klconfig.Config(vault_verbs=[["acmevault", r"^get\b", alternative, None]])
+    def verdict(binary, alternative):
+        cfg = klconfig.Config(vault_verbs=[[binary, r"^get\b", alternative, None]])
         raw = json.dumps({"hook_event_name": "PreToolUse", "tool_name": "Bash",
-                          "tool_input": {"command": "acmevault get TOKEN"},
+                          "tool_input": {"command": binary + " get TOKEN"},
                           "cwd": os.getcwd()})
         return vault_cli.run(klpayload.parse(raw), cfg) or ("", "", {})
 
     # Control first: an alternative that prints nothing IS shown, so the arm below
     # is not green merely because alternatives never reach the message at all.
-    kind, msg, _ = verdict("acmevault list")
+    kind, msg, _ = verdict("acmevault", "acmevault list")
     s.check("user row: a harmless alternative is refused-with", kind, "deny")
     s.check_in("user row: a harmless alternative is shown", "acmevault list", msg)
-    kind, msg, _ = verdict(IN + " run -- <cmd>")
+    # A DIFFERENT binary, on purpose. A per-config cache that hands this second
+    # config the first one's table has no row for `zetavault`: the call is not
+    # refused and the next arm reds. With one binary for both, a stale table
+    # refused anyway and showed the first config's harmless alternative, so the
+    # "dropped" arm passed for a reason that had nothing to do with the guard.
+    kind, msg, _ = verdict("zetavault", IN + " run -- <cmd>")
     s.check("user row: a runner alternative still refuses", kind, "deny")
     s.check("user row: a runner alternative is dropped", IN + " run" in msg, False)
