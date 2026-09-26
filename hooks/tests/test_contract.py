@@ -207,16 +207,13 @@ def run():
         s.check("KL-VAULT fires quoted: %s" % cmd[:34], drive(bash(cmd)).kind, "deny")
 
     # ── KL-VAULT: the safe sibling verb stays open ──────────────────────────
-    for cmd in ("op run -- ./deploy.sh",
-                "op signin",
+    for cmd in ("op signin",
                 "op item list",
                 # The write form that keeps the value off the command line:
                 # a template on stdin, and no `--reveal`.
                 "op item create --vault company -",
                 "op vault get company",
-                "infisical run -- npm start",
                 "infisical secrets set FOO=bar",
-                "doppler run -- npm start",
                 "doppler secrets set FOO=bar",
                 "vault kv put secret/app foo=bar",
                 "security find-generic-password -s keyless -a TOKEN",

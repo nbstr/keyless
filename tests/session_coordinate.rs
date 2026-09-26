@@ -97,8 +97,9 @@ const RENDERERS: &[&str] = &[
 ///
 /// The `hooks` row is the one that decides the shape. That table answers "which
 /// VERB prints a value, and which one does not" for `infisical`, `op`,
-/// `pass-cli`, `pass`, `vault` and more; its `pass-cli run -- <cmd>` remedy is
-/// about the operator's OWN `pass-cli`, against whatever session they keep.
+/// `pass-cli`, `pass`, `vault` and more; a remedy of its that names a vendor CLI
+/// — `op item create --vault <V> -`, `pass ls` — is about the operator's OWN
+/// CLI, against whatever session they keep.
 /// Attaching `keyless`'s session directory to it would send somebody's personal
 /// command into an agent's vault-scoped identity. A gate that demands a wrong
 /// edit is worse than no gate.

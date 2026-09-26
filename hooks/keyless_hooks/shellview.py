@@ -26,7 +26,7 @@ __all__ = [
     "expand_local_assignments",
     "interpreter_payloads", "rest_after_head", "first_positional",
     "positional_span", "delegated_head",
-    "flatten_substitutions", "substitution_payloads",
+    "flatten_substitutions", "substitution_payloads", "substitution_spans",
     "assignment_split", "is_wrapper", "unquote", "tokens",
 ]
 
@@ -660,29 +660,48 @@ def substitution_payloads(cmd, depth=2):
     out = []
     if not cmd or depth <= 0:
         return out
-    n = len(cmd)
+    for start, end, backquoted in substitution_spans(cmd):
+        inner = cmd[start:end]
+        out.append(inner)
+        if not backquoted:
+            out.extend(substitution_payloads(inner, depth - 1))
+    return out
+
+
+def substitution_spans(text):
+    """(start, end, backquoted) of each OUTERMOST substitution body in `text`.
+
+    Offsets index `text`, so a caller that finds the spans on a blanked view can
+    slice the body out of the raw string. That is what lets `command_texts` look
+    for substitutions only where the shell will run them while still handing back
+    the body as written — a body sliced from the blanked view loses every quoted
+    argument inside it, `$(sh -c 'op read x')` included.
+    """
+    out = []
+    if not text:
+        return out
+    n = len(text)
     i = 0
     while i < n:
-        if cmd[i] == "$" and i + 1 < n and cmd[i + 1] == "(":
+        if text[i] == "$" and i + 1 < n and text[i + 1] == "(":
             depth_paren = 1
             j = i + 2
             while j < n and depth_paren:
-                if cmd[j] == "(":
+                if text[j] == "(":
                     depth_paren += 1
-                elif cmd[j] == ")":
+                elif text[j] == ")":
                     depth_paren -= 1
                 j += 1
-            inner = cmd[i + 2:j - 1] if depth_paren == 0 else cmd[i + 2:]
-            if inner.strip():
-                out.append(inner)
-                out.extend(substitution_payloads(inner, depth - 1))
+            end = j - 1 if depth_paren == 0 else n
+            if text[i + 2:end].strip():
+                out.append((i + 2, end, False))
             i = j
             continue
-        if cmd[i] == "`":
-            j = cmd.find("`", i + 1)
-            inner = cmd[i + 1:j] if j != -1 else cmd[i + 1:]
-            if inner.strip():
-                out.append(inner)
+        if text[i] == "`":
+            j = text.find("`", i + 1)
+            end = j if j != -1 else n
+            if text[i + 1:end].strip():
+                out.append((i + 1, end, True))
             i = (j + 1) if j != -1 else n
             continue
         i += 1
