@@ -508,6 +508,7 @@ def claims_in_message(body):
 KNOWN_UNSCRUBBED = [
     "208f29f8da35a406fb40383d1fdc12b804a5f0d0",
     "145d8e08a1f146de643cf2270005752f5a738ef6",
+    "94cd6d1f2537ecc92e140880c74c183311c7de1e",
 ]
 
 # One planted message per shape that was really written into this history.
