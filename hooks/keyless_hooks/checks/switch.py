@@ -7,7 +7,7 @@ change whether any check answers that question at all — this call, or every
 call after it. The adversary here is not a leaked value; it is a session that
 routes around every other check by turning them off first.
 
-Three shapes, one refusal:
+Three shapes, one refusal — and one narrow exception, in the section below:
 
     the disable/uninstall verb    `keyless disable`, `keyless uninstall`,
                                    and the pack's own uninstall scripts —
@@ -18,6 +18,54 @@ Three shapes, one refusal:
     a shell write                 the same files, reached from Bash — a
                                    redirect, `tee`, `cp`, `sed -i`, a payload
                                    handed to an interpreter
+
+── two files, and only one of them configures a guard ──────────────────────
+
+`hooks.json` and the project-layer `.keyless-hooks.json` are the guard config.
+Rewriting either disarms the pack, so every shape above stays refused for them,
+in every spelling, with no exception at all.
+
+`config.json` is a different animal wearing the same coat. It is the CLI's
+credential DECLARATIONS — a `secrets` map of name to `{store, vault, item,
+field}` — and it holds no credential value, only coordinates. Nothing in this
+pack reads it to reach a verdict: `served` reads that map's KEYS and spends them
+on the WORDING of a remedy inside a refusal it has already decided. So a name
+added there cannot turn any deny into an allow.
+
+What CAN be weakened through that file is real, and none of it is a new name:
+
+    `stores`          every backend's BINARY PATH lives there, and
+                      `keyless run` executes it
+    an existing name  repointed, it reads a credential from somewhere else
+    a removed name    what was declared, and enumerable, narrows
+
+So the rule is stated as the combination it EXCLUDES, never as the first token
+that matches: `config.json`, and nothing else, may GAIN keys under `secrets`,
+with every pre-existing name's route and every other part of the document
+deeply unchanged, judged on content this process can actually compute.
+Everything else about that file stays refused.
+
+`SecretRoute` in `src/config.rs` is what makes a gained name inert rather than
+merely narrow: it carries coordinates only — no binary, no socket, no timeout,
+no command — and the loader ignores a field it does not know, so an unrecognised
+key inside a new entry executes nothing.
+
+A SHELL write to `config.json` is refused whatever it would have written. A
+redirect's content does not exist when this check runs, so there is nothing to
+judge, and a gate that guesses is wrong in the direction that ships.
+`NotebookEdit` is refused for the reason it always was: it addresses a cell, not
+this file's text.
+
+Anything undeterminable is refused — an absent file, either side unparseable, an
+`old_string` that is missing or matches more than once, a document past the size
+the CLI's own loader will read. That is the call `secretpaths` already makes for
+the credential list, one level up.
+
+Why the allowance exists rather than being tidier without it: declaring a name
+is the one act this file is FOR, the CLI has no verb that performs it, and the
+refusal sat in front of a change that cannot weaken anything. A gate that
+refuses correct work is a gate its owner switches off, and then it protects
+nothing.
 
 A *read* of the config is not this check's business; the reader heads below
 are the ones a person or an agent legitimately reaches for to see what is
@@ -39,7 +87,7 @@ that decision is made: outside the session, by someone at a terminal.
 import os
 import re
 
-from .. import secretpaths
+from .. import declarations, secretpaths
 from ..executed import command_texts
 from ..shellview import (delegated_head, expand_local_assignments,
                          file_operands_spanned, flatten_substitutions, head_of,
@@ -52,12 +100,13 @@ CHECK = "KL-SWITCH"
 
 _WRITE_TOOLS = frozenset(["Write", "Edit", "MultiEdit", "NotebookEdit"])
 
-# The two files this pack itself reads: its own `hooks.json`, and the CLI's
-# `config.json` that `served.py` already reads back out under `KEYLESS_CONFIG`
-# / `XDG_CONFIG_HOME`. Kept as one pair rather than two separate lists because
-# every location either file can live at is the same directory, one basename
-# apart.
-_GUARD_BASENAMES = ("hooks.json", "config.json")
+# The two files this pack itself reads. They sit in the same directory, one
+# basename apart, and that adjacency is ALL they have in common — which is why
+# they are two constants and not one pair. One configures the guards; the other
+# declares credential coordinates and configures nothing here. The module
+# docstring carries which act is refused for which, and why.
+_HOOKS_BASENAME = "hooks.json"
+_CONFIG_BASENAME = "config.json"
 
 # The project-layer file `config.py` merges on top of the user's own — matched
 # by basename alone, at any depth, because a project checkout can put it
@@ -241,53 +290,130 @@ def _scan_disable_and_uninstall(cmd, base, cfg):
 
 # ── the pack's own config files, read or written ───────────────────────────
 
-def _guard_targets():
-    """Every literal path this session's guard files could resolve to.
+# Which of the pack's own files a path names. Two roles rather than one flag,
+# because the two are refused on different terms — see the module docstring.
+_ROLE_GUARD = "guard-config"
+_ROLE_DECLARATIONS = "declarations"
+
+
+def _guard_target_sets():
+    """`(guard-config paths, declarations paths)` — every literal path each of
+    the pack's two files could resolve to.
+
+    Two sets rather than one, because a BASENAME cannot tell them apart and the
+    consequence of getting it wrong is not symmetric. `KEYLESS_HOOKS_CONFIG` is
+    an ordinary environment variable and may perfectly well name a file spelled
+    `config.json` — and then that file IS the guard config. So a path answering
+    to both sets is the guard config, and the declarations set is what is LEFT
+    after subtracting it: the ambiguous case lands on the refusing side by
+    construction rather than by a test somebody remembered to write.
 
     Not tested against the filesystem — a target absent right now is still a
     target the call in front of us would create, and `secretpaths` states the
     same rule for the credential list this pack already protects.
     """
     home = os.path.expanduser("~")
-    targets = set()
+    guard, declared = set(), set()
     if home:
         base = os.path.join(home, ".config", "keyless")
-        targets.update(os.path.normpath(os.path.join(base, name))
-                       for name in _GUARD_BASENAMES)
+        guard.add(os.path.normpath(os.path.join(base, _HOOKS_BASENAME)))
+        declared.add(os.path.normpath(os.path.join(base, _CONFIG_BASENAME)))
     xdg = os.environ.get("XDG_CONFIG_HOME")
     if xdg:
         base = os.path.join(xdg, "keyless")
-        targets.update(os.path.normpath(os.path.join(base, name))
-                       for name in _GUARD_BASENAMES)
+        guard.add(os.path.normpath(os.path.join(base, _HOOKS_BASENAME)))
+        declared.add(os.path.normpath(os.path.join(base, _CONFIG_BASENAME)))
     hooks_override = os.environ.get("KEYLESS_HOOKS_CONFIG")
     if hooks_override:
-        targets.add(os.path.normpath(hooks_override))
+        guard.add(os.path.normpath(hooks_override))
     config_override = os.environ.get("KEYLESS_CONFIG")
     if config_override:
-        targets.add(os.path.normpath(config_override))
-    return targets
+        declared.add(os.path.normpath(config_override))
+    return frozenset(guard), frozenset(declared - guard)
 
 
-def _is_guard_path(candidate, cwd, targets):
+def _guard_targets():
+    """Every literal path any of the pack's own files could resolve to.
+
+    The union, for the scans that ask one question of both files: which needles
+    are worth tokenizing for, which directories reach them, and whether a shell
+    statement names one — a shell write is refused whichever of the two it hits.
+    """
+    guard, declared = _guard_target_sets()
+    return guard | declared
+
+
+def _guard_role(candidate, cwd, guard_targets, declaration_targets):
+    """`_ROLE_GUARD`, `_ROLE_DECLARATIONS`, or None for a path that is neither.
+
+    The project-layer file is matched by basename at any depth and is always the
+    guard role: it is read by `config.load` to configure the checks themselves.
+    """
     if not candidate:
-        return False
+        return None
     stripped = candidate.strip().strip("'\"")
     if not stripped:
-        return False
+        return None
     if os.path.basename(stripped) == _PROJECT_GUARD_BASENAME:
-        return True
+        return _ROLE_GUARD
     forms = set(secretpaths.expansions(candidate, cwd))
     resolved = secretpaths.resolve(candidate, cwd)
     if resolved:
         forms.add(resolved)
-    return any(os.path.normpath(form) in targets for form in forms)
+    forms = {os.path.normpath(form) for form in forms}
+    if forms & guard_targets:
+        return _ROLE_GUARD
+    if forms & declaration_targets:
+        return _ROLE_DECLARATIONS
+    return None
+
+
+def _is_guard_path(candidate, cwd, targets):
+    """Does this candidate name one of the pack's own files, given a set of them.
+
+    Every target is handed over as the guard set, so this answers the one
+    question its callers ask and cannot accidentally inherit the declarations
+    allowance: the allowance is decided in `_tool_write_hit`, on content, and a
+    caller with no content to judge must never reach it.
+    """
+    return _guard_role(candidate, cwd, targets, frozenset()) is not None
 
 
 def _tool_write_hit(payload):
-    path = payload.file_path
-    if not path or not _is_guard_path(path, payload.cwd, _guard_targets()):
+    guard_targets, declaration_targets = _guard_target_sets()
+    role = _guard_role(payload.file_path, payload.cwd,
+                       guard_targets, declaration_targets)
+    if role is None:
         return None
-    return ("deny", _message("tool-write"), {"tool": payload.tool})
+    if role == _ROLE_DECLARATIONS and _declares_a_name(payload):
+        # A name gained, nothing else moved. Silence rather than an `allow`:
+        # this pack never emits one (see `engine`), and silence is what leaves
+        # every other check free to judge the same call — including the one that
+        # refuses a credential VALUE written into this very content.
+        return None
+    kind = "declarations-write" if role == _ROLE_DECLARATIONS else "tool-write"
+    return ("deny", _message(kind), {"tool": payload.tool, "role": role})
+
+
+def _declares_a_name(payload):
+    """True only for a write that leaves keyless's `config.json` holding the
+    same document plus one or more new `secrets` keys.
+
+    The on-disk content is read HERE, immediately before the answer, and read
+    again on the next call rather than remembered: a decision cached across
+    calls would be a decision about a file that has since moved. `declarations`
+    owns everything the answer rests on, its refusals included.
+    """
+    target = secretpaths.resolve(payload.file_path, payload.cwd)
+    if not target:
+        return False
+    before = declarations.read_bounded(target)
+    if before is None:
+        return False
+    after = declarations.written_content(payload, before)
+    if after is None:
+        return False
+    return declarations.adds_only_names(before, after)
 
 
 def _redirect_targets(stmt):
@@ -398,7 +524,44 @@ _READS = ("\n\nReading those files is not refused — `cat` or `jq` show what is
           "configured, and `keyless ls` and `keyless doctor` report it.")
 
 
+# The declarations file gets its own refusal, because the generic one above is
+# wrong about it twice over: that file configures no guard, and there IS one act
+# on it this session reaches. Saying which is not a recipe for undoing anything
+# — it is the act that was just refused, described precisely enough to be
+# retried correctly — and a refusal that withholds it teaches a reader to retry
+# blind, which is how a gate earns the reputation that gets it removed.
+#
+# It still names no way to switch a guard OFF, which is the property the generic
+# message has and this one must keep.
+_DECLARATIONS = (
+    "[%s] This write changes more of keyless's own `config.json` than the "
+    "`secrets` map. Refused.\n\n"
+    "That file holds no credential value — it holds coordinates — so DECLARING "
+    "a name in it is not refused. A write that adds names under `secrets`, "
+    "leaves every name already declared pointing exactly where it pointed, and "
+    "leaves every other part of the document alone, goes through. This one does "
+    "not.\n\n"
+    "What is refused, and why each one is not a detail:\n"
+    "  * anything outside `secrets`. Every backend's binary path lives there, "
+    "and `keyless run` executes it.\n"
+    "  * a name removed, or one already declared whose route moves. Either "
+    "changes where a credential is read from.\n"
+    "  * a write whose result cannot be computed from here — a shell redirect, "
+    "an absent or unparseable file, an `old_string` that is missing or matches "
+    "more than once. Undecidable is refused, never guessed.\n\n"
+    "Reading the file is not refused: `cat` or `jq` show what is declared, and "
+    "`keyless ls` reports it with `keyless items` and `keyless fields` naming "
+    "what a store calls an item and a field — none of the three prints a "
+    "value.\n\n"
+    "Everything else about this file is a person's decision, made at a terminal "
+    "outside this session. This refusal does not name another way to do it, "
+    "because there is not meant to be one this session can reach."
+    % CHECK)
+
+
 def _message(kind):
+    if kind == "declarations-write":
+        return _DECLARATIONS
     return (
         "[%s] %s Refused.\n\n"
         "Switching the guards off, or changing the files that configure them, "

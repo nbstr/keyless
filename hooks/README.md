@@ -35,9 +35,18 @@ reports `SWITCHED OFF` for as long as it is.
 
 That word is a person's, typed at a terminal — not an agent session's. `KL-SWITCH`
 refuses `keyless disable`, `keyless uninstall`, the pack's own uninstall scripts,
-and any write to `hooks.json` or `config.json`, however the call is wrapped or
-spelled, from inside a session. The switch still works; it just is not reachable
-from in here.
+and any write to `hooks.json` or the project-layer `.keyless-hooks.json`, however
+the call is wrapped or spelled, from inside a session. The switch still works; it
+just is not reachable from in here.
+
+`config.json` is the one file with an exception, and it is a narrow one. That file
+declares credential COORDINATES and configures no guard, so a write that only ADDS
+names under `secrets` — every name already declared still pointing where it
+pointed, every other part of the document untouched — is not refused. Nothing else
+about it is: not `stores`, where a backend's binary path lives and which
+`keyless run` executes, not a name removed or repointed, and not a shell write,
+whose content does not exist when the check runs.
+`keyless_hooks/checks/switch.py` carries the reasoning.
 
 ---
 
@@ -58,7 +67,7 @@ than a retry or a question.
 | `KL-HEREDOC` | a credential literal written into a file through a here-document — `cat > f <<EOF` | **deny**, **warn** when no file is named |
 | `KL-WRITE` | a credential literal in a `Write`, `Edit`, `MultiEdit` or `NotebookEdit` | **rewrite**, **deny** or **warn** — see below |
 | `KL-DEST` | a `Write`/`Edit`/`MultiEdit`/`NotebookEdit` landing on an existing credential file, which copies its whole content to the host's file-history store on the way through | **deny** |
-| `KL-SWITCH` | a session reaching for the pack's own off switch — `keyless disable`/`uninstall`, its own uninstall scripts, or a write to `hooks.json`/`config.json` | **deny** |
+| `KL-SWITCH` | a session reaching for the pack's own off switch — `keyless disable`/`uninstall`, its own uninstall scripts, or a write to `hooks.json` — and every write to `config.json` but one that only ADDS a declared name | **deny** |
 | `KL-SEEN` | a credential shape in tool output | **warn** |
 
 ### It prefers rewriting to refusing — where the rewrite is a repair

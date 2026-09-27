@@ -689,8 +689,8 @@
   "id": "M99-guard-targets-empty",
   "why": "The default hooks.json/config.json locations are dropped from the guard set. Every write to `~/.config/keyless/hooks.json` then matches nothing, and the switch's own config is wide open from a session that never has to touch the CLI at all.",
   "file": "keyless_hooks/checks/switch.py",
-  "find": "    home = os.path.expanduser(\"~\")\n    targets = set()\n    if home:",
-  "replace": "    home = os.path.expanduser(\"~\")\n    targets = set()\n    if False:"
+  "find": "    home = os.path.expanduser(\"~\")\n    guard, declared = set(), set()\n    if home:",
+  "replace": "    home = os.path.expanduser(\"~\")\n    guard, declared = set(), set()\n    if False:"
  },
  {
   "id": "M100-tee-admitted-as-a-reader",
@@ -866,5 +866,96 @@
   "file": "keyless_hooks/vaultscan.py",
   "find": "    if cache.get(\"cfg\") is cfg:\n",
   "replace": "    if \"table\" in cache:\n"
+ },
+ {
+  "id": "M109-a-declared-name-may-be-removed",
+  "why": "Stops checking that every name already declared survives the write, so a write that takes names away reads as one that only adds them \u2014 and what keyless will serve, and therefore what a refusal offers as a remedy, narrows to whatever the session left behind.",
+  "file": "keyless_hooks/declarations.py",
+  "find": "        if name not in gained or not _same(route, gained[name]):",
+  "replace": "        if False:"
+ },
+ {
+  "id": "M110-an-unparseable-document-reads-as-empty",
+  "why": "A document that will not parse comes back as an empty mapping instead of a refusal, so both sides of the comparison collapse to nothing in common and a write of arbitrary content reads as additive. Undecidable has to refuse; read as empty it approves everything.",
+  "file": "keyless_hooks/declarations.py",
+  "find": "        return None\n    return data if isinstance(data, dict) else None",
+  "replace": "        return {}\n    return data if isinstance(data, dict) else {}"
+ },
+ {
+  "id": "M111-the-guard-config-gets-the-declarations-allowance",
+  "why": "Drops the role from the test, so the content allowance reaches hooks.json and the project-layer file as well. A write that adds a key under `secrets` then goes through on the file that configures the checks themselves \u2014 and that file's own keys are lists of what is protected, so a write judged additive under one key can rewrite every other.",
+  "file": "keyless_hooks/checks/switch.py",
+  "find": "    if role == _ROLE_DECLARATIONS and _declares_a_name(payload):",
+  "replace": "    if _declares_a_name(payload):"
+ },
+ {
+  "id": "M112-a-path-named-as-both-resolves-to-declarations",
+  "why": "Flips which set keeps a path that both variables point at. The guard config is then the side that loses it, so a file serving as the guard config takes the declarations allowance \u2014 the exact ambiguity the subtraction exists to land on the refusing side.",
+  "file": "keyless_hooks/checks/switch.py",
+  "find": "    return frozenset(guard), frozenset(declared - guard)",
+  "replace": "    return frozenset(guard - declared), frozenset(declared)"
+ },
+ {
+  "id": "M113-the-hooks-config-override-is-not-a-guard-target",
+  "why": "The variable that relocates the guard config stops contributing a target, so a guard config kept anywhere but the default location is not recognised as one at all \u2014 and a write to it is judged by nothing.",
+  "file": "keyless_hooks/checks/switch.py",
+  "find": "    hooks_override = os.environ.get(\"KEYLESS_HOOKS_CONFIG\")\n    if hooks_override:\n        guard.add(os.path.normpath(hooks_override))",
+  "replace": "    hooks_override = \"\"\n    if hooks_override:\n        guard.add(os.path.normpath(hooks_override))"
+ },
+ {
+  "id": "M114-the-loader-size-bound-is-not-applied",
+  "why": "Removes the bound the CLI's own loader holds, so a write that pushes the document past it reads as additive. Past that size keyless reads no config at all, so the write takes every declared name away rather than adding one.",
+  "file": "keyless_hooks/declarations.py",
+  "find": "    if len(after_text.encode(\"utf-8\", \"surrogatepass\")) > MAX_CONFIG_BYTES:",
+  "replace": "    if False:"
+ },
+ {
+  "id": "M115-a-gained-name-need-not-be-a-route",
+  "why": "Admits a gained name whose value is not a mapping. The CLI's loader answers that with a type error and reads no config, so the write is every declared name lost wearing the shape of one gained.",
+  "file": "keyless_hooks/declarations.py",
+  "find": "        if name not in declared and not isinstance(route, dict):",
+  "replace": "        if False:"
+ },
+ {
+  "id": "M116-one-json-type-may-stand-in-for-another",
+  "why": "Compares by whether either value is an instance of the other's type, which is the plain-equality defect with extra steps: a boolean and the integer beside it become equal, so a flag retyped outside the secrets map passes as unchanged \u2014 and the loader answers a retyped flag by reading no config.",
+  "file": "keyless_hooks/declarations.py",
+  "find": "    if type(left) is not type(right):\n        return False",
+  "replace": "    if not isinstance(left, type(right)) and not isinstance(right, type(left)):\n        return False"
+ },
+ {
+  "id": "M117-an-edit-is-applied-to-nothing",
+  "why": "Applies the edits to an empty document instead of the content on disk, so no anchor ever resolves and every edit becomes uncomputable. It fails toward refusing, which is the safe direction and still a defect: the allowance covers no edit tool at all, and nothing but an arm on the allowed case reports that.",
+  "file": "keyless_hooks/declarations.py",
+  "find": "    text = before",
+  "replace": "    text = \"\""
+ },
+ {
+  "id": "M118-a-bulk-edit-is-judged-on-its-first-edit",
+  "why": "Judges a bulk edit on its first entry and ignores the rest, so an edit that adds a name carries every later edit through unexamined \u2014 a route moved or a store rewritten in the second entry is never compared.",
+  "file": "keyless_hooks/declarations.py",
+  "find": "    for old, new, every in edits:",
+  "replace": "    for old, new, every in edits[:1]:"
+ },
+ {
+  "id": "M121-an-absent-file-reads-as-an-empty-document",
+  "why": "An absent declarations file is treated as an empty document rather than as nothing to compare against, so a write that CREATES it is additive against that emptiness \u2014 and a created file may declare `stores`, where a backend's binary path lives and which `keyless run` executes.",
+  "file": "keyless_hooks/checks/switch.py",
+  "find": "    before = declarations.read_bounded(target)\n    if before is None:\n        return False",
+  "replace": "    before = declarations.read_bounded(target)\n    if before is None:\n        before = \"{}\""
+ },
+ {
+  "id": "M122-a-constant-only-one-reader-accepts-is-taken",
+  "why": "Takes the non-finite constants Python's own reader accepts and the crate's refuses, so the comparison can be between two documents the CLI cannot read \u2014 and report one of them as additive. What lands is a config keyless will not load at all, which is every declared name gone rather than one gained.",
+  "file": "keyless_hooks/declarations.py",
+  "find": "        data = json.loads(text, object_pairs_hook=_no_duplicate_keys,\n                          parse_constant=_refuse_constant)",
+  "replace": "        data = json.loads(text, object_pairs_hook=_no_duplicate_keys)"
+ },
+ {
+  "id": "M123-a-duplicate-key-is-resolved-rather-than-refused",
+  "why": "Resolves a duplicate key the way Python does instead of refusing it. Both readers keep the last one inside the `secrets` map, so this looks harmless \u2014 and at the TOP LEVEL the crate's loader refuses the document and falls back to declaring nothing, while this side keeps the last and sees every name. A write carrying one is then judged additive here and takes every declaration away there.",
+  "file": "keyless_hooks/declarations.py",
+  "find": "        data = json.loads(text, object_pairs_hook=_no_duplicate_keys,\n                          parse_constant=_refuse_constant)",
+  "replace": "        data = json.loads(text, parse_constant=_refuse_constant)"
  }
 ]
