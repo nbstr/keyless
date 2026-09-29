@@ -957,5 +957,26 @@
   "file": "keyless_hooks/declarations.py",
   "find": "        data = json.loads(text, object_pairs_hook=_no_duplicate_keys,\n                          parse_constant=_refuse_constant)",
   "replace": "        data = json.loads(text, parse_constant=_refuse_constant)"
+ },
+ {
+  "id": "M124-arithmetic-reads-as-a-command",
+  "why": "The arithmetic reader is what keeps `pass=$((pass + 1))` from being a statement headed `pass` with the verb `+`. Returning 0 puts every `$(( ... ))` and `(( ... ))` back in command position, and the vault gate refuses a bash counter.",
+  "file": "keyless_hooks/shellview.py",
+  "find": "                return j + 2 if j + 1 < n and text[j + 1] == \")\" else 0",
+  "replace": "                return 0"
+ },
+ {
+  "id": "M125-a-command-inside-arithmetic-is-dropped",
+  "why": "Arithmetic runs no command, but a command substitution nested in it does, and `substitution_spans` returns it as a command line of its own. Dropping that makes a vault read inside `$(( ... ))` silent.",
+  "file": "keyless_hooks/shellview.py",
+  "find": "            out.extend((body + a, body + b, bq)\n                       for a, b, bq in substitution_spans(text[body:arith_end - 2]))",
+  "replace": "            pass"
+ },
+ {
+  "id": "M126-cq-run-is-not-a-runner",
+  "why": "`cq run [flags] -- <cmd>` runs <cmd>. Without the runner row its head is `cq`, and every head-anchored gate - a print verb, `env`, a nested `keyless run` child - is blind to what the job queue runs.",
+  "file": "keyless_hooks/shellview.py",
+  "find": "_SUBCOMMAND_RUNNERS = {\"cq\": \"run\"}",
+  "replace": "_SUBCOMMAND_RUNNERS = {}"
  }
 ]
