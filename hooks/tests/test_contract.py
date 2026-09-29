@@ -237,6 +237,45 @@ def run():
                 'git commit -m "wrap claude mcp get in keyless"'):
         s.check("KL-VAULT look-alike: %s" % cmd[:38], drive(bash(cmd)).kind, "silent")
 
+    # ── KL-VAULT: arithmetic is not a command ───────────────────────────────
+    #
+    # `$(( … ))` and `(( … ))` hold variables and operators. Read as command
+    # substitution / a subshell, `pass=$((pass + 1))` — a bash counter — was a
+    # statement headed `pass` with the verb `+`, refused as a password-manager
+    # read. That is the false positive that makes a pack get uninstalled.
+    for cmd in ("echo $((pass + 1))",
+                "pass=0; pass=$((pass + 1))",
+                'echo "$((pass + 1))"',
+                "(( pass += 1 ))",
+                "let pass+=1",
+                'echo "pass"',
+                "echo $(( $(echo $((pass+1))) ))"):
+        s.check("KL-VAULT arithmetic silent: %s" % cmd[:34], drive(bash(cmd)).kind, "silent")
+
+    # ...but a COMMAND inside arithmetic is still a command, and a `$((` whose
+    # parentheses do not close as `))` is a command substitution with a subshell
+    # in it — bash reads it that way, so this does too.
+    for cmd in ("echo $(( $(pass show y) + 1 ))",
+                "echo $(( `pass show y` + 1 ))",
+                "(( $(pass show y) > 0 ))",
+                "echo $((pass show y) )",
+                "((pass++)); pass show z",
+                "( pass show z )"):
+        s.check("KL-VAULT inside arithmetic fires: %s" % cmd[:26], drive(bash(cmd)).kind, "deny")
+
+    # ── KL-VAULT: through the job queue ─────────────────────────────────────
+    #
+    # `cq run [flags] -- <cmd>` runs <cmd>; every heavy command on this machine
+    # goes through it. Its head was `cq`, so every head-anchored gate was blind
+    # to the child: a print verb, `env`, a nested `keyless run` child.
+    for cmd in ("cq run -- pass show x",
+                "cq run --kind vitest -- pass show x",
+                "cq run -- sudo pass show x",
+                "cq run -- keyless run -s X -- pass show y"):
+        s.check("KL-VAULT through cq run fires: %s" % cmd[:30], drive(bash(cmd)).kind, "deny")
+    for cmd in ("cq status", "cq run -- pass ls", "cq run -- pnpm test"):
+        s.check("KL-VAULT through cq run silent: %s" % cmd[:30], drive(bash(cmd)).kind, "silent")
+
     # ── KL-ENV ──────────────────────────────────────────────────────────────
     v = drive(bash("env"))
     s.check("KL-ENV bare env rewrites", v.kind, "rewrite")

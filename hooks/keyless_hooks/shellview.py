@@ -217,9 +217,16 @@ def _separator_positions(view):
         return []
     pos = [0]
     n = len(view)
+    # Arithmetic words are variables and operators, never commands: cut at the
+    # `(` of `$((pass + 1))` and it became a statement headed `pass` — refused as
+    # a vault read. A `$( … )` nested inside the arithmetic is NOT masked.
+    masked = _arithmetic_mask(view)
     i = 0
     while i < n:
         c = view[i]
+        if i in masked:
+            i += 1
+            continue
         # `{` opens a group only when a space follows, and `}` closes one only
         # when a space precedes. Without that test `cat ${F}` is cut into `cat $`
         # and `F}`, which destroys the operand this whole module exists to read.
@@ -255,9 +262,18 @@ def statement_spans(cmd):
     spans = []
     for idx, start in enumerate(cuts):
         end = cuts[idx + 1] if idx + 1 < len(cuts) else len(cmd)
-        # Trim the separator characters themselves off the front of the slice.
-        while start < end and (view[start] in ";&|(){}\n" or view[start].isspace()):
-            start += 1
+        # Trim the separator characters themselves off the front of the slice —
+        # and an arithmetic command, `(( pass += 1 ))`, whose words run nothing.
+        # Trimming its `((` as separators left `pass += 1` standing as a command.
+        while start < end:
+            arith_end = _arithmetic_end(view, start)
+            if arith_end:
+                start = arith_end
+                continue
+            if view[start] in ";&|(){}\n" or view[start].isspace():
+                start += 1
+                continue
+            break
         # And off the back — but only a closer with no opener of its own inside
         # the slice, so `$(env)` yields the statement `env` while `cat ${F}`
         # keeps its brace. A statement carrying a trailing `)` is not the same
@@ -408,6 +424,30 @@ _WRAPPER_ARG = re.compile(r"^\d+(?:\.\d+)?[smhd]?$")
 _SCRIPT_COMMAND_FLAG = re.compile(r"^(?:--command|-[A-Za-z]*c)$")
 
 
+# Programs that run a child command given after a subcommand and a `--`:
+# `cq run [--kind k] -- <cmd>`, the job queue every heavy command on this machine
+# goes through. Unlike `env` or `sudo`, the bare program is a command of its own
+# (`cq status`), so it wraps only with its subcommand AND the separator. Without
+# `--` nothing here can tell a flag's value from the command, and the statement
+# keeps `cq` as its head, as it always did.
+_SUBCOMMAND_RUNNERS = {"cq": "run"}
+
+
+def _runner_separator(stmt, spans, index, name):
+    """Index of the `--` ending `<runner> <subcommand> [flags] --`, or -1."""
+    sub = _SUBCOMMAND_RUNNERS.get(name)
+    if sub is None or index + 1 >= len(spans):
+        return -1
+    first = spans[index + 1]
+    if unquote(stmt[first[0]:first[1]]) != sub:
+        return -1
+    for k in range(index + 2, len(spans)):
+        tok = stmt[spans[k][0]:spans[k][1]]
+        if tok == "--":
+            return k
+    return -1
+
+
 def _walk_head(stmt):
     """(name, end_offset, last_wrapper) — the shared head walk.
 
@@ -418,9 +458,14 @@ def _walk_head(stmt):
     last_wrapper = ("", -1)
     skip_next = False
     script_file = False
-    for start, end in words(stmt):
+    runner_until = -1
+    spans = list(words(stmt))
+    for index, (start, end) in enumerate(spans):
         tok = stmt[start:end]
         if not tok:
+            continue
+        if index <= runner_until:
+            # Inside `cq run … --`: its own flags and the separator.
             continue
         if skip_next:
             # The operand of a bare redirect operator. Without this, the head of
@@ -467,6 +512,11 @@ def _walk_head(stmt):
         if name in _WRAPPERS:
             last_wrapper = (name, end)
             script_file = name == "script"
+            continue
+        separator = _runner_separator(stmt, spans, index, name)
+        if separator >= 0:
+            runner_until = separator
+            last_wrapper = (name, spans[separator][1])
             continue
         return name, end, last_wrapper
     return "", -1, last_wrapper
@@ -668,6 +718,61 @@ def substitution_payloads(cmd, depth=2):
     return out
 
 
+def _arithmetic_end(text, i):
+    """The offset just past a `$(( … ))` expansion or a `(( … ))` arithmetic
+    command starting at `i`, or 0. Neither contains a command.
+
+    Bash reads `$((` as arithmetic when the parenthesis it opens at `((` closes as
+    a `))` pair. When it does not — `$((cmd) arg)`, a subshell inside a command
+    substitution — bash falls back to a command substitution, and so does this:
+    only a genuine `))` close is skipped, so `$((op read x) )` stays a command.
+    An unterminated `$((` is left to the substitution scan too, which is the
+    direction that reads MORE as a command, never less.
+    """
+    if text.startswith("$((", i):
+        j = i + 3
+    elif text.startswith("((", i):
+        j = i + 2
+    else:
+        return 0
+    depth = 2
+    n = len(text)
+    while j < n:
+        c = text[j]
+        if c == "(":
+            depth += 1
+        elif c == ")":
+            depth -= 1
+            if depth == 1:
+                # The inner `(` of `$((` just closed. Arithmetic only if the
+                # outer one closes immediately after it.
+                return j + 2 if j + 1 < n and text[j + 1] == ")" else 0
+        j += 1
+    return 0
+
+
+def _arithmetic_mask(text):
+    """Offsets of `text` inside arithmetic — `$(( … ))` or `(( … ))`, delimiters
+    included. None of them can begin a command.
+
+    A command substitution NESTED in the arithmetic is masked here too, and that
+    is safe: `substitution_spans` returns it as a command line of its own, the
+    same path every `$( … )` takes, so `$(( $(pass show x) + 1 ))` is still read
+    as the vault read it is. One path, so the mutation proving it can fail.
+    """
+    masked = set()
+    n = len(text)
+    i = 0
+    while i < n:
+        end = _arithmetic_end(text, i)
+        if end:
+            masked.update(range(i, end))
+            i = end
+        else:
+            i += 1
+    return masked
+
+
 def substitution_spans(text):
     """(start, end, backquoted) of each OUTERMOST substitution body in `text`.
 
@@ -683,6 +788,16 @@ def substitution_spans(text):
     n = len(text)
     i = 0
     while i < n:
+        arith_end = _arithmetic_end(text, i)
+        if arith_end:
+            # `$(( … ))` is ARITHMETIC, not a command: `$((pass + 1))` runs no
+            # program named `pass`. But `$(( $(cmd) + 1 ))` runs `cmd`, so the
+            # substitutions NESTED in the arithmetic are still returned.
+            body = i + (3 if text[i] == "$" else 2)
+            out.extend((body + a, body + b, bq)
+                       for a, b, bq in substitution_spans(text[body:arith_end - 2]))
+            i = arith_end
+            continue
         if text[i] == "$" and i + 1 < n and text[i + 1] == "(":
             depth_paren = 1
             j = i + 2
