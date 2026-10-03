@@ -305,8 +305,22 @@ DEFAULT_VAULT_VERBS = [
     # group, so `--output=name` cannot match by backtracking around the `name`
     # exclusion — an optional `[= ]?` did exactly that and turned the safe
     # format into a block.
+    #
+    # The verb path for kubectl is not the generic one: `keyless_hooks/kubectl.py`
+    # rebuilds it from kubectl's own flag grammar, and writes `secret` into the
+    # type slot whenever the type is not a literal (`$2`, `${T}`, `$(…)`, a
+    # backtick) — a type decided at run time cannot be proven not to be a Secret.
+    # `--raw` and `--template` render the object exactly as `-o json` and
+    # `-o go-template` do, so they satisfy the format condition too.
     ["kubectl", r"^get\s+secret", "",
-     r"(?:^|\s)(?:--output|-o)(?:[= ]\s*|(?=[a-z]))(?!name\b)"],
+     r"(?:^|\s)(?:(?:--output|-o)(?:[= ]\s*|(?=[a-z]))(?!name\b)"
+     r"|--raw(?:[= ]|$)|--template(?:[= ]|$))"],
+    # `edit` hands the whole object, `.data` included, to $KUBE_EDITOR, and in a
+    # session with no terminal the only editor that works is one that prints.
+    # `apply view-last-applied` prints the last-applied annotation, which holds
+    # the `.data` map of any Secret that was ever `kubectl apply`-ed.
+    ["kubectl", r"^edit\s+secret", "", None],
+    ["kubectl", r"^apply\s+view-last-applied\s+secret", "", None],
     # ── Railway — documented ────────────────────────────────────────────────
     # Every spelling of `railway variables` renders the value table, `--set`
     # included, so there is no metadata sibling to carve out here.

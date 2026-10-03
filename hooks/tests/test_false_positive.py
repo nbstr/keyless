@@ -178,6 +178,19 @@ SAFE = [
     "kubectl get secret db -o=name",
     "kubectl describe secret db",
     "kubectl get pods -o yaml",
+    # A variable in a NAME slot names an object of a literal type; a variable in
+    # the TYPE slot is only refused when the format can render `.data`.
+    "kubectl get pod $P -o yaml",
+    "kubectl get $2 db",
+    "kubectl get $2 db -o name",
+    "kubectl describe $2 db",
+    # `all` is a category that does not contain Secrets.
+    "kubectl get all -A -o yaml",
+    "kubectl -n prod get configmap app -o yaml",
+    "kubectl get configmap secret-config -o yaml",
+    "kubectl get --raw /api/v1/namespaces/default/pods",
+    "kubectl edit deployment web",
+    "porter kubectl --project 1 --cluster 5281 -- get pods -n default -o yaml",
     # ── Railway — documented ────────────────────────────────────────────────
     "railway variables --help",
     "railway status",
