@@ -10,7 +10,9 @@ live here for the same reason: a gate that disagreed with its sibling about what
 """
 
 from .executed import command_texts
-from .shellview import head_of, rest_after_head, statements, words
+from .kubectl import (HEADS as KUBECTL_HEADS, kubectl_args, kubectl_path,
+                      opaque_substitutions)
+from .shellview import head_of, rest_after_head, statements, tokens, words
 
 __all__ = ["is_help", "verb_path", "per_config", "acts"]
 
@@ -164,9 +166,38 @@ def acts(payload, cfg):
     for text in _texts(cmd, cfg):
         for stmt in statements(text):
             head = head_of(stmt)
-            if not head:
+            if not head or head in KUBECTL_HEADS:
                 continue
             rest = rest_after_head(stmt)
             if is_help(rest):
                 continue
+            yield head, rest, verb_path(rest)
+        for act in _kubectl_acts(text):
+            yield act
+
+
+def _kubectl_acts(text):
+    """The kubectl calls in `text`, each with the path `kubectl.py` rebuilds.
+
+    Read from a view where every top-level substitution is ONE opaque word. The
+    statement splitter ends a statement at `$(`, so `kubectl get $(echo secret)
+    db -o yaml` would otherwise reach this as `get $(` with its output flag cut
+    off — the substitution itself is still run, and scanned, as its own text.
+    """
+    for stmt in statements(opaque_substitutions(text)):
+        head = head_of(stmt)
+        if head not in KUBECTL_HEADS:
+            continue
+        rest = rest_after_head(stmt)
+        if is_help(rest):
+            continue
+        # kubectl's resource TYPE decides whether a call renders a Secret, and
+        # the generic path cannot find it: flags precede it, and a variable can
+        # stand in for it. `kubectl.py` says why.
+        toks = tokens(rest)
+        kpath = kubectl_path(head, toks)
+        if kpath is not None:
+            yield "kubectl", " ".join(kubectl_args(head, toks)), kpath
+        if head != "kubectl":
+            # `porter` keeps its own act, for any row a user writes for it.
             yield head, rest, verb_path(rest)

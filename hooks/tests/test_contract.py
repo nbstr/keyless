@@ -230,6 +230,71 @@ def run():
                 "claude mcp get --help"):
         s.check("KL-VAULT silent: %s" % cmd[:38], drive(bash(cmd)).kind, "silent")
 
+    # ── KL-VAULT: a kubectl TYPE that is not a literal, or not where the generic
+    # path looks ─────────────────────────────────────────────────────────────
+    #
+    # Measured on a real session: a loop calling `kubectl get $2 …` read
+    # production Secrets while the literal spelling was refused. A type decided
+    # at run time cannot be proven not to be `secret`, so it is read as one.
+    # The rest are the same act with the type somewhere the verb-path rule did
+    # not look: behind a flag, in a comma list, in a TYPE/NAME pair, in another
+    # case, behind `porter kubectl`, or fetched by URL.
+    for cmd in ("kubectl get $2 db -o yaml",
+                'kubectl get "$2" db -o json',
+                "kubectl get ${KIND} db -o yaml",
+                "kubectl get $(echo secret) db -o yaml",
+                "kubectl get `echo secret` db -o yaml",
+                "for r in secret cm; do kubectl get $r x -n prod -o json; done",
+                "f(){ kubectl get $2 $3 -n $1 -o json | python3 -c 'x'; }; f p secret a",
+                "echo secret | xargs -I{} kubectl get {} db -o yaml",
+                "kubectl $VERB secret db -o yaml",
+                "kubectl -n prod get secret db -o yaml",
+                "kubectl get -n prod secret db -o yaml",
+                "kubectl --context prod get secrets -o json",
+                "kubectl get -o yaml -- secret db",
+                "kubectl get cm,secret -o yaml",
+                "kubectl get pod/a secret/b -o yaml",
+                "kubectl get Secret db -o yaml",
+                "kubectl get SECRETS -A -o json",
+                "kubectl get secrets.v1. db -o yaml",
+                "kubectl get se\\cret db -o yaml",
+                'kubectl get "sec"ret db -o yaml',
+                # An unknown flag before the type may or may not eat the next
+                # word; the reading that finds a Secret wins.
+                "kubectl get --weird val secret db -o yaml",
+                "kubectl --weird val get secret db -o yaml",
+                "kubectl get secret db --template={{.data}}",
+                "kubectl get --raw /api/v1/namespaces/default/secrets/db",
+                "kubectl get --raw=/api/v1/namespaces/default/secrets",
+                "kubectl get --raw $URL",
+                "kubectl edit secret db",
+                "kubectl edit $2 db",
+                "kubectl apply view-last-applied secret/db",
+                "porter kubectl -- get secret db -o yaml",
+                "porter kubectl --project 1 --cluster 5281 -- get $R db -o json"):
+        s.check("KL-VAULT fires kubectl: %s" % cmd[:34], drive(bash(cmd)).kind, "deny")
+
+    # The same verbs on a type that is provably not a Secret, and on a Secret
+    # rendered in a form that carries no value, stay open.
+    for cmd in ("kubectl get pod $P -o yaml",
+                "kubectl get $2 db",
+                "kubectl get $2 db -o name",
+                "kubectl describe $2 db",
+                "kubectl get all -A -o yaml",
+                "kubectl get pods,svc -o wide",
+                "kubectl get deploy/web -o yaml",
+                "kubectl -n prod get configmap app -o yaml",
+                "kubectl get configmap secret-config -o yaml",
+                "kubectl get --weird val pods -o yaml",
+                "kubectl get --raw /api/v1/namespaces/default/pods",
+                "kubectl edit deployment web",
+                "kubectl apply view-last-applied deploy/web",
+                "kubectl get secret --help",
+                "porter kubectl --print-kubeconfig",
+                "porter kubectl --project 1 --cluster 5281 -- get pods -n default -o yaml",
+                'git commit -m "kubectl get $2 -o yaml read the secret"'):
+        s.check("KL-VAULT silent kubectl: %s" % cmd[:34], drive(bash(cmd)).kind, "silent")
+
     # ── KL-VAULT: look-alikes ───────────────────────────────────────────────
     for cmd in ('git commit -m "document op read usage"',
                 'echo "use op read to fetch it"',

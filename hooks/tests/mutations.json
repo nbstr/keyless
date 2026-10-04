@@ -978,5 +978,103 @@
   "file": "keyless_hooks/shellview.py",
   "find": "_SUBCOMMAND_RUNNERS = {\"cq\": \"run\"}",
   "replace": "_SUBCOMMAND_RUNNERS = {}"
+ },
+ {
+  "id": "M127-kubectl-variable-type-is-literal",
+  "why": "The arm a real session walked through: `kubectl get $2 db -o json` read production Secrets because a type spelled through a variable was taken at face value. Reading `$`, a backtick or `{}` as a literal reopens exactly that door.",
+  "file": "keyless_hooks/kubectl.py",
+  "find": "    if \"$\" in tok or \"`\" in tok or \"{}\" in tok:",
+  "replace": "    if False:"
+ },
+ {
+  "id": "M128-kubectl-valued-flag-is-boolean",
+  "why": "`kubectl -n prod get secret db -o yaml` reaches the type only when `-n` is skipped WITH its operand. Calling every known valued flag boolean puts `prod` in the verb slot and the Secret behind it.",
+  "file": "keyless_hooks/kubectl.py",
+  "find": "    if tok in _VALUED:\n        return \"valued\"",
+  "replace": "    if tok in _VALUED:\n        return \"boolean\""
+ },
+ {
+  "id": "M129-kubectl-type-list-reads-first-only",
+  "why": "`kubectl get cm,secret -o yaml` renders the Secret second. Testing the whole comma list as one type misses every Secret that is not alone in it.",
+  "file": "keyless_hooks/kubectl.py",
+  "find": "    return any(_type_is_secret(p) for p in lit.split(\",\") if p)",
+  "replace": "    return _type_is_secret(lit)"
+ },
+ {
+  "id": "M130-kubectl-type-is-case-sensitive",
+  "why": "kubectl resolves `Secret` and `SECRETS` to the core Secret. A case-sensitive comparison lets the Kind spelling through.",
+  "file": "keyless_hooks/kubectl.py",
+  "find": "    kind = part.split(\"/\", 1)[0].split(\".\", 1)[0].lower()",
+  "replace": "    kind = part.split(\"/\", 1)[0].split(\".\", 1)[0]"
+ },
+ {
+  "id": "M131-kubectl-type-name-pairs-first-only",
+  "why": "With any TYPE/NAME positional every positional is a type, so `get pod/a secret/b` renders a Secret in the second slot. Reading only the first slot misses it.",
+  "file": "keyless_hooks/kubectl.py",
+  "find": "    if any(\"/\" in (_literal(o) or \"\") for o in objects):\n        return range(len(objects))",
+  "replace": "    if False:\n        return range(len(objects))"
+ },
+ {
+  "id": "M132-kubectl-type-reads-every-positional",
+  "why": "The over-blocking direction: reading every positional as a type turns `kubectl get pod $P -o yaml` \u2014 a pod, whatever $P holds \u2014 into a refusal, which is the false positive that gets a pack uninstalled.",
+  "file": "keyless_hooks/kubectl.py",
+  "find": "    return range(min(len(objects), 1))",
+  "replace": "    return range(len(objects))"
+ },
+ {
+  "id": "M133-kubectl-unknown-flag-one-reading",
+  "why": "A bare flag the parser does not know may or may not eat the next word. Trying only one reading lets `kubectl get --weird val secret db -o yaml` through.",
+  "file": "keyless_hooks/kubectl.py",
+  "find": "    for idx in unknown[:_MAX_UNKNOWN]:",
+  "replace": "    for idx in unknown[:0]:"
+ },
+ {
+  "id": "M134-kubectl-substitution-cuts-statement",
+  "why": "The statement splitter ends a statement at `$(`, so without the opaque view `kubectl get $(echo secret) db -o yaml` reaches the check as `get $(` with its output flag cut off.",
+  "file": "keyless_hooks/kubectl.py",
+  "find": "    spans = substitution_spans(text)\n    if not spans:",
+  "replace": "    spans = substitution_spans(text)\n    if True:"
+ },
+ {
+  "id": "M135-porter-kubectl-not-read",
+  "why": "`porter kubectl -- get secret db -o yaml` is kubectl bound to a Porter cluster. Not unwrapping it leaves the head `porter`, which no row names.",
+  "file": "keyless_hooks/kubectl.py",
+  "find": "    if head != \"porter\":\n        return None",
+  "replace": "    if True:\n        return None"
+ },
+ {
+  "id": "M136-kubectl-raw-secrets-path-open",
+  "why": "`kubectl get --raw /api/v1/.../secrets/db` returns the object as JSON, `.data` included, with no type positional at all.",
+  "file": "keyless_hooks/kubectl.py",
+  "find": "        if lit is None or \"/secrets\" in lit.lower():",
+  "replace": "        if lit is None:"
+ },
+ {
+  "id": "M137-kubectl-template-not-a-format",
+  "why": "`--template={{.data}}` renders the map exactly as `-o go-template` does. Dropping it from the format condition lets the Secret print.",
+  "file": "keyless_hooks/config.py",
+  "find": "     r\"|--raw(?:[= ]|$)|--template(?:[= ]|$))\"],",
+  "replace": "     r\"|--raw(?:[= ]|$))\"],"
+ },
+ {
+  "id": "M138-kubectl-edit-secret-open",
+  "why": "`kubectl edit secret` hands the whole object to $KUBE_EDITOR, and with no terminal the only editor that works prints it.",
+  "file": "keyless_hooks/config.py",
+  "find": "    [\"kubectl\", r\"^edit\\s+secret\", \"\", None],",
+  "replace": "    [\"kubectl\", r\"^zzz-never-matches\", \"\", None],"
+ },
+ {
+  "id": "M139-kubectl-acts-never-yielded",
+  "why": "The wiring: `_kubectl_acts` is the only place a kubectl statement becomes an act. Unhooking it silences every kubectl row while the table still looks populated.",
+  "file": "keyless_hooks/vaultscan.py",
+  "find": "        for act in _kubectl_acts(text):\n            yield act",
+  "replace": "        pass"
+ },
+ {
+  "id": "M140-kubectl-secret-not-first",
+  "why": "The rows anchor on `^get\\s+secret`. Leaving the rewritten `secret` in its own slot makes `get pod/a secret/b` read `get pod/a secret`, which no row matches.",
+  "file": "keyless_hooks/kubectl.py",
+  "find": "    rest = [o for i, o in enumerate(objects) if i not in secret]\n    return \" \".join([verb, SECRET] + rest), unknown, True",
+  "replace": "    rest = [SECRET if i in secret else o for i, o in enumerate(objects)]\n    return \" \".join([verb] + rest), unknown, True"
  }
 ]
