@@ -466,17 +466,21 @@ is the observed case. It is spelled as the PAIR `git grep`, never as `git`, or
 `git show HEAD:.npmrc` would earn the exemption too. The pathspec after the
 pattern is still a path, so `git grep TOKEN .npmrc` is still refused.
 
-**Only the glob expansion is ever withheld, never the literal match**, and that
-asymmetry is a safety property rather than a detail. Dropping the pattern token's
-candidates outright allowed `grep EMAIL= /tmp/e2e.env`: the pattern `EMAIL=` is
-shaped like an assignment, the positional walk skips it as one, and the FILE
-becomes "the pattern". While only expansion is withheld, that mis-identification
-costs a false positive; while the candidate is dropped, it costs the credential.
+**For an ordinary pattern token only the glob expansion is withheld, never the
+literal match**, and that asymmetry is a safety property rather than a detail.
+Dropping the pattern token's candidates outright allowed `grep EMAIL=
+/tmp/e2e.env`: the pattern `EMAIL=` is shaped like an assignment, the positional
+walk skips it as one, and the FILE becomes "the pattern". While only expansion is
+withheld, that mis-identification costs a false positive; while the candidate is
+dropped, it costs the credential.
 
-The cost of that choice is one known, deliberate false positive: a literal
-fragment inside a regex — `grep -n 'dotenv\|\.env' app.mjs` — is still refused,
-because `.env` matches the protected list by name and no amount of withholding
-glob expansion reaches it.
+A pattern token that reaches its program wholly quoted and still carrying a
+backslash — `grep -n 'dotenv\|\.env' app.mjs`, `grep -E 'vibe-agent\.env'` —
+loses its literal match as well. Its fragment `.env` spells a protected name, but
+the token cannot deliver that file even when the walk mis-identifies it: a quoted
+backslash reaches the program intact, so the file such a token opens is named
+with the backslash in it. Unquoted, the shell removes the backslash first, which
+is why `grep EMAIL= e2e\.env` is still refused.
 
 ---
 

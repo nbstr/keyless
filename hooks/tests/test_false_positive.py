@@ -393,24 +393,6 @@ FILE_TRUE_POSITIVES = [
     "grep EMAIL= /tmp/e2e.env",
 ]
 
-# A LITERAL fragment carved out of a pattern is a KNOWN, DELIBERATE false
-# positive, and it is recorded here rather than fixed.
-#
-#     grep -n 'dotenv\|\.env' app.mjs      refused; opens no credential file
-#
-# `candidate_operands` yields `.env` out of that regex and it matches the
-# protected list by name, so no amount of withholding GLOB expansion reaches it.
-# The only fix is to drop the pattern token's candidates outright, and the
-# `grep EMAIL=` row above is what that costs: a pattern this walk mis-identifies
-# then exempts a real file. A false positive on a regex that happens to spell a
-# protected basename is the cheaper of the two, so it stays.
-#
-# Reopening this needs a pattern-argument identification that cannot be fooled by
-# an assignment-shaped or flag-shaped pattern — not a wider exemption.
-FILE_KNOWN_FALSE_POSITIVES = [
-    "grep -n 'dotenv\\|\\.env' notes.txt",
-]
-
 # ── an ESCAPED shell metacharacter is an argument, never a separator ────────
 #
 # A `find` expression carries its own parentheses and its own `-exec` terminator,
