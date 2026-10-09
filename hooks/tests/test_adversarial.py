@@ -185,11 +185,19 @@ ATTACKS = [
                          "a NAME-keyed match into a file that expands nothing"),
     ("git_history",      "git show HEAD:.npmrc",
                          "a protected path read out of git history"),
+    ("vault_py_system",  "python3 -c \"import os; os.system('op read op://a/b')\"",
+                         "a print verb handed to a language's own process API"),
 ]
 
 # Rows that are NOT blocked, with the reason each is structurally out of reach.
 # This is the published limit set. Adding a row here is a deliberate act.
 SURVIVORS = {
+    "vault_py_system": "the verb is a string argument to Python's `os.system`, and "
+                       "no shell reading of Python code reaches inside a string "
+                       "literal. Seeing it means knowing which calls of which "
+                       "language hand their argument to a shell — "
+                       "nbstr/keyless#89, and the `debt:` marker in "
+                       "`keyless_hooks/languages.py`.",
     "xargs": "the operand reaches the reader through a pipe at RUN time; no static "
              "view of the command text contains it as an operand of `cat`.",
     "outer_var": "the variable was assigned by an earlier tool call. The hook sees "

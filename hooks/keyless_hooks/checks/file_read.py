@@ -23,9 +23,10 @@ import time
 
 from .. import served as served_mod
 from ..secretpaths import is_protected, names_in, resolve
+from ..pattern_token import is_unmistakable_regex, pattern_token_start
 from ..shellview import (delegated_head, expand_local_assignments,
                          file_operands_spanned, flatten_substitutions,
-                         head_of, positional_span, statements, strip_heredocs,
+                         head_of, statements, strip_heredocs,
                          substitution_payloads)
 
 CHECK = "KL-FILE"
@@ -261,39 +262,6 @@ def _bash_deny(payload, cfg):
     return None
 
 
-def _pattern_token_start(stmt, head, cfg):
-    """Offset of the token holding this statement's PATTERN argument, or -1.
-
-    -1 means "exempt nothing", and every path that cannot answer the question
-    returns it — an unrecognised head, a pattern supplied by `-e`/`-f`, a
-    statement with no positional at all. That is the direction that fails toward
-    blocking.
-
-    This answer decides GLOB EXPANSION only, never the literal match, so a wrong
-    answer here costs a false positive or a missed glob and can never allow a
-    literal protected path through. Keep it that way: the caller's comment
-    records the leak that appeared the one time this became load-bearing for the
-    verdict itself.
-
-    An INTERPRETER is refused the exemption because its first positional is a
-    script path it opens and executes rather than a pattern — it sits on
-    `pattern_tools` for its `-c`/`-e` payload alone. The caller already forces
-    expansion off for interpreters, so today this is belt-and-braces rather than
-    the only thing holding `python3 .env`.
-    """
-    if not head or head in cfg.interpreters:
-        return -1
-    if head in cfg.pattern_tools:
-        return positional_span(stmt, 0)[1]
-    # A head whose own first positional is a subcommand — `git grep <re>`. The
-    # pair must be on the list; `git` alone never earns the exemption, or
-    # `git show HEAD:.npmrc` would earn it too.
-    sub = positional_span(stmt, 0)[0]
-    if sub and ("%s %s" % (head, sub)) in cfg.pattern_subcommands:
-        return positional_span(stmt, 1)[1]
-    return -1
-
-
 def _scan_statements(text, payload, cfg):
     for stmt in statements(text):
         head = head_of(stmt)
@@ -335,7 +303,15 @@ def _scan_statements(text, payload, cfg):
         # An offset also settles `grep .env .env`, where the same string is a
         # pattern in one position and a real read in the other. A string
         # comparison exempts both.
-        pattern_start = _pattern_token_start(stmt, head, cfg)
+        pattern_start = pattern_token_start(stmt, head, cfg)
+        # And where the pattern token is UNMISTAKABLY a regex — wholly quoted and
+        # still carrying a backslash when it reaches the program — no candidate
+        # carved from it is a path at all, literal or expanded. `grep -E
+        # 'mirror|vibe-agent\.env' log` was refused on the fragment `.env`. The
+        # safety argument lives on `is_unmistakable_regex`: a mis-identified token
+        # of that shape opens a file whose NAME holds a backslash, which is not
+        # the protected file the fragment spells.
+        regex_only = is_unmistakable_regex(stmt, pattern_start)
         # Nothing inside an interpreter's code is glob-expanded, because no shell
         # ever expanded it — `python3 -c "re.findall('.*', s)"` hands the
         # interpreter that string verbatim. The code arrives as a FLAG value, not
@@ -347,21 +323,26 @@ def _scan_statements(text, payload, cfg):
         # string in those is a regex, not a path.
         in_code = head in cfg.interpreters
         for cand, tok_start in file_operands_spanned(stmt, head, cfg.interpreters):
-            # ONLY the glob expansion is withheld, never the literal match, and
-            # that asymmetry is the whole safety property of this exemption.
+            # For an ordinary pattern token ONLY the glob expansion is withheld,
+            # never the literal match, and that asymmetry is the safety property
+            # of this exemption.
             #
-            # Dropping the candidate outright was tried and it opened a real
-            # hole: `grep EMAIL= /tmp/e2e.env` has a PATTERN shaped like an
-            # assignment, `positional_span` skips it as one, and the FILE is then
-            # identified as the pattern and exempted — a genuine credential read,
-            # silently allowed. Replayed against real traffic, that is not a
-            # contrived spelling; it is how a shell script reads one value out of
-            # an env file.
+            # Dropping every candidate of the pattern token was tried and it
+            # opened a real hole: `grep EMAIL= /tmp/e2e.env` has a PATTERN shaped
+            # like an assignment, `positional_span` skips it as one, and the FILE
+            # is then identified as the pattern and exempted — a genuine
+            # credential read, silently allowed. Replayed against real traffic,
+            # that is not a contrived spelling; it is how a shell script reads one
+            # value out of an env file.
             #
             # Withholding only the expansion keeps the mis-identification a NOISE
             # bug instead of a LEAK: whatever token this picks, a literal
-            # protected path in it is still matched and still refused.
+            # protected path in it is still matched and still refused. The one
+            # token whose literal match is dropped is `regex_only`, and it holds
+            # under the same mis-identification for the reason given above.
             from_pattern = pattern_start >= 0 and tok_start == pattern_start
+            if from_pattern and regex_only:
+                continue
             pattern = is_protected(cand, payload.cwd, cfg,
                                    expand_globs=(not in_code and not from_pattern))
             if not pattern:

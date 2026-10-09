@@ -19,6 +19,8 @@ the other sees `.env` with no idea what touches it. It takes both.
 
 import re
 
+from .languages import runs_inline_code
+
 __all__ = [
     "strip_quoted", "strip_heredocs", "heredocs", "Heredoc", "stripped",
     "statement_spans", "statements", "head_of", "head_or_wrapper", "words",
@@ -41,7 +43,14 @@ _WRAPPERS = frozenset([
 
 # Shell keywords after which a COMMAND begins. Omitting these is the classic
 # hole: `for f in *; do cat .env; done` puts the real verb after `do`.
-_KEYWORDS = frozenset(["do", "then", "else", "elif", "in", "while", "until", "if"])
+#
+# `in` is not one. In `for`, `select` and `case` it introduces WORDS — a list to
+# iterate or a pattern to match — and no shell starts a command there. Cutting
+# after it made the first list word a statement head, so `for w in pass fail; do
+# echo $w; done` was refused as the vault read `pass fail`. The list stays inside
+# the `for` statement, where its words are still operands: `for f in .env; do cat
+# $f; done` is refused on `.env` exactly as before, now under the head `for`.
+_KEYWORDS = frozenset(["do", "then", "else", "elif", "while", "until", "if"])
 
 _ASSIGN_PREFIX = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 _REDIRECT_TOKEN = re.compile(r"^\d*(?:>>|>&|>\||&>>|&>|>|<<<|<<|<&|<)")
@@ -840,9 +849,15 @@ def interpreter_payloads(cmd, interpreters, depth=2):
             out.append(scripted)
             out.extend(interpreter_payloads(scripted, interpreters, depth - 1))
             continue
-        if head_of(stmt) not in interpreters:
+        head = head_of(stmt)
+        if head not in interpreters:
             continue
-        for start, end in words(stmt):
+        spans = words(stmt)
+        if not runs_inline_code(head, [stmt[a:b] for a, b in spans]):
+            # `python3 find.py 'pass received'` hands the script an ARGUMENT.
+            # Only a shell runs its arguments; see `languages`.
+            continue
+        for start, end in spans:
             tok = stmt[start:end]
             if len(tok) >= 2 and tok[0] == tok[-1] and tok[0] in ("'", '"'):
                 inner = tok[1:-1]

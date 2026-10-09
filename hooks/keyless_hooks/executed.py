@@ -15,6 +15,7 @@ KL-FILE also flattens substitutions into their enclosing statement, so the move
 is not a swap — and that is tracked as nbstr/keyless#82.
 """
 
+from .languages import BACKTICK_RUNS_SHELL, is_foreign
 from .shellview import heredocs, head_of, interpreter_payloads, statements, substitution_spans
 
 __all__ = ["executed_view", "fed_bodies", "command_texts"]
@@ -76,13 +77,34 @@ def executed_view(cmd, docs=None):
 
 
 def fed_bodies(docs, interpreters):
-    """Here-document bodies handed to a program that runs them as code —
-    `bash <<EOF`, `ssh host <<EOF`. Every line there is a command, whether or
-    not the delimiter was quoted: quoting stops EXPANSION, never execution."""
+    """The command lines inside here-document bodies handed to a program that
+    runs them as code.
+
+    For a SHELL — `bash <<EOF`, `ssh host <<EOF` — that is the whole body: every
+    line is a command, whether or not the delimiter was quoted, because quoting
+    stops EXPANSION, never execution.
+
+    For a language of its own — `python3 - <<'PY'` — no line is a shell command,
+    and reading one as shell is what refused Python's `pass` statement and a line
+    of prose inside a Python string as vault reads. The only shell such a body can
+    hold is a back-quoted span in a language where backticks run one (Perl, Ruby,
+    PHP), and only those spans are returned. A body fed to an unquoted delimiter
+    is still EXPANDED by the outer shell first; `command_texts` reads those `$(…)`
+    off the enclosing text, where they stay visible.
+    """
     out = []
     for doc in docs:
-        if any(head_of(stmt) in interpreters for stmt in statements(doc.opener)):
+        heads = [h for h in (head_of(stmt) for stmt in statements(doc.opener))
+                 if h in interpreters]
+        if not heads:
+            continue
+        if not all(is_foreign(h) for h in heads):
             out.append(doc.body)
+            continue
+        if any(h in BACKTICK_RUNS_SHELL for h in heads):
+            view = executed_view(doc.body)
+            out.extend(doc.body[a:b] for a, b, backquoted in substitution_spans(view)
+                       if backquoted)
     return out
 
 

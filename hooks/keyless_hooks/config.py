@@ -88,11 +88,15 @@ DEFAULT_ALLOWED = [
 #
 # `cp` and `mv` are absent on purpose: relocating a protected file out from
 # under its own glob is a bypass, not a metadata read.
+#
+# `print` is zsh's `echo`, a builtin with no option that opens a file. A file it
+# is handed through `$(<.env)` is read by the substitution, which KL-FILE scans
+# as its own statement.
 DEFAULT_NON_READERS = [
     "ls", "stat", "test", "[", "[[", "touch", "mkdir", "rm", "rmdir",
     "chmod", "chown", "chgrp", "file", "find", "du", "df", "basename",
-    "dirname", "shred", "unlink", "ln", "echo", "printf", "true", "false",
-    ":", "cd", "pwd", "which", "type", "man", "keyless",
+    "dirname", "shred", "unlink", "ln", "echo", "printf", "print", "true",
+    "false", ":", "cd", "pwd", "which", "type", "man", "keyless",
 ]
 
 # Programs whose first positional argument is a PATTERN, a script or a filter —
@@ -111,6 +115,12 @@ DEFAULT_NON_READERS = [
 # one, and the FILE becomes "the pattern". While only expansion is withheld, that
 # mis-identification costs a false positive or a missed glob; while the candidate
 # is dropped, it costs the credential.
+#
+# One pattern token loses its literal match too: one that reaches the program
+# wholly quoted and still carrying a backslash, `grep 'vibe-agent\.env'`. Even
+# mis-identified, such a token opens a file whose name holds the backslash, so it
+# cannot deliver the protected file its fragment spells —
+# `pattern_token.is_unmistakable_regex` carries the argument.
 #
 # The exemption covers the whole token, keyed on POSITION — see
 # `shellview.positional_span`. Keying it on the candidate's STRING exempted only
