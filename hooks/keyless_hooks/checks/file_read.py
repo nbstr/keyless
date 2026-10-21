@@ -19,10 +19,11 @@ spellings walk straight past a `Bash(cat:*)` deny.
 """
 
 import os
+import re
 import time
 
 from .. import served as served_mod
-from ..secretpaths import is_protected, names_in, resolve
+from ..secretpaths import is_protected, match_sentence, names_in, resolve
 from ..pattern_token import is_unmistakable_regex, pattern_token_start
 from ..shellview import (delegated_head, expand_local_assignments,
                          file_operands_spanned, flatten_substitutions,
@@ -124,9 +125,11 @@ def _read_rewrite(payload, cfg):
     path = payload.file_path
     if not path:
         return None
-    pattern = is_protected(path, payload.cwd, cfg)
-    if not pattern:
+    protection = is_protected(path, payload.cwd, cfg)
+    if not protection:
         return None
+    pattern = protection.pattern
+    provenance = _provenance(protection, path)
 
     resolved = resolve(path, payload.cwd)
     if resolved is None:
@@ -136,8 +139,10 @@ def _read_rewrite(payload, cfg):
         # became `<cwd>/~/.cckeys.json`, `isfile` said no, and the read was
         # ALLOWED. "The file is not there" and "I could not look" are the same
         # empty answer from a filesystem test, and only one of them is safe.
-        return ("deny", _deny_text(path, pattern, [], "unresolvable path", "Read"),
-                {"path": path[:120], "pattern": pattern, "names": 0})
+        return ("deny", _deny_text(path, pattern, [], "unresolvable path", "Read",
+                                   provenance),
+                {"path": path[:120], "pattern": pattern, "names": 0,
+                 "origin": protection.origin})
     if not os.path.isfile(resolved):
         # Nothing to redact and nothing to leak. No opinion.
         return None
@@ -148,8 +153,10 @@ def _read_rewrite(payload, cfg):
         # The rewrite could not be produced. Fall back to a deny rather than
         # letting the read through: a rewrite that silently does not happen is
         # the one failure mode of this design that leaks.
-        return ("deny", _deny_text(resolved, pattern, names, note, "Read"),
-                {"path": resolved, "pattern": pattern, "names": len(names)})
+        return ("deny", _deny_text(resolved, pattern, names, note, "Read",
+                                   provenance),
+                {"path": resolved, "pattern": pattern, "names": len(names),
+                 "origin": protection.origin})
 
     message = (
         "[%s] %s matched the protected pattern `%s`, so this Read was redirected "
@@ -157,10 +164,14 @@ def _read_rewrite(payload, cfg):
         "each with what keyless will actually do for it; no value is, and the "
         "plaintext is not obtainable in this session."
         % (CHECK, resolved, pattern, view, len(names)))
+    # A rewrite's extra is the tool-input PATCH the engine merges, never a log
+    # record, so nothing descriptive belongs in it.
     return ("rewrite", message, {"file_path": view})
 
 
-def _deny_text(target, pattern, names, note, how):
+def _deny_text(target, pattern, names, note, how, provenance=None):
+    """The refusal. `provenance` is the clause that says HOW the match was
+    reached, and it changes no verdict — see `_provenance` below."""
     listed = ", ".join(names[:25]) if names else "(none readable: %s)" % (note or "unknown")
     more = " …and %d more" % (len(names) - 25) if len(names) > 25 else ""
     if names:
@@ -172,6 +183,7 @@ def _deny_text(target, pattern, names, note, how):
     return (
         "[%s] %s matched the protected pattern `%s`. Its content is a credential, "
         "so this %s is refused.\n\n"
+        "%s"
         "The names it declares — no values: %s%s\n\n"
         "What keyless will do for each name above:\n"
         "%s\n"
@@ -182,7 +194,52 @@ def _deny_text(target, pattern, names, note, how):
         "session by setting KEYLESS_HOOKS_DISABLE=1 in the settings file's "
         "`env` block. A session cannot set its own environment, which is the "
         "point."
-        % (CHECK, target, pattern, how, listed, more, remedy))
+        % (CHECK, target, pattern, how,
+           ("How that match was reached: %s\n\n" % provenance) if provenance else "",
+           listed, more, remedy))
+
+
+# A head holding one of these is not spelled like a program name. It is the
+# tell that a statement was carved out of a REGEX rather than out of a command
+# line, which is the whole discrimination this clause exists to carry.
+_NOT_A_COMMAND_WORD = re.compile(r"[*?\[\]+|()^$\\]")
+
+
+def _statement_sentence(view, head, cfg):
+    """WHICH view of the command the operand came out of, and what that
+    statement's head says about whether it was a command line at all.
+
+    The config's own word lists are consulted before the metacharacter test,
+    because several real commands are spelled with one — `[` and `[[` are both
+    on `non_readers` — and calling one of those "not a command name" would be a
+    false claim in a message whose whole job is to be trusted. The claim is made
+    only about a head this pack has never heard of AND that carries a
+    metacharacter.
+    """
+    where = "The operand was read out of %s" % view
+    if not head:
+        return "%s, in a statement with no recognised head." % where
+    if (head not in cfg.non_readers and head not in cfg.interpreters
+            and head not in cfg.pattern_tools
+            and _NOT_A_COMMAND_WORD.search(head)):
+        return ("%s, in a statement whose head `%s` carries a regex or glob "
+                "metacharacter rather than being spelled like a command name."
+                % (where, head))
+    return "%s, as an argument of `%s`." % (where, head)
+
+
+def _provenance(protection, candidate, statement=None):
+    """One paragraph separating a credential path from a string that globbed
+    onto one.
+
+    It decides nothing. Every verdict is reached before this is called, and this
+    is the only thing a reader has to tell a TRUE refusal — an operand that names
+    a credential file — from one whose operand was a regex fragment the matcher
+    expanded against a real directory. The two prescribe opposite next actions
+    and were byte-identical in this message.
+    """
+    sentence = match_sentence(protection, candidate)
+    return "%s %s" % (sentence, statement) if statement else sentence
 
 
 def _names_for(target):
@@ -200,21 +257,26 @@ def _grep_deny(payload, cfg):
     path = payload.tool_input.get("path")
     if not isinstance(path, str) or not path:
         return None
-    pattern = is_protected(path, payload.cwd, cfg)
-    if not pattern:
+    protection = is_protected(path, payload.cwd, cfg)
+    if not protection:
         return None
+    pattern = protection.pattern
+    provenance = _provenance(protection, path)
     resolved = resolve(path, payload.cwd)
     if resolved is None:
         # Same trap as the Read path above: unresolvable is not absent.
-        return ("deny", _deny_text(path, pattern, [], "unresolvable path", "Grep"),
-                {"path": path[:120], "pattern": pattern, "names": 0})
+        return ("deny", _deny_text(path, pattern, [], "unresolvable path", "Grep",
+                                   provenance),
+                {"path": path[:120], "pattern": pattern, "names": 0,
+                 "origin": protection.origin})
     if not os.path.isfile(resolved):
         # A directory is not a protected file; the per-file gate covers whatever
         # inside it is protected when it is actually read.
         return None
     names, note = _names_for(resolved)
-    return ("deny", _deny_text(resolved, pattern, names, note, "Grep"),
-            {"path": resolved, "pattern": pattern, "names": len(names)})
+    return ("deny", _deny_text(resolved, pattern, names, note, "Grep", provenance),
+            {"path": resolved, "pattern": pattern, "names": len(names),
+             "origin": protection.origin})
 
 
 # ── Bash ────────────────────────────────────────────────────────────────────
@@ -248,21 +310,34 @@ def _bash_deny(payload, cfg):
     #
     # The module already holds that a heredoc body is text ABOUT commands rather
     # than commands. This makes the two halves agree.
+    #
+    # Each view is LABELLED, because which one fired is the other half of the
+    # answer to "was this operand ever a path": a candidate carved out of a
+    # substitution BODY reached the matcher through a view that reads raw text
+    # and ignores quoting, and that is exactly where a regex fragment arrives
+    # looking like a statement.
     base = strip_heredocs(cmd)
-    texts = [base, expand_local_assignments(base), flatten_substitutions(base)]
-    texts.extend(substitution_payloads(base))
+    views = [
+        ("the command as written", base),
+        ("the command with its local variable assignments expanded",
+         expand_local_assignments(base)),
+        ("the command with its `$( … )` substitutions flattened",
+         flatten_substitutions(base)),
+    ]
+    views.extend(("the body of a `$( … )` command substitution", payload_text)
+                 for payload_text in substitution_payloads(base))
     seen = set()
-    for text in texts:
+    for label, text in views:
         if text in seen:
             continue
         seen.add(text)
-        hit = _scan_statements(text, payload, cfg)
+        hit = _scan_statements(text, payload, cfg, label)
         if hit:
             return hit
     return None
 
 
-def _scan_statements(text, payload, cfg):
+def _scan_statements(text, payload, cfg, view=None):
     for stmt in statements(text):
         head = head_of(stmt)
         if head and head in cfg.non_readers:
@@ -343,10 +418,11 @@ def _scan_statements(text, payload, cfg):
             from_pattern = pattern_start >= 0 and tok_start == pattern_start
             if from_pattern and regex_only:
                 continue
-            pattern = is_protected(cand, payload.cwd, cfg,
-                                   expand_globs=(not in_code and not from_pattern))
-            if not pattern:
+            protection = is_protected(cand, payload.cwd, cfg,
+                                      expand_globs=(not in_code and not from_pattern))
+            if not protection:
                 continue
+            pattern = protection.pattern
             # The deny fires either way — a Bash operand is refused on the
             # STRING. Resolution only decides whether the refusal can also name
             # what is configured in the file, which is the half that makes the
@@ -355,7 +431,11 @@ def _scan_statements(text, payload, cfg):
             names, note = _names_for(resolved) if resolved else ([], "unresolvable path")
             return ("deny",
                     _deny_text(cand, pattern, names, note,
-                               "command (`%s`)" % (head or "unrecognised")),
+                               "command (`%s`)" % (head or "unrecognised"),
+                               _provenance(protection, cand,
+                                           _statement_sentence(view, head, cfg)
+                                           if view else None)),
                     {"operand": cand[:120], "pattern": pattern,
-                     "head": head[:40], "names": len(names)})
+                     "head": head[:40], "names": len(names),
+                     "origin": protection.origin, "view": view})
     return None

@@ -13,6 +13,8 @@ its owner disables — and then it protects nothing at all.
 import os
 import sys
 
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 import harness
 from harness import (DECOY, VENDOR_DECOYS, Suite, bash, drive, fixtures,
                      read, write)
@@ -109,6 +111,107 @@ def run():
     # a heredoc writing a runbook that MENTIONS the command
     doc = "cat <<'EOF' > runbook.md\nDo not run: cat .env\nEOF"
     s.check("KL-FILE heredoc mention", drive(bash(doc)).kind, "silent")
+
+    # ── KL-FILE: the refusal says HOW the match was reached ─────────────────
+    #
+    # A refusal on an operand that NAMES a credential file and a refusal on a
+    # regex fragment the matcher expanded onto one are the same verdict, and
+    # were the same message. They prescribe opposite next actions — accept the
+    # first and never re-spell past it, rewrite the command for the second — so
+    # the message has to separate them, and the provenance clause is the only
+    # thing in it that does.
+    #
+    # Both directions are asserted on both arms. A clause that said `literally`
+    # on every refusal would satisfy the first assertion of each pair and
+    # discriminate nothing, which is the shape this whole file exists to catch.
+    regex_cwd = os.path.join(root, "regex-cwd")
+    literal = drive(bash("cat .env"))
+    bridged = drive(bash("cat .*", cwd=regex_cwd))
+    s.check("KL-FILE literal deny still fires", literal.kind, "deny")
+    s.check("KL-FILE glob-bridged deny still fires", bridged.kind, "deny")
+    s.check_in("KL-FILE literal deny says LITERALLY",
+               "matched `.env` literally, as written", literal.message)
+    s.check_in("KL-FILE literal deny names what the operand argued to",
+               "as an argument of `cat`", literal.message)
+    s.check("KL-FILE literal deny never claims an expansion",
+            "expanded as a glob" in literal.message, False)
+    s.check_in("KL-FILE glob-bridged deny says NOT literally",
+               "did NOT match `.npmrc` literally", bridged.message)
+    s.check_in("KL-FILE glob-bridged deny names the expansion",
+               "expanded as a glob", bridged.message)
+    s.check_in("KL-FILE glob-bridged deny names where it expanded",
+               regex_cwd, bridged.message)
+
+    # WHICH view the operand came out of is the other half of the answer, and a
+    # candidate carved out of a substitution BODY is the shape the real false
+    # positives arrive in: a regex holding `$(` is read as a command, because
+    # that view reads raw text and ignores quoting on purpose.
+    s.check_in("KL-FILE as-written deny names its view",
+               "out of the command as written", literal.message)
+    body = drive(bash('echo "$(cat .env)"'))
+    s.check("KL-FILE substitution-body bypass is still refused", body.kind, "deny")
+    s.check_in("KL-FILE substitution-body deny names its view",
+               "out of the body of a `$( … )` command substitution", body.message)
+    dollar = drive(bash("""python3 -c "import re; re.search(r'^a.*?$(.*?)b', t)" """,
+                        cwd=regex_cwd))
+    s.check("KL-FILE a regex holding a substitution still denies",
+            dollar.kind, "deny")
+    s.check_in("KL-FILE names a head that is not spelled like a command",
+               "carries a regex or glob metacharacter", dollar.message)
+
+    # A real command spelled WITH a metacharacter must not be accused of being a
+    # regex. `[` and `[[` are both on `non_readers`, so no payload can carry one
+    # as far as this clause — which is exactly why the exemption is asserted as
+    # a unit rather than through a command.
+    from keyless_hooks.checks.file_read import _statement_sentence
+    from keyless_hooks.config import load as _load_cfg
+    _cfg = _load_cfg(root)
+    s.check("a metacharacter head is named as not-a-command",
+            "carries a regex or glob metacharacter"
+            in _statement_sentence("a view", ".*?", _cfg), True)
+    s.check("a real command spelled with a metacharacter is not accused",
+            "carries a regex or glob metacharacter"
+            in _statement_sentence("a view", "[", _cfg), False)
+    s.check_in("a known command is named as what the operand argued to",
+               "as an argument of `[`", _statement_sentence("a view", "[", _cfg))
+
+    # Every ORIGIN the matcher can produce gets a sentence, and the sentence says
+    # LITERAL or not. A branch nobody exercised would fall through to the default
+    # and report a symlink-resolved or glob-expanded match as "literally, as
+    # written" — a false claim in a refusal, which is worse than a vague one. The
+    # `via` half is asserted too: each origin reads a different intermediate
+    # string, so a wrong one prints `None` into the message rather than failing.
+    # `names` is what the sentence must spell out. For `literal` the matched form
+    # IS the candidate, so naming the candidate names the form; every other
+    # origin reached a DIFFERENT string and has to say which.
+    #
+    # 🔴 `path` and `via` are deliberately NON-OVERLAPPING, and the loop asserts
+    # that rather than trusting the table. The first cut of this used a `via`
+    # that was a prefix of its own `path` — the realistic spelling — so a
+    # mutation printing `path` where `via` belongs still contained the needle,
+    # and the arm passed over its own mutant. The needle has to sit in exactly
+    # one field or the assertion cannot fail.
+    from keyless_hooks import secretpaths as _sp
+    ORIGINS = [
+        # origin           path              via          literal  names
+        (_sp.LITERAL,      "/alpha/.env",    None,         True,  "cand"),
+        (_sp.HOME,         "/alpha/.npmrc",  None,         True,  "/alpha/.npmrc"),
+        (_sp.CWD,          "/alpha/.env",    "/bravo",     True,  "/bravo"),
+        (_sp.SYMLINK,      "/alpha/.env",    "/bravo/ln",  True,  "/bravo/ln"),
+        (_sp.GLOB,         "/alpha/.npmrc",  "/bravo/.*",  False, "/bravo/.*"),
+        (_sp.GLOB_SYMLINK, "/alpha/.npmrc",  "/bravo/.*",  False, "/alpha/.npmrc"),
+    ]
+    for origin, path, via, literally, names in ORIGINS:
+        sentence = _sp.match_sentence(
+            _sp.Protection(".env", path, origin, via), "cand")
+        s.check("origin %s says literal=%s" % (origin, literally),
+                "did NOT match" not in sentence, literally)
+        s.check("origin %s prints no None" % origin, "None" in sentence, False)
+        s.check_in("origin %s names what it reached through" % origin,
+                   names, sentence)
+        s.check("origin %s needle sits in exactly one field" % origin,
+                sum(1 for f in (path, via) if f and names in f),
+                0 if names == "cand" else 1)
 
     # ── KL-FILE: Read is rewritten, not refused ─────────────────────────────
     v = drive(read(os.path.join(root, ".env")))

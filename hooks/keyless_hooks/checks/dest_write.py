@@ -94,9 +94,13 @@ def run(payload, cfg):
         # one shape with genuinely no opinion to give.
         return None
 
-    pattern = is_protected(path, payload.cwd, cfg)
-    if not pattern:
+    protection = is_protected(path, payload.cwd, cfg)
+    if not protection:
         return None
+    # KL-DEST takes a destination out of a tool payload, which is a path and not
+    # a shell operand — so there is no glob for the match to have been bridged
+    # by, and no provenance clause to print. The pattern is all this check needs.
+    pattern = protection.pattern
 
     verb = _VERB.get(payload.tool, "write")
     resolved = resolve(path, payload.cwd)

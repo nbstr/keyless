@@ -9,11 +9,48 @@ secret file are copied into output, so it is written to make that impossible
 rather than unlikely.
 """
 
+import collections
 import os
 import re
 from fnmatch import fnmatch
 
-__all__ = ["is_protected", "is_allowed", "names_in", "expansions", "resolve"]
+__all__ = ["is_protected", "is_allowed", "names_in", "expansions",
+           "expansions_spanned", "resolve", "Form", "Protection",
+           "match_sentence"]
+
+# HOW a candidate string reached the filesystem path that matched a pattern.
+#
+# A refusal that prints only the candidate and the pattern cannot tell its reader
+# which of two opposite situations it is in: an operand that IS a protected path,
+# or a string that merely EXPANDED onto one. The first is a credential read and
+# re-spelling it is the wrong move; the second is a regex, a quantifier or a
+# slice that globbed onto a real file, and the command has to be rewritten. The
+# information that separates them is produced here, inside `expansions`, and was
+# discarded before the message was built.
+#
+# `via` is the intermediate string this form came through, and it is a different
+# thing per origin — the base directory for `CWD`, the pattern handed to `glob`
+# for `GLOB`, the path whose realpath this is for `SYMLINK`. `match_sentence`
+# below is the one place that reads it, so the per-origin meaning stays next to
+# the per-origin sentence.
+Form = collections.namedtuple("Form", "path origin via")
+
+LITERAL = "literal"
+HOME = "home"
+CWD = "cwd"
+SYMLINK = "symlink"
+GLOB = "glob"
+GLOB_SYMLINK = "glob-symlink"
+
+# The two origins where the candidate did not NAME the matched path. Every other
+# origin reached it by expanding a `~`, joining a working directory or following
+# a symlink — each of which a shell would have done to the same string.
+EXPANDED_ORIGINS = frozenset([GLOB, GLOB_SYMLINK])
+
+# What `is_protected` answers with. A namedtuple holding fields is always truthy,
+# so the no-match answer stays `None` and every caller's `if not protection`
+# remains the test it was before this carried provenance.
+Protection = collections.namedtuple("Protection", "pattern path origin via")
 
 # A key in an env / ini / JSON / YAML file. Bounded at 64 characters and anchored
 # whole: the bound is what stops a base64 line ending in `=` from being read as a
@@ -77,8 +114,9 @@ _NOT_A_PATH = ("==",)
 # question asked.
 
 
-def expansions(candidate, cwd, expand_globs=True):
-    """Every filesystem path a candidate string could denote.
+def expansions_spanned(candidate, cwd, expand_globs=True):
+    """Every filesystem path a candidate string could denote, each with its
+    ORIGIN — how the candidate reached it.
 
     A union rather than a single answer, because a deny must consider the path as
     requested AND the path as resolved: a checkout where most `.env` paths are
@@ -90,6 +128,10 @@ def expansions(candidate, cwd, expand_globs=True):
     rather than a path — see `checks/file_read`. Literal matching is unaffected in
     both directions, so `grep TOKEN .env` is still refused either way; only the
     filesystem expansion of a metacharacter blob is withheld.
+
+    The ORIGIN decides no verdict. It is produced alongside the same set of forms
+    this function has always produced, in the same order, and it exists so a
+    refusal can say which form matched and how — see `Form` above.
     """
     if not candidate:
         return []
@@ -104,25 +146,39 @@ def expansions(candidate, cwd, expand_globs=True):
         # answers ENOTDIR — so treating it as that file is a refusal of something
         # that was never a read.
         return []
+    # A leading `~` or `$HOME` is expanded in place, so the form below is no
+    # longer the candidate as typed and the message must not claim it is.
+    written = LITERAL
     if cand.startswith("~"):
         cand = os.path.expanduser(cand)
+        written = HOME
     elif _HOME_VAR.match(cand):
         cand = os.path.join(os.path.expanduser("~"), cand.split("/", 1)[1])
+        written = HOME
     if "$" in cand:
         # An unexpanded substitution. Keep the literal — a glob may still match a
         # protected basename inside it — but do not pretend to resolve it.
-        return [cand]
+        return [Form(cand, written, None)]
 
-    out = [cand]
+    out = [Form(cand, written, None)]
+    seen = set([cand])
     base = cwd if cwd and os.path.isabs(cwd) else os.getcwd()
     absolute = cand if os.path.isabs(cand) else os.path.normpath(os.path.join(base, cand))
-    if absolute not in out:
-        out.append(absolute)
+    if absolute not in seen:
+        seen.add(absolute)
+        # An absolute candidate only got NORMALISED here; a relative one was
+        # joined onto a working directory the hook was told about, which is a
+        # claim worth printing when it is what produced the match.
+        if os.path.isabs(cand):
+            out.append(Form(absolute, written, None))
+        else:
+            out.append(Form(absolute, CWD, base))
     try:
         if os.path.lexists(absolute):
             real = os.path.realpath(absolute)
-            if real not in out:
-                out.append(real)
+            if real not in seen:
+                seen.add(real)
+                out.append(Form(real, SYMLINK, absolute))
         elif _GLOB_CHARS.search(cand) and expand_globs:
             # `cat .e*v` never reaches the matcher as `.env`, because the shell
             # expands it and the hook sees the pattern. Expanding it here is the
@@ -130,16 +186,62 @@ def expansions(candidate, cwd, expand_globs=True):
             # matches nothing yields nothing.
             import glob as _glob
             for hit in _glob.glob(absolute)[:_MAX_GLOB]:
-                if hit not in out:
-                    out.append(hit)
+                if hit not in seen:
+                    seen.add(hit)
+                    out.append(Form(hit, GLOB, absolute))
                 real = os.path.realpath(hit)
-                if real not in out:
-                    out.append(real)
+                if real not in seen:
+                    seen.add(real)
+                    out.append(Form(real, GLOB_SYMLINK, absolute))
     except (OSError, ValueError):
         # An unresolvable path is not a protected path we can name; the literal
         # forms above still get their glob test.
         pass
     return out
+
+
+def expansions(candidate, cwd, expand_globs=True):
+    """The paths of `expansions_spanned`, in the same order, without origins.
+
+    The two must never disagree about the SET, which is why one is derived from
+    the other rather than written twice.
+    """
+    return [form.path for form in
+            expansions_spanned(candidate, cwd, expand_globs)]
+
+
+def match_sentence(protection, candidate):
+    """One sentence saying how `candidate` reached `protection.pattern`.
+
+    LITERAL or not is the distinction the sentence exists to carry, and it is
+    stated in the first clause rather than left to be inferred from the rest: an
+    operand that names a credential file and a regex fragment that globbed onto
+    one are the same refusal today, and they prescribe opposite next actions.
+    """
+    cand = (candidate or "").strip().strip("'\"")
+    # One test draws the literal / not-literal line, so a new expanded origin
+    # cannot be reported as literal by being forgotten in a branch below.
+    if protection.origin in EXPANDED_ORIGINS:
+        tail = ("a match of that expansion resolves to `%s`"
+                if protection.origin == GLOB_SYMLINK
+                else "that expansion matched `%s`") % protection.path
+        return ("`%s` did NOT match `%s` literally. It was expanded as a glob — "
+                "`%s` — and %s."
+                % (cand, protection.pattern, protection.via, tail))
+    if protection.origin == HOME:
+        return ("`%s` matched `%s` literally, once its leading home directory "
+                "was expanded: it names `%s`."
+                % (cand, protection.pattern, protection.path))
+    if protection.origin == CWD:
+        return ("`%s` matched `%s` literally, as `%s` — resolved against the "
+                "working directory `%s`."
+                % (cand, protection.pattern, protection.path, protection.via))
+    if protection.origin == SYMLINK:
+        return ("`%s` matched `%s` literally, through a symlink: `%s` resolves "
+                "to `%s`."
+                % (cand, protection.pattern, protection.via, protection.path))
+    return ("`%s` matched `%s` literally, as written."
+            % (cand, protection.pattern))
 
 
 def resolve(candidate, cwd):
@@ -226,21 +328,28 @@ def is_allowed(candidate, cwd, cfg, expand_globs=True):
 
 
 def is_protected(candidate, cwd, cfg, expand_globs=True):
-    """The pattern that protects this candidate, or None.
+    """The `Protection` covering this candidate, or None.
 
     Exclusions win. `.env.example` is matched by `.env.*` and must still be
     readable, so the allow list is tested first and cannot be shadowed by a
     broader protected glob added later.
+
+    The answer carries the matched FORM and its ORIGIN beside the pattern,
+    because a refusal that prints only the pattern cannot say whether the
+    candidate NAMED that file or merely expanded onto it. Nothing about WHICH
+    candidates are protected changed when that was added: the forms, their order
+    and the pattern order are untouched, so the pattern in the returned tuple is
+    the same string this used to return on its own.
     """
-    forms = expansions(candidate, cwd, expand_globs)
+    forms = expansions_spanned(candidate, cwd, expand_globs)
     if not forms:
         return None
     if is_allowed(candidate, cwd, cfg, expand_globs) is not None:
         return None
     for form in forms:
         for pattern in cfg.protected:
-            if _matches(form, pattern):
-                return pattern
+            if _matches(form.path, pattern):
+                return Protection(pattern, form.path, form.origin, form.via)
     return None
 
 
