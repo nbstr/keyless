@@ -226,7 +226,14 @@ _PLACEHOLDER = re.compile(
     r"%[A-Za-z0-9_]+%|\{\{[^}]*\}\}|your[\w-]*|my[\w-]*|some[\w-]*|the[\w-]*|changeme|placeholder|"
     r"redacted|example\w*|dummy|sample|insert\w*|todo|fixme|none|null|nil|true|"
     r"false|undefined|unset|abc123\w*|foobar\w*|test\w*|fake\w*|secret|password|"
-    r"password123|keyless:\w*|\[keyless:[^\]]*\])$")
+    r"password123|keyless:\w*|\[keyless:[^\]]*\]|(?-i:\[[A-Z][A-Z0-9 _-]*\]))$")
+
+# `[YOUR-PASSWORD]` above is the documentation convention for a slot the reader
+# fills in — Supabase prints every connection string that way. In a URL it is
+# not even a working value: RFC 3986 admits no raw `[` in userinfo, so a client
+# handed that string as typed cannot authenticate with it. Upper-case only,
+# because a generated password can begin with `[` and end with `]`; a bracketed
+# phrase of capitals, digits, spaces, `_` and `-` is a label.
 
 _LOOKS_LIKE_PATH = re.compile(r"^(?:\.{0,2}/|~/|[A-Za-z]:\\)")
 _KEY_CHARS = re.compile(r"[A-Za-z0-9_.-]")
@@ -307,6 +314,22 @@ _QUOTED_REF_HEADS = frozenset([
 ])
 _SEGMENT = re.compile(r"^[A-Za-z_$][A-Za-z0-9_$]*$")
 
+# A value spelled as an ENVIRONMENT-VARIABLE NAME — capitals and digits joined by
+# underscores — is the name of a credential, not one. It is what `keyless ls`
+# prints (`inject as -s AWS_SECRET_ACCESS_KEY=<STORE_NAME>.`), what a name
+# mapping is (`NEXUS_API_KEY=NEXUS_STAGING_API_KEY`), and what a workflow's
+# secret wiring holds (`client_secret_secret: GOOGLE_CLIENT_SECRET`). Each was
+# reported as a credential in a transcript, and none carries a value.
+#
+# At least one underscore, because the shape that is ALL capitals and digits with
+# none is base32 — a TOTP seed — and that is a credential. No vendor format and
+# no generator in common use emits upper-case words joined by `_`; the residual
+# is a hand-made password spelled like an identifier, and a hand-made password
+# spelled like an identifier is the `_is_reference` residual class already.
+# A single trailing `.` is the end of the sentence the name was printed in: the
+# value class admits `.`, so `-s X=NAME.` captured it.
+_ENV_NAME = re.compile(r"^[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+\.?$")
+
 # Characters that end an EXPRESSION and cannot end a bare value in any data
 # grammar. `.env`, a shell assignment, YAML, an INI and an HTTP header all run a
 # bare value to whitespace or to end of line; none of them puts a `(`, a `,` or a
@@ -360,10 +383,12 @@ def _is_reference(text, start, end):
 
     What this does NOT separate is the residual class, and naming it is worth
     more than a claim of completeness: a bare identifier that ends on whitespace
-    or on end of line. `password`: `E2E_LOGIN_PASSWORD` and `PGPASSWORD`=<a real
+    or on end of line. `password`: `e2eLoginPassword` and `PGPASSWORD`=<a real
     literal> are the same three tokens in the same order, and only the value's
     own randomness tells them apart, and that class is a large minority of the
-    name-keyed findings that still survive this test.
+    name-keyed findings that still survive this test. The one identifier
+    spelling that IS separated is an environment-variable name — see
+    `_ENV_NAME`.
 
     Three discriminators reach it and none is here, each for a measured reason:
     an ENTROPY floor, which no pattern in this module tests and which moves with
@@ -383,6 +408,8 @@ def _is_reference(text, start, end):
         # whose userinfo password is a back-quoted substitution. That row is the
         # ONE proof that KL-ASSIGN's expansion-blanking is load-bearing rather
         # than decorative, and clearing it here would make the proof vacuous.
+        return True
+    if _ENV_NAME.match(value):
         return True
     quoted = start > 0 and text[start - 1] in "\"'`"
     if not quoted and (text[end] if end < len(text) else "") in _CODE_END:

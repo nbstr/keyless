@@ -1076,5 +1076,68 @@
   "file": "keyless_hooks/kubectl.py",
   "find": "    rest = [o for i, o in enumerate(objects) if i not in secret]\n    return \" \".join([verb, SECRET] + rest), unknown, True",
   "replace": "    rest = [SECRET if i in secret else o for i, o in enumerate(objects)]\n    return \" \".join([verb] + rest), unknown, True"
+ },
+ {
+  "id": "MA1-quoted-glob-expanded-again",
+  "why": "KL-FILE: a word the shell never globs is expanded against the cwd again, which refused a quoted PromQL `.*` as a read of `.npmrc`.",
+  "file": "keyless_hooks/checks/file_read.py",
+  "find": "            globbed = keeps_glob(word, (own_head, head))\n",
+  "replace": "            globbed = True\n"
+ },
+ {
+  "id": "MA2-self-globbing-list-ignored",
+  "why": "KL-FILE: a program that globs its own argument loses the expansion, so `find -name '.e*' -exec cat` passes.",
+  "file": "keyless_hooks/shellglob.py",
+  "find": "    return any(h in SELF_GLOBBING for h in heads if h)\n",
+  "replace": "    return False\n"
+ },
+ {
+  "id": "MA3-local-shell-code-not-rescanned",
+  "why": "KL-FILE: a local shell's `-c`/`eval` code is no longer scanned as its own command, so `bash -c 'cat .e*'` passes.",
+  "file": "keyless_hooks/checks/file_read.py",
+  "find": "                 for payload_text in local_shell_payloads(base))\n",
+  "replace": "                 for payload_text in [])\n"
+ },
+ {
+  "id": "MB1-raw-query-string-judged",
+  "why": "KL-VAULT: the whole `--raw` URL is judged again, so a substitution in the query string of a service-proxy path reads as a Secret.",
+  "file": "keyless_hooks/kubectl.py",
+  "find": "        lit = _literal(_raw_path(raw))\n",
+  "replace": "        lit = _literal(raw)\n"
+ },
+ {
+  "id": "MB2-raw-path-emptied",
+  "why": "KL-VAULT: the path cut returns nothing, so a raw read naming /secrets passes.",
+  "file": "keyless_hooks/kubectl.py",
+  "find": "    return raw if cut < 0 else raw[:cut]\n",
+  "replace": "    return \"\"\n"
+ },
+ {
+  "id": "MC1-env-name-is-a-value",
+  "why": "KL-SEEN: a value spelled as a variable NAME is reported as a credential again \u2014 keyless ls output and name mappings.",
+  "file": "keyless_hooks/fingerprint.py",
+  "find": "    if _ENV_NAME.match(value):\n        return True\n",
+  "replace": ""
+ },
+ {
+  "id": "MC2-env-name-shape-widened",
+  "why": "KL-SEEN: the name shape no longer needs capitals and an underscore, so a literal behind API_KEY and a base32 seed pass.",
+  "file": "keyless_hooks/fingerprint.py",
+  "find": "_ENV_NAME = re.compile(r\"^[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+\\.?$\")",
+  "replace": "_ENV_NAME = re.compile(r\"(?i)^[A-Z][A-Z0-9_]*\\.?$\")"
+ },
+ {
+  "id": "MC3-doc-placeholder-reported",
+  "why": "KL-SEEN: the bracketed documentation placeholder in a URL password slot is reported as a password again.",
+  "file": "keyless_hooks/fingerprint.py",
+  "find": "|(?-i:\\[[A-Z][A-Z0-9 _-]*\\]))$\")",
+  "replace": ")$\")"
+ },
+ {
+  "id": "MC4-doc-placeholder-case-folded",
+  "why": "KL-SEEN: the placeholder rule inherits the pattern's case-folding, so a real bracketed password passes.",
+  "file": "keyless_hooks/fingerprint.py",
+  "find": "|(?-i:\\[[A-Z][A-Z0-9 _-]*\\]))$\")",
+  "replace": "|\\[[A-Z][A-Z0-9 _-]*\\])$\")"
  }
 ]

@@ -35,7 +35,7 @@ nothing but an AWS key is spelled `AKIA` plus sixteen upper alphanumerics. A
 positional match is proof from the grammar AROUND the value — URL userinfo, an
 `Authorization: Bearer` argument — which no identifier can fake. The name-keyed
 rule is the one `fingerprint` documents as unable to separate a literal from an
-identifier that merely looks opaque — `password`: `E2E_LOGIN_PASSWORD` — so
+identifier that merely looks opaque — `password`: `e2eLoginPassword` — so
 refusing on it would refuse ordinary source edits, and rewriting on it corrupts
 them. Telling the author is the only act that is right whichever it was.
 

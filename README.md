@@ -1861,7 +1861,7 @@ is proved a credential by its own SHAPE, or by the grammar around it, and the
 destination's reader resolves the reference. A value flagged only because the
 identifier beside it reads like a credential is REPORTED and never edited, in
 any destination: that rule cannot tell `PGPASSWORD=<a literal>` from
-`password`: `E2E_LOGIN_PASSWORD`, and a file edited on evidence that weak is
+`password`: `e2eLoginPassword`, and a file edited on evidence that weak is
 handed back broken and called repaired.
 
 Same two rules as the binary. Every hook fails open — a crash, a timeout, an

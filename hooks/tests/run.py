@@ -15,6 +15,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import harness  # noqa: E402
+import test_act_not_word  # noqa: E402
 import test_adversarial  # noqa: E402
 import test_contract  # noqa: E402
 import test_daemon_advice  # noqa: E402
@@ -31,6 +32,7 @@ import test_switch  # noqa: E402
 # The floor each layer must clear. Deliberately well under the current counts —
 # this catches a layer that collapsed to nothing, not a layer that lost one case.
 MIN_CHECKS = {
+    "test_act_not_word": 40,
     "test_contract": 120,
     "test_false_positive": 120,
     "test_failopen": 60,
@@ -51,7 +53,7 @@ def main():
     layers = [test_contract, test_false_positive, test_failopen,
               test_adversarial, test_shell_grammar, test_daemon_advice,
               test_install, test_publication, test_switch,
-              test_no_value_reaches_a_transcript,
+              test_no_value_reaches_a_transcript, test_act_not_word,
               test_latency.CONTROLS]
     if not fast:
         layers.append(test_latency)

@@ -25,10 +25,11 @@ import time
 from .. import served as served_mod
 from ..secretpaths import is_protected, match_sentence, names_in, resolve
 from ..pattern_token import is_unmistakable_regex, pattern_token_start
+from ..shellglob import keeps_glob, local_shell_payloads
 from ..shellview import (delegated_head, expand_local_assignments,
                          file_operands_spanned, flatten_substitutions,
                          head_of, statements, strip_heredocs,
-                         substitution_payloads)
+                         substitution_payloads, words)
 
 CHECK = "KL-FILE"
 _RENDER_TTL = 6 * 3600
@@ -326,6 +327,8 @@ def _bash_deny(payload, cfg):
     ]
     views.extend(("the body of a `$( … )` command substitution", payload_text)
                  for payload_text in substitution_payloads(base))
+    views.extend(("the code handed to a shell (`-c` or `eval`)", payload_text)
+                 for payload_text in local_shell_payloads(base))
     seen = set()
     for label, text in views:
         if text in seen:
@@ -340,6 +343,7 @@ def _bash_deny(payload, cfg):
 def _scan_statements(text, payload, cfg, view=None):
     for stmt in statements(text):
         head = head_of(stmt)
+        own_head = head
         if head and head in cfg.non_readers:
             # A command that cannot put a file's content on stdout. This is the
             # closed side of the allowlist: small, enumerable, and it fails
@@ -387,16 +391,22 @@ def _scan_statements(text, payload, cfg, view=None):
         # of that shape opens a file whose NAME holds a backslash, which is not
         # the protected file the fragment spells.
         regex_only = is_unmistakable_regex(stmt, pattern_start)
-        # Nothing inside an interpreter's code is glob-expanded, because no shell
-        # ever expanded it — `python3 -c "re.findall('.*', s)"` hands the
-        # interpreter that string verbatim. The code arrives as a FLAG value, not
-        # a positional, so the rule above cannot reach it.
+        # Nothing inside an interpreter's code is glob-expanded HERE, because no
+        # shell expanded it at this level — `python3 -c "re.findall('.*', s)"`
+        # hands the interpreter that string verbatim. The code arrives as a FLAG
+        # value, not a positional, so the rule above cannot reach it.
         #
-        # The shell case keeps its expansion by another road: `bash -c "cat .e*v"`
-        # is re-scanned as its own command, where the head is `cat` and this test
-        # is false. Only python/node/ruby payloads lose it, and a glob-shaped
-        # string in those is a regex, not a path.
+        # A local shell's code is globbed by THAT shell, so it is scanned again as
+        # a command of its own — the view built from `local_shell_payloads` above
+        # — where `cat .e*` is an unquoted glob and `./pq.sh '.*'` is not.
         in_code = head in cfg.interpreters
+        # A glob the SHELL leaves alone is a literal string to the program,
+        # unless the program globs its own arguments — `shellglob` carries the
+        # rule and its ceiling. `./pq.sh '{path=~".*webhook.*"}'` hands the
+        # script a PromQL matcher; expanding its `.*` against the cwd matched
+        # `.npmrc` and refused a query as a credential read.
+        body = strip_heredocs(stmt)
+        word_of = dict(words(body))
         for cand, tok_start in file_operands_spanned(stmt, head, cfg.interpreters):
             # For an ordinary pattern token ONLY the glob expansion is withheld,
             # never the literal match, and that asymmetry is the safety property
@@ -418,8 +428,11 @@ def _scan_statements(text, payload, cfg, view=None):
             from_pattern = pattern_start >= 0 and tok_start == pattern_start
             if from_pattern and regex_only:
                 continue
+            word = body[tok_start:word_of[tok_start]] if tok_start in word_of else ""
+            globbed = keeps_glob(word, (own_head, head))
             protection = is_protected(cand, payload.cwd, cfg,
-                                      expand_globs=(not in_code and not from_pattern))
+                                      expand_globs=(not in_code and not from_pattern
+                                                    and globbed))
             if not protection:
                 continue
             pattern = protection.pattern

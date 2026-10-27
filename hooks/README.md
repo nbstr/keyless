@@ -107,7 +107,7 @@ Evidence comes in three kinds, and only two of them license an edit:
 
 The name-keyed row is the one worth defending, and it is why the two questions
 are kept apart. That rule cannot separate a literal from an identifier that
-merely looks opaque — `password`: `E2E_LOGIN_PASSWORD` — so refusing would
+merely looks opaque — `password`: `e2eLoginPassword` — so refusing would
 refuse ordinary source edits and substituting corrupts them. Reporting it is the
 only act that is right whichever of the two it was.
 
@@ -662,13 +662,14 @@ Measured on Claude Code 2.1.223, not inferred:
   written behind a credential-shaped identifier — `PGPASSWORD=<a literal>` — now
   reaches disk with a warning instead of being substituted away. It is given up
   knowingly. The same rule cannot separate that from `password`:
-  `E2E_LOGIN_PASSWORD`, and the three discriminators that reach the ambiguity —
+  `e2eLoginPassword`, and the three discriminators that reach the ambiguity —
   an entropy floor, a `:` versus `=` separator, "the same word appears elsewhere
   in this file" — were each measured dropping a real credential. An edit made on
   evidence that cannot support it is the larger failure: it corrupted a shell
   script and a document before the split existed, and announced both as repairs.
-  A member path, a call, an expression ending on `(`, `,` or `)`, and a run-time
-  `$( … )` are withheld before that point, each with a false-positive row
+  A member path, a call, an expression ending on `(`, `,` or `)`, a value spelled
+  as an environment-variable NAME (`AWS_SECRET_ACCESS_KEY=STORE_KEY_NAME`), and a
+  run-time `$( … )` are withheld before that point, each with a false-positive row
   driving it in `tests/test_false_positive.py`.
 
   The marker is at the head of `checks/literal_write.py` with its ceiling — only
