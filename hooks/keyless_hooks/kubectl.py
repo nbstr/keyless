@@ -26,7 +26,8 @@ so `Secret`, `SECRETS` and `secrets.v1.` all resolve to the core Secret.
 
 `kubectl get --raw <path>` speaks to the API server by URL and returns the object
 as JSON, `.data` included. A raw path naming `/secrets` — or one that is not a
-literal — is read as a Secret read for the same reason.
+literal — is read as a Secret read for the same reason. The PATH is the part
+before the query string; see `_raw_path`.
 
 `describe` is deliberately absent: it prints each key's SIZE and never its value.
 `get all` is literal and never includes Secrets — the `all` category does not
@@ -94,6 +95,25 @@ def _literal(tok):
         # `{}` is the operand `xargs -I{}` and `find -exec` substitute.
         return None
     return tok.replace('"', "").replace("'", "").replace("\\", "")
+
+
+def _raw_path(raw):
+    """The PATH of a `--raw` URL: everything before its first literal `?`.
+
+    The API server routes on the path alone, so the path is what decides whether
+    the call reads a Secret. The query string is parameters to whatever the path
+    named — a label selector, or the PromQL a service proxy forwards — and no
+    value it holds can turn `services/prometheus-server:80/proxy` into
+    `secrets`. Judging the whole URL refused `kubectl get --raw
+    "…/proxy/api/v1/query?query=${q}"` as an unprovable Secret read, while the
+    same call from a script file passed.
+
+    A substitution BEFORE the `?` stays in the path and keeps it unprovable:
+    `${NS}` may hold `default/secrets/db?`, and `${R:?}` puts its own `?` after
+    the `$`, so the cut still leaves the `$` on the path side.
+    """
+    cut = raw.find("?")
+    return raw if cut < 0 else raw[:cut]
 
 
 def _type_is_secret(part):
@@ -210,7 +230,7 @@ def _path(args, eats=frozenset()):
         verb, objects = "apply view-last-applied", objects[1:]
 
     if raw is not None:
-        lit = _literal(raw)
+        lit = _literal(_raw_path(raw))
         if lit is None or "/secrets" in lit.lower():
             return "get " + SECRET, unknown, True
 

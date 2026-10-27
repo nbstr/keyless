@@ -699,6 +699,8 @@ WRITE_REFERENCE_FALSE_POSITIVES = [
      + "false });\n"),
     ("runtime fetch written into a file",
      "AUTH_TOKEN" + _REF_EQ + '"' + "$(cat ~/.token)" + '"' + "\n"),
+    ("environment-variable name at end of line",
+     "await login({\n  password" + _REF_CO + "E2E_LOGIN_PASSWORD\n});\n"),
 ]
 
 # ── the assignment NAME, and why the collapse is positional ─────────────────
@@ -736,7 +738,7 @@ ASSIGN_NAME_COLLAPSE = [
 # than a side effect.
 WRITE_REFERENCE_RESIDUAL = (
     "unqualified identifier at end of line",
-    "await login({\n  password" + _REF_CO + "E2E_LOGIN_PASSWORD\n});\n")
+    "await login({\n  password" + _REF_CO + "e2eLoginPassword\n});\n")
 
 # ── the file types this check REWRITES, where a wrong match corrupts ────────
 #
