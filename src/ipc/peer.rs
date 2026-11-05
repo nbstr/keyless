@@ -343,18 +343,38 @@ pub mod live {
     /// the file's own contents would be a second implementation that could disagree
     /// with the kernel's.
     pub fn code_hash_of_file(path: &Path) -> io::Result<[u8; CDHASH_LEN]> {
-        let output = std::process::Command::new("/usr/bin/codesign")
-            .arg("-d")
-            .arg("--verbose=4")
-            .arg(path)
-            .output()?;
+        if let Some(slice) = SLICE_THE_KERNEL_RUNS
+            && let Some(hash) = reported_cd_hash(path, Some(slice))?
+        {
+            return Ok(hash);
+        }
+        reported_cd_hash(path, None)?.ok_or_else(|| {
+            io::Error::other(format!(
+                "codesign did not report a CDHash for {}; the file may be unsigned",
+                path.display()
+            ))
+        })
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    const SLICE_THE_KERNEL_RUNS: Option<&str> = Some("arm64e");
+    #[cfg(not(target_arch = "aarch64"))]
+    const SLICE_THE_KERNEL_RUNS: Option<&str> = None;
+
+    fn reported_cd_hash(path: &Path, slice: Option<&str>) -> io::Result<Option<[u8; CDHASH_LEN]>> {
+        let mut command = std::process::Command::new("/usr/bin/codesign");
+        command.arg("-d").arg("--verbose=4");
+        if let Some(slice) = slice {
+            command.arg("--arch").arg(slice);
+        }
+        let output = command.arg(path).output()?;
         // `codesign -d` writes its report to stderr.
         let report = String::from_utf8_lossy(&output.stderr);
         for line in report.lines() {
             if let Some(rest) = line.strip_prefix("CDHash=") {
                 let hex = rest.trim();
                 if let Some(bytes) = decode_hex(hex) {
-                    return Ok(bytes);
+                    return Ok(Some(bytes));
                 }
                 return Err(io::Error::other(format!(
                     "codesign reported a CDHash of {} characters, not {}",
@@ -363,10 +383,7 @@ pub mod live {
                 )));
             }
         }
-        Err(io::Error::other(format!(
-            "codesign did not report a CDHash for {}; the file may be unsigned",
-            path.display()
-        )))
+        Ok(None)
     }
 
     #[cfg(test)]
