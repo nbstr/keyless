@@ -207,20 +207,28 @@ fn doctor_reports_a_healthy_setup_and_leaks_nothing() {
 fn doctor_reports_a_broken_store_without_blocking_anything() {
     let dir = scratch("e2e-doctor-broken");
     let config = config_with_stub(&dir, &Stub::Dead);
-    let output = keyless(&[
-        "--config",
-        &config.display().to_string(),
-        "--audit",
-        &dir.join("audit.jsonl").display().to_string(),
-        "doctor",
-    ]);
+    let output = keyless_env(
+        &[("KEYLESS_ASCII", "1")],
+        &[
+            "--config",
+            &config.display().to_string(),
+            "--audit",
+            &dir.join("audit.jsonl").display().to_string(),
+            "doctor",
+        ],
+    );
     assert_eq!(output.status.code(), Some(1));
     let report = stdout_of(&output);
     assert!(report.contains("problem(s)"), "{report}");
     assert!(!report.contains("\n0 problem(s)"), "{report}");
     // The row that failed must say what to do about it. A diagnosis with no
     // next action is the shape this report used to have.
-    assert!(report.contains("→"), "{report}");
+    assert!(
+        report
+            .lines()
+            .any(|line| line.trim_start().starts_with("-> ")),
+        "{report}"
+    );
 }
 
 // ---------------------------------------------------------------------------

@@ -77,10 +77,9 @@ RUN set -eux; \
     echo "container user ${user}:${group} (${UID}:${GID})" 
 
 # A UTF-8 locale, because the product READS one. `Style::decide` picks its
-# arrow from LC_ALL/LC_CTYPE/LANG, and a bare Debian sets none of them -- so the
-# report renders `->` where `tests/cli.rs` asserts `\u{2192}`, and one end-to-end
-# case fails for a reason that is about the image rather than the code. GitHub's
-# ubuntu runners set C.UTF-8; this matches them, which is the point.
+# glyphs from LC_ALL/LC_CTYPE/LANG, and a bare Debian sets none of them. GitHub's
+# ubuntu runners set C.UTF-8; this matches them, so the image renders what a
+# runner renders.
 ENV LANG=C.UTF-8 \
     LC_ALL=C.UTF-8 \
     CARGO_HOME=/cargo \
