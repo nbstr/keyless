@@ -2,7 +2,10 @@ mod cli_support;
 mod support;
 
 use cli_support::{config_with_stub, keyless, line_for, stderr_of, stdout_of};
-use support::{Backend, DECOY_VALUE, INFISICAL_DECOY, Stub, scratch, stub_infisical};
+use support::backend::Backend;
+use support::infisical::stub_infisical;
+use support::keychain::Stub;
+use support::{DECOY_VALUE, INFISICAL_DECOY, scratch};
 
 // ---------------------------------------------------------------------------
 // The happy path, end to end.
@@ -129,13 +132,13 @@ fn the_exit_code_is_forwarded() {
 }
 
 // ---------------------------------------------------------------------------
-// Degrading, end to end.
+// Degrading and refusing, end to end.
 // ---------------------------------------------------------------------------
 
 #[test]
-fn a_missing_name_degrades_and_still_runs_the_command() {
+fn a_store_that_errors_degrades_and_still_runs_the_command() {
     let dir = scratch("e2e-degraded");
-    let config = config_with_stub(&dir, &Stub::NotFound);
+    let config = config_with_stub(&dir, &Stub::Errors);
 
     let output = keyless(&[
         "--config",
@@ -160,6 +163,33 @@ fn a_missing_name_degrades_and_still_runs_the_command() {
     );
     assert!(
         stderr_of(&output).contains("keyless: DEGRADED — 2 names unresolved: DECOY, OTHER"),
+        "stderr was: {}",
+        stderr_of(&output)
+    );
+}
+
+#[test]
+fn a_name_the_store_does_not_hold_is_refused_and_the_command_never_runs() {
+    let dir = scratch("e2e-refused");
+    let config = config_with_stub(&dir, &Stub::NotFound);
+
+    let output = keyless(&[
+        "--config",
+        &config.display().to_string(),
+        "--no-audit",
+        "run",
+        "-s",
+        "DECOY",
+        "--",
+        "/bin/sh",
+        "-c",
+        "printf ran; exit 21",
+    ]);
+
+    assert_eq!(output.status.code(), Some(64), "{}", stderr_of(&output));
+    assert_eq!(stdout_of(&output), "", "the command ran");
+    assert!(
+        stderr_of(&output).contains("keyless: REFUSED"),
         "stderr was: {}",
         stderr_of(&output)
     );
@@ -195,10 +225,10 @@ fn a_name_the_config_never_declared_says_so_and_a_declared_one_does_not() {
         "exit 7",
     ]);
 
-    assert_eq!(output.status.code(), Some(7), "the command must still run");
+    assert_eq!(output.status.code(), Some(64), "both names are refused");
     let stderr = stderr_of(&output);
 
-    let undeclared = line_for(&stderr, "NOT_DECLARED_ANYWHERE");
+    let undeclared = line_for(&stderr, "`NOT_DECLARED_ANYWHERE`");
     assert!(
         undeclared.contains("not declared in your config"),
         "the undeclared name did not name the file that is missing the line: {stderr}"
@@ -212,9 +242,9 @@ fn a_name_the_config_never_declared_says_so_and_a_declared_one_does_not() {
     // declared must keep pointing at the store. If both lines start naming the
     // config, one conflation has been traded for another and every reader is
     // sent to the wrong file instead of the wrong store.
-    let declared = line_for(&stderr, "DECOY");
+    let declared = line_for(&stderr, "`DECOY`");
     assert_eq!(
-        declared, "keyless:   DECOY: not found in any store",
+        declared, "keyless:   `DECOY`: not found in any store",
         "the declared-and-absent message changed: {stderr}"
     );
 }
@@ -311,7 +341,7 @@ fn the_audit_row_records_the_name_and_masks_a_value_typed_on_the_command_line() 
 #[test]
 fn a_degraded_run_records_which_names_were_missing() {
     let dir = scratch("e2e-audit-degraded");
-    let config = config_with_stub(&dir, &Stub::NotFound);
+    let config = config_with_stub(&dir, &Stub::Errors);
     let audit = dir.join("audit.jsonl");
 
     let _ = keyless(&[

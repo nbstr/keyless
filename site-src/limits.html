@@ -1,0 +1,69 @@
+<section class="band" id="limits">
+  <div class="col">
+    <div class="rule reveal">
+      <div class="eyebrow"><span class="dash"></span><span class="eyebrow-txt">what it does not catch</span></div>
+      <div class="head">
+        <h2>A filter,<br>not a control.</h2>
+        <p class="deck">Three tokens defeat it: <code>sh -c 'echo $TOKEN &gt; /tmp/x'</code>. By design.
+          The threat model is a capable agent taking a shortcut, not an adversary.</p>
+      </div>
+    </div>
+
+    <div class="slab reveal">
+      <div class="grid g2">
+        <div class="pad">
+          <h3>Output masking, driven at the real binary</h3>
+          <p class="deck-s gap-s">keyless filters what comes back out through the pipe. Six shapes were
+            driven at it, and these verdicts are what was observed rather than what was hoped.</p>
+          <ul class="rows gap-m">
+            <li><span class="k">the raw value, echoed</span><span class="lbl g">masked</span></li>
+            <li><span class="k">contiguous hex</span><span class="lbl g">masked</span></li>
+            <li><span class="k">one byte per write — <code>fold -w1</code></span><span class="lbl g">masked</span></li>
+            <li><span class="k">gzip</span><span class="lbl">not caught</span></li>
+            <li><span class="k"><code>xxd -p</code> wrapped at 60 columns</span><span class="lbl">not caught</span></li>
+            <li><span class="k">HTTP Basic — user and secret base64'd together</span><span class="lbl">length-dependent</span></li>
+          </ul>
+        </div>
+        <div class="pad">
+          <ul class="notes">
+            <li><b>The child gets the real value.</b> It can write it to a file, POST it anywhere, or
+              print it. Masking filters the pipe; it does not constrain the process.</li>
+            <li><b>Nothing here survives <code>sudo</code>.</b> If you are an admin on your own machine,
+              this is a boundary against your sessions — not against you.</li>
+            <li><b>One part is a control, not a habit.</b> The daemon's store is owned by a uid you are
+              not, at mode <code>0600</code>. The install asks for <code>sudo</code> exactly once, to
+              create that user, and nothing afterwards does.</li>
+            <li><b>macOS only for the daemon.</b> CI runs the Linux link and <em>requires it to fail</em>,
+              on four named XNU symbols. Linux is unshipped because it is untested, and the build says so
+              out loud.</li>
+          </ul>
+        </div>
+      </div>
+    </div>
+
+    <div class="slab reveal slab-gap">
+      <div class="grid g2">
+        <div class="pad stat">
+          <div class="n"><span class="v">4</span></div>
+          <p class="deck-s l">attacks get past the hook pack that rides alongside — each one named in
+            the repository, and pinned by a suite that fails in both directions.</p>
+        </div>
+        <div class="pad">
+          <div class="lbl">the number that is not here</div>
+          <p class="deck-s gap-s"><b>There is no "leaks prevented" counter on this page, and there never
+            will be.</b> A security product's success is a non-event. keyless cannot show you the leak
+            that did not happen, and a number nobody can audit is exactly the wrong thing to put on a page
+            like this one.</p>
+        </div>
+      </div>
+    </div>
+
+    <p class="caveat reveal">
+      Every verdict above was driven at the real binary, not read from a document.
+      &nbsp;&middot;&nbsp; <b>Three of five masking limits carry a test.</b> The other two do not, and
+      this page will not claim otherwise.
+    </p>
+  </div>
+</section>
+
+<!-- ============================================================= INSTALL -->

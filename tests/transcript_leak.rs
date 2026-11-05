@@ -24,7 +24,8 @@ mod support;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
-use support::{DECOY_VALUE, Stub, install_executable, keychain_stub_config, scratch};
+use support::keychain::{Stub, keychain_stub_config};
+use support::{DECOY_VALUE, install_executable, scratch};
 
 const BIN: &str = env!("CARGO_BIN_EXE_keyless");
 

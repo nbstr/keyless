@@ -38,7 +38,10 @@ use keyless::cmd::run::{Binding, RunRequest, TtyPolicy, run};
 use keyless::config::Config;
 use keyless::store::{self, Invocation, Registry};
 
-use support::{Backend, scratch, stub_infisical, witness_env, witnessed_env};
+use support::backend::Backend;
+use support::child_witness::{witness_env, witnessed_env};
+use support::infisical::stub_infisical;
+use support::scratch;
 
 /// The value the stub backend answers with. Obviously not a credential, and
 /// distinctive enough that a leak into stderr is unmistakable.

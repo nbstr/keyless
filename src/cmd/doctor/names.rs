@@ -175,6 +175,12 @@ pub(super) fn report_names(
                     .join("; "),
                 Some("the store answered and refused this name".to_owned()),
             ),
+            refused @ Resolution::Refused { .. } => (
+                Mark::Broken,
+                "broken",
+                refused.reason(),
+                Some("a run naming it is refused, and its command never starts".to_owned()),
+            ),
             // Nothing was asked, so nothing is known about whether the name
             // exists. Saying `absent` here would send the reader to the vault
             // instead of to the one line of config that fixes it.

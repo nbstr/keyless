@@ -1,0 +1,65 @@
+<section class="band" id="degraded">
+  <div class="col">
+    <div class="rule reveal">
+      <div class="eyebrow"><span class="dash"></span><span class="eyebrow-txt">the sharp edge</span></div>
+      <div class="head">
+        <h2>A green run<br>can be a lie.</h2>
+        <p class="deck">This is the one thing that will bite you, so it gets a section rather than a
+          footnote. Read the banner, not the exit code.</p>
+      </div>
+    </div>
+
+    <div class="slab reveal">
+      <div class="grid g2">
+        <div class="pad">
+          <div class="scroll-x">
+<pre><span class="c">$</span> <span class="k">keyless run -s TYPOED_NAME -- deploy</span>
+<span class="r">REFUSED</span><span class="o">: no store holds TYPOED_NAME. The command was not run.</span>
+<span class="c">$</span> <span class="k">echo $?</span>
+<span class="o">64</span>
+
+<span class="c">$</span> <span class="k">keyless run -s DEPLOY_TOKEN -- deploy</span>   <span class="c"># its store is silent</span>
+<span class="v">DEGRADED</span><span class="o">: DEPLOY_TOKEN did not resolve.</span>
+<span class="o">Running the command anyway, with an untouched environment.</span>
+
+<span class="o">deploy: 401 Unauthorized</span>
+<span class="c">$</span> <span class="k">echo $?</span>
+<span class="o">0</span>   <span class="c">← the exit code cannot tell you</span></pre>
+          </div>
+        </div>
+        <div class="pad">
+          <h3>keyless never blocks on a failure.</h3>
+          <p class="deck-s gap-m">It refuses only a name its store does not hold, an empty name, or a
+            caller that fails attestation: exit 64, and the command never runs. A store in silence or a
+            daemon that cannot answer warns on stderr, runs the child with an untouched environment, and
+            forwards the child's exit code. <b>So a missing credential is a 401 at exit 0.</b></p>
+          <p class="deck-s gap-m">Nothing in the exit status separates a working secret from one its
+            store could not serve. Only the <span class="v">DEGRADED</span> banner does — which is why it
+            is a banner and not a debug line.</p>
+          <div class="hr"></div>
+          <p class="micro">a trade, stated out loud: a store&rsquo;s failure will not be the reason your pipeline stops</p>
+        </div>
+      </div>
+    </div>
+
+    <div class="slab reveal slab-gap">
+      <div class="grid g1">
+        <div class="pad">
+          <div class="lbl">and one rule of syntax, because it catches everyone once</div>
+          <div class="scroll-x gap-m">
+<pre><span class="r">✗</span> <span class="k">keyless run -s TOKEN -- curl -H "$TOKEN" …</span>        <span class="c"># your shell expands it FIRST → arrives empty</span>
+<span class="r">✗</span> <span class="k">keyless run -s TOKEN -- curl -H '$TOKEN' …</span>        <span class="c"># keyless expands nothing → arrives literal</span>
+<span class="g">✓</span> <span class="k">keyless run -s TOKEN -- sh -c 'curl -H "$TOKEN" …'</span>  <span class="c"># only the INNER shell expands</span></pre>
+          </div>
+          <p class="micro gap-l">
+            both wrong spellings inject correctly and still send nothing useful &mdash; neither fault is
+            visible to the broker, because by the time it runs the argument is already empty or already
+            literal
+          </p>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- =========================================================== THE LIMITS -->

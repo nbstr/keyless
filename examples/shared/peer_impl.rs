@@ -225,6 +225,7 @@ fn report(tag: &str, outcome: Result<Reply, String>) {
         }
         Ok(Reply::Absent) => format!("{tag} status=absent"),
         Ok(Reply::Denied(reason)) => format!("{tag} status=denied reason={reason}"),
+        Ok(Reply::Refused(reason)) => format!("{tag} status=refused reason={reason}"),
         Ok(Reply::Failed(reason)) => format!("{tag} status=failed reason={reason}"),
         Ok(Reply::Info { .. }) => format!("{tag} status=info"),
         // Neither path here yields one: `Client` waits heartbeats out, and

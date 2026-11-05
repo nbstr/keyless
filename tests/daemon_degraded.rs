@@ -17,6 +17,10 @@
 //! Plus a fourth that matters as much: nothing the daemon does may cause a
 //! value to appear anyway. A degraded run has no local fallback to reach for,
 //! by construction — see `store::build`.
+//!
+//! Two cases mark the boundary: a daemon that refuses the caller, and one
+//! whose store answers that it does not hold the name, have not failed, so
+//! those runs are refused, not degraded.
 
 mod support;
 
@@ -41,7 +45,9 @@ use keyless::cmd::run::{Binding, RunRequest, TtyPolicy, run};
 use keyless::store;
 use keyless::store::Invocation;
 
-use support::{DECOY_VALUE, client_config, scratch, short_socket_path, witness, witnessed};
+use support::child_witness::{witness, witnessed};
+use support::client::client_config;
+use support::{DECOY_VALUE, scratch, short_socket_path};
 
 /// How long a client waits before giving up on a wedged daemon. Short, so the
 /// timeout tests do not dominate the suite.
@@ -334,16 +340,25 @@ fn a_daemon_claiming_success_with_no_value_degrades() {
 
 #[cfg(any(target_os = "macos", keyless_force_xnu))]
 #[test]
-fn a_daemon_that_refuses_the_caller_degrades() {
-    // A refused attestation must look exactly like every other failure from
-    // `run`'s point of view: warn, and run the command anyway.
+fn a_daemon_that_refuses_the_caller_refuses_the_run_and_never_starts_the_child() {
+    // The one daemon answer that is not a failure: it answered, and the answer
+    // is that this caller may not have the value. Running the command anyway
+    // would pass that verdict off as an outage.
     let dir = scratch("daemon-denied");
-    let config = support::daemon_config(&dir);
-    support::write_secrets(&config.stores.file.path, &[("DECOY", DECOY_VALUE)]);
-    let running = support::start_daemon(&config, support::policy_allowing_nobody());
+    let config = support::daemon::daemon_config(&dir);
+    support::client::write_secrets(&config.stores.file.path, &[("DECOY", DECOY_VALUE)]);
+    let running = support::daemon::start_daemon(&config, support::daemon::policy_allowing_nobody());
 
     let marker = dir.join("marker");
-    assert_degraded_but_ran("denied", running.socket(), &marker);
+    let (outcome, notes) = run_against(running.socket(), &marker, 7);
+
+    assert!(!marker.exists(), "the child started: {notes}");
+    assert_eq!(outcome.state, State::Refused, "{notes}");
+    assert_eq!(outcome.exit_code, 64, "{notes}");
+    assert!(
+        notes.contains("REFUSED"),
+        "the caller was not told; stderr was `{notes}`"
+    );
 
     drop(running);
     let _ = std::fs::remove_dir_all(&dir);
@@ -353,10 +368,10 @@ fn a_daemon_that_refuses_the_caller_degrades() {
 #[test]
 fn a_daemon_whose_store_is_broken_degrades() {
     let dir = scratch("daemon-brokenstore");
-    let config = support::daemon_config(&dir);
+    let config = support::daemon::daemon_config(&dir);
     // The store file is never created, so the daemon is healthy and its
     // backend is not.
-    let running = support::start_daemon(&config, support::policy_allowing_self());
+    let running = support::daemon::start_daemon(&config, support::daemon::policy_allowing_self());
 
     let marker = dir.join("marker");
     assert_degraded_but_ran("broken store", running.socket(), &marker);
@@ -367,14 +382,21 @@ fn a_daemon_whose_store_is_broken_degrades() {
 
 #[cfg(any(target_os = "macos", keyless_force_xnu))]
 #[test]
-fn a_daemon_that_does_not_have_the_name_degrades() {
+fn a_daemon_whose_store_does_not_hold_the_name_refuses_the_run() {
+    // Not a failure either: the store answered, and the answer is that the
+    // name names nothing. Running the command would hand it a missing value
+    // and let it fail somewhere harder to read.
     let dir = scratch("daemon-absentname");
-    let config = support::daemon_config(&dir);
-    support::write_secrets(&config.stores.file.path, &[("SOMETHING_ELSE", DECOY_VALUE)]);
-    let running = support::start_daemon(&config, support::policy_allowing_self());
+    let config = support::daemon::daemon_config(&dir);
+    support::client::write_secrets(&config.stores.file.path, &[("SOMETHING_ELSE", DECOY_VALUE)]);
+    let running = support::daemon::start_daemon(&config, support::daemon::policy_allowing_self());
 
     let marker = dir.join("marker");
-    assert_degraded_but_ran("absent name", running.socket(), &marker);
+    let (outcome, notes) = run_against(running.socket(), &marker, 7);
+
+    assert!(!marker.exists(), "the child started: {notes}");
+    assert_eq!(outcome.state, State::Refused, "{notes}");
+    assert_eq!(outcome.exit_code, 64, "{notes}");
 
     drop(running);
     let _ = std::fs::remove_dir_all(&dir);
@@ -387,9 +409,9 @@ fn a_daemon_that_dies_between_two_runs_degrades_the_second() {
     // the only difference is that the daemon stopped. The second run must lose
     // the secret and keep the command.
     let dir = scratch("daemon-dies");
-    let config = support::daemon_config(&dir);
-    support::write_secrets(&config.stores.file.path, &[("DECOY", DECOY_VALUE)]);
-    let running = support::start_daemon(&config, support::policy_allowing_self());
+    let config = support::daemon::daemon_config(&dir);
+    support::client::write_secrets(&config.stores.file.path, &[("DECOY", DECOY_VALUE)]);
+    let running = support::daemon::start_daemon(&config, support::daemon::policy_allowing_self());
     let socket = running.socket().to_path_buf();
 
     let first_marker = dir.join("marker-before");

@@ -1,0 +1,119 @@
+<section class="band" id="stores">
+  <div class="col">
+    <div class="rule reveal">
+      <div class="eyebrow"><span class="dash"></span><span class="eyebrow-txt">your vault is the foundation</span></div>
+      <div class="head">
+        <h2>Not another<br>vault.</h2>
+        <p class="deck">keyless stores nothing. It resolves through the vault you already run, using
+          that vault's own injection path — the safe one it already shipped. What it will not do is put
+          that vault's read verb anywhere an agent can reach it.</p>
+      </div>
+    </div>
+
+    <div class="slab reveal">
+      <div class="srcs">
+        <div class="src">
+          <svg class="mark" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round" aria-hidden="true">
+            <path d="M12 2.4 20 5.9v6.6c0 4.4-3.2 7.6-8 9.1-4.8-1.5-8-4.7-8-9.1V5.9z"/>
+            <circle cx="12" cy="11" r="2.2"/>
+            <path d="M12 13.2v3.2" stroke-linecap="round"/>
+          </svg>
+          <div>
+            <div class="src-k">keyless reads from this</div>
+            <h4 class="gap-s">Proton Pass</h4>
+          </div>
+          <p>Resolved through the Pass CLI's own injection path — the verb that hands a secret to a
+            process without printing it. keyless keeps no copy of anything it reads.</p>
+        </div>
+        <div class="src">
+          <svg class="mark" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round" aria-hidden="true">
+            <path d="M12 2.4 20.2 7v10L12 21.6 3.8 17V7z"/>
+            <path d="M12 8.1 16.1 10.4v4.2L12 16.9 7.9 14.6v-4.2z"/>
+          </svg>
+          <div>
+            <div class="src-k">keyless reads from this</div>
+            <h4 class="gap-s">Infisical</h4>
+          </div>
+          <p>Resolved through the Infisical CLI's own injection path, per project and per environment.
+            Your access rules stay exactly where they are.</p>
+        </div>
+        <div class="src">
+          <svg class="mark" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round" aria-hidden="true">
+            <circle cx="12" cy="12" r="9.2"/>
+            <path d="M12 7.6v8.8M9.4 10.2h5.2v3.4H9.4z"/>
+          </svg>
+          <div>
+            <div class="src-k">keyless reads from this</div>
+            <h4 class="gap-s">1Password</h4>
+          </div>
+          <p>Resolved through <code>op run</code>, in the one vault you name and no other.
+            Behind the daemon, a service account scoped to that vault is the boundary.</p>
+        </div>
+      </div>
+    </div>
+
+    <div class="slab reveal slab-gap">
+      <div class="grid g2">
+        <div class="pad">
+          <h3>The verbs it will not call on your vault</h3>
+          <p class="deck-s gap-s">Your vault ships a printing verb whatever keyless does. The guarantee
+            is that keyless never builds a command containing one.</p>
+          <ul class="rows gap-m">
+            <li><span class="k">view &middot; show &middot; get</span><span class="lbl">Proton Pass — printing an entry</span></li>
+            <li><span class="k">read &middot; item get &middot; inject</span><span class="lbl">1Password — printing a value</span></li>
+            <li><span class="k">export &middot; read &middot; reveal</span><span class="lbl">Infisical — printing a value</span></li>
+          </ul>
+          <p class="micro gap-l">
+            <b>a test asserts none of these words ever appears</b> in the command keyless builds &mdash;
+            for every store, in both directions
+          </p>
+        </div>
+        <div class="pad">
+          <h3>And the verbs it does not have itself</h3>
+          <p class="deck-s gap-s">The other half of the same property. A narrower door onto your vault
+            is worth nothing if the door has a window.</p>
+          <div class="scroll-x gap-m">
+<pre><span class="c">$</span> <span class="k">keyless get DATABASE_URL</span>
+<span class="r">error: unrecognized subcommand 'get'</span>
+
+<span class="c">$</span> <span class="k">keyless put DATABASE_URL --value …</span>
+<span class="r">error: unexpected argument '--value' found</span></pre>
+          </div>
+          <p class="micro gap-l">
+            both observed live &mdash; <b>the absence is the design</b>
+          </p>
+        </div>
+      </div>
+    </div>
+
+    <div class="slab reveal slab-gap">
+      <div class="grid g1">
+        <div class="pad">
+          <div class="lesser">
+            <svg class="mark" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round" aria-hidden="true">
+              <path d="M6 2.4h7.6L19 7.9v13.7H6z"/>
+              <path d="M13.6 2.4v5.5H19"/>
+              <path d="M9 12.6h7M9 16.1h4.6" stroke-linecap="round"/>
+            </svg>
+            <div>
+              <div class="src-k r">the lesser case</div>
+              <h4 class="gap-s">The plaintext file on disk</h4>
+              <p class="deck-s gap-s">If you have no vault at all, this is where the secret is: plaintext,
+                copied between machines, committed by accident. keyless helps here too. But it is not the
+                interesting case, and it is not the one that brought this tool into existence — <b>that
+                one had both vaults already.</b></p>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <p class="caveat reveal">
+      A value on a command line is recorded by the shell, the history file and the transcript alike
+      &mdash; which is the documented reason <b>keyless put has no --value flag</b>. You are prompted, or
+      you pipe.
+    </p>
+  </div>
+</section>
+
+<!-- ======================================================= THE SHARP EDGE -->

@@ -3,7 +3,7 @@
 use std::path::Path;
 use std::process::{Command, Output};
 
-use crate::support::{Stub, keychain_stub_config};
+use crate::support::keychain::{Stub, keychain_stub_config};
 
 pub const BIN: &str = env!("CARGO_BIN_EXE_keyless");
 
@@ -47,7 +47,7 @@ pub fn line_for(stderr: &str, name: &str) -> String {
     stderr
         .lines()
         .find(|line| line.starts_with(&prefix))
-        .unwrap_or_else(|| panic!("no degraded line for `{name}` in: {stderr}"))
+        .unwrap_or_else(|| panic!("no line for `{name}` in: {stderr}"))
         .to_owned()
 }
 

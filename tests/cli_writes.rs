@@ -2,7 +2,8 @@ mod cli_support;
 mod support;
 
 use cli_support::{config_with_stub, keyless, stderr_of, stdout_of};
-use support::{DECOY_VALUE, Stub, scratch, stub_security};
+use support::keychain::{Stub, stub_security};
+use support::{DECOY_VALUE, scratch};
 
 #[test]
 fn there_is_no_way_to_pass_a_value_to_put_as_an_argument() {
@@ -125,8 +126,9 @@ fn new_prints_where_it_stored_the_value_and_never_the_value() {
 
 #[test]
 fn a_write_verb_refuses_rather_than_degrading_and_says_what_is_missing() {
-    // The asymmetry with `run`, at the CLI boundary. `run` never refuses; a write
-    // that "degraded" would report success with nothing stored.
+    // The asymmetry with `run`, at the CLI boundary. `run` never refuses over a
+    // failure; a write that "degraded" would report success with nothing
+    // stored.
     let dir = scratch("write-refuses");
     let config = dir.join("config.json");
     std::fs::write(

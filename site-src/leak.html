@@ -1,0 +1,193 @@
+<section class="band" id="leak">
+  <div class="col">
+    <div class="rule reveal">
+      <div class="eyebrow"><span class="dash"></span><span class="eyebrow-txt">why this exists</span></div>
+      <div class="head">
+        <h2>A vault, used<br>correctly.</h2>
+        <p class="deck">These pairs come from a real setup with both vaults already in place, where the
+          secrets leaked anyway. Nothing about that setup was wrong. Each pair is the same moment, twice,
+          and the vault is present in both halves.</p>
+      </div>
+    </div>
+
+    <!-- pair 1 ------------------------------------------------------------- -->
+    <div class="pair reveal">
+      <div class="pair-head">
+        <h3>The vault did its job. The read verb undid it.</h3>
+        <p class="deck-s gap-s">The secret was encrypted at rest, in the right vault, with the right
+          access. Then something needed the value — a person debugging, a script, an agent — and every
+          vault has a verb for that. It writes to stdout, and stdout is the transcript.</p>
+      </div>
+      <div class="slab">
+        <div class="duo">
+          <div class="side side-leak">
+            <div class="term">
+              <div class="termbar"><span class="pip leak"></span><span class="tag tag-leak">your vault, read verb</span></div>
+              <div class="term-body">
+<pre><span class="c">$</span> <span class="k">pass-cli item view billing-db</span>
+<span class="o">password  </span><span class="r">postgres://demo:not-a-real-password@db.example.com/app</span>
+<span class="c">$</span> <span class="k">psql "</span><span class="r">postgres://demo:not-a-real-password@…</span><span class="k">"</span>
+<span class="o">psql (16.2)  connected.</span>
+
+<span class="c"># the vault was never breached. it was ASKED.</span></pre>
+              </div>
+            </div>
+            <p class="side-note">Correct credentials, correct permissions, correct vault. The value is
+              in the transcript now — <b>and in whatever that transcript syncs to</b>. No amount of vault
+              hygiene takes it back.</p>
+            <div class="ledger">
+              <div class="leak"><span class="ln">stdout</span><span class="lv">the value</span></div>
+              <div class="leak"><span class="ln">scrollback</span><span class="lv">the value</span></div>
+              <div class="leak"><span class="ln">shell history</span><span class="lv">the value</span></div>
+              <div class="leak"><span class="ln">the transcript</span><span class="lv">the value</span></div>
+              <div class="leak"><span class="ln">the child's environ</span><span class="lv">the value</span></div>
+            </div>
+          </div>
+          <div class="side side-safe">
+            <div class="term">
+              <div class="termbar"><span class="pip"></span><span class="tag tag-safe">the same vault, via keyless</span></div>
+              <div class="term-body">
+<pre><span class="c">$</span> <span class="k">keyless run -s DATABASE_URL -- psql</span>
+<span class="o">psql (16.2)</span>  <span class="g">connected.</span>
+
+<span class="c"># resolved through the vault's own injection path.</span>
+<span class="c"># nothing printed it, because nothing here can.</span></pre>
+              </div>
+            </div>
+            <p class="side-note">Same vault, same secret, same permissions.
+              <b>keyless has no verb that would print it</b> — so no agent, and no habit, can reach one.</p>
+            <div class="ledger">
+              <div><span class="ln">stdout</span><span class="lv">nothing</span></div>
+              <div><span class="ln">scrollback</span><span class="lv">nothing</span></div>
+              <div><span class="ln">shell history</span><span class="lv">the name</span></div>
+              <div><span class="ln">the transcript</span><span class="lv">the name</span></div>
+              <div class="held"><span class="ln">the child's environ</span><span class="lv">the value</span></div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- pair 2 ------------------------------------------------------------- -->
+    <div class="pair reveal">
+      <div class="pair-head">
+        <h3>Nobody typed a secret. The machine printed four.</h3>
+        <p class="deck-s gap-s">A credential on a command line is readable by anything that can list
+          processes. One routine listing put four live tokens into a transcript — no paste, no mistake,
+          no warning.</p>
+      </div>
+      <div class="slab">
+        <div class="duo">
+          <div class="side side-leak">
+            <div class="term">
+              <div class="termbar"><span class="pip leak"></span><span class="tag tag-leak">values on the command line</span></div>
+              <div class="term-body">
+<pre><span class="c">$</span> <span class="k">&lt;a routine process listing&gt;</span>
+<span class="o">4812  deploy  --token</span> <span class="r">not-a-real-token-7b3e91</span>
+<span class="o">4855  sync    --key  </span> <span class="r">not-a-real-key-4f2a9c</span>
+<span class="o">4901  mailer  --pass </span> <span class="r">not-a-real-pass-d0177a</span>
+<span class="o">4933  worker  --auth </span> <span class="r">not-a-real-auth-9e42bc</span></pre>
+              </div>
+            </div>
+            <p class="side-note">Four live values, in one command's output, in the transcript.
+              <b>Nothing was typed wrong.</b></p>
+            <div class="ledger">
+              <div class="leak"><span class="ln">stdout</span><span class="lv">4 values</span></div>
+              <div class="leak"><span class="ln">scrollback</span><span class="lv">4 values</span></div>
+              <div><span class="ln">shell history</span><span class="lv">the listing</span></div>
+              <div class="leak"><span class="ln">the transcript</span><span class="lv">4 values</span></div>
+              <div class="leak"><span class="ln">any process table</span><span class="lv">4 values</span></div>
+            </div>
+          </div>
+          <div class="side side-safe">
+            <div class="term">
+              <div class="termbar"><span class="pip"></span><span class="tag tag-safe">names on the command line</span></div>
+              <div class="term-body">
+<pre><span class="c">$</span> <span class="k">&lt;the same routine listing&gt;</span>
+<span class="o">4812  keyless run -s</span> <span class="g">DEPLOY_TOKEN</span> <span class="o">-- deploy</span>
+<span class="o">4855  keyless run -s</span> <span class="g">SYNC_KEY    </span> <span class="o">-- sync</span>
+<span class="o">4901  keyless run -s</span> <span class="g">MAIL_PASS   </span> <span class="o">-- mailer</span>
+<span class="o">4933  keyless run -s</span> <span class="g">WORKER_AUTH </span> <span class="o">-- worker</span></pre>
+              </div>
+            </div>
+            <p class="side-note">The same listing, the same four jobs. <b>It reads out four names</b> —
+              which is exactly what a listing should be able to see.</p>
+            <div class="ledger">
+              <div><span class="ln">stdout</span><span class="lv">4 names</span></div>
+              <div><span class="ln">scrollback</span><span class="lv">4 names</span></div>
+              <div><span class="ln">shell history</span><span class="lv">the listing</span></div>
+              <div><span class="ln">the transcript</span><span class="lv">4 names</span></div>
+              <div class="held"><span class="ln">any process table</span><span class="lv">4 names</span></div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- pair 3 ------------------------------------------------------------- -->
+    <div class="pair reveal">
+      <div class="pair-head">
+        <h3>Every leak costs a rotation. Then it costs everyone else one.</h3>
+        <p class="deck-s gap-s">Rotate, re-enter, re-wire, tell the team. The work is not the leak — the
+          work is the treadmill the leak starts.</p>
+      </div>
+      <div class="slab">
+        <div class="duo">
+          <div class="side side-leak">
+            <div class="term">
+              <div class="termbar"><span class="pip leak"></span><span class="tag tag-leak">the treadmill</span></div>
+              <div class="term-body">
+<pre><span class="r">ROTATE</span>  <span class="o">DEPLOY_TOKEN</span>  <span class="c">value reached a transcript</span>
+<span class="r">ROTATE</span>  <span class="o">SYNC_KEY    </span>  <span class="c">value reached a transcript</span>
+<span class="r">ROTATE</span>  <span class="o">MAIL_PASS   </span>  <span class="c">value reached a transcript</span>
+<span class="r">ROTATE</span>  <span class="o">WORKER_AUTH </span>  <span class="c">value reached a transcript</span>
+<span class="r">ROTATE</span>  <span class="o">DATABASE_URL</span>  <span class="c">value reached a transcript</span>
+<span class="c">…and each one is a re-wire, and a message to the team</span></pre>
+              </div>
+            </div>
+            <p class="side-note">A rotation is not the fix. <b>It is the bill for a leak that already
+              happened</b> — and it arrives again next week.</p>
+            <div class="ledger">
+              <div class="leak"><span class="ln">values to rotate</span><span class="lv">5</span></div>
+              <div class="leak"><span class="ln">places to re-wire</span><span class="lv">5</span></div>
+              <div class="leak"><span class="ln">people to tell</span><span class="lv">the team</span></div>
+              <div class="leak"><span class="ln">transcripts to purge</span><span class="lv">not possible</span></div>
+              <div class="leak"><span class="ln">next week</span><span class="lv">again</span></div>
+            </div>
+          </div>
+          <div class="side side-safe">
+            <div class="term">
+              <div class="termbar"><span class="pip"></span><span class="tag tag-safe">the treadmill stops</span></div>
+              <div class="term-body">
+<pre><span class="c">$</span> <span class="k">keyless ls</span>
+<span class="g">DEPLOY_TOKEN</span>  <span class="c">resolvable</span>
+<span class="g">SYNC_KEY    </span>  <span class="c">resolvable</span>
+<span class="g">MAIL_PASS   </span>  <span class="c">resolvable</span>
+<span class="g">WORKER_AUTH </span>  <span class="c">resolvable</span>
+<span class="g">DATABASE_URL</span>  <span class="c">resolvable</span>
+
+<span class="c"># nothing to rotate. no value ever reached a transcript.</span></pre>
+              </div>
+            </div>
+            <p class="side-note"><b>ls names what it can resolve.</b> It prints no values, because there
+              is no verb on this tool that prints one.</p>
+            <div class="ledger">
+              <div><span class="ln">values to rotate</span><span class="lv">0</span></div>
+              <div><span class="ln">places to re-wire</span><span class="lv">0</span></div>
+              <div><span class="ln">people to tell</span><span class="lv">nobody</span></div>
+              <div><span class="ln">transcripts to purge</span><span class="lv">none carry one</span></div>
+              <div class="held"><span class="ln">next week</span><span class="lv">the same</span></div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <p class="caveat reveal">
+      Every value on this page is invented and says so in its own text. <b>Nothing here is a real
+      credential</b>, and a test scans this file on every commit to keep it that way.
+    </p>
+  </div>
+</section>
+
+<!-- ========================================================== THE STORES -->

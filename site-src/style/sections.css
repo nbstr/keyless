@@ -1,0 +1,223 @@
+/* ---------------------------------------------------------- the pipeline */
+/* Motion that teaches: one pulse leaves the store, passes through keyless into
+   the child process, and stops dead at the wall. The surfaces below never
+   light. That is the whole product, in four seconds, without a sentence. */
+.pipe{
+  display:grid;align-items:stretch;
+  grid-template-columns:minmax(0,1fr) 44px minmax(0,1fr) 44px minmax(0,1fr) 16px;
+  padding:26px 22px;
+}
+@media(max-width:860px){.pipe{grid-template-columns:minmax(0,1fr);padding:22px}}
+.stage{
+  border:1px solid rgba(255,255,255,.14);padding:14px 16px;
+  display:flex;flex-direction:column;justify-content:center;gap:8px;min-height:94px;
+}
+.stage .st-l{font-family:var(--mono);font-size:10px;letter-spacing:.18em;text-transform:uppercase;color:rgba(255,255,255,.55)}
+.stage .st-v{font-family:var(--mono);font-size:13px;line-height:1.5;color:rgba(255,255,255,.92);overflow-wrap:anywhere}
+.stage.is-store{border-color:rgba(157,155,234,.35)}
+.stage.is-broker{border-color:rgba(255,255,255,.24)}
+.stage.is-child{border-color:rgba(95,211,154,.42)}
+.wire{position:relative;display:flex;align-items:center;justify-content:center}
+.wire::before{content:"";position:absolute;left:0;right:0;top:50%;height:1px;background:rgba(255,255,255,.22)}
+/* The arrowhead carries DIRECTION when the pulse is elsewhere in its cycle —
+   and it is the only thing that does when motion is off entirely. */
+.wire::after{
+  content:"";position:absolute;right:0;top:50%;margin-top:-3px;width:0;height:0;
+  border-left:5px solid rgba(255,255,255,.34);
+  border-top:3px solid transparent;border-bottom:3px solid transparent;
+}
+.dot{
+  position:absolute;top:50%;left:0;width:7px;height:7px;border-radius:50%;
+  background:var(--green);margin-top:-3.5px;opacity:0;
+  box-shadow:0 0 0 3px rgba(95,211,154,.14);
+}
+.js .dot{animation:travel 4s var(--ease-hover) infinite}
+.js .wire.w2 .dot{animation-delay:.7s}
+@keyframes travel{
+  0%{left:0;opacity:0}
+  8%{opacity:1}
+  50%{left:calc(100% - 7px);opacity:1}
+  70%{left:calc(100% - 7px);opacity:1}
+  80%{opacity:0}
+  100%{left:0;opacity:0}
+}
+/* The wall. Nothing crosses it, so it is the only thing on this page that
+   flashes — and it flashes on ARRIVAL, not on a timer of its own. */
+.wall{position:relative;display:flex;align-items:stretch;justify-content:center}
+.wall i{display:block;width:2px;background:var(--green);opacity:.3;border-radius:2px}
+/* An unlabelled green line is a mystery, not a diagram. This says what it is. */
+.pipe-cap{grid-column:1/-1;margin-top:18px;display:flex;justify-content:flex-end}
+.pipe-cap span{color:rgba(255,255,255,.6);text-align:right}
+@media(max-width:860px){.pipe-cap{justify-content:flex-start;margin-top:14px}.pipe-cap span{text-align:left}}
+.js .wall i{animation:wallhit 4s var(--ease-hover) infinite}
+@keyframes wallhit{
+  0%,44%{opacity:.3;box-shadow:none}
+  52%{opacity:1;box-shadow:0 0 14px 2px rgba(95,211,154,.45)}
+  74%,100%{opacity:.3;box-shadow:none}
+}
+@media(max-width:860px){
+  .wire{height:30px}
+  .wire::before{left:50%;right:auto;top:0;bottom:0;height:auto;width:1px}
+  .dot{left:50%;top:0;margin-top:0;margin-left:-3.5px}
+  .js .dot{animation-name:travel-v}
+  .wall{height:18px}
+  .wall i{width:100%;height:2px;align-self:center}
+  .wire::after{
+    right:50%;margin-right:-3px;top:auto;bottom:0;margin-top:0;
+    border-left:3px solid transparent;border-right:3px solid transparent;
+    border-top:5px solid rgba(255,255,255,.34);border-bottom:0;
+  }
+}
+@keyframes travel-v{
+  0%{top:0;opacity:0}
+  8%{opacity:1}
+  50%{top:calc(100% - 7px);opacity:1}
+  70%{top:calc(100% - 7px);opacity:1}
+  80%{opacity:0}
+  100%{top:0;opacity:0}
+}
+
+/* ------------------------------------------------------- the leak ledger */
+/* The page's recurring device. The same five surfaces every time, so a reader
+   learns the row once and then reads every later instance at a glance. */
+.ledger{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:1px;background:var(--panel)}
+/* Five cells in two columns leaves an empty sixth slot, which reads as a
+   missing surface rather than as padding. The last one spans the row instead.
+   At one column `1 / -1` is simply that column, so this needs no second guard. */
+@media(max-width:900px){
+  .ledger{grid-template-columns:repeat(2,minmax(0,1fr))}
+  .ledger > div:last-child{grid-column:1 / -1}
+}
+@media(max-width:430px){.ledger{grid-template-columns:minmax(0,1fr)}}
+.ledger > div{background:var(--well);padding:13px 16px;min-width:0}
+.ledger .ln{
+  font-family:var(--mono);font-size:10px;line-height:14px;letter-spacing:.16em;
+  text-transform:uppercase;color:rgba(255,255,255,.55);display:block;
+}
+.ledger .lv{
+  display:flex;align-items:center;gap:7px;margin-top:7px;
+  font-family:var(--mono);font-size:12px;line-height:16px;color:rgba(255,255,255,.6);
+  overflow-wrap:anywhere;
+}
+.ledger .lv::before{content:"";width:5px;height:5px;border-radius:50%;background:rgba(255,255,255,.28);flex:none}
+.ledger .leak .lv{color:var(--leak)}
+.ledger .leak .lv::before{background:var(--leak)}
+.ledger .held .lv{color:var(--green)}
+.ledger .held .lv::before{background:var(--green)}
+/* Inside a before/after column the ledger sits on that column's own ground, so
+   the two halves never read as the same surface. */
+.side-leak .ledger > div{background:var(--ground-leak)}
+.side-safe .ledger > div{background:var(--ground-safe)}
+
+/* ------------------------------------------------------ before/after pair */
+.pair + .pair{margin-top:60px}
+.pair-head{margin-bottom:22px;max-width:70ch}
+.duo{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:1px;background:var(--panel);border:1px solid var(--panel)}
+@media(max-width:1024px){.duo{grid-template-columns:minmax(0,1fr)}}
+.side{min-width:0;display:flex;flex-direction:column}
+.side-leak{background:var(--ground-leak)}
+.side-safe{background:var(--ground-safe)}
+.side .term{background:transparent;border:0;flex:1}
+.side .termbar{border-bottom:1px solid rgba(255,255,255,.08)}
+.tag{
+  font-family:var(--mono);font-size:10px;letter-spacing:.18em;text-transform:uppercase;
+  padding:3px 8px;border-radius:5px;border:1px solid;white-space:nowrap;
+}
+.tag-leak{color:var(--leak);border-color:rgba(232,131,107,.4)}
+.tag-safe{color:var(--green);border-color:rgba(95,211,154,.4)}
+.side-note{
+  padding:0 18px 18px;font-family:var(--mono);font-size:11px;line-height:18px;
+  letter-spacing:.05em;color:rgba(255,255,255,.6);
+}
+@media(min-width:640px){.side-note{padding:0 24px 22px}}
+.side-note b{font-weight:500;color:rgba(255,255,255,.95)}
+
+/* --------------------------------------------------------- store sources */
+/* Two cards, not three. The plaintext file used to sit in this same grid beside
+   the two vaults, which read at a glance as "these are the three things keyless
+   replaces" — exactly backwards. The vaults are what keyless reads FROM. The
+   lesser case now lives in its own strip, below, visibly not part of this set. */
+.srcs{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:1px;background:var(--panel);border:1px solid var(--panel)}
+@media(max-width:800px){.srcs{grid-template-columns:minmax(0,1fr)}}
+.src{background:var(--cell-a);padding:26px 24px;display:flex;flex-direction:column;gap:14px;min-width:0}
+.src.is-past{background:var(--ground-leak)}
+/* The demoted case: a horizontal strip, half the visual weight of a source card. */
+.lesser{display:flex;align-items:flex-start;gap:18px;flex-wrap:wrap}
+.lesser .mark{width:26px;height:26px;color:var(--leak)}
+.lesser div{min-width:0;flex:1 1 320px}
+/* The three marks share one 24-unit grid, one 1.5 stroke and one join style, so
+   they read as a set rather than three logos pasted next to each other. */
+.mark{width:34px;height:34px;color:var(--green);flex:none}
+.src.is-past .mark{color:var(--leak)}
+.src .src-k{
+  font-family:var(--mono);font-size:11px;letter-spacing:.14em;text-transform:uppercase;
+  color:rgba(255,255,255,.55);
+}
+.src.is-past .src-k{color:var(--leak)}
+.src p{font-size:14px;line-height:22px;color:rgba(255,255,255,.6)}
+
+/* ----------------------------------------------------------- misc blocks */
+.rows li{
+  display:grid;grid-template-columns:minmax(0,1fr) auto;gap:16px;align-items:baseline;
+  padding:13px 0;
+}
+.rows li + li{border-top:1px solid rgba(255,255,255,.07)}
+.rows .k{font-family:var(--mono);font-size:12px;line-height:19px;color:rgba(255,255,255,.82)}
+.rows li > *{min-width:0;overflow-wrap:anywhere}
+@media(max-width:640px){
+  .rows li{grid-template-columns:minmax(0,1fr);gap:5px}
+  .rows li .lbl{text-align:left}
+}
+.notes li{padding:15px 0;color:rgba(255,255,255,.65);font-size:15px;line-height:24px}
+.notes li + li{border-top:1px solid rgba(255,255,255,.07)}
+.notes b{color:#fff;font-weight:600}
+.notes em{font-style:normal;color:#fff}
+.stat .n{font-size:clamp(1.9rem,4vw,3rem);font-weight:600;letter-spacing:-.04em;line-height:1;color:#fff}
+.stat .l{margin-top:13px;max-width:36ch}
+.verbs{font-family:var(--mono);font-size:14px;color:rgba(255,255,255,.9);line-height:2.1}
+
+/* ----------------------------------------------------------------- footer */
+footer{border-top:1px solid var(--panel);padding:60px 0 76px}
+footer .cols{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:32px;align-items:start}
+@media(max-width:640px){footer .cols{grid-template-columns:1fr}}
+footer ul{display:grid;gap:10px;text-align:right}
+@media(max-width:640px){footer ul{text-align:left}}
+
+/* ----------------------------------------------------------------- motion */
+/* Gated on .js: without scripting the reveal never resolves, and an ungated
+   rule would leave the whole page at opacity 0 — blank, with no way back. */
+.js .reveal{opacity:0;transform:translateY(14px);
+  transition:opacity .5s var(--ease-reveal),transform .5s var(--ease-reveal)}
+.js .reveal.in{opacity:1;transform:none}
+/* a .slab is centred BY a transform, so a reveal on the same element must carry
+   that centring through both states or the panel jumps off-axis */
+.js .slab.reveal{transform:translateX(-50%) translateY(14px)}
+.js .slab.reveal.in{transform:translateX(-50%)}
+.cascade{opacity:0;transform:translateY(14px);animation:cascade .5s var(--ease-reveal) forwards}
+@keyframes cascade{to{opacity:1;transform:none}}
+/* A .slab is centred BY a transform, so an animation on the same element has to
+   carry that centring through EVERY keyframe. `transform:none` does not mean
+   "leave the other transform alone" — it wipes translateX(-50%), and the panel
+   lands half a viewport to the right, dragging the whole document's scrollWidth
+   with it. Measured: at 1440 the page scrolled to 2112px. The .reveal twin
+   below has always handled this; .cascade needs its own keyframes for the same
+   reason, not a shared one. */
+.slab.cascade{transform:translateX(-50%) translateY(14px);animation-name:cascade-slab}
+@keyframes cascade-slab{to{opacity:1;transform:translateX(-50%)}}
+.d1{animation-delay:40ms}.d2{animation-delay:100ms}.d3{animation-delay:170ms}
+.d4{animation-delay:250ms}.d5{animation-delay:340ms}.d6{animation-delay:440ms}
+@media(prefers-reduced-motion:reduce){
+  *,*::before,*::after{
+    animation-duration:.001ms!important;animation-iteration-count:1!important;
+    transition-duration:.001ms!important;scroll-behavior:auto!important}
+  .js .reveal{opacity:1;transform:none}
+  .js .slab.reveal,.js .slab.reveal.in{transform:translateX(-50%)}
+  .cascade{opacity:1;transform:none;animation:none}
+  .slab.cascade{transform:translateX(-50%)}
+  /* The pulse parks AT the wall rather than hiding: the end state is the thing
+     the diagram teaches, so stillness must still show it. */
+  .js .dot{animation:none;opacity:1;left:calc(100% - 7px)}
+  .js .wall i{animation:none;opacity:1}
+}
+html{scroll-behavior:smooth}
+@media(prefers-reduced-motion:reduce){html{scroll-behavior:auto}}

@@ -249,7 +249,7 @@ fn the_vendor_is_handed_a_cleared_environment_on_a_lookup_too() {
 }
 
 #[test]
-fn a_run_degrades_rather_than_injecting_the_callers_own_environment() {
+fn a_run_is_refused_rather_than_injecting_the_callers_own_environment() {
     // `doctor --probe` is a report; `run` is the surface that hands a value to
     // a program, and a successful run says NOTHING — so this case reads what
     // the child was actually given rather than what the tool said about it.
@@ -273,31 +273,26 @@ fn a_run_degrades_rather_than_injecting_the_callers_own_environment() {
     );
 
     // Same command, same caller environment; only the store changes.
+    std::fs::remove_file(&seen).expect("clear the control's record");
     let empty = config_for(&dir, &vendor_holding_nothing(&dir), NAME);
-    let mut degraded = vec!["run", "-s", NAME];
-    degraded.extend_from_slice(&child);
-    let output = keyless(&empty, &degraded);
+    let mut refused = vec!["run", "-s", NAME];
+    refused.extend_from_slice(&child);
+    let output = keyless(&empty, &refused);
     let (out, err) = text(&output);
-    assert!(err.contains("DEGRADED"), "{err}");
+    // The store holds nothing under the name, and says so; the caller's own
+    // variable answering the vendor's lookup must not read as the store's
+    // value. The defect was `keyless` claiming to have fetched it.
+    assert!(err.contains("REFUSED"), "{err}");
     assert!(
         err.contains(NAME),
-        "the degrade must name what did not resolve: {err}"
+        "the refusal must name what did not resolve: {err}"
     );
     assert!(
         !format!("{out}{err}").contains(FROM_THE_CALLER),
         "the caller's value reached the output: {out}{err}"
     );
-    // What the child sees is the caller's own untouched environment, which is
-    // exactly right — and is why the report above matters. The defect was never
-    // that the child got the wrong bytes; it was that `keyless` claimed to have
-    // fetched them.
-    assert_eq!(
-        std::fs::read_to_string(&seen).expect("the child ran"),
-        FROM_THE_CALLER
-    );
-    // Never blocks. A lookup that could not answer degrades the run and
-    // forwards the child's own exit code, which is this tool's whole contract.
-    assert_eq!(output.status.code(), Some(0), "stderr: {err}");
+    assert!(!seen.exists(), "the child ran: {err}");
+    assert_eq!(output.status.code(), Some(64), "stderr: {err}");
 }
 
 // ---------------------------------------------------------------------------

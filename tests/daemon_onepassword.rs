@@ -29,10 +29,11 @@ use std::path::Path;
 use keyless::daemon::config::DaemonConfig;
 use keyless::store::{self, Invocation, Resolution};
 
-use support::{
-    Backend, ONEPASSWORD_DECOY, client_config, policy_allowing_self, scratch, short_socket_path,
-    start_daemon, stub_op, write_secrets,
-};
+use support::backend::Backend;
+use support::client::{client_config, write_secrets};
+use support::daemon::{policy_allowing_self, start_daemon};
+use support::onepassword::stub_op;
+use support::{ONEPASSWORD_DECOY, scratch, short_socket_path};
 
 /// The one name the daemon's config declares, by title.
 const DECLARED: &str = "FIXTURE_DECLARED";

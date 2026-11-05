@@ -7,8 +7,16 @@ use std::io::{self, Write};
 
 use crate::cmd::status::{Mark, Style, action, heading, row};
 use crate::config::Config;
-use crate::error::StoreError;
 use crate::store::{Registry, Store};
+
+mod failing;
+
+#[cfg(test)]
+mod dormant_tests;
+#[cfg(test)]
+mod onepassword_tests;
+#[cfg(test)]
+mod remedy_tests;
 
 /// Every backend this build knows about, in the order a report lists them.
 ///
@@ -68,7 +76,7 @@ pub(super) fn store_rows(config: &Config, registry: &Registry) -> Vec<StoreRow> 
                     detail: points_at(config, id),
                     action: None,
                 },
-                Err(error) => failing_row(config, id, &error),
+                Err(error) => failing::failing_row(config, id, &error),
             },
             None => dormant_row(config, id),
         })
@@ -156,95 +164,6 @@ fn points_at(config: &Config, id: &str) -> String {
         // is the whole claim the row makes; inventing coordinates for it would
         // be worse than saying nothing.
         other => format!("backend `{other}`"),
-    }
-}
-
-/// A live store that could not answer.
-///
-/// The three [`StoreError`] variants already separate the three places a reader
-/// has to be sent — the install, their own config file, and the store itself —
-/// so the mark and the action are read off the variant rather than sniffed out
-/// of a message.
-fn failing_row(config: &Config, id: &str, error: &StoreError) -> StoreRow {
-    let (mark, state) = match error {
-        // Not there yet: no binary, no login, no network. A step nobody took,
-        // which is amber rather than red — but still a problem, because a store
-        // that was ENABLED and cannot answer is a store that cannot serve.
-        StoreError::Unavailable { .. } => (Mark::NotSetUp, "absent"),
-        // One line of the config file, and nothing was contacted.
-        StoreError::Misconfigured { .. } => (Mark::NotSetUp, "config"),
-        // Installed, reached, and saying no.
-        StoreError::Backend { .. } => (Mark::Broken, "broken"),
-    };
-    StoreRow {
-        id: id.to_owned(),
-        mark,
-        state,
-        // The vendor's own words, so a reader knows which of the many ways this
-        // backend fails they are looking at. Never its stdout; see
-        // `crate::error`.
-        detail: detail_of(error),
-        action: Some(remedy(config, id, error)),
-    }
-}
-
-/// The cause, without the `store `x`` prefix `Display` adds for a log line.
-fn detail_of(error: &StoreError) -> String {
-    match error {
-        StoreError::Unavailable { detail, .. }
-        | StoreError::Backend { detail, .. }
-        | StoreError::Misconfigured { detail, .. } => detail.clone(),
-    }
-}
-
-/// What to type next, per backend and per kind of failure.
-///
-/// Written here rather than inside each adapter because it is advice about this
-/// MACHINE, not about the lookup that failed — and because a `Misconfigured`
-/// error already carries the config fix in its own detail, so repeating it would
-/// give a reader two sentences to reconcile.
-fn remedy(config: &Config, id: &str, error: &StoreError) -> String {
-    if matches!(error, StoreError::Misconfigured { .. }) {
-        return format!(
-            "the fix is one line of {}'s config file, not anything in the store",
-            crate::NAME
-        );
-    }
-    match id {
-        "keychain" => "unlock the login keychain in Keychain Access, \
-                       or check `stores.keychain.binary`"
-            .to_owned(),
-        "infisical" => "`infisical login`, then check `stores.infisical.project_id` \
-                        and the `env` on each name"
-            .to_owned(),
-        // The command with THIS machine's session directory already in it. The
-        // sentence it replaces — "`pass-cli login` into
-        // `stores.proton.session_dir`" — is followable only by someone who
-        // already knows that the directory travels in an environment variable;
-        // typed literally it logs into the DEFAULT session, which on a machine
-        // with a full-account login answers `Already authenticated` and leaves
-        // the broken session untouched. That answer cost a day.
-        "proton" => match &config.stores.proton.session_dir {
-            Some(dir) => format!(
-                "`{}`, or re-issue the agent token — the variable is not optional, \
-                 a bare `pass-cli login` logs into the DEFAULT session",
-                crate::store::proton::login_into(dir.as_path())
-            ),
-            None => format!(
-                "set `stores.proton.session_dir`, then log in with `{}`",
-                crate::store::proton::scoped_command_template("login")
-            ),
-        },
-        "daemon" => "start `keylessd`, or set `stores.daemon.enabled` to false so \
-                     this machine reads its own stores"
-            .to_owned(),
-        // `op signin` is the vendor's own bootstrap and is idempotent; the
-        // account is the half that goes wrong on a machine with two of them.
-        "onepassword" => "`op signin`, then check `stores.onepassword.vault` names a vault \
-                          that login can see, and `stores.onepassword.account` when this \
-                          machine has more than one account"
-            .to_owned(),
-        other => format!("check the settings for `stores.{other}`"),
     }
 }
 
@@ -374,11 +293,8 @@ fn subject_width(rows: &[StoreRow]) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::{points_at, remedy};
-    // The whole-report fixtures, so a row asserted here can also be followed
-    // into the render a person actually reads.
+    use super::points_at;
     use crate::cmd::doctor::tests::{Named, flat, loaded, report};
-    use crate::error::StoreError;
     use crate::store::Registry;
 
     #[test]
@@ -459,191 +375,5 @@ mod tests {
             "{detail}"
         );
         assert!(!detail.contains("HOME"), "{detail}");
-    }
-
-    /// A `Unavailable` from a store, for the rows that are about the ACTION.
-    fn unavailable(store: &str) -> StoreError {
-        StoreError::Unavailable {
-            store: store.to_owned(),
-            detail: "the session cannot be used".to_owned(),
-        }
-    }
-
-    #[test]
-    fn the_proton_next_action_names_the_variable_that_selects_the_session() {
-        // The action column is a separate sentence from the adapter's detail,
-        // and it is the one a reader copies. `pass-cli login` on its own logs
-        // into the DEFAULT session — on macOS `~/Library/Application
-        // Support/proton-pass-cli/.session` — which on a machine with a
-        // full-account login answers `Already authenticated` and leaves the
-        // configured session exactly as broken as it was. That answer is true,
-        // it is about a different session, and it cost a day on 2026-08-10.
-        let load = loaded(
-            r#"{"stores":{"proton":{"enabled":true,"session_dir":"/tmp/keyless-doctor-agent"}}}"#,
-        );
-        let action = remedy(&load.config, "proton", &unavailable("proton"));
-        assert!(
-            action.contains("PROTON_PASS_SESSION_DIR=/tmp/keyless-doctor-agent pass-cli login"),
-            "the next action did not name this machine's session directory: {action}"
-        );
-    }
-
-    /// The detail column of one row of a computed set, by store id.
-    fn detail_of(rows: &[super::StoreRow], id: &str) -> String {
-        rows.iter()
-            .find(|row| row.id == id)
-            .unwrap_or_else(|| panic!("no `{id}` row was produced"))
-            .detail
-            .clone()
-    }
-
-    /// Rows for a config in which every KNOWN backend is dormant.
-    ///
-    /// The live store carries a backend id this build has never heard of, which
-    /// is what keeps all four known rows dormant while still leaving something
-    /// answering — a set that is dormant end to end is reported as the single
-    /// `(none) absent` summary instead of as rows, and there would be nothing to
-    /// read.
-    fn dormant_rows(json: &str) -> Vec<super::StoreRow> {
-        let load = loaded(json);
-        super::store_rows(
-            &load.config,
-            &Registry::new(vec![Box::new(Named("elsewhere"))]),
-        )
-    }
-
-    #[test]
-    fn a_dormant_row_says_which_of_the_silences_it_is() {
-        // Three silences that used to look identical, and each sends the reader
-        // somewhere different: the daemon serves this machine, you switched this
-        // store off, or the config enables it and this registry did not build it
-        // — the last of which means the line the reader would go and edit is
-        // already correct.
-        //
-        // The daemon is the one that is decided by its own question rather than
-        // by an `enabled` flag, and the test that its row is chosen BY ID is the
-        // whole of this case: with that comparison inverted every other backend
-        // is answered as though it were the daemon, and the daemon is answered
-        // with a sentence about a config key nobody wrote.
-        //
-        // The socket is named explicitly and points nowhere, so this asserts on
-        // the config in front of it rather than on whether a daemon happens to
-        // be running on the machine executing the suite.
-        let enabled = dormant_rows(
-            r#"{"stores":{"keychain":{"enabled":true},
-                          "infisical":{"enabled":true},
-                          "onepassword":{"enabled":true},
-                          "proton":{"enabled":true},
-                          "daemon":{"enabled":false,
-                                    "socket":"/nonexistent/keyless-doctor/daemon.sock"}},
-                "secrets":{}}"#,
-        );
-        for id in ["keychain", "infisical", "onepassword", "proton"] {
-            assert_eq!(
-                detail_of(&enabled, id),
-                "enabled here, but this registry did not construct it",
-                "`{id}` is enabled in this config, so `you switched it off` would \
-                 send the reader to edit a line that is already right"
-            );
-        }
-        assert_eq!(
-            detail_of(&enabled, "daemon"),
-            "not enabled in this config",
-            "the daemon row is chosen by the store's id, and it is the one row \
-             that has no `enabled` sentence to give"
-        );
-
-        // The other silence, from the same function: a store the reader really
-        // did switch off. Without this the assertions above hold for a row that
-        // never reads the flag at all.
-        let off = dormant_rows(
-            r#"{"stores":{"keychain":{"enabled":false},
-                          "daemon":{"enabled":false,
-                                    "socket":"/nonexistent/keyless-doctor/daemon.sock"}},
-                "secrets":{}}"#,
-        );
-        assert_eq!(
-            detail_of(&off, "keychain"),
-            "\"enabled\": false under `stores.keychain`"
-        );
-
-        // And the third, which outranks both: with the daemon serving, a local
-        // store is suppressed rather than off.
-        let served = dormant_rows(
-            r#"{"stores":{"keychain":{"enabled":true},
-                          "daemon":{"enabled":true,
-                                    "socket":"/nonexistent/keyless-doctor/daemon.sock"}},
-                "secrets":{}}"#,
-        );
-        assert_eq!(
-            detail_of(&served, "keychain"),
-            "suppressed: the daemon serves every name on this machine"
-        );
-    }
-
-    #[test]
-    fn a_dormant_detail_reaches_the_report_a_person_reads() {
-        // The rows above are a computed set; this is the render. A detail column
-        // that never left `store_rows` would be a fact the reader never gets.
-        let load = loaded(
-            r#"{"stores":{"keychain":{"enabled":true},
-                          "daemon":{"enabled":false,
-                                    "socket":"/nonexistent/keyless-doctor/daemon.sock"}},
-                "secrets":{}}"#,
-        );
-        let (text, _) = report(
-            &load,
-            Registry::new(vec![Box::new(Named("elsewhere"))]),
-            false,
-        );
-        assert!(
-            flat(&text).contains("enabled here, but this registry did not construct it"),
-            "{text}"
-        );
-    }
-
-    #[test]
-    fn a_proven_onepassword_row_names_the_vault_it_is_confined_to() {
-        // The vault is the whole point of this backend, so a green row that
-        // did not name it would certify the wrong thing: "1Password answered"
-        // is true of every vault the login can see, and this store reads one.
-        let load = loaded(
-            r#"{"stores":{"onepassword":{"enabled":true,"vault":"company","account":"demo"}},
-                "secrets":{}}"#,
-        );
-        let detail = points_at(&load.config, "onepassword");
-        assert!(detail.contains("vault \"company\""), "{detail}");
-        assert!(detail.contains("account demo"), "{detail}");
-
-        // An empty vault is not a coordinate. The store refuses it as no vault
-        // at all, so a row printing `vault ""` would be the report contradicting
-        // the store it describes — and it reads as a vault whose name is blank
-        // rather than as the config key nobody filled in.
-        let load = loaded(r#"{"stores":{"onepassword":{"enabled":true,"vault":""}}}"#);
-        let detail = points_at(&load.config, "onepassword");
-        assert!(detail.contains("vault unset"), "{detail}");
-        assert!(!detail.contains("vault \"\""), "{detail}");
-
-        // With no account named, the row must not invent one: the CLI chose,
-        // and which one it chose is a fact this report never read.
-        let load = loaded(r#"{"stores":{"onepassword":{"enabled":true,"vault":"company"}}}"#);
-        let detail = points_at(&load.config, "onepassword");
-        assert!(detail.contains("chosen by the CLI"), "{detail}");
-
-        let action = remedy(&load.config, "onepassword", &unavailable("onepassword"));
-        assert!(action.contains("op signin"), "{action}");
-        assert!(action.contains("stores.onepassword.vault"), "{action}");
-        assert!(action.contains("stores.onepassword.account"), "{action}");
-    }
-
-    #[test]
-    fn the_proton_next_action_with_no_session_directory_asks_for_one_first() {
-        // There is no directory to name, so the advice must not invent one. It
-        // still says how the directory travels, because that is the half nobody
-        // guesses.
-        let load = loaded(r#"{"stores":{"proton":{"enabled":true}}}"#);
-        let action = remedy(&load.config, "proton", &unavailable("proton"));
-        assert!(action.contains("stores.proton.session_dir"), "{action}");
-        assert!(action.contains("PROTON_PASS_SESSION_DIR"), "{action}");
     }
 }

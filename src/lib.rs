@@ -6,16 +6,22 @@
 //!
 //! # The invariant that outranks everything else
 //!
-//! There is no code path in which `keyless run` exits without spawning the
-//! child. Not on a missing store, not on an unknown name, not on a corrupt
-//! config, not on a store that errors. It warns on stderr and execs anyway
-//! with the environment unchanged. A tool that blocks the work gets removed,
-//! and then the plaintext comes back.
+//! `keyless run` never blocks on a failure it did not cause. Not on a missing
+//! store, not on a corrupt config, not on a store or daemon that errors or
+//! falls silent. It warns on stderr and execs anyway with the environment
+//! unchanged. A tool that blocks the work gets removed, and then the plaintext
+//! comes back.
 //!
-//! Two states exist and there is no third:
+//! It refuses only a request a store answered: a name the store does not hold,
+//! an empty name, or a caller that fails attestation. Then the child never
+//! starts, because running it without the credential it named fails somewhere
+//! harder to read.
+//!
+//! Three states, one per thing that can happen to the child:
 //!
 //! - [`State::Injected`] — every requested name resolved, was injected, and is masked.
-//! - [`State::Degraded`] — anything else. The child runs with an unmodified environment.
+//! - [`State::Degraded`] — a store could not answer. The child runs with an unmodified environment.
+//! - [`State::Refused`] — a store holds no such name, or declined the request. The child never starts.
 //!
 //! # The verb that does not exist
 //!
@@ -34,8 +40,9 @@
 //! [`attest`] is the decision.
 //!
 //! The boundary does not change the rule above it. A daemon that is absent,
-//! wedged, refusing or slow is a [`State::Degraded`] like any other store
-//! failure, and the child still runs.
+//! wedged, broken or slow is a [`State::Degraded`] like any other store
+//! failure, and the child still runs; a daemon whose store answers that it
+//! holds no such name refuses the run like any other store would.
 //!
 //! # The daemon is macOS-only, and that is a compile-time fact
 //!
@@ -89,17 +96,22 @@ pub const DAEMON_NAME: &str = "keylessd";
 
 /// The outcome of a `run`, from the caller's point of view.
 ///
-/// Deliberately two-valued. A third state ("partially injected") would mean the
-/// child sometimes sees a subset of what was asked for, which is harder to
-/// reason about than either all or nothing.
+/// There is no "partially injected": that would mean the child sometimes sees
+/// a subset of what was asked for, which is harder to reason about than either
+/// all or nothing. A refusal is all or nothing too — one refused name refuses
+/// the whole run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum State {
     /// Every requested name resolved. The child's environment carries them and
     /// its output is masked.
     Injected,
-    /// At least one requested name did not resolve. The child's environment is
-    /// untouched and nothing is masked, because there is nothing to mask.
+    /// At least one requested name got no answer from its store. The child's
+    /// environment is untouched and nothing is masked, because there is
+    /// nothing to mask.
     Degraded,
+    /// For at least one name, a store answered that it holds no such name or
+    /// declined the request. No child was started.
+    Refused,
 }
 
 impl State {
@@ -109,6 +121,7 @@ impl State {
         match self {
             State::Injected => "INJECTED",
             State::Degraded => "DEGRADED",
+            State::Refused => "REFUSED",
         }
     }
 }

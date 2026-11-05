@@ -122,9 +122,10 @@ impl Store for DaemonStore {
         match self.client.request(&Request::resolve(name)) {
             Ok(Reply::Value(secret)) => Ok(Some(secret)),
             Ok(Reply::Absent) => Ok(None),
-            Ok(Reply::Denied(reason)) => {
-                Err(self.backend(format!("refused by the daemon: {reason}")))
-            }
+            Ok(Reply::Denied(reason) | Reply::Refused(reason)) => Err(StoreError::Refused {
+                store: self.id().to_owned(),
+                detail: reason,
+            }),
             Ok(Reply::Failed(reason)) => Err(self.backend(reason)),
             Ok(Reply::Info { .. }) => {
                 Err(self.backend("the daemon answered a resolve with an info reply"))
@@ -160,6 +161,10 @@ impl Store for DaemonStore {
     /// see [`crate::ipc::client::Client::take_advisory`].
     fn advisory(&self) -> Option<String> {
         self.client.take_advisory()
+    }
+
+    fn judges_names(&self) -> bool {
+        true
     }
 }
 

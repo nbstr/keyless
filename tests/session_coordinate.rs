@@ -90,7 +90,7 @@ const RENDERERS: &[&str] = &[
 ///
 /// | where | role | prescribing a session directory would be |
 /// |---|---|---|
-/// | `src/**`, `README.md` | what `keyless` tells its operator to run | correct — this is the corpus |
+/// | `src/**`, `README.md`, `docs/guide/**` | what `keyless` tells its operator to run | correct — this is the corpus |
 /// | `tests/**` | an INPUT to a fixture, or an assertion about one | meaningless |
 /// | `hooks/**` | the guard's remedy table, covering every vendor CLI alike | **wrong** — see below |
 /// | `site/**` | the command `keyless` exists to refuse, shown as such | wrong |
@@ -117,7 +117,7 @@ fn in_corpus(path: &std::path::Path) -> bool {
     {
         return false;
     }
-    text.contains("/src/") || text.ends_with("README.md")
+    text.contains("/src/") || text.ends_with("README.md") || text.contains("/docs/guide/")
 }
 
 /// Every path the published repository carries, asked of git rather than named.

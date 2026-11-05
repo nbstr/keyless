@@ -1,0 +1,36 @@
+<script>
+(function(){
+"use strict";
+
+/* 100vw includes the scrollbar; the layout must not. Measure it and expose it,
+   or every full-bleed slab is wider than the visible area and the page scrolls
+   sideways at exactly the scrollbar's width. */
+function measureScrollbar(){
+  var sbw = window.innerWidth - document.documentElement.clientWidth;
+  document.documentElement.style.setProperty("--sbw", (sbw > 0 ? sbw : 0) + "px");
+}
+measureScrollbar();
+window.addEventListener("resize", measureScrollbar);
+window.addEventListener("load", measureScrollbar);
+
+/* ------------------------------------------------------------------ reveal */
+var reduce = window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+var targets = document.querySelectorAll(".reveal");
+
+if (reduce || !("IntersectionObserver" in window)) {
+  for (var i = 0; i < targets.length; i++) targets[i].classList.add("in");
+} else {
+  var io = new IntersectionObserver(function(entries){
+    entries.forEach(function(e){
+      if (!e.isIntersecting) return;
+      e.target.classList.add("in");
+      io.unobserve(e.target);
+    });
+  }, {rootMargin:"0px 0px -10% 0px", threshold:0.06});
+  for (var j = 0; j < targets.length; j++) io.observe(targets[j]);
+}
+
+})();
+</script>
+</body>
+</html>

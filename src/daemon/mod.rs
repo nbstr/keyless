@@ -49,27 +49,29 @@ pub mod resolver;
 pub mod session;
 pub mod shadow;
 
-use std::io::{self, Write};
-use std::os::fd::AsFd;
+mod accept;
+mod connection;
+mod heartbeat;
+mod running;
+#[cfg(test)]
+mod tests;
+
+use std::io;
 use std::os::unix::fs::PermissionsExt;
-use std::os::unix::net::{UnixListener, UnixStream};
+use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize};
 use std::thread;
 use std::time::Duration;
 
-use crate::attest::{Attestation, Denial, Policy, attest};
-use crate::audit::{AuditLog, Event, Peer};
-use crate::ipc::protocol::{Op, Reply, Request, read_frame, write_frame};
-use crate::mask::Masker;
-use crate::secret::Secret;
-use crate::store::catalogue::{Catalogue, Rebuilder, Route};
+use crate::attest::{Denial, Policy};
+use crate::audit::AuditLog;
+use crate::store::catalogue::{Catalogue, Rebuilder};
 use crate::store::proton_session::Generations;
-use crate::{NAME, State};
 
 use self::config::DaemonConfig;
-use self::resolver::{Outcome, Refresher, Resolver, Source};
+use self::resolver::{Refresher, Resolver};
 
 /// Socket mode: owner and group may connect, nobody else.
 ///
@@ -85,19 +87,6 @@ pub const SOCKET_MODE: u32 = 0o660;
 /// and bind its own in place of it, which is the cheapest possible attack on
 /// this design.
 pub const SOCKET_DIR_MODE: u32 = 0o755;
-
-/// How many connections may be in flight at once.
-///
-/// Above this the daemon answers and closes rather than queueing, so a runaway
-/// client cannot make the daemon unresponsive to the other nineteen sessions.
-const MAX_CONNECTIONS: usize = 64;
-
-/// Longest name a client may ask for. Names go into audit rows, so an unbounded
-/// one is a way to push a row over the atomic-write cap.
-const MAX_NAME_CHARS: usize = 128;
-
-/// How often the accept loop checks whether it has been told to stop.
-const ACCEPT_POLL: Duration = Duration::from_millis(5);
 
 /// How often a request in flight tells the client it is still there — from
 /// the moment its frame is decoded to the moment its reply is written, see
@@ -125,13 +114,16 @@ pub struct Daemon {
     /// Every name this daemon can serve — the operator's declarations, and
     /// whatever the enumerable stores mint. See [`crate::store::catalogue`].
     catalogue: Arc<Catalogue>,
-    /// Keeps that index current, off the request path.
+    /// Keeps that index current.
     ///
     /// Held behind an `Arc` and handed to every connection, because a miss is
     /// the only thing that starts a rebuild and a miss happens on a connection
     /// thread. Its worker stops when the last of those `Arc`s drops, which is
     /// when the accept thread lets go of the daemon.
     rebuilder: Arc<Rebuilder>,
+    /// How long a miss waits on the rebuild it started: the timeout of the one
+    /// store that mints names.
+    rebuild_within: Duration,
     idle: Duration,
     live: Arc<AtomicUsize>,
     /// Shared with the stores this daemon resolves through, and with the
@@ -146,35 +138,6 @@ pub struct Daemon {
     /// so a changed date takes effect on the next restart.
     token_expires: Option<String>,
 }
-
-/// Where a resolved value came from, for [`Daemon::record`] — [`resolver::Answer`]'s
-/// `source` and `age` carried together, since neither reaches a row without
-/// the other and a call that has one always has both.
-struct Served {
-    source: Source,
-    age: Option<Duration>,
-}
-
-/// What was decided about a request, and why — [`Daemon::record`]'s fixed
-/// grep-able word and, where one exists, the free-text detail beside it.
-struct Decision<'a> {
-    word: &'a str,
-    reason: Option<&'a str>,
-}
-
-impl<'a> Decision<'a> {
-    fn new(word: &'a str) -> Self {
-        Decision { word, reason: None }
-    }
-
-    fn with_reason(word: &'a str, reason: &'a str) -> Self {
-        Decision {
-            word,
-            reason: Some(reason),
-        }
-    }
-}
-
 impl Daemon {
     /// Create the socket and get ready to serve.
     ///
@@ -220,7 +183,9 @@ impl Daemon {
             socket: config.socket.to_path_buf(),
             policy: Arc::new(policy),
             resolver: Arc::new(
-                Resolver::new(backends.registry, config.ttl()).with_stale_window(config.stale()),
+                Resolver::new(backends.registry, config.ttl())
+                    .with_stale_window(config.stale())
+                    .with_silent_window(config.silent()),
             ),
             audit: Arc::new(
                 AuditLog::new(config.audit.to_path_buf())
@@ -228,6 +193,7 @@ impl Daemon {
             ),
             catalogue,
             rebuilder,
+            rebuild_within: Duration::from_millis(config.stores.proton.timeout_ms),
             idle: config.idle_timeout(),
             live: Arc::new(AtomicUsize::new(0)),
             generations,
@@ -245,80 +211,6 @@ impl Daemon {
     #[must_use]
     pub fn resolver(&self) -> &Arc<Resolver> {
         &self.resolver
-    }
-
-    /// Serve until `stop` is set.
-    ///
-    /// Non-blocking accept with a short poll rather than a blocking accept plus
-    /// a self-pipe: this loop has one job and five milliseconds of latency on
-    /// shutdown costs nothing, where a self-pipe would add a second descriptor
-    /// and a second failure mode to the most security-sensitive loop in the
-    /// program.
-    pub fn serve_until(&self, stop: &AtomicBool) {
-        while !stop.load(Ordering::Relaxed) {
-            match self.listener.accept() {
-                Ok((stream, _)) => self.dispatch(stream),
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                    thread::sleep(ACCEPT_POLL);
-                }
-                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-                Err(error) => {
-                    // An accept that fails for any other reason is worth
-                    // saying out loud, but is not worth stopping for: the next
-                    // one usually works, and a daemon that exits takes the
-                    // whole fleet degraded with it.
-                    let _ = writeln!(io::stderr(), "{NAME}d: accept failed: {error}");
-                    thread::sleep(ACCEPT_POLL);
-                }
-            }
-        }
-    }
-
-    fn dispatch(&self, stream: UnixStream) {
-        if self.live.load(Ordering::Relaxed) >= MAX_CONNECTIONS {
-            // Answering is better than dropping: the client learns immediately
-            // and degrades, rather than waiting out its whole timeout.
-            let _ = write_frame(
-                &mut &stream,
-                &Reply::Failed("the daemon is at its connection limit".to_owned())
-                    .encode()
-                    .unwrap_or_default(),
-            );
-            return;
-        }
-
-        // Attested here, on the accept loop's own thread, rather than left for
-        // the connection thread below to do once it exists. A freshly spawned
-        // thread's first slice of CPU is scheduled whenever the OS gets to it,
-        // and a legitimate peer that is a short-lived process — `keyless run`
-        // wrapping a command that finishes fast — can exit before that
-        // happens, which turns "identified late" into "unidentifiable" for no
-        // reason connected to who the peer was. The accept loop is already
-        // running, so there is no second thread's scheduling to wait on: this
-        // reads the kernel's facts about the peer as close to connect as any
-        // code in this daemon ever will. Every request after the first is
-        // still attested fresh, in `Connection::serve`, which is what defends
-        // against a peer that `exec`s a different image mid-connection.
-        let first_attestation = attest(stream.as_fd(), &self.policy);
-
-        let worker = Connection {
-            policy: Arc::clone(&self.policy),
-            resolver: Arc::clone(&self.resolver),
-            audit: Arc::clone(&self.audit),
-            catalogue: Arc::clone(&self.catalogue),
-            rebuilder: Arc::clone(&self.rebuilder),
-            idle: self.idle,
-            live: Arc::clone(&self.live),
-            token_expires: self.token_expires.clone(),
-        };
-        self.live.fetch_add(1, Ordering::Relaxed);
-        if thread::Builder::new()
-            .name(format!("{NAME}d-conn"))
-            .spawn(move || worker.serve(stream, first_attestation))
-            .is_err()
-        {
-            self.live.fetch_sub(1, Ordering::Relaxed);
-        }
     }
 }
 
@@ -347,435 +239,6 @@ fn remove_stale_socket(path: &Path) -> io::Result<()> {
         Err(error) => Err(error),
     }
 }
-
-struct Connection {
-    policy: Arc<Policy>,
-    resolver: Arc<Resolver>,
-    audit: Arc<AuditLog>,
-    catalogue: Arc<Catalogue>,
-    rebuilder: Arc<Rebuilder>,
-    idle: Duration,
-    live: Arc<AtomicUsize>,
-    /// See [`Daemon::token_expires`].
-    token_expires: Option<String>,
-}
-
-impl Drop for Connection {
-    fn drop(&mut self) {
-        self.live.fetch_sub(1, Ordering::Relaxed);
-    }
-}
-
-impl Connection {
-    /// `first_attestation` is the peer's identity as read at accept time, by
-    /// the caller — see [`Daemon::dispatch`] for why that reading is not
-    /// redone here for the connection's first request. Every request after it
-    /// re-attests fresh, in the loop below.
-    fn serve(self, stream: UnixStream, first_attestation: Attestation) {
-        // The listener is non-blocking so the accept loop can poll its stop
-        // flag, and on BSD an accepted socket INHERITS that flag. Left set, the
-        // first read that arrives a moment before its data returns EAGAIN, the
-        // frame reader takes that for a read deadline passing, and the
-        // connection is torn down under a client that did nothing wrong. It survives a single
-        // request-and-reply — the request is usually already buffered by the
-        // time accept returns — and fails the moment a client sends a second
-        // one, which is why it has to be cleared here rather than trusted to
-        // the timeouts below.
-        if let Err(error) = stream.set_nonblocking(false) {
-            let _ = writeln!(
-                io::stderr(),
-                "{NAME}d: cannot make the connection blocking: {error}"
-            );
-            return;
-        }
-        let _ = stream.set_read_timeout(Some(self.idle));
-        let _ = stream.set_write_timeout(Some(self.idle));
-
-        let mut reader = io::BufReader::new(match stream.try_clone() {
-            Ok(clone) => clone,
-            Err(_) => return,
-        });
-
-        let mut attestation = Some(first_attestation);
-        loop {
-            let frame = match read_frame(&mut reader) {
-                Ok(Some(frame)) => frame,
-                // A clean end of stream is the ordinary way a client leaves.
-                Ok(None) => return,
-                Err(error) => {
-                    let _ = write_frame(
-                        &mut &stream,
-                        &Reply::Failed(error.to_string())
-                            .encode()
-                            .unwrap_or_default(),
-                    );
-                    return;
-                }
-            };
-
-            // The first iteration spends the accept-time reading; every one
-            // after it attests fresh. A process can `exec` a different image
-            // without closing its sockets, so trusting the first reading for a
-            // second request would authorise a program that is no longer
-            // running.
-            let this_attestation = attestation
-                .take()
-                .unwrap_or_else(|| attest(stream.as_fd(), &self.policy));
-
-            let request = match Request::decode(&frame) {
-                Ok(request) => request,
-                Err(error) => {
-                    let _ = write_frame(
-                        &mut &stream,
-                        &Reply::Failed(error.to_string())
-                            .encode()
-                            .unwrap_or_default(),
-                    );
-                    continue;
-                }
-            };
-
-            // Taken here, before anything is decided about the request, and
-            // held until the reply exists — see [`Heartbeat`] for why the
-            // guard lives on this thread for the whole request rather than
-            // around whichever step is slow today.
-            let heartbeat = request
-                .progress
-                .then(|| Heartbeat::start(&stream))
-                .flatten();
-            let (reply, advisory) = self.answer(&request, &this_attestation);
-            let encoded = match reply.encode_with_advisory(advisory.as_deref()) {
-                Ok(encoded) => encoded,
-                Err(_) => return,
-            };
-            // The join is the handover between the two writers: the beat
-            // thread writes only whole frames, and it has written its last
-            // before the reply frame starts, so the bytes never interleave.
-            drop(heartbeat);
-            if write_frame(&mut &stream, &encoded).is_err() {
-                return;
-            }
-        }
-    }
-
-    /// Answer one request against an already-attested peer — see
-    /// [`Daemon::dispatch`] and the loop in [`Connection::serve`] for when
-    /// that attestation was read.
-    ///
-    /// The advisory alongside the reply is `Some` only down the [`Op::Resolve`]
-    /// path — every `keyless run` request, and no other verb — see
-    /// [`credential::run_expiry_advisory`].
-    fn answer(&self, request: &Request, attestation: &Attestation) -> (Reply, Option<String>) {
-        if let Some(denial) = attestation.denial() {
-            let detail = denial.to_string();
-            self.record(
-                request,
-                attestation,
-                Decision::with_reason(denial.kind(), &detail),
-                State::Degraded,
-                None,
-                None,
-            );
-            return (Reply::Denied(detail), None);
-        }
-
-        match request.op {
-            Op::Ping => (Reply::Info { names: Vec::new() }, None),
-            Op::Names => {
-                // A listing over a daemon that has never enumerated answers the
-                // declared set and asks for the rest. The asker gets today's
-                // answer immediately rather than waiting on a vault, and the
-                // next listing is complete — which is the same demand-driven
-                // shape a miss takes, for the same reason: nothing here runs on
-                // a clock.
-                if self.catalogue.indexed_at().is_none() {
-                    self.rebuilder.queue_full();
-                }
-                (
-                    Reply::Info {
-                        names: self.catalogue.names(),
-                    },
-                    None,
-                )
-            }
-            Op::Resolve => self.resolve(request, attestation),
-        }
-    }
-
-    fn resolve(&self, request: &Request, attestation: &Attestation) -> (Reply, Option<String>) {
-        let advisory = credential::run_expiry_advisory(self.token_expires.as_deref());
-
-        if request.name.is_empty() || request.name.chars().count() > MAX_NAME_CHARS {
-            self.record(
-                request,
-                attestation,
-                Decision::new("bad-name"),
-                State::Degraded,
-                None,
-                None,
-            );
-            return (
-                Reply::Failed(format!(
-                    "a name must be between 1 and {MAX_NAME_CHARS} characters"
-                )),
-                advisory,
-            );
-        }
-
-        let answer = self.resolver.resolve(&request.name);
-        let served = Some(Served {
-            source: answer.source,
-            age: answer.age,
-        });
-
-        let reply = match answer.outcome {
-            Outcome::Found(secret) => {
-                self.record(
-                    request,
-                    attestation,
-                    Decision::new("allow"),
-                    State::Injected,
-                    Some(secret.as_ref()),
-                    served,
-                );
-                // One more copy of the plaintext, which the reply owns and
-                // zeroizes when it is dropped. The `Arc` in the cache keeps
-                // the original.
-                Reply::Value(Secret::new(secret.expose().to_owned()))
-            }
-            Outcome::Absent => {
-                // The verdict is dropped: `Reply::Absent` carries no sentence,
-                // so composing one would walk every title for nothing.
-                let _ = self.missed(&request.name);
-                self.record(
-                    request,
-                    attestation,
-                    Decision::new("absent"),
-                    State::Degraded,
-                    None,
-                    served,
-                );
-                Reply::Absent
-            }
-            Outcome::Failed { reason, kind } => {
-                let route = self.missed(&request.name);
-                self.record(
-                    request,
-                    attestation,
-                    Decision::new(kind.as_str()),
-                    State::Degraded,
-                    None,
-                    served,
-                );
-                let advice = self.catalogue.advice(&request.name, &route);
-                Reply::Failed(format!("{reason}; {advice}"))
-            }
-        };
-        (reply, advisory)
-    }
-
-    /// Queue whatever a name that produced no value needs, and hand back what
-    /// the catalogue said about it.
-    ///
-    /// # Why this runs AFTER the resolve and never before it
-    ///
-    /// Two reasons, and the second is the one that bites. A resolve that
-    /// produces a value must not gain a lock or a lookup it did not have, so
-    /// the catalogue is off the happy path entirely.
-    ///
-    /// And the catalogue must not GATE a request. The keychain store defaults
-    /// its account to the name itself and the file store keys on the name, so
-    /// both serve names that appear in no `secrets` entry and in no index. A
-    /// gate would turn every one of those into a miss — the tool would stop
-    /// serving names it serves today, and the index would look correct while
-    /// doing it.
-    fn missed(&self, name: &str) -> Route {
-        let route = self.catalogue.route(name);
-        if matches!(route, Route::Unknown { .. }) {
-            self.rebuilder.queue(name);
-        }
-        // Handed back rather than recomputed by whoever wants the sentence:
-        // this verdict already cost a walk of the index, and `advice` would
-        // otherwise make the same walk a second time on the one arm that uses
-        // it.
-        route
-    }
-
-    /// Write one audit row.
-    ///
-    /// `secret` is passed so the claimed argv can be masked with it: a caller
-    /// that put the value on its own command line — the habit this tool
-    /// replaces — must not have it copied into the daemon's log, which is the
-    /// one log the caller cannot edit afterwards.
-    ///
-    /// `served` is `None` on a row that never asked the resolver at all — an
-    /// attestation denial, a malformed name — and `Some` on every row that
-    /// did, whatever it decided. A `Some` row naming [`Source::Stale`] is the
-    /// fact [`resolver::Source::as_str`] exists for: the value this row
-    /// served was not read from the vendor a moment ago, and its `age` says
-    /// how long ago it was.
-    fn record(
-        &self,
-        request: &Request,
-        attestation: &Attestation,
-        decision: Decision<'_>,
-        state: State,
-        secret: Option<&Secret>,
-        served: Option<Served>,
-    ) {
-        let masker = match secret {
-            Some(secret) => Masker::from_secrets([(request.name.as_str(), secret)]),
-            None => Masker::new(),
-        };
-
-        let names = if request.name.is_empty() {
-            Vec::new()
-        } else {
-            vec![request.name.clone()]
-        };
-        let unresolved = if state == State::Injected {
-            Vec::new()
-        } else {
-            names.clone()
-        };
-
-        let mut event = Event::new("resolve", state, names, &request.argv, &masker)
-            // The caller's claim, recorded as such. `cwd` on a daemon row is
-            // the client's, not the daemon's — the daemon's own working
-            // directory is `/` and would say nothing.
-            .with_cwd(masker.mask_str(&request.cwd))
-            .with_unresolved(unresolved)
-            .with_decision(decision.word);
-
-        if let Some(reason) = decision.reason {
-            event = event.with_reason(reason);
-        }
-
-        if let Some(served) = served {
-            event = event.with_source(served.source.as_str());
-            if let Some(age) = served.age {
-                event = event.with_age(age);
-            }
-        }
-
-        if let Some(peer) = attestation.peer() {
-            event = event.with_peer(Peer {
-                uid: peer.uid,
-                pid: peer.pid,
-                generation: peer.generation,
-                unique_id: peer.unique_id,
-                code_hash: peer.code_hash_hex(),
-                image: peer.image.display().to_string(),
-            });
-        }
-
-        if let Err(error) = self.audit.append(&event) {
-            // An unwritable audit log is serious and is still not a reason to
-            // stop answering: the alternative is that a full disk takes the
-            // whole fleet's secrets away.
-            let _ = writeln!(io::stderr(), "{NAME}d: audit: {error}");
-        }
-    }
-}
-
-/// The connection saying "still here" on the socket every [`HEARTBEAT`], for
-/// as long as this is held.
-///
-/// # Why the guard is the connection thread's, for the life of the request
-///
-/// The heartbeat once wrapped the lookup alone, because the lookup was the
-/// step known to be slow: a vendor CLI and a network round trip. Everything
-/// else on the request path ran on the connection thread in silence — and
-/// one of those steps is this daemon's own slow one. An audit append takes an
-/// exclusive lock on a log every connection thread shares, reads its tail,
-/// and writes an anchor through a full `fsync`, so under a busy log or a slow
-/// disk the append alone outlasts what the lookup left of the client's
-/// deadline. Five degrades on a live install had that shape: the client gave
-/// up, and the daemon then recorded `allow` for the same name a few seconds
-/// later. A denial and a malformed name write rows on the same lock and were
-/// never under the heartbeat at all, so a refused client on a held log read
-/// as a wedge rather than a refusal.
-///
-/// The client's deadline bounds SILENCE, and it cannot know which step it is
-/// waiting on. So the guard is taken by the connection thread the moment the
-/// request is decoded and dropped only when the reply exists, and coverage is
-/// a property of the request path rather than of any step on it: a step added
-/// later — another audit row, a catalogue walk — is under the heartbeat
-/// without anyone remembering to put it there.
-///
-/// # Two writers, one socket, and why the bytes never interleave
-///
-/// While this is held there are two threads that may write to the
-/// connection, and the frame writer is whole-frame: the beat thread writes
-/// nothing but complete `Working` frames, and the connection thread writes
-/// nothing at all until it has dropped this, which joins the beat thread.
-/// That join is the handover between the two writers, so the reply frame
-/// starts only after the last heartbeat frame has ended.
-///
-/// # What happens when the client has already gone
-///
-/// The heartbeat write fails, the beating stops, and the request goes on
-/// being answered anyway. The lookup is already paid for; letting it finish
-/// records the audit row the request earned and leaves the value in the
-/// resolver's cache, so the retry the caller is about to make is answered
-/// from memory. Abandoning it would throw away the work and make the next
-/// attempt pay for it again — which, on a store that is slow enough to have
-/// reached this code, is how a client ends up unable to resolve a name it
-/// asks for repeatedly.
-struct Heartbeat {
-    /// Dropped to tell the beat thread to stop; the thread sees it as the
-    /// channel disconnecting.
-    stop: Option<std::sync::mpsc::Sender<()>>,
-    thread: Option<thread::JoinHandle<()>>,
-}
-
-impl Heartbeat {
-    /// Start beating on `stream`.
-    ///
-    /// `None` when there is no descriptor or no thread to be had, and the
-    /// request is then answered in silence — which is late, and late is
-    /// exactly what this daemon did before it could speak.
-    fn start(stream: &UnixStream) -> Option<Self> {
-        let stream = stream.try_clone().ok()?;
-        let (stop, stopped) = std::sync::mpsc::channel::<()>();
-        let thread = thread::Builder::new()
-            .name(format!("{NAME}d-heartbeat"))
-            .spawn(move || {
-                let mut heard = true;
-                loop {
-                    match stopped.recv_timeout(HEARTBEAT) {
-                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                            if heard {
-                                heard = write_frame(
-                                    &mut &stream,
-                                    &Reply::Working.encode().unwrap_or_default(),
-                                )
-                                .is_ok();
-                            }
-                        }
-                        // Nothing is ever sent; the sender dropping is the
-                        // only thing this can receive.
-                        Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
-                    }
-                }
-            })
-            .ok()?;
-        Some(Heartbeat {
-            stop: Some(stop),
-            thread: Some(thread),
-        })
-    }
-}
-
-impl Drop for Heartbeat {
-    fn drop(&mut self) {
-        drop(self.stop.take());
-        if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
-        }
-    }
-}
-
 /// A daemon running on its own thread, stopped when this is dropped.
 ///
 /// Exists for tests and for `keylessd --foreground`, so both drive the same
@@ -796,95 +259,6 @@ pub struct Running {
     refresher: Option<Refresher>,
 }
 
-impl Running {
-    /// Start serving on a background thread, and keep the session alive.
-    ///
-    /// # Why the renewal loop starts HERE and not in `main`
-    ///
-    /// It started in the binary, and that was wrong in two ways that only
-    /// showed up when something tried to test it.
-    ///
-    /// A daemon is a thing that serves names and keeps the identity it serves
-    /// them with; `main` is argument parsing and a signal wait. Wiring the loop
-    /// there made "is this daemon renewing?" a question about which entry point
-    /// happened to construct it — so every integration case in this crate, all
-    /// of which build a daemon through this function, ran against one that
-    /// never renewed. A test asserting the loop's behaviour passed by
-    /// describing a loop that was not running.
-    ///
-    /// It also meant an embedder using this crate as a library got a daemon
-    /// whose Proton session lapsed in two hours, with nothing to say so.
-    ///
-    /// After the socket is bound, so a renewal taking a few seconds does not
-    /// delay the sessions waiting to connect.
-    ///
-    /// # Errors
-    ///
-    /// The accept thread not starting, or a config that asks for the renewal
-    /// loop and cannot support a login — the second carried verbatim from
-    /// [`self::session::spawn`], because an operator who wrote `auto_login`
-    /// has said the session matters and starting without it is the silent
-    /// outage that loop exists to end.
-    pub fn spawn(daemon: Daemon, config: &DaemonConfig) -> io::Result<Self> {
-        // The same `Generations` the daemon's Proton store reads through: the
-        // loop creates and publishes into it, and every store sees a fresh
-        // generation the moment this loop makes one current.
-        let session = self::session::spawn(config, daemon.generations.as_ref())
-            .map_err(|detail| io::Error::new(io::ErrorKind::InvalidInput, detail))?;
-        let stop = Arc::new(AtomicBool::new(false));
-        let socket = daemon.socket.clone();
-        let resolver = Arc::clone(&daemon.resolver);
-        let flag = Arc::clone(&stop);
-        let thread = thread::Builder::new()
-            .name(format!("{NAME}d-accept"))
-            .spawn(move || daemon.serve_until(&flag))?;
-        let refresher = Some(Resolver::start(&resolver));
-        Ok(Running {
-            stop,
-            socket,
-            resolver,
-            thread: Some(thread),
-            session,
-            refresher,
-        })
-    }
-
-    /// Whether this daemon is keeping a Proton session alive.
-    #[must_use]
-    pub fn renews_its_session(&self) -> bool {
-        self.session.is_some()
-    }
-
-    /// Where it is listening.
-    #[must_use]
-    pub fn socket(&self) -> &Path {
-        &self.socket
-    }
-
-    /// How many times a store has actually been asked.
-    #[must_use]
-    pub fn upstream_calls(&self) -> u64 {
-        self.resolver.upstream_calls()
-    }
-}
-
-impl Drop for Running {
-    fn drop(&mut self) {
-        // The renewal loop first: it spawns vendor children, and stopping the
-        // accept loop while one is in flight leaves the process waiting on a
-        // join for something nobody is stopping. The refresh workers spawn the
-        // same children, so they stop on the same terms and for the same
-        // reason.
-        drop(self.session.take());
-        drop(self.refresher.take());
-        self.stop.store(true, Ordering::Relaxed);
-        if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
-        }
-        let _ = std::fs::remove_file(&self.socket);
-    }
-}
-
 /// Denials, rendered for an operator reading the daemon's own stderr.
 ///
 /// Separate from the wire message on purpose: the wire tells the caller what to
@@ -892,163 +266,4 @@ impl Drop for Running {
 #[must_use]
 pub fn describe_denial(denial: &Denial) -> String {
     format!("{} ({})", denial, denial.kind())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{Daemon, SOCKET_MODE, remove_stale_socket};
-    use crate::attest::Policy;
-    use crate::daemon::config::DaemonConfig;
-    use std::os::unix::fs::PermissionsExt;
-    use std::path::PathBuf;
-
-    // The socket cannot live in the scratch directory below: read the file for
-    // the measurement, and for why `TMPDIR` decided whether these tests passed.
-    include!(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/tests/support/short_socket.rs"
-    ));
-
-    fn scratch(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "keyless-daemon-{tag}-{}-{:?}",
-            std::process::id(),
-            std::thread::current().id()
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("mkdir");
-        dir
-    }
-
-    #[test]
-    fn the_socket_is_group_writable_and_nothing_more() {
-        // Connecting needs write, not read. A `0640` socket would be
-        // unreachable by the very group it was created for, and a `0666` one
-        // would let any user on the machine talk to the daemon.
-        let dir = scratch("mode");
-        let socket = short_socket_path(&dir);
-        let config = DaemonConfig {
-            socket: socket.clone().into(),
-            audit: dir.join("audit.jsonl").into(),
-            ..DaemonConfig::default()
-        };
-        let daemon = Daemon::bind(&config, Policy::new()).expect("bind");
-        let mode = std::fs::metadata(daemon.socket())
-            .expect("stat")
-            .permissions()
-            .mode()
-            & 0o777;
-        assert_eq!(mode, SOCKET_MODE, "mode was {mode:04o}");
-        assert_eq!(mode & 0o007, 0, "other must not be able to connect");
-        drop(daemon);
-        let _ = std::fs::remove_file(&socket);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn a_stale_socket_is_replaced() {
-        let dir = scratch("stale");
-        let socket = short_socket_path(&dir);
-        let config = DaemonConfig {
-            socket: socket.clone().into(),
-            audit: dir.join("audit.jsonl").into(),
-            ..DaemonConfig::default()
-        };
-        let first = Daemon::bind(&config, Policy::new()).expect("first bind");
-        drop(first);
-        // The inode is still there; binding again must work.
-        let second = Daemon::bind(&config, Policy::new()).expect("second bind over a stale socket");
-        drop(second);
-        let _ = std::fs::remove_file(&socket);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn a_denied_request_still_hears_the_daemon_while_its_audit_row_waits_on_the_lock() {
-        // A denial's audit row is written under the same exclusive lock as an
-        // allow's, and a heartbeat scoped to the lookup never covered it: a
-        // refused client waiting on a busy log heard nothing and reported a
-        // wedge, not a refusal. Held from outside for longer than the
-        // deadline, the lock stands in for any other connection thread inside
-        // a slow append.
-        use crate::ipc::client::Client;
-        use crate::ipc::protocol::{Reply, Request};
-        use std::time::Duration;
-
-        let dir = scratch("denied-under-held-lock");
-        let socket = short_socket_path(&dir);
-        let config = DaemonConfig {
-            socket: socket.clone().into(),
-            audit: dir.join("audit.jsonl").into(),
-            idle_timeout_seconds: 5,
-            stores: crate::daemon::config::DaemonStores {
-                file: crate::daemon::config::FileStoreConfig {
-                    enabled: true,
-                    path: dir.join("secrets.json").into(),
-                },
-                ..Default::default()
-            },
-            ..DaemonConfig::default()
-        };
-        std::fs::write(&*config.stores.file.path, b"{}").expect("write secrets");
-        // Nothing pinned, so this process is refused, and refused BEFORE any
-        // store is asked: the only slow step on this path is the daemon's own
-        // audit append.
-        let daemon = Daemon::bind(&config, Policy::new()).expect("bind");
-        let running = super::Running::spawn(daemon, &config).expect("start the accept loop");
-
-        let silence = Duration::from_secs(1);
-        let client = Client::new(running.socket().to_path_buf(), silence);
-
-        // The control: an unheld log answers the refusal at once.
-        match client.request(&Request::resolve("DECOY")) {
-            Ok(Reply::Denied(_)) => {}
-            other => panic!("an unpinned daemon must refuse at once, got {other:?}"),
-        }
-
-        let hold = Duration::from_millis(2_500);
-        let log = std::fs::OpenOptions::new()
-            .read(true)
-            .append(true)
-            .open(&config.audit)
-            .expect("open the daemon's audit log");
-        log.lock().expect("hold the audit log's lock");
-        let holder = std::thread::spawn(move || {
-            std::thread::sleep(hold);
-            log.unlock().expect("release the audit log's lock");
-        });
-
-        let started = std::time::Instant::now();
-        let reply = client.request(&Request::resolve("DECOY"));
-        holder.join().expect("the lock holder");
-        assert!(
-            started.elapsed() >= hold - Duration::from_millis(100),
-            "the reply came back before the lock was released, so the denial row was \
-             never behind it and this proves nothing: {:?}",
-            started.elapsed()
-        );
-        match reply {
-            Ok(Reply::Denied(_)) => {}
-            other => panic!(
-                "a daemon that has refused and is waiting on its own log must keep the \
-                 client waiting with it, got {other:?}"
-            ),
-        }
-
-        drop(running);
-        let _ = std::fs::remove_file(&socket);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn a_regular_file_at_the_socket_path_is_refused_rather_than_deleted() {
-        // Otherwise a mistyped `socket` field is a delete-any-file primitive
-        // running as the daemon's uid.
-        let dir = scratch("notasocket");
-        let path = dir.join("important.txt");
-        std::fs::write(&path, b"not a socket").expect("write");
-        assert!(remove_stale_socket(&path).is_err());
-        assert!(path.exists(), "the file must still be there");
-        let _ = std::fs::remove_dir_all(&dir);
-    }
 }

@@ -6,13 +6,18 @@
 //!
 //! # The invariant
 //!
-//! This function spawns the child on every path where a child can exist. There
-//! is no early return for a missing store, an unknown name, a corrupt config,
-//! or a backend that errors — each of those sets [`State::Degraded`], writes one
-//! line to stderr, and continues to the spawn. The only two ways out without a
-//! child are [`RunError::NoCommand`] (nothing was asked for) and
-//! [`RunError::SpawnFailed`] (the command does not exist), and neither is this
-//! tool declining to run something it could have run.
+//! This function spawns the child on every path where a failure is not the
+//! caller's. There is no early return for a missing store, a silent store, a
+//! corrupt config, or a backend or daemon that errors — each of those sets
+//! [`State::Degraded`], writes one line to stderr, and continues to the spawn.
+//!
+//! The one deliberate way out without a child is a refused run: a store
+//! answered the request, and the answer is that it is wrong — a name the store
+//! does not hold, an empty name, or a caller the daemon will not serve. That
+//! sets [`State::Refused`] and returns [`EXIT_REFUSED`]; `resolve::fate`
+//! decides which verdicts refuse. The other
+//! two are [`RunError::NoCommand`] (nothing was asked for) and
+//! [`RunError::SpawnFailed`] (the command does not exist).
 //!
 //! The reason is not politeness. A tool that occasionally blocks the work gets
 //! removed, and what comes back is the plaintext literal on the command line.
@@ -24,9 +29,9 @@
 //! ENVIRONMENT rather than the command, and report them against the program: a
 //! stored value containing a NUL byte produced `cannot execute /bin/sh: nul byte
 //! found`, exit 127, no child. The kernel gets a second say now —
-//! [`caused_by_the_environment`] — and its refusal drops the injection and
+//! [`spawn::caused_by_the_environment`] — and its refusal drops the injection and
 //! spawns again, degraded. A refusal that says the machine is momentarily out of
-//! process slots is retried rather than reported; see [`spawn_persistently`].
+//! process slots is retried rather than reported; see [`spawn::spawn_persistently`].
 //!
 //! So `SpawnFailed` means what it says: nothing this tool did to the environment
 //! is left in the explanation.
@@ -34,35 +39,52 @@
 //! # Three things here are bounded on purpose
 //!
 //! Each was an unbounded wait that ended with the child either never running or
-//! never being reported: [`resolve_all`] (N deadlines became one),
+//! never being reported: [`resolve::resolve_all`] (N deadlines became one),
 //! [`PUMP_DRAIN_GRACE`] (a grandchild holding the pipes), and
 //! [`crate::store::exec::spawn_persistently`] (two concurrent spawns deadlocking
 //! on an inherited descriptor, and a `fork` refused for want of process slots).
 //! Read those three before changing the shape of this function.
 
 use std::ffi::OsString;
-use std::io::{self, Write};
-use std::os::fd::OwnedFd;
-use std::os::unix::process::CommandExt;
-use std::path::Path;
-use std::process::{Command, Stdio};
+use std::io::Write;
 use std::sync::{Arc, mpsc};
-use std::thread;
 
-use nix::sys::signal::SigSet;
 use nix::unistd::Pid;
 
 use crate::audit::{AuditLog, Event};
 use crate::error::RunError;
-use crate::mask::{Masker, pump};
-use crate::secret::Secret;
-use crate::store::{Registry, Resolution};
+use crate::mask::Masker;
+use crate::store::Registry;
 use crate::tty::relay::{Prepared, Relay};
-use crate::tty::{self, Pty, TtyError};
 use crate::{NAME, State};
+
+mod binding;
+mod filter;
+mod resolve;
+mod spawn;
+mod variables;
+
+#[cfg(test)]
+mod binding_tests;
+#[cfg(test)]
+mod spawn_tests;
+#[cfg(test)]
+mod variables_tests;
+
+use filter::{drain_pumps, start_filters, warn_output_left_open};
+use resolve::{Gathered, gather};
+use spawn::{
+    StdioPlan, acquire_terminal, assemble, caused_by_the_environment, exit_code_of, injection,
+    spawn_persistently,
+};
+use variables::{deconflict, quoting_warnings};
 
 /// How many backend failure reasons to print under the degraded banner.
 const MAX_REASONS_SHOWN: usize = 3;
+
+/// The exit code of a refused run: `EX_USAGE`, because the request was wrong
+/// and the child never started, so no exit code of its own exists.
+pub const EXIT_REFUSED: i32 = 64;
 
 /// How `run` decides whether the child gets a pseudo-terminal.
 ///
@@ -84,17 +106,6 @@ pub enum TtyPolicy {
     SimulateAllocationFailure,
 }
 
-impl TtyPolicy {
-    fn acquire(self) -> Result<Pty, TtyError> {
-        match self {
-            TtyPolicy::Pipes => Err(TtyError::NotATerminal),
-            TtyPolicy::SimulateAllocationFailure => Err(TtyError::Simulated),
-            TtyPolicy::Auto if tty::is_interactive() => tty::allocate(),
-            TtyPolicy::Auto => Err(TtyError::NotATerminal),
-        }
-    }
-}
-
 /// One `--secret` request: which name to look up, and which variables to put it in.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Binding {
@@ -107,165 +118,6 @@ pub struct Binding {
     /// Empty when the caller spelled `ENV=NAME`, and empty for a name no config
     /// declares. See [`Binding::declared`] and [`crate::config::SecretRoute::aliases`].
     pub also: Vec<String>,
-}
-
-impl Binding {
-    /// Parse `NAME` or `ENV=NAME`.
-    ///
-    /// The two-part form exists because the store's name for a credential and
-    /// the variable a tool reads are often different — `gh` wants
-    /// `GITHUB_TOKEN` whatever the item is called.
-    ///
-    /// Syntax only: this reads the spec and nothing else, so a request parsed
-    /// here lands in exactly the one variable the spec spells. Use
-    /// [`Binding::declared`] to also give the credential the variables its
-    /// declaration says it answers to.
-    pub fn parse(spec: &str) -> Result<Self, String> {
-        let (env, name) = match spec.split_once('=') {
-            Some((env, name)) => (env.trim(), name.trim()),
-            None => (spec.trim(), spec.trim()),
-        };
-        if name.is_empty() {
-            return Err(format!("`{spec}` names no secret"));
-        }
-        if !is_valid_env_name(env) {
-            return Err(format!(
-                "`{env}` is not a usable environment variable name (letters, digits and underscore, not starting with a digit)"
-            ));
-        }
-        if let Some(reason) = hijacks_the_child(env) {
-            return Err(format!(
-                "`{env}` cannot be bound to a secret: {reason}. The value would choose what \
-                 the child runs, and masking would hide it while it did"
-            ));
-        }
-        Ok(Binding {
-            env: env.to_owned(),
-            name: name.to_owned(),
-            also: Vec::new(),
-        })
-    }
-
-    /// Parse a spec, and give the credential every variable its declaration says
-    /// it answers to.
-    ///
-    /// This is what the binary calls, and the difference between it and
-    /// [`Binding::parse`] is the whole of the fix described in
-    /// [`crate::config::SecretRoute::aliases`]: a bare `-s NAME` reaches the
-    /// child under the variable the program actually reads, without anybody
-    /// having to know that the label and the variable were different.
-    ///
-    /// # A config is not a trusted input
-    ///
-    /// It arrives by `--config` or `KEYLESS_CONFIG`, so a declaration can name
-    /// any variable at all — including the ones in [`hijacks_the_child`], where
-    /// the stored VALUE would choose which program the child runs while masking
-    /// hid it doing so. Every derived variable therefore goes through the same
-    /// two checks a typed one does, and a rejected one is dropped rather than
-    /// failing the run: the caller asked for a name, not for an alias, and the
-    /// name still resolves and still lands in its own variable.
-    pub fn declared(spec: &str, config: &crate::config::Config) -> Result<Self, String> {
-        let mut binding = Binding::parse(spec)?;
-        // A spelled `ENV=NAME` is an instruction about where the value goes. It
-        // is not widened, because the caller has already answered the question.
-        if binding.env != binding.name {
-            return Ok(binding);
-        }
-        binding.also = config
-            .route(&binding.name)
-            .aliases(&binding.name)
-            .into_iter()
-            .filter(|variable| {
-                variable != &binding.env
-                    && is_valid_env_name(variable)
-                    && hijacks_the_child(variable).is_none()
-            })
-            .collect();
-        Ok(binding)
-    }
-
-    /// Every variable this request would set, the spelled one first.
-    fn targets(&self) -> Vec<String> {
-        std::iter::once(self.env.clone())
-            .chain(self.also.iter().cloned())
-            .collect()
-    }
-}
-
-fn is_valid_env_name(candidate: &str) -> bool {
-    let mut chars = candidate.chars();
-    match chars.next() {
-        Some(first) if first.is_ascii_alphabetic() || first == '_' => {}
-        _ => return false,
-    }
-    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
-}
-
-/// Variables whose value decides **which code runs**, before the child's own
-/// first instruction. Bound to a secret, the store chooses the program.
-///
-/// # The attack this closes
-///
-/// ```console
-/// $ keyless run -s PATH=DECOY -- sh -c '...'
-/// ```
-///
-/// resolved `DECOY` out of the store, put it in `PATH`, and the `sh` that ran
-/// came from the directory the stored VALUE named — not from `/bin`. **And the
-/// value is a needle in the masker, so it is redacted out of everything the run
-/// prints while it is doing this.** A substitution that is both effective and
-/// invisible is the worst combination available, and nothing else in this tool
-/// lets a store's contents reach a decision rather than a variable.
-///
-/// # Why this is a denylist, and why a denylist cannot be complete
-///
-/// An allowlist is not available: the whole product is binding a value to a
-/// variable name that only the caller's tool knows — `GITHUB_TOKEN`,
-/// `STRIPE_KEY`, whatever an internal service reads. There is no set of legal
-/// names to enumerate.
-///
-/// So this is a denylist, and a denylist over "variables that cause code to be
-/// loaded" is **open-ended by construction**: every interpreter is free to
-/// invent one, and `PYTHONPATH`, `NODE_OPTIONS`, `PERL5LIB`, `RUBYOPT`,
-/// `JAVA_TOOL_OPTIONS` and `GEM_PATH` are each a code-loading variable belonging
-/// to software this crate does not know about and cannot enumerate.
-///
-/// What this list is therefore scoped to is the boundary `keyless` itself owns:
-/// **the variables the operating system's process startup and dynamic linker
-/// read, plus the ones the shell reads before it runs the command it was
-/// given.** Those decide what happens between this tool's `execve` and the
-/// child's first instruction, which is the interval this tool is responsible
-/// for. Past that instruction the child is running its own code and its own
-/// rules, and a value bound to `NODE_OPTIONS` is the caller's to get right.
-///
-/// Stated plainly rather than implied, because the alternative is a reader
-/// believing the list is exhaustive: **binding a secret to a variable your
-/// interpreter treats as code is still possible and is still a bad idea.**
-fn hijacks_the_child(env: &str) -> Option<&'static str> {
-    // Exact names read by process startup or by a shell before it runs its
-    // argument. `IFS` re-splits words; `ENV`, `BASH_ENV` and `ZDOTDIR` name a
-    // file the shell SOURCES; `SHELLOPTS` turns options on, `xtrace` among
-    // them; `CDPATH` redirects a `cd`.
-    const STARTUP: &[&str] = &[
-        "PATH",
-        "IFS",
-        "ENV",
-        "BASH_ENV",
-        "ZDOTDIR",
-        "SHELLOPTS",
-        "CDPATH",
-    ];
-    if STARTUP.contains(&env) {
-        return Some("it decides which program the child finds and runs");
-    }
-    // The dynamic linkers, by prefix: glibc and musl read `LD_PRELOAD`,
-    // `LD_LIBRARY_PATH` and `LD_AUDIT`; dyld reads `DYLD_INSERT_LIBRARIES` and
-    // `DYLD_LIBRARY_PATH`. A prefix rather than a list, because both families
-    // keep adding members and a missed one loads attacker code.
-    if env.starts_with("LD_") || env.starts_with("DYLD_") {
-        return Some("the dynamic linker loads code named by it, before `main`");
-    }
-    None
 }
 
 /// Everything one `run` needs.
@@ -304,6 +156,37 @@ pub struct Outcome {
     pub unresolved: Vec<String>,
 }
 
+/// How long the masking filters get to finish after the child has been reaped.
+///
+/// # Why a bound, when the child has already exited
+///
+/// A pipe reaches end-of-file when the LAST writer closes it, and the child's
+/// own children inherit it. So:
+///
+/// ```console
+/// $ keyless run -s DECOY -- sh -c 'echo ran > proof; sleep 300 &'
+/// ```
+///
+/// reaps `sh` immediately and then waits five minutes on a pipe held open by a
+/// grandchild nobody is watching. Measured 2026-08-08: 300 s on this path, 0.20 s
+/// with no secret to mask.
+///
+/// **The pty path has the same hole and it is bounded by this same number.** A
+/// pty master reports end-of-stream on the same rule a pipe does — when the last
+/// holder lets go — so [`crate::tty::relay::Relay::drain`] reads this constant
+/// too. On Linux the grandchild has to survive the `SIGHUP` that ends the
+/// child's session before it can hold the terminal open, which one `trap` does;
+/// on macOS it cannot hold it open at all, because XNU revokes a controlling
+/// terminal when its session dies. So this bound is load-bearing on exactly one
+/// of the two platforms, and unobservable on the other.
+///
+/// Two seconds is far more than draining a stream that already has its bytes in
+/// it needs, and it is not a wait anybody experiences as a hang. What it costs,
+/// in the case above, is the output a backgrounded grandchild writes after its
+/// parent exits — which a shell would not have shown either once its pipeline
+/// ended.
+pub(crate) const PUMP_DRAIN_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// Resolve, inject, spawn, mask, record.
 ///
 /// `notes` receives the human-facing warnings. It is a parameter rather than
@@ -326,53 +209,14 @@ pub fn run(request: RunRequest<'_>, notes: &mut dyn Write) -> Result<Outcome, Ru
         let _ = writeln!(notes, "{NAME}: warning: {warning}");
     }
 
-    let mut resolved: Vec<(Vec<String>, Secret)> = Vec::new();
-    let mut injected_names: Vec<String> = Vec::new();
-    let mut unresolved: Vec<String> = request.unusable.to_vec();
-    let mut reasons: Vec<String> = Vec::new();
-    // Which backends answered, for the audit row. A `run` can only ever reach a
-    // reader — the write identities are not in a `Registry` and cannot be —
-    // so the row says `<store> (reader)` and a row that ever said `(manager)`
-    // could not have come from here.
-    let mut identities: Vec<String> = Vec::new();
-
-    for ((binding, plan), resolution) in request.bindings.iter().zip(plans).zip(resolve_all(
-        request.registry,
-        request.bindings,
-        notes,
-    )) {
-        match resolution {
-            Resolution::Found { store, secret } => {
-                let usable = !secret.expose().as_bytes().contains(&0);
-                // Kept in `resolved` either way, because `resolved` is what the
-                // masker is compiled from and a value that resolved is a value
-                // worth redacting whether or not it can be injected.
-                injected_names.push(binding.name.clone());
-                resolved.push((plan, secret));
-                if usable {
-                    let identity = format!("{store} (reader)");
-                    if !identities.contains(&identity) {
-                        identities.push(identity);
-                    }
-                } else {
-                    // An environment value is a NUL-terminated C string, so a
-                    // value containing a NUL cannot be one. Reaching `execve`
-                    // with it is not a degrade, it is `RunError::SpawnFailed`
-                    // and exit 127 — the child never runs. Refused here, where
-                    // it costs the documented degrade instead.
-                    unresolved.push(binding.name.clone());
-                    reasons.push(format!(
-                        "{}: the value contains a NUL byte, which no environment variable can hold",
-                        binding.name
-                    ));
-                }
-            }
-            other => {
-                unresolved.push(binding.name.clone());
-                reasons.push(format!("{}: {}", binding.name, other.reason()));
-            }
-        }
-    }
+    let Gathered {
+        mut resolved,
+        mut injected_names,
+        mut unresolved,
+        reasons,
+        identities,
+        refusals,
+    } = gather(&request, plans, notes);
 
     // Read after every resolve above has had its turn, never before: a
     // backend's advisory is the reply to the request this run just made, not
@@ -405,6 +249,10 @@ pub fn run(request: RunRequest<'_>, notes: &mut dyn Write) -> Result<Outcome, Ru
             .zip(&injected_names)
             .map(|((_, secret), name)| (name.as_str(), secret)),
     ));
+
+    if !refusals.is_empty() {
+        return Ok(refuse(&request, &refusals, &masker, notes));
+    }
 
     if state == State::Degraded {
         let _ = writeln!(
@@ -508,67 +356,11 @@ pub fn run(request: RunRequest<'_>, notes: &mut dyn Write) -> Result<Outcome, Ru
         prepared.start(Pid::from_raw(child.id().cast_signed()), Arc::clone(&masker))
     });
 
-    // One `finished` message per pump. Threads rather than join handles is not
-    // the interesting part — a channel is, because `JoinHandle` has no timed
-    // join and the drain below has to be bounded. See [`PUMP_DRAIN_GRACE`].
-    let (finished, pumps_done) = mpsc::channel::<()>();
-    let mut pumps = 0_usize;
-    if relay.is_none() && masking {
-        let mut start = |body: Box<dyn FnOnce() + Send>, notes: &mut dyn Write| {
-            match thread::Builder::new()
-                .name("keyless-mask".to_owned())
-                .spawn(body)
-            {
-                Ok(_) => pumps += 1,
-                // The OS refused a thread. The child is already running and its
-                // exit code is still owed to the caller, so this costs the
-                // masking of one stream and nothing else.
-                Err(error) => {
-                    let _ = writeln!(
-                        notes,
-                        "{NAME}: warning: cannot start the output filter ({error}); \
-                         one stream of the child's output is not redacted"
-                    );
-                }
-            }
-        };
-        // `io::stdout()` and not `io::stdout().lock()`, and that is the second
-        // half of the bounded drain rather than a style choice. A held lock is
-        // released when its guard drops, and a filter abandoned at the deadline
-        // never drops anything — it is still blocked on a read of a pipe a
-        // grandchild holds open. Holding the process-wide stdout lock for the
-        // pump's whole life therefore moved the hang instead of removing it:
-        // `run` returned on time, and `main`'s closing `stdout().flush()`
-        // blocked forever on the guard nobody would ever drop.
-        //
-        // Locking per write costs one uncontended acquisition per 8 KiB read and
-        // keeps each `write_all` atomic, which is the only atomicity a stream
-        // filter needs.
-        if let Some(stream) = child.stdout.take() {
-            let masker = Arc::clone(&masker);
-            let finished = finished.clone();
-            start(
-                Box::new(move || {
-                    let _ = pump(stream, io::stdout(), masker);
-                    let _ = finished.send(());
-                }),
-                notes,
-            );
-        }
-        if let Some(stream) = child.stderr.take() {
-            let masker = Arc::clone(&masker);
-            let finished = finished.clone();
-            start(
-                Box::new(move || {
-                    let _ = pump(stream, io::stderr(), masker);
-                    let _ = finished.send(());
-                }),
-                notes,
-            );
-        }
-    }
-    // The loop's own clone would otherwise keep the channel open forever.
-    drop(finished);
+    let (pumps, pumps_done) = if relay.is_none() && masking {
+        start_filters(&mut child, &masker, notes)
+    } else {
+        (0, mpsc::channel::<()>().1)
+    };
 
     let status = child.wait();
 
@@ -613,810 +405,46 @@ pub fn run(request: RunRequest<'_>, notes: &mut dyn Write) -> Result<Outcome, Ru
     })
 }
 
-/// Which variables each request may set, once two requests that would have
-/// landed in the same one have been separated.
+/// End a run whose request a store declined, without starting its child.
 ///
-/// # The one case the tool cannot decide, and therefore does not
-///
-/// A declaration says which variable its credential answers to, so two
-/// declarations can name the SAME variable — which is the ordinary shape of one
-/// credential per environment, all read by the same program under one name. Ask
-/// for both in one run and something has to give, and "the last one wins" is
-/// decided by the order the flags happen to be in. That is the failure this
-/// whole area exists to remove, aimed at a target where it would be far worse:
-/// the value that arrives is a real, working credential from the wrong side of a
-/// boundary, and nothing anywhere reports it.
-///
-/// So a variable two requests both derive is set from NEITHER. Each value is
-/// still injected under its own declared name, which is unique by construction —
-/// nothing is lost, and the run is not blocked. This is the one place a message
-/// is written, because it is the one case where the right answer is genuinely
-/// not knowable from what was asked.
-///
-/// Programs whose argument is itself a program, so a `$VAR` inside it is
-/// expanded by the CHILD and is correct.
-///
-/// `sh -c 'psql "$DATABASE_URL"'` is the sanctioned form and must never be
-/// warned about, which is the whole reason this list exists. Anything not on it
-/// receives its arguments already expanded, by the shell that typed them.
-const EXPANDS_ITS_OWN_ARGUMENTS: [&str; 12] = [
-    "sh", "bash", "zsh", "dash", "ksh", "fish", "env", "eval", "ssh", "docker", "make", "just",
-];
-
-/// The quoting mistake, caught at the moment it is made rather than taught in
-/// advance.
-///
-/// # The wall this removes
-///
-/// A variable this tool injects exists in the CHILD's environment. Two spellings
-/// look right and send nothing:
-///
-/// ```text
-/// keyless run -s TOKEN -- curl -H "Authorization: Bearer $TOKEN" …
-///     expanded by the CALLING shell, where TOKEN is unset — an EMPTY header
-/// keyless run -s TOKEN -- curl -H 'Authorization: Bearer $TOKEN' …
-///     never expanded by anybody — the literal five characters reach curl
-/// ```
-///
-/// The second is visible from inside this process: the argument arrives holding
-/// `$TOKEN` verbatim, and `curl` does not expand anything. So it is reported,
-/// with the corrected line, instead of living in a document somebody has to have
-/// read first.
-///
-/// **The first is NOT visible and that is stated rather than papered over.** By
-/// the time this process starts, the calling shell has already replaced it with
-/// the empty string, and an empty argument is a legitimate thing to pass. There
-/// is no measurement that distinguishes them, so nothing here guesses.
-///
-/// It is a warning and never a refusal: the never-block invariant has no
-/// exceptions, and a literal `$TOKEN` is occasionally what somebody means.
-fn quoting_warnings(program: &OsString, args: &[OsString], plans: &[Vec<String>]) -> Vec<String> {
-    let head = Path::new(program)
-        .file_name()
-        .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    if EXPANDS_ITS_OWN_ARGUMENTS.contains(&head.as_str()) {
-        return Vec::new();
-    }
-
-    let mut warnings = Vec::new();
-    for variable in plans.iter().flatten() {
-        let needle = format!("${variable}");
-        let braced = format!("${{{variable}}}");
-        if args.iter().any(|argument| {
-            let text = argument.to_string_lossy();
-            text.contains(&needle) || text.contains(&braced)
-        }) {
-            warnings.push(format!(
-                "`{needle}` reached `{head}` unexpanded — it is a literal, not the \
-                 credential. `{head}` does not expand variables; only a shell does, \
-                 and the variable is set in the CHILD. Wrap the command: \
-                 `-- sh -c '{head} … {needle} …'`, with the body in SINGLE quotes"
-            ));
-        }
-    }
-    warnings
-}
-
-/// A variable the caller SPELLED is never displaced either. `-s VAR=NAME` is an
-/// instruction, and a derived variable is an inference; an inference that
-/// overwrote an instruction would make the typed form unreliable, and the typed
-/// form is the escape hatch everything else here depends on.
-fn deconflict(bindings: &[Binding], notes: &mut dyn Write) -> Vec<Vec<String>> {
-    use std::collections::{BTreeMap, BTreeSet};
-
-    let spelled: BTreeSet<&str> = bindings
-        .iter()
-        .map(|binding| binding.env.as_str())
-        .collect();
-
-    // Names rather than a count: two `-s NAME` for the same name are one
-    // credential asked for twice, which collides with nothing.
-    let mut claimants: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
-    for binding in bindings {
-        for variable in &binding.also {
-            claimants
-                .entry(variable.as_str())
-                .or_default()
-                .insert(binding.name.as_str());
-        }
-    }
-
-    for (variable, names) in &claimants {
-        if spelled.contains(variable) {
-            let _ = writeln!(
-                notes,
-                "{NAME}: `{variable}` was named on the command line, so it keeps that value; \
-                 {} also answers to it and is in its own variable instead",
-                names.iter().cloned().collect::<Vec<_>>().join(", ")
-            );
-        } else if names.len() > 1 {
-            let _ = writeln!(
-                notes,
-                "{NAME}: {} all answer to `{variable}`, so nothing sets it — which one you \
-                 meant is not in the command. Each value is in its own variable; spell the \
-                 one you want with `-s {variable}=<name>`",
-                names.iter().cloned().collect::<Vec<_>>().join(", ")
-            );
-        }
-    }
-
-    bindings
-        .iter()
-        .map(|binding| {
-            let mut targets = binding.targets();
-            targets.retain(|variable| {
-                variable == &binding.env
-                    || claimants.get(variable.as_str()).is_some_and(|names| {
-                        names.len() == 1 && !spelled.contains(variable.as_str())
-                    })
-            });
-            targets
-        })
-        .collect()
-}
-
-/// Ask every backend for every name at once.
-///
-/// # Why this is not a loop
-///
-/// A lookup's deadline is per-lookup, so sequentially N names that each hit it
-/// cost N × the deadline. Measured 2026-08-08 against a backend that never
-/// answers: **three names took 36.03 seconds before the child ran.** Thirty
-/// names is five minutes of a terminal doing nothing, and the run does still
-/// happen at the end of it — which is worse than failing, because nothing on
-/// screen says waiting is the correct thing to do.
-///
-/// Concurrently, N names cost one deadline. That is the difference between a
-/// pause and a hang, and the never-block invariant is about the second.
-///
-/// A backend that the OS will not give a thread for is resolved on this thread
-/// instead: slower is not a failure, and [`thread::Builder`] is what makes that
-/// a branch rather than a panic.
-fn resolve_all(
-    registry: &Registry,
-    bindings: &[Binding],
+/// Every name is reported unresolved, the ones that did resolve included:
+/// refusal is all or nothing, so none of them reached a child.
+fn refuse(
+    request: &RunRequest<'_>,
+    refusals: &[String],
+    masker: &Masker,
     notes: &mut dyn Write,
-) -> Vec<Resolution> {
-    if bindings.len() < 2 {
-        return bindings
-            .iter()
-            .map(|binding| registry.resolve(&binding.name))
-            .collect();
-    }
-
-    let mut slots: Vec<Option<Resolution>> = bindings.iter().map(|_| None).collect();
-    thread::scope(|scope| {
-        let mut running = Vec::new();
-        for (index, binding) in bindings.iter().enumerate() {
-            let started = thread::Builder::new()
-                .name(format!("keyless-resolve-{index}"))
-                .spawn_scoped(scope, || registry.resolve(&binding.name));
-            match started {
-                Ok(handle) => running.push((index, handle)),
-                Err(error) => {
-                    let _ = writeln!(
-                        notes,
-                        "{NAME}: warning: cannot look `{}` up concurrently ({error}); \
-                         doing it in turn",
-                        binding.name
-                    );
-                    slots[index] = Some(registry.resolve(&binding.name));
-                }
-            }
-        }
-        for (index, handle) in running {
-            slots[index] = Some(handle.join().unwrap_or_else(|_| {
-                Resolution::Failed(vec![crate::error::StoreError::Unavailable {
-                    store: "keyless".to_owned(),
-                    detail: "the lookup ended unexpectedly".to_owned(),
-                }])
-            }));
-        }
-    });
-
-    slots
-        .into_iter()
-        // Every slot is filled by one of the two arms above; this is the
-        // expression that says so without an `unwrap`. `undeclared: false`
-        // claims nothing about a config this expression never saw.
-        .map(|slot| slot.unwrap_or(Resolution::NotFound { undeclared: false }))
-        .collect()
-}
-
-/// How long the masking filters get to finish after the child has been reaped.
-///
-/// # Why a bound, when the child has already exited
-///
-/// A pipe reaches end-of-file when the LAST writer closes it, and the child's
-/// own children inherit it. So:
-///
-/// ```console
-/// $ keyless run -s DECOY -- sh -c 'echo ran > proof; sleep 300 &'
-/// ```
-///
-/// reaps `sh` immediately and then waits five minutes on a pipe held open by a
-/// grandchild nobody is watching. Measured 2026-08-08: 300 s on this path, 0.20 s
-/// with no secret to mask.
-///
-/// **The pty path has the same hole and it is bounded by this same number.** A
-/// pty master reports end-of-stream on the same rule a pipe does — when the last
-/// holder lets go — so [`crate::tty::relay::Relay::drain`] reads this constant
-/// too. On Linux the grandchild has to survive the `SIGHUP` that ends the
-/// child's session before it can hold the terminal open, which one `trap` does;
-/// on macOS it cannot hold it open at all, because XNU revokes a controlling
-/// terminal when its session dies. So this bound is load-bearing on exactly one
-/// of the two platforms, and unobservable on the other.
-///
-/// Two seconds is far more than draining a stream that already has its bytes in
-/// it needs, and it is not a wait anybody experiences as a hang. What it costs,
-/// in the case above, is the output a backgrounded grandchild writes after its
-/// parent exits — which a shell would not have shown either once its pipeline
-/// ended.
-pub(crate) const PUMP_DRAIN_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
-
-/// The one thing a caller needs to know when a filter is abandoned at the
-/// deadline.
-///
-/// Shared by the pipe path and the pty path, because they abandon for the same
-/// reason and the reader's next question is the same either way.
-fn warn_output_left_open(notes: &mut dyn Write) {
+) -> Outcome {
+    let state = State::Refused;
     let _ = writeln!(
         notes,
-        "{NAME}: warning: the child exited but something it started still holds its \
-         output open; anything written from here on is not shown"
+        "{NAME}: {state} — {} of {} names refused; the command was not run",
+        refusals.len(),
+        request.bindings.len() + request.unusable.len()
     );
-}
-
-/// Wait for the masking filters, but not forever.
-fn drain_pumps(pumps: usize, done: &mpsc::Receiver<()>, notes: &mut dyn Write) {
-    let deadline = std::time::Instant::now() + PUMP_DRAIN_GRACE;
-    for _ in 0..pumps {
-        let left = deadline.saturating_duration_since(std::time::Instant::now());
-        if done.recv_timeout(left).is_err() {
-            warn_output_left_open(notes);
-            return;
-        }
-    }
-}
-
-/// How the child's three standard streams are arranged.
-///
-/// Named, because the command is assembled from it more than once: a spawn that
-/// the kernel refuses because of the ENVIRONMENT is retried without one, and a
-/// `Command`'s stdio cannot be read back out of it.
-enum StdioPlan {
-    /// The child inherits this process's stdio untouched. Nothing to mask.
-    Inherit,
-    /// Two pipes through the masking filters.
-    Pipes,
-    /// One pseudo-terminal, held so it can be wired more than once.
-    ///
-    /// `None` once the child has been spawned and this process has closed its
-    /// own copy — see [`StdioPlan::release_slave`], which is the step that
-    /// decides whether the run ever ends. The variant stays `Pty` either way,
-    /// because "the pty wiring survived" is what the caller tests it for.
-    Pty(Option<OwnedFd>),
-}
-
-impl StdioPlan {
-    /// Close this process's copy of the pty slave, now the child has its own.
-    ///
-    /// # Why this is not housekeeping
-    ///
-    /// A pty master reports end-of-stream only when the LAST slave descriptor
-    /// closes. The output filter reads that master, so one forgotten copy in
-    /// this process leaves the filter blocked in `read` forever — after the
-    /// child is dead, after it has been reaped, with nothing left to report it.
-    ///
-    /// **macOS hid this and Linux did not, which is why it shipped.** The child
-    /// is a session leader owning the pty, and XNU *revokes* a controlling
-    /// terminal when its session ends: every other descriptor onto that
-    /// terminal is invalidated and the master is handed an end-of-file it never
-    /// earned. Linux performs no such revoke, so the leaked descriptor keeps
-    /// the pty open and `keyless run` hangs indefinitely. Measured 2026-08-09
-    /// on rust 1.89 / aarch64, parent holding one slave copy, child gone:
-    ///
-    /// | child owned the tty as session leader | macOS | Linux |
-    /// |---|---|---|
-    /// | no  | master read blocks | master read blocks |
-    /// | yes | master read returns 0 | master read blocks |
-    ///
-    /// So the macOS column was never evidence that this process had let go. It
-    /// is evidence that something else let go on its behalf.
-    fn release_slave(&mut self) {
-        if let StdioPlan::Pty(slave) = self {
-            // Dropping the descriptor is the close.
-            drop(slave.take());
-        }
-    }
-}
-
-/// What actually goes into the child's environment, given the state.
-fn injection(state: State, resolved: &[(Vec<String>, Secret)]) -> &[(Vec<String>, Secret)] {
-    if state == State::Injected {
-        resolved
-    } else {
-        &[]
-    }
-}
-
-/// Build the command. Never fails — a pty that cannot be wired becomes pipes.
-fn assemble(
-    program: &std::ffi::OsStr,
-    args: &[OsString],
-    injected: &[(Vec<String>, Secret)],
-    plan: &mut StdioPlan,
-    notes: &mut dyn Write,
-) -> Command {
-    let mut command = Command::new(program);
-    command.args(args);
-    for (variables, secret) in injected {
-        for env in variables {
-            command.env(env, secret.expose());
-        }
-    }
-    match plan {
-        StdioPlan::Inherit => {}
-        StdioPlan::Pipes => {
-            command.stdout(Stdio::piped());
-            command.stderr(Stdio::piped());
-        }
-        // `None` cannot happen: the plan is only ever re-assembled BEFORE the
-        // spawn, and the slave is released only after one. It is still handled
-        // as an ordinary wiring failure rather than with an `unwrap`, because
-        // falling back to pipes is the right outcome for every other way this
-        // step fails and the never-block rule does not make an exception for a
-        // case the author believes is unreachable.
-        StdioPlan::Pty(None) => {
-            let _ = writeln!(
-                notes,
-                "{NAME}: warning: the pseudo-terminal was already handed to a child; \
-                 falling back to pipes"
-            );
-            *plan = StdioPlan::Pipes;
-            command.stdout(Stdio::piped());
-            command.stderr(Stdio::piped());
-        }
-        StdioPlan::Pty(Some(slave)) => {
-            if let Err(error) = wire_pty(&mut command, slave) {
-                let _ = writeln!(notes, "{NAME}: warning: {error}; falling back to pipes");
-                *plan = StdioPlan::Pipes;
-                command.stdout(Stdio::piped());
-                command.stderr(Stdio::piped());
-            }
-        }
-    }
-    command
-}
-
-/// Spawn the run's own child, retrying while the OS is merely out of process
-/// slots.
-///
-/// The retry, the backoff and the errno that qualifies for one all live in
-/// [`crate::store::exec`], beside the mutex that serialises the act of forking.
-/// One place owns "create a child on this machine", so a store lookup and a run
-/// cannot disagree about what `EAGAIN` means — and that function holds the only
-/// `Command::spawn` call in `src/`, so there is no door into a spawn that skips
-/// the retry.
-///
-/// `None` rather than a deadline: reaching the spawn IS this call's contract,
-/// nothing is waiting on it, and a run that gave up early would be the
-/// never-block failure the retry exists to remove.
-fn spawn_persistently(command: &mut Command) -> io::Result<std::process::Child> {
-    crate::store::exec::spawn_persistently(command, None)
-}
-
-/// Whether a spawn failure is about the environment being injected rather than
-/// about the command.
-///
-/// Both members are measured, and each of them used to end the run at exit 127
-/// with no child:
-///
-/// - A value containing a NUL byte. std rejects it before `execve` and reports
-///   `InvalidInput` — `cannot execute /bin/sh: nul byte found`, which names the
-///   wrong culprit entirely. Also refused earlier, at resolution, where the
-///   message can name the secret; this is the backstop.
-/// - A value large enough to exceed `ARG_MAX`. `E2BIG`, `Argument list too
-///   long`. Measured on macOS: 1.0 MB runs, 1.5 MB does not. **Deliberately not
-///   pre-checked**, because the true limit is the kernel's and counts the
-///   argument list, the inherited environment and the pointer array together —
-///   a guess tight enough to be safe would refuse runs that work today, and the
-///   kernel is the only thing that knows the answer exactly. So it is allowed to
-///   answer, and the answer is a degrade rather than a failure.
-///
-/// A retry is sound because neither failure leaves anything behind: std reports
-/// an exec failure from the forked child over a pipe, and that child then exits.
-/// There is no half-spawned process to collide with.
-fn caused_by_the_environment(error: &io::Error) -> bool {
-    if error.kind() == io::ErrorKind::InvalidInput {
-        return true;
-    }
-    error.raw_os_error() == Some(nix::libc::E2BIG)
-}
-
-/// The child's exit code, following the shell convention for signals.
-fn exit_code_of(status: &std::process::ExitStatus) -> i32 {
-    if let Some(code) = status.code() {
-        return code;
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::ExitStatusExt;
-        if let Some(signal) = status.signal() {
-            return 128 + signal;
-        }
-    }
-    1
-}
-
-/// Obtain a pseudo-terminal, or explain on stderr why the child is getting a
-/// pipe instead.
-///
-/// Never returns an error, by construction. Every failure here is a *degraded
-/// experience*, never a refusal: the caller carries on to the spawn either way.
-/// The silent case is deliberate — not being at a terminal is the ordinary
-/// state of a script, a CI job or an agent's shell call, and announcing it on
-/// every invocation would train the reader to ignore this tool's stderr.
-fn acquire_terminal(policy: TtyPolicy, notes: &mut dyn Write) -> Option<Prepared> {
-    let outcome = policy.acquire().and_then(Prepared::new);
-    match outcome {
-        Ok(prepared) => Some(prepared),
-        Err(TtyError::NotATerminal) => None,
-        Err(error) => {
-            let _ = writeln!(
-                notes,
-                "{NAME}: warning: no pseudo-terminal ({error}); the child's output is piped, \
-                 so it will behave as though it is not on a terminal"
-            );
-            None
-        }
-    }
-}
-
-/// Wire the pty slave into the child's three standard streams.
-///
-/// The duplicates are taken first so a failure leaves `command` untouched and
-/// the caller can fall back to pipes with nothing half-configured. The slave is
-/// borrowed rather than consumed, because a command refused for its environment
-/// is assembled a second time and would otherwise have no terminal left to wire.
-fn wire_pty(command: &mut Command, slave: &OwnedFd) -> io::Result<()> {
-    let for_stdin = slave.try_clone()?;
-    let for_stdout = slave.try_clone()?;
-    let for_stderr = slave.try_clone()?;
-    command.stdin(Stdio::from(for_stdin));
-    command.stdout(Stdio::from(for_stdout));
-    command.stderr(Stdio::from(for_stderr));
-
-    // Hoisted out of the `unsafe` block below so its own SAFETY comment still
-    // means something: inside that block the compiler would treat this call as
-    // already justified, and the reason it is sound would go unstated.
-    let enter_pty_session = || -> io::Result<()> {
-        // SAFETY: `pre_exec` runs after the standard library has dup'd the
-        // configured stdio into place, so fd 0 is the pty slave.
-        unsafe { tty::adopt_controlling_terminal() }?;
-        // A blocked signal mask survives `exec`. This process blocks five
-        // signals so it can `sigwait` on them; inheriting that would leave the
-        // child unable to see its own Ctrl-C or its own resize.
-        SigSet::empty().thread_set_mask().map_err(io::Error::from)
-    };
-    // SAFETY: the closure calls only async-signal-safe functions — `setsid`,
-    // `ioctl` and `pthread_sigmask` — and allocates nothing, which is the whole
-    // of `pre_exec`'s contract.
-    unsafe {
-        command.pre_exec(enter_pty_session);
-    }
-    Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-
-    use super::Binding;
-
-    use crate::config::Config;
-
-    fn config_of(json: &str) -> Config {
-        serde_json::from_str(json).expect("valid config")
+    for refusal in refusals {
+        let _ = writeln!(notes, "{NAME}:   {refusal}");
     }
 
-    #[test]
-    fn a_bare_name_binds_to_itself() {
-        assert_eq!(
-            Binding::parse("GITHUB_TOKEN").expect("valid"),
-            Binding {
-                env: "GITHUB_TOKEN".to_owned(),
-                name: "GITHUB_TOKEN".to_owned(),
-                also: Vec::new(),
-            }
-        );
-    }
-
-    /// The seam. `parse` is syntax and must stay so: every existing caller of it
-    /// binds exactly one variable, and a `parse` that started consulting a
-    /// config would change what those callers do without any of them being
-    /// touched.
-    #[test]
-    fn parse_alone_never_widens_a_request() {
-        let binding = Binding::parse("LABEL").expect("valid");
-        assert!(binding.also.is_empty());
-        assert_eq!(binding.targets(), ["LABEL"]);
-    }
-
-    #[test]
-    fn a_declared_name_also_lands_in_the_variable_its_route_names() {
-        let config = config_of(r#"{"secrets":{"LABEL":{"key":"THE_VARIABLE"}}}"#);
-        let binding = Binding::declared("LABEL", &config).expect("valid");
-        assert_eq!(binding.env, "LABEL");
-        assert_eq!(binding.targets(), ["LABEL", "THE_VARIABLE"]);
-    }
-
-    #[test]
-    fn a_spelled_request_is_never_widened() {
-        let config = config_of(r#"{"secrets":{"LABEL":{"key":"THE_VARIABLE"}}}"#);
-        let binding = Binding::declared("CHOSEN=LABEL", &config).expect("valid");
-        assert_eq!(binding.targets(), ["CHOSEN"]);
-    }
-
-    #[test]
-    fn a_declaration_that_would_hijack_the_child_is_dropped_not_obeyed() {
-        // A config is not a trusted input. Every derived variable meets the same
-        // two refusals a typed one does, and a refused one costs the alias
-        // rather than the run.
-        for hostile in ["PATH", "LD_PRELOAD", "DYLD_INSERT_LIBRARIES", "IFS"] {
-            let config = config_of(&format!(
-                r#"{{"secrets":{{"LABEL":{{"var":"{hostile}"}}}}}}"#
-            ));
-            let binding = Binding::declared("LABEL", &config).expect("valid");
-            assert_eq!(binding.targets(), ["LABEL"], "{hostile} was injected");
+    let unresolved: Vec<String> = request
+        .unusable
+        .iter()
+        .cloned()
+        .chain(request.bindings.iter().map(|binding| binding.name.clone()))
+        .collect();
+    if let Some(log) = request.audit {
+        let event = Event::new("run", state, Vec::new(), request.argv, masker)
+            .with_unresolved(unresolved.clone())
+            .with_exit_code(EXIT_REFUSED);
+        if let Err(error) = log.append(&event) {
+            let _ = writeln!(notes, "{NAME}: warning: {error}");
         }
     }
 
-    #[test]
-    fn a_declaration_naming_something_no_environment_can_hold_is_dropped() {
-        let config = config_of(r#"{"secrets":{"LABEL":{"var":"not a variable"}}}"#);
-        assert_eq!(
-            Binding::declared("LABEL", &config)
-                .expect("valid")
-                .targets(),
-            ["LABEL"]
-        );
-    }
-
-    #[test]
-    fn an_undeclared_name_answers_to_itself_alone() {
-        let config = config_of(r#"{"secrets":{"OTHER":{"key":"THE_VARIABLE"}}}"#);
-        assert_eq!(
-            Binding::declared("LABEL", &config)
-                .expect("valid")
-                .targets(),
-            ["LABEL"]
-        );
-    }
-
-    /// Two labels for one variable is the ordinary shape of one credential per
-    /// environment. Asked for together, ordering must not pick the winner.
-    #[test]
-    fn a_variable_two_names_answer_to_is_set_by_neither() {
-        let config = config_of(r#"{"secrets":{"A":{"key":"SHARED"},"B":{"key":"SHARED"}}}"#);
-        let bindings = [
-            Binding::declared("A", &config).expect("valid"),
-            Binding::declared("B", &config).expect("valid"),
-        ];
-        let mut notes: Vec<u8> = Vec::new();
-        let plans = super::deconflict(&bindings, &mut notes);
-        assert_eq!(plans, [["A"], ["B"]]);
-        let said = String::from_utf8_lossy(&notes);
-        assert!(said.contains("SHARED"), "{said}");
-    }
-
-    /// Reversing the flags must not reverse the outcome — which is the property
-    /// the test above cannot see on its own.
-    #[test]
-    fn the_undecidable_case_does_not_depend_on_flag_order() {
-        let config = config_of(r#"{"secrets":{"A":{"key":"SHARED"},"B":{"key":"SHARED"}}}"#);
-        let forwards = [
-            Binding::declared("A", &config).expect("valid"),
-            Binding::declared("B", &config).expect("valid"),
-        ];
-        let backwards = [
-            Binding::declared("B", &config).expect("valid"),
-            Binding::declared("A", &config).expect("valid"),
-        ];
-        let mut sink: Vec<u8> = Vec::new();
-        let one = super::deconflict(&forwards, &mut sink);
-        let other = super::deconflict(&backwards, &mut sink);
-        assert_eq!(one, [["A"], ["B"]]);
-        assert_eq!(other, [["B"], ["A"]]);
-    }
-
-    #[test]
-    fn one_name_asked_for_twice_collides_with_nothing() {
-        // Two `-s LABEL` are one credential requested twice, not two claimants.
-        let config = config_of(r#"{"secrets":{"LABEL":{"key":"THE_VARIABLE"}}}"#);
-        let bindings = [
-            Binding::declared("LABEL", &config).expect("valid"),
-            Binding::declared("LABEL", &config).expect("valid"),
-        ];
-        let mut notes: Vec<u8> = Vec::new();
-        let plans = super::deconflict(&bindings, &mut notes);
-        assert_eq!(
-            plans,
-            [["LABEL", "THE_VARIABLE"], ["LABEL", "THE_VARIABLE"]]
-        );
-        assert_eq!(String::from_utf8_lossy(&notes), "");
-    }
-
-    #[test]
-    fn an_inference_never_overwrites_an_instruction() {
-        let config = config_of(r#"{"secrets":{"OTHER":{"key":"TARGET"}}}"#);
-        let bindings = [
-            Binding::declared("TARGET=CHOSEN", &config).expect("valid"),
-            Binding::declared("OTHER", &config).expect("valid"),
-        ];
-        let mut notes: Vec<u8> = Vec::new();
-        let plans = super::deconflict(&bindings, &mut notes);
-        assert_eq!(plans, [["TARGET"], ["OTHER"]]);
-        assert!(String::from_utf8_lossy(&notes).contains("TARGET"));
-    }
-
-    #[test]
-    fn an_alias_binds_to_a_different_variable() {
-        let binding = Binding::parse("GH_TOKEN=work-github-pat").expect("valid");
-        assert_eq!(binding.env, "GH_TOKEN");
-        assert_eq!(binding.name, "work-github-pat");
-    }
-
-    #[test]
-    fn an_unusable_variable_name_is_rejected_at_parse_time() {
-        assert!(Binding::parse("9LIVES").is_err());
-        assert!(Binding::parse("has space=X").is_err());
-        assert!(Binding::parse("=X").is_err());
-        assert!(Binding::parse("X=").is_err());
-    }
-
-    #[test]
-    fn underscores_and_digits_are_fine_after_the_first_character() {
-        assert!(Binding::parse("_PRIVATE_1").is_ok());
-    }
-
-    // -----------------------------------------------------------------------
-    // The spawn retry, which is a never-block guard rather than an optimisation.
-    //
-    // A `fork` refused with `EAGAIN` under `RLIMIT_NPROC` is the machine saying
-    // "not right now". Giving up on the first one turns a transient limit into a
-    // dead command — exit 127, no child — which is the single outcome `keyless
-    // run`'s contract forbids.
-    //
-    // The loop, its budget and its jitter now live beside the spawn mutex in
-    // [`crate::store::exec`], and so do the tests that drive them through a
-    // seam. What is left here is the WIRING: this module's own spawn path still
-    // going through that loop, which no test over there can see.
-    // -----------------------------------------------------------------------
-
-    /// The wiring, which the seam tests in `store::exec` cannot see.
-    ///
-    /// They exercise the retry loop directly, so a `spawn_persistently` that had
-    /// stopped calling it would leave every one of them green. This runs the
-    /// shipped path against a real binary.
-    #[test]
-    fn the_shipped_spawn_path_produces_a_real_child() {
-        let mut command = std::process::Command::new("/usr/bin/true");
-        let mut child = super::spawn_persistently(&mut command).expect("`true` must run");
-        assert!(child.wait().expect("the child must be reapable").success());
-    }
-
-    // The shared timeout harness, from the file the integration suites use.
-    // Included rather than copied: a unit test in `src/` cannot see `tests/`,
-    // and a second copy of a hang-detector is a second copy that can rot.
-    include!(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/tests/support/within.rs"
-    ));
-
-    /// The pty half of the never-block invariant, tested where BOTH platforms
-    /// can see it fail.
-    ///
-    /// `tests/pty.rs` covers this end to end, and on Linux it is merciless — but
-    /// it is BLIND on macOS, because XNU revokes a controlling terminal when the
-    /// child's session ends and cleans up the leak on this process's behalf.
-    /// Measured 2026-08-09 against the source with `release_slave` absent: 10 of
-    /// 11 pty cases fail on Linux and 11 of 11 pass on macOS.
-    ///
-    /// So this drops to the mechanism, where there is no session and no child
-    /// and therefore nothing to revoke. A master whose last slave is closed must
-    /// END the stream — Linux says `EIO`, macOS says end-of-file — and a slave
-    /// this process is still holding makes both of them block forever instead.
-    /// That is why the read is inside `within`: without a bound the regression
-    /// is a hang, and a hang reports nothing.
-    #[test]
-    fn releasing_the_pty_slave_lets_the_master_reach_end_of_stream() {
-        use super::StdioPlan;
-        use std::io::Read;
-
-        // The crate's own opener rather than `openpty`, for the reason stated
-        // on it: `openpty` runs its whole body with inheritable descriptors
-        // live, and the lib test binary spawns children from other threads
-        // while this one runs. A slave that walked into one of them would keep
-        // this pty open and turn the read below into the timeout it is here to
-        // detect.
-        let (master, slave) =
-            crate::tty::open_pty(None, None).expect("this platform must provide a pty");
-        let mut plan = StdioPlan::Pty(Some(slave));
-        plan.release_slave();
-
-        let ended = within(
-            PATIENCE,
-            "reading a pty master whose only slave has been released",
-            move || {
-                let mut buf = [0u8; 16];
-                match std::fs::File::from(master).read(&mut buf) {
-                    // macOS: end-of-file. Linux: EIO. Both mean the same thing.
-                    Ok(0) => true,
-                    Err(error) => error.raw_os_error() == Some(nix::libc::EIO),
-                    Ok(_) => false,
-                }
-            },
-        );
-        assert!(
-            ended,
-            "the master neither ended nor errored, so something is still holding \
-             the slave"
-        );
-    }
-
-    /// The wall, removed rather than documented.
-    ///
-    /// Every one of these was a paragraph in somebody's rules file, which is a
-    /// deferred fix: it reaches whoever read it, once, before they made the
-    /// mistake. The warning reaches them at the moment they make it.
-    #[test]
-    fn a_literal_dollar_name_handed_to_a_non_shell_is_reported() {
-        use super::quoting_warnings;
-        use std::ffi::OsString;
-
-        let plans = vec![vec!["TOKEN".to_owned()]];
-        let args: Vec<OsString> = ["-H", "Authorization: Bearer $TOKEN"]
-            .iter()
-            .map(OsString::from)
-            .collect();
-        let warnings = quoting_warnings(&OsString::from("curl"), &args, &plans);
-        assert_eq!(warnings.len(), 1, "{warnings:?}");
-        assert!(warnings[0].contains("$TOKEN"), "{warnings:?}");
-        assert!(warnings[0].contains("sh -c"), "{warnings:?}");
-        // `${TOKEN}` is the same mistake with braces, and it used to slip past
-        // a check that only looked for the bare spelling.
-        let braced: Vec<OsString> = vec![OsString::from("Bearer ${TOKEN}")];
-        assert_eq!(
-            quoting_warnings(&OsString::from("curl"), &braced, &plans).len(),
-            1
-        );
-    }
-
-    /// THE CONTROL, and it is the reason the list of interpreters exists.
-    ///
-    /// `sh -c '… $TOKEN …'` is the CORRECT form and contains the same literal.
-    /// A check that warned on it would fire on every properly written command
-    /// in the tool's own documentation — and a warning that fires on the right
-    /// answer is one people learn to ignore, which costs more than it saves.
-    #[test]
-    fn the_sanctioned_shell_form_is_never_warned_about() {
-        use super::quoting_warnings;
-        use std::ffi::OsString;
-
-        let plans = vec![vec!["TOKEN".to_owned()]];
-        for program in ["sh", "/bin/bash", "zsh", "env", "ssh"] {
-            let args: Vec<OsString> = ["-c", "curl -H \"Authorization: Bearer $TOKEN\" $URL"]
-                .iter()
-                .map(OsString::from)
-                .collect();
-            assert!(
-                quoting_warnings(&OsString::from(program), &args, &plans).is_empty(),
-                "`{program}` was warned about, and it expands its own arguments"
-            );
-        }
-        // A name nobody asked for is not this tool's business either.
-        let args = vec![OsString::from("$SOMETHING_ELSE")];
-        assert!(quoting_warnings(&OsString::from("curl"), &args, &plans).is_empty());
+    Outcome {
+        state,
+        exit_code: EXIT_REFUSED,
+        injected: Vec::new(),
+        unresolved,
     }
 }

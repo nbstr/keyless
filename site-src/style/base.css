@@ -1,0 +1,255 @@
+/* ------------------------------------------------------------------ reset */
+*,*::before,*::after{box-sizing:border-box}
+html,body,h1,h2,h3,h4,p,ul,ol,li,figure,pre,table{margin:0;padding:0}
+ul,ol{list-style:none}
+button{font:inherit;color:inherit;background:none;border:0;cursor:pointer}
+a{color:inherit;text-decoration:none}
+img,svg{display:block;max-width:100%}
+
+/* -------------------------------------------------------------- variables */
+:root{
+  --bg:#090A0B;
+  --well:#050505;
+  --cell-a:#070807;
+  --cell-b:#080908;
+  --text:#F6F7F9;
+  --hair:#23262A;
+  --panel:rgba(255,255,255,.09);
+  /* The two semantic states, and the third that is neither.
+     Measured against --well #050505: green 10.94:1, coral 7.66:1,
+     violet 8.06:1. The coral is deliberately desaturated — an alarm red would
+     fight the green for the eye, and the page needs both readable in one row. */
+  --green:#5FD39A;
+  --leak:#E8836B;
+  --violet:#9D9BEA;
+  /* The before/after asymmetry is carried by the GROUND, not only by the text,
+     so a reader knows which column is which before reading a word. */
+  --ground-leak:#0E0806;
+  --ground-safe:#050A08;
+  --btn:#1C1E21;
+  --code-bg:rgba(255,255,255,.06);
+  --sans:ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
+  --mono:ui-monospace,SFMono-Regular,Menlo,Monaco,"Liberation Mono",monospace;
+  --ease-reveal:cubic-bezier(.16,1,.3,1);
+  --ease-hover:cubic-bezier(.4,0,.2,1);
+  --ease-out:cubic-bezier(0,0,.2,1);
+}
+
+/* ------------------------------------------------------------------- base */
+body{
+  background:var(--bg);
+  color:var(--text);
+  font-family:var(--sans);
+  font-size:16px;
+  line-height:24px;
+  -webkit-font-smoothing:antialiased;
+  text-rendering:optimizeLegibility;
+}
+::selection{background:rgba(95,211,154,.22)}
+:focus-visible{outline:2px solid var(--green);outline-offset:3px;border-radius:3px}
+
+/* ------------------------------------------------------------ type system */
+h1{
+  font-size:clamp(2.5rem,min(7.2vw,8.6vh),5.4rem);
+  font-weight:600;line-height:.98;letter-spacing:-.035em;color:#fff;
+  text-wrap:balance;
+}
+h2{
+  font-size:clamp(2.2rem,4.6vw,3.9rem);
+  font-weight:600;line-height:.94;letter-spacing:-.045em;color:#fff;
+  text-wrap:balance;
+}
+h3{font-size:22px;font-weight:600;line-height:1.18;letter-spacing:-.03em;color:var(--text);text-wrap:balance}
+h4{font-size:17px;font-weight:600;line-height:1.3;letter-spacing:-.02em;color:#fff}
+/* The dimming system is alpha steps of white and the FLOOR is .55.
+   Composited over the darkest surface on the page (--well #050505) that is
+   6.22:1, which clears WCAG AA at every text size used here. Hierarchy at the
+   quiet end is carried by SIZE, TRACKING and CASE, never by dimming further —
+   a limit nobody can read is not published. */
+.dim{color:rgba(255,255,255,.55)}
+.mono{font-family:var(--mono)}
+.lbl{
+  font-family:var(--mono);font-size:11px;line-height:15px;font-weight:500;
+  letter-spacing:.16em;text-transform:uppercase;color:rgba(255,255,255,.55);
+}
+.micro{
+  font-family:var(--mono);font-size:11px;line-height:17px;letter-spacing:.14em;
+  text-transform:uppercase;color:rgba(255,255,255,.55);
+}
+.micro b,.lbl b{font-weight:500;color:rgba(255,255,255,.95)}
+.deck{font-size:16px;line-height:25px;color:rgba(255,255,255,.6);max-width:64ch}
+.deck-s{font-size:15px;line-height:23px;color:rgba(255,255,255,.6);max-width:60ch}
+.deck b,.deck-s b{color:#fff;font-weight:600}
+code{
+  font-family:var(--mono);font-size:max(11px,.875em);
+  background:var(--code-bg);border-radius:4px;padding:.12em .38em;
+  color:rgba(255,255,255,.82);
+}
+.g{color:var(--green)}
+.r{color:var(--leak)}
+.v{color:var(--violet)}
+
+/* ----------------------------------------------------------------- layout */
+.col{max-width:1152px;margin:0 auto;padding:0 24px}
+/* Full-bleed escape. --sbw is the scrollbar width, measured in JS: 100vw
+   INCLUDES the scrollbar, so without subtracting it every slab is wider than
+   the visible area and the whole document scrolls sideways. */
+.slab{
+  position:relative;left:50%;
+  width:calc(100vw - var(--sbw,0px) - 3rem);
+  max-width:90rem;
+  transform:translateX(-50%);
+}
+@media(max-width:640px){.slab{width:calc(100vw - var(--sbw,0px) - 2rem)}}
+.slab-gap{margin-top:44px}
+section.band{padding:104px 0}
+@media(min-width:640px){section.band{padding:144px 0}}
+.rule{border-top:1px solid var(--panel);padding-top:24px;margin-bottom:44px}
+@media(min-width:640px){.rule{padding-top:32px;margin-bottom:60px}}
+.eyebrow{display:flex;align-items:center;gap:12px}
+.eyebrow .dash{width:36px;height:1px;background:var(--green);flex:none}
+.eyebrow-txt{
+  font-family:var(--mono);font-size:11px;line-height:15px;letter-spacing:.20em;
+  text-transform:uppercase;color:rgba(255,255,255,.6);
+}
+.head{
+  display:grid;grid-template-columns:minmax(0,1fr) minmax(260px,.52fr);
+  align-items:end;gap:28px;margin-top:28px;
+}
+@media(max-width:900px){.head{grid-template-columns:1fr;align-items:start;gap:18px}}
+.caveat{
+  margin-top:32px;font-family:var(--mono);font-size:11px;line-height:19px;
+  letter-spacing:.14em;text-transform:uppercase;color:rgba(255,255,255,.6);
+  /* `ch` ignores letter-spacing, so 76ch of this face renders about 60 visible
+     characters and orphans a narrow column on a wide screen. Measured, not
+     guessed at. */
+  max-width:96ch;
+}
+.caveat b{font-weight:500;color:rgba(255,255,255,.95)}
+
+/* the hairline grid: the wrapper's background IS every divider */
+.grid{display:grid;gap:1px;background:var(--panel);border:1px solid var(--panel)}
+.grid > *{background:var(--cell-a);min-width:0}
+.grid > *:nth-child(even){background:var(--cell-b)}
+/* Column counts live in classes, never inline: an inline grid-template-columns
+   cannot be overridden by a media query, so a slab set inline stays
+   multi-column at 390px and clips its own cells. */
+.g1{grid-template-columns:minmax(0,1fr)}
+.g2{grid-template-columns:repeat(2,minmax(0,1fr))}
+@media(max-width:1024px){.g2{grid-template-columns:minmax(0,1fr)}}
+.pad{padding:24px}
+@media(min-width:640px){.pad{padding:28px 32px}}
+.stack{display:flex;flex-direction:column;gap:14px}
+.hr{border-top:1px solid rgba(255,255,255,.08);margin:24px 0}
+.gap-s{margin-top:12px}
+.gap-m{margin-top:18px}
+.gap-l{margin-top:22px}
+
+/* ------------------------------------------------------------------- nav */
+nav{
+  position:fixed;top:0;left:0;right:0;height:64px;z-index:50;
+  background:rgba(9,10,11,.86);backdrop-filter:blur(12px);
+  -webkit-backdrop-filter:blur(12px);
+  border-bottom:1px solid rgba(255,255,255,.08);
+}
+nav .inner{
+  max-width:1152px;margin:0 auto;padding:0 24px;height:100%;
+  display:flex;align-items:center;justify-content:space-between;gap:24px;
+}
+.wordmark{display:flex;align-items:baseline;gap:10px;flex:none}
+.wordmark .name{font-size:16px;font-weight:600;letter-spacing:-.03em;color:#fff}
+.wordmark .tail{letter-spacing:.16em}
+nav ul{display:flex;align-items:center;gap:22px;min-width:0}
+nav ul li{flex:none;white-space:nowrap}
+nav .actions{display:flex;align-items:center;gap:8px;flex:none}
+nav a.navlink{transition:color .15s var(--ease-hover)}
+nav a.navlink:hover{color:rgba(255,255,255,.92)}
+.chip{
+  font-family:var(--mono);font-size:11px;letter-spacing:.16em;text-transform:uppercase;
+  color:rgba(255,255,255,.6);border:1px solid var(--hair);border-radius:8px;
+  padding:5px 9px;white-space:nowrap;
+  transition:color .15s var(--ease-hover),border-color .15s var(--ease-hover);
+}
+a.chip:hover{color:rgba(255,255,255,.9);border-color:rgba(255,255,255,.26)}
+/* Below 880px the section links scroll sideways INSIDE the bar rather than
+   disappearing. No JS, so it cannot break with scripting off; min-width:0 keeps
+   the overflow in this box and off the document. */
+@media(max-width:880px){
+  nav .inner{gap:14px}
+  .wordmark .tail{display:none}
+  nav ul{
+    gap:18px;flex:1 1 auto;overflow-x:auto;overflow-y:hidden;
+    -webkit-overflow-scrolling:touch;scrollbar-width:none;
+    -webkit-mask-image:linear-gradient(to right,#000 calc(100% - 24px),transparent);
+    mask-image:linear-gradient(to right,#000 calc(100% - 24px),transparent);
+  }
+  nav ul::-webkit-scrollbar{display:none}
+}
+
+/* ------------------------------------------------------------------ hero */
+header.hero{padding:126px 0 88px}
+@media(min-width:640px){header.hero{padding:164px 0 104px}}
+.hero-eyebrow{
+  font-family:var(--mono);font-size:13px;line-height:19px;font-weight:500;
+  letter-spacing:.26em;text-transform:uppercase;color:rgba(255,255,255,.6);
+}
+/* Both headline lines sit at full contrast. The old two-tone treatment dimmed
+   the second line, and here the two lines ARE the contrast — "run" against
+   "never read" — so fading either half argues against the sentence. Every h2 on
+   the page is single-tone for the same reason. */
+.hero h1{margin-top:26px;max-width:17ch}
+/* `text-wrap:pretty` is the widow guard, not `balance`: these two blocks run to
+   three lines at 390 and it is the LAST line that strands a word there. */
+.hero .sub{
+  margin-top:24px;max-width:56ch;font-size:17px;line-height:27px;
+  color:rgba(255,255,255,.6);text-wrap:pretty;
+}
+.hero .sub b{color:#fff;font-weight:600}
+.hero-cmd-wrap{margin-top:52px}
+.cta-row{margin-top:36px;display:flex;flex-wrap:wrap;align-items:center;gap:20px}
+.cta{
+  display:inline-flex;align-items:center;justify-content:center;gap:10px;
+  height:52px;width:340px;max-width:100%;border-radius:9999px;
+  background:var(--btn);border:1px solid var(--hair);color:#fff;
+  font-size:15px;font-weight:500;letter-spacing:-.01em;
+  transition:background .15s var(--ease-hover),border-color .15s var(--ease-hover);
+}
+.cta:hover{background:#24272B;border-color:rgba(255,255,255,.22)}
+.cta .arw,.cta-alt .arw{transition:transform .2s var(--ease-out)}
+.cta:hover .arw,.cta-alt:hover .arw{transform:translateX(4px)}
+@media(max-width:640px){.cta{width:100%}}
+.cta-alt{
+  display:inline-flex;align-items:center;gap:8px;
+  font-family:var(--mono);font-size:11px;letter-spacing:.16em;text-transform:uppercase;
+  color:rgba(255,255,255,.6);transition:color .15s var(--ease-hover);
+}
+.cta-alt:hover{color:rgba(255,255,255,.9)}
+.linkline{color:var(--green);border-bottom:1px solid rgba(95,211,154,.4)}
+
+/* ------------------------------------------------------------- terminals */
+.term{background:var(--well);border:1px solid var(--panel)}
+.termbar{
+  display:flex;align-items:center;gap:10px;padding:11px 18px;
+  border-bottom:1px solid var(--panel);flex-wrap:wrap;
+}
+.pip{width:6px;height:6px;border-radius:50%;background:var(--green);flex:none}
+.pip.leak{background:var(--leak)}
+.scroll-x{overflow-x:auto}
+.term-body{padding:20px 18px;overflow-x:auto}
+@media(min-width:640px){.term-body{padding:24px}}
+pre{
+  font-family:var(--mono);font-size:12px;line-height:1.85;letter-spacing:.2px;
+  background:transparent;color:rgba(255,255,255,.72);white-space:pre;
+}
+pre .c{color:rgba(255,255,255,.55)}   /* comments and prompts */
+pre .k{color:rgba(255,255,255,.95)}   /* what you typed */
+pre .o{color:rgba(255,255,255,.72)}   /* what came back */
+pre .g{color:var(--green)}
+pre .r{color:var(--leak)}
+pre .v{color:var(--violet)}
+/* The hero command is the single most important line on the page, so it is set
+   larger than every other terminal and nothing shares its box. */
+.hero-cmd .term-body{padding:26px 20px}
+@media(min-width:640px){.hero-cmd .term-body{padding:34px}}
+.hero-cmd pre{font-size:clamp(11.5px,1.95vw,17px);line-height:1.75}
+

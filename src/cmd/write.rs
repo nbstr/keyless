@@ -22,7 +22,7 @@
 //!
 //! No `--value`, no `--secret`, no positional value. An argument is readable
 //! from the process table for as long as the process lives — the CLI-flag
-//! shape, one of the four the README's *Why this exists* names.
+//! shape, one of the four ways a value leaks.
 //! Offering the flag guarantees it gets used, so the flag does not exist —
 //! structurally, the same way `run` has no `--reveal`.
 //!
@@ -32,14 +32,14 @@
 //! because `printf '%s\n'` and a heredoc both add one and a credential whose own
 //! last byte is a newline is not distinguishable from one without.
 //!
-//! # These verbs may refuse. `run` may not
+//! # These verbs refuse on failure. `run` does not
 //!
 //! See [`crate::store::manage`] for the argument. Briefly: `run` never blocks
-//! because blocking somebody's work gets the tool removed, after which the
-//! plaintext comes back. `new` and `put` are setup steps with a person watching,
-//! nothing downstream waits on them, and a write that "degraded" would report
-//! success with nothing stored — which the next `run` would report as a missing
-//! name for a reason nobody can find.
+//! on a store's failure because blocking somebody's work gets the tool removed,
+//! after which the plaintext comes back. `new` and `put` are setup steps with a
+//! person watching, nothing downstream waits on them, and a write that
+//! "degraded" would report success with nothing stored — which the next `run`
+//! would report as a missing name for a reason nobody can find.
 
 use std::io::{self, BufRead, Read, Write};
 

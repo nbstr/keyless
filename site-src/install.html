@@ -1,0 +1,95 @@
+<section class="band" id="install">
+  <div class="col">
+    <div class="rule reveal">
+      <div class="eyebrow"><span class="dash"></span><span class="eyebrow-txt">install</span></div>
+      <div class="head">
+        <h2>Dry-run<br>by default.</h2>
+        <p class="deck">The installer prints every command it would run, in order, and changes nothing.
+          <code>--commit</code> is the only thing that makes it act.</p>
+      </div>
+    </div>
+
+    <div class="slab reveal">
+      <div class="grid g2">
+        <div class="pad">
+          <div class="lbl">the client</div>
+          <div class="scroll-x gap-m">
+<pre><span class="k">git clone https://github.com/nbstr/keyless</span>
+<span class="k">cd keyless</span>
+<span class="k">cargo install --path .</span>
+<span class="k">keyless --version</span>              <span class="c"># proves it is on your PATH</span></pre>
+          </div>
+          <p class="micro gap-m">
+            rust 1.89 or later &middot; <b>cargo install writes to ~/.cargo/bin, which has to be on your
+            PATH</b> &mdash; the --version line is there so you find that out now rather than three
+            commands later
+          </p>
+          <div class="hr"></div>
+          <div class="lbl">and the uid boundary</div>
+          <div class="scroll-x gap-m">
+<pre><span class="k">cargo build --release</span>            <span class="c"># the installer copies from target/release</span>
+<span class="k">./install/install.sh</span>             <span class="c"># prints the plan, changes nothing</span>
+<span class="k">sudo ./install/install.sh --commit</span></pre>
+          </div>
+          <p class="deck-s gap-l">
+            It needs <code>sudo</code> exactly once, to create a user. Nothing afterwards does.
+            <code>uninstall.sh</code> reverses all of it — the launchd job, the files and the account —
+            and is dry-run too.
+          </p>
+        </div>
+        <div class="pad">
+          <div class="lbl">the seven verbs, and there is no eighth</div>
+          <p class="verbs gap-s">run &middot; ls &middot; items &middot; fields &middot; new &middot; put &middot; doctor</p>
+          <p class="deck-s gap-s">Six of them name things. One of them runs a command with a value in its
+            environment. None of them prints a value.</p>
+          <div class="hr"></div>
+          <div class="lbl">observed, not quoted</div>
+          <ul class="rows gap-s">
+            <li><span class="k">cargo test</span><span class="lbl g">464 passed, 0 failed, 15 ignored</span></li>
+            <li><span class="k">cargo fmt --check</span><span class="lbl g">exit 0 — zero bytes out</span></li>
+            <li><span class="k">hooks/tests/run.py</span><span class="lbl g">613 checks, all green</span></li>
+            <li><span class="k">hooks/tests/mutate.py</span><span class="lbl g">41 / 41 mutations caught</span></li>
+            <li><span class="k">packages in the lock file</span><span class="lbl">24</span></li>
+            <li><span class="k">values printed, ever</span><span class="lbl">0</span></li>
+          </ul>
+          <p class="micro gap-l">
+            <a class="linkline" href="https://github.com/nbstr/keyless" rel="noopener">github.com/nbstr/keyless</a>
+            &nbsp;&middot;&nbsp; MIT
+          </p>
+        </div>
+      </div>
+    </div>
+
+    <p class="caveat reveal">
+      The 15 ignored tests are the entire live Proton Pass suite, which needs a real account &mdash; CI
+      asserts <b>ignored == 15</b> precisely so that stays visible rather than quietly drifting.
+      &nbsp;&middot;&nbsp; There is no telemetry, and a test scans the binary for endpoint strings to keep
+      it that way.
+    </p>
+  </div>
+</section>
+
+<footer>
+  <div class="col">
+    <div class="cols">
+      <div>
+        <div class="wordmark"><span class="name">keyless</span><span class="lbl tail">use a secret without holding one</span></div>
+        <p class="deck-s gap-m">
+          Name it, and the value reaches the child process and nothing else. Rust, MIT, macOS.
+        </p>
+      </div>
+      <ul class="lbl">
+        <li><a class="navlink" href="#leak">the leak</a></li>
+        <li><a class="navlink" href="#stores">your stores</a></li>
+        <li><a class="navlink" href="#degraded">the sharp edge</a></li>
+        <li><a class="navlink" href="#limits">what it does not catch</a></li>
+        <li><a class="navlink" href="#install">install</a></li>
+        <li><a class="navlink linkline" href="https://github.com/nbstr/keyless" rel="noopener">github.com/nbstr/keyless</a></li>
+      </ul>
+    </div>
+    <p class="micro" style="margin-top:44px;max-width:78ch">
+      Every number on this page has an artifact behind it in the repository.
+    </p>
+  </div>
+</footer>
+

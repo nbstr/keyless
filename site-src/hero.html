@@ -1,0 +1,96 @@
+</head>
+<body>
+<script>document.documentElement.className += " js";</script>
+
+<nav>
+  <div class="inner">
+    <div class="wordmark">
+      <span class="name">keyless</span>
+      <span class="lbl tail">secrets broker</span>
+    </div>
+    <ul class="lbl">
+      <li><a class="navlink" href="#leak">the leak</a></li>
+      <li><a class="navlink" href="#stores">your stores</a></li>
+      <li><a class="navlink" href="#degraded">the sharp edge</a></li>
+      <li><a class="navlink" href="#limits">limits</a></li>
+    </ul>
+    <div class="actions">
+      <a class="chip" href="https://github.com/nbstr/keyless" rel="noopener">github</a>
+      <a class="chip" href="#install">install</a>
+    </div>
+  </div>
+</nav>
+
+<!-- =============================================================== HERO -->
+<header class="hero">
+  <div class="col">
+    <p class="hero-eyebrow cascade d1">Secrets broker for coding agents</p>
+    <!-- The non-breaking space keeps "the secret." together. Without it 390
+         breaks after "the" and strands "secret." — the payload word — on a line
+         of its own. It has no effect at any width where the line already fits. -->
+    <h1 class="cascade d2">Run the command.<br>Never read the&nbsp;secret.</h1>
+    <p class="sub cascade d3">
+      Your vault can print a value. <b>keyless cannot</b> — so nothing in your transcript ever holds one.
+    </p>
+
+    <div class="hero-cmd-wrap cascade d4">
+      <div class="term hero-cmd">
+        <div class="termbar">
+          <span class="pip"></span>
+          <span class="lbl">the whole interface</span>
+        </div>
+        <div class="term-body">
+<pre><span class="c">$</span> <span class="k">keyless run -s DATABASE_URL -- psql</span>
+<span class="o">psql (16.2)</span>  <span class="g">connected.</span>
+<span class="c"># from your vault. printed nowhere.</span></pre>
+        </div>
+      </div>
+    </div>
+
+    <div class="cta-row cascade d5">
+      <a class="cta" href="#install">Install it <span class="arw">&rarr;</span></a>
+      <a class="cta-alt" href="#limits">Read what it does not catch <span class="arw">&rarr;</span></a>
+    </div>
+  </div>
+
+  <div class="slab cascade d6 gap-l">
+    <div class="grid g1">
+      <div class="pipe">
+        <div class="stage is-store">
+          <span class="st-l">your store</span>
+          <span class="st-v">Proton Pass<br>1Password<br>Infisical</span>
+        </div>
+        <div class="wire w1"><span class="dot"></span></div>
+        <div class="stage is-broker">
+          <span class="st-l">keyless</span>
+          <span class="st-v">resolves via the vault’s own run</span>
+        </div>
+        <div class="wire w2"><span class="dot"></span></div>
+        <div class="stage is-child">
+          <span class="st-l">the child process</span>
+          <span class="st-v">psql, with the value in its environment</span>
+        </div>
+        <div class="wall"><i></i></div>
+        <div class="pipe-cap"><span class="micro">nothing to the right of this line ever receives the value</span></div>
+      </div>
+    </div>
+    <div class="ledger">
+      <div><span class="ln">stdout</span><span class="lv">nothing</span></div>
+      <div><span class="ln">scrollback</span><span class="lv">nothing</span></div>
+      <div><span class="ln">shell history</span><span class="lv">nothing</span></div>
+      <div><span class="ln">the transcript</span><span class="lv">nothing</span></div>
+      <div class="held"><span class="ln">the child's environ</span><span class="lv">the value</span></div>
+    </div>
+  </div>
+
+  <div class="col">
+    <p class="caveat cascade d6">
+      It reads from the vault you already run &mdash; <b>Proton Pass</b>, <b>1Password</b> or <b>Infisical</b>.
+      &nbsp;&middot;&nbsp; <b>keyless get</b> is not a typo you can make; it does not exist.
+      &nbsp;&middot;&nbsp; Three states — <b>INJECTED</b>, <b>REFUSED</b> or <b>DEGRADED</b>.
+      &nbsp;&middot;&nbsp; MIT &middot; Rust &middot; macOS &middot; five direct dependencies.
+    </p>
+  </div>
+</header>
+
+<!-- ========================================================== THE LEAK -->

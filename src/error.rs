@@ -50,6 +50,15 @@ pub enum StoreError {
         /// What is missing, and how to supply it.
         detail: String,
     },
+    /// The backend declined the request itself — a name nothing could find,
+    /// or a caller it will not serve. Not a failure to answer: the answer is
+    /// that the request is wrong, so `run` refuses rather than degrades.
+    Refused {
+        /// Store identifier, e.g. `daemon`.
+        store: String,
+        /// The rule the request broke. Never contains a value.
+        detail: String,
+    },
 }
 
 impl StoreError {
@@ -59,7 +68,19 @@ impl StoreError {
         match self {
             StoreError::Unavailable { store, .. }
             | StoreError::Backend { store, .. }
-            | StoreError::Misconfigured { store, .. } => store,
+            | StoreError::Misconfigured { store, .. }
+            | StoreError::Refused { store, .. } => store,
+        }
+    }
+
+    /// The cause, without the `store `x`` prefix `Display` adds for a log line.
+    #[must_use]
+    pub fn detail(&self) -> &str {
+        match self {
+            StoreError::Unavailable { detail, .. }
+            | StoreError::Backend { detail, .. }
+            | StoreError::Misconfigured { detail, .. }
+            | StoreError::Refused { detail, .. } => detail,
         }
     }
 }
@@ -75,6 +96,9 @@ impl fmt::Display for StoreError {
             }
             StoreError::Misconfigured { store, detail } => {
                 write!(f, "store `{store}` was not asked: {detail}")
+            }
+            StoreError::Refused { store, detail } => {
+                write!(f, "store `{store}` refused: {detail}")
             }
         }
     }

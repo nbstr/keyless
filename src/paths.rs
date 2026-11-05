@@ -68,10 +68,10 @@ pub fn home() -> Option<PathBuf> {
 /// | `~/foo` with no `HOME` | **refused at parse time** |
 ///
 /// A refusal is a `serde` error, which [`crate::config::Config::load`] turns
-/// into a reported problem plus the default config: every name degrades, `run`
-/// prints the reason on stderr before it spawns the child, and `doctor` prints
-/// it as `PROBLEM`. That is loud and it still runs the command, which is this
-/// crate's rule. The rejected alternative was to keep the literal and warn —
+/// into a reported problem plus the default config: `run` prints the reason on
+/// stderr and carries on with the defaults, and `doctor` prints it as
+/// `PROBLEM`. That is loud and it never blocks the command on the config, which
+/// is this crate's rule. The rejected alternative was to keep the literal and warn —
 /// that leaves the wrong directory being created, which is the whole defect,
 /// merely narrated.
 ///

@@ -9,7 +9,9 @@ mod cli_support;
 mod support;
 
 use cli_support::{config_with_stub, keyless, keyless_env, stdout_of};
-use support::{Backend, DECOY_VALUE, Stub, scratch};
+use support::backend::Backend;
+use support::keychain::Stub;
+use support::{DECOY_VALUE, scratch};
 
 // ---------------------------------------------------------------------------
 // The verb that must not exist.
@@ -205,7 +207,7 @@ fn an_ambient_op_reference_never_reaches_the_vendor() {
     // finds in the whole environment, which buys a read nobody asked for and
     // fails the probe with a message naming a variable unrelated to the lookup.
     let dir = support::scratch("e2e-op-ambient-reference");
-    let stub = support::stub_op(&dir, &Backend::Injects(support::ONEPASSWORD_DECOY));
+    let stub = support::onepassword::stub_op(&dir, &Backend::Injects(support::ONEPASSWORD_DECOY));
     let config = dir.join("config.json");
     std::fs::write(
         &config,

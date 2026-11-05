@@ -298,7 +298,7 @@ mod tests {
         assert!(
             release.contains("panic = \"abort\""),
             "the release profile no longer aborts; the scrub limit documented in \
-             this module and in the README must be revisited"
+             this module must be revisited"
         );
     }
 

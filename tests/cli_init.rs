@@ -4,7 +4,8 @@ mod support;
 use std::process::Command;
 
 use cli_support::{BIN, keyless, row_for, state_of, stdout_of};
-use support::{DECOY_VALUE, Stub, scratch, stub_security};
+use support::keychain::{Stub, stub_security};
+use support::{DECOY_VALUE, scratch};
 
 // ---------------------------------------------------------------------------
 // `init`.

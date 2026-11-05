@@ -591,7 +591,7 @@ html{scroll-behavior:smooth}
     <p class="caveat cascade d6">
       It reads from the vault you already run &mdash; <b>Proton Pass</b>, <b>1Password</b> or <b>Infisical</b>.
       &nbsp;&middot;&nbsp; <b>keyless get</b> is not a typo you can make; it does not exist.
-      &nbsp;&middot;&nbsp; Two states, no third — <b>INJECTED</b> or <b>DEGRADED</b>.
+      &nbsp;&middot;&nbsp; Three states — <b>INJECTED</b>, <b>REFUSED</b> or <b>DEGRADED</b>.
       &nbsp;&middot;&nbsp; MIT &middot; Rust &middot; macOS &middot; five direct dependencies.
     </p>
   </div>
@@ -926,7 +926,12 @@ html{scroll-behavior:smooth}
         <div class="pad">
           <div class="scroll-x">
 <pre><span class="c">$</span> <span class="k">keyless run -s TYPOED_NAME -- deploy</span>
-<span class="v">DEGRADED</span><span class="o">: TYPOED_NAME did not resolve.</span>
+<span class="r">REFUSED</span><span class="o">: no store holds TYPOED_NAME. The command was not run.</span>
+<span class="c">$</span> <span class="k">echo $?</span>
+<span class="o">64</span>
+
+<span class="c">$</span> <span class="k">keyless run -s DEPLOY_TOKEN -- deploy</span>   <span class="c"># its store is silent</span>
+<span class="v">DEGRADED</span><span class="o">: DEPLOY_TOKEN did not resolve.</span>
 <span class="o">Running the command anyway, with an untouched environment.</span>
 
 <span class="o">deploy: 401 Unauthorized</span>
@@ -935,15 +940,16 @@ html{scroll-behavior:smooth}
           </div>
         </div>
         <div class="pad">
-          <h3>keyless never refuses your command.</h3>
-          <p class="deck-s gap-m">An unresolvable name warns on stderr, runs the child with an untouched
-            environment, and forwards the child's exit code. <b>So a missing credential is a 401 at exit
-            0.</b></p>
-          <p class="deck-s gap-m">Nothing in the exit status separates a working secret from a missing
-            one. Only the <span class="v">DEGRADED</span> banner does — which is why it is a banner and
-            not a debug line.</p>
+          <h3>keyless never blocks on a failure.</h3>
+          <p class="deck-s gap-m">It refuses only a name its store does not hold, an empty name, or a
+            caller that fails attestation: exit 64, and the command never runs. A store in silence or a
+            daemon that cannot answer warns on stderr, runs the child with an untouched environment, and
+            forwards the child's exit code. <b>So a missing credential is a 401 at exit 0.</b></p>
+          <p class="deck-s gap-m">Nothing in the exit status separates a working secret from one its
+            store could not serve. Only the <span class="v">DEGRADED</span> banner does — which is why it
+            is a banner and not a debug line.</p>
           <div class="hr"></div>
-          <p class="micro">a trade, stated out loud: keyless will not be the reason your pipeline stops</p>
+          <p class="micro">a trade, stated out loud: a store&rsquo;s failure will not be the reason your pipeline stops</p>
         </div>
       </div>
     </div>

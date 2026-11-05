@@ -104,6 +104,7 @@ HOOK_CHECK_FLOOR=500
 echo "${BOLD}gate${OFF} ${DIM}$(uname -s), $(rustc -V 2>/dev/null || echo 'no rustc')${OFF}"
 
 run_step "format"  cargo fmt --check
+run_step "site assembled from site-src" bash scripts/site.sh --check
 run_step "clippy"  heavy 'cargo clippy --locked --all-targets -- -D warnings'
 
 # Named binaries, not a bare `cargo build`. On Linux a bare build exits 101 for

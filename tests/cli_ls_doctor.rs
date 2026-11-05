@@ -4,7 +4,10 @@ mod support;
 use cli_support::{
     config_with_stub, keyless, keyless_env, row_for, state_of, stderr_of, stdout_of,
 };
-use support::{Backend, DECOY_VALUE, INFISICAL_DECOY, Stub, scratch, stub_infisical};
+use support::backend::Backend;
+use support::infisical::stub_infisical;
+use support::keychain::Stub;
+use support::{DECOY_VALUE, INFISICAL_DECOY, scratch};
 
 // ---------------------------------------------------------------------------
 // ls and doctor.
