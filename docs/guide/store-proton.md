@@ -51,6 +51,52 @@ Degrading the *name* is not refusing the *command*: the child still runs, with
 its exit code and its terminal intact. Nothing is spawned and no remote audit
 entry is written for a read whose identity nobody chose.
 
+## An agent session ends — `auto_login` logs it back in
+
+Proton ends an agent session: "a lifetime of 2 hours", say the vendor's docs,
+though one measured on 2026-11-11 still answered 2 h 09 after its login. The
+read that finds it ended deletes `<session_dir>/.session`, and a write still in
+flight can put an empty `session.json` back. From then on every Proton name
+degrades with `This operation requires an authenticated client` until somebody
+logs in again. The daemon renews its own session; a session does nothing
+unless asked:
+
+```json
+"proton": {
+  "enabled": true,
+  "session_dir": "~/.keyless-pass-session",
+  "session": {
+    "auto_login": true,
+    "token": { "service": "keyless-proton", "account": "my-agent" }
+  }
+}
+```
+
+With that, the lookup that finds the session ended reads the agent token out
+of that login-keychain item, logs the session in again, and retries once. The
+config names the item, never the token; the token goes into the environment of
+that one login and nowhere else. Store it once — `security` prompts for it, so
+it stays out of your shell history:
+
+```console
+$ security add-generic-password -U -s keyless-proton -a my-agent -w
+```
+
+The item needs a service of its own. Under the keychain store's `service`, or
+at the coordinates of a name under `secrets`, `keyless run -s` could hand the
+token to any command — so `keyless` warns on every run and leaves auto-login
+off until it moves. Off by default, nothing changes for a config that does not
+ask.
+
+After a Homebrew upgrade of `pass-cli`, macOS asks once more before the new
+binary reads the session's key. A lookup gives up after `timeout_ms`, before
+anyone has typed a password, so the prompt comes back for every name. Answer it
+once by hand, with *Always Allow*:
+
+```console
+$ PROTON_PASS_SESSION_DIR=~/.keyless-pass-session pass-cli info
+```
+
 ## Address items by NAME — a share id is minted per session
 
 **A share id is not a coordinate you can store.** Measured 2026-08-08: the same

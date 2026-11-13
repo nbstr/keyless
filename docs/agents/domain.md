@@ -18,7 +18,8 @@ Single context:
 ├── GLOSSARY.md
 ├── docs/adr/
 │   ├── 0001-serve-the-last-value-while-a-store-is-silent.md
-│   └── 0002-refuse-unknown-names.md
+│   ├── 0002-refuse-unknown-names.md
+│   └── 0003-a-session-logs-back-in-only-when-asked.md
 └── src/
 ```
 

@@ -324,9 +324,10 @@ impl Default for InfisicalConfig {
 /// Proton Pass settings.
 ///
 /// As with Infisical, the login is the CLI's. There is no field for an agent
-/// token; `pass-cli` reads its own. What there *is* a field for is **which**
-/// login — see [`ProtonConfig::session_dir`], which is the difference between
-/// reading one vault and reading the whole account.
+/// token's value; `pass-cli` reads its own, and [`ProtonSessionLogin`] names
+/// only the keychain item a token sits in. What there *is* a field for is
+/// **which** login — see [`ProtonConfig::session_dir`], which is the difference
+/// between reading one vault and reading the whole account.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ProtonConfig {
     /// Path to, or name of, the `pass-cli` binary.
@@ -366,6 +367,10 @@ pub struct ProtonConfig {
     /// [`crate::store::manage`] for the asymmetry with `run`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub manager: Option<ProtonManagerConfig>,
+    /// Whether a lookup logs [`ProtonConfig::session_dir`] back in once Proton
+    /// has ended its session. Off unless asked for; see [`ProtonSessionLogin`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<ProtonSessionLogin>,
     /// How long one lookup may take before it degrades the run.
     #[serde(default = "default_timeout_ms")]
     pub timeout_ms: u64,
@@ -399,12 +404,43 @@ impl Default for ProtonConfig {
             binary: default_proton_binary(),
             session_dir: None,
             manager: None,
+            session: None,
             timeout_ms: default_timeout_ms(),
             listing_ttl_ms: default_listing_ttl_ms(),
             probe_binary: default_probe_binary(),
             enabled: false,
         }
     }
+}
+
+/// How a session gets back in once Proton has ended it.
+///
+/// Proton ends an agent session, and on a session nothing renews it: every
+/// Proton name degrades until somebody logs in again by hand. With
+/// `auto_login`, the lookup that finds the session ended logs it in again with
+/// the agent token kept in the login keychain, then retries.
+///
+/// Spelled as the daemon spells its own renewal switch,
+/// `stores.proton.session.auto_login`, so the setting keeps its name across the
+/// boundary. See [`crate::store::proton::AutoLogin`].
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct ProtonSessionLogin {
+    /// Off unless asked for.
+    #[serde(default)]
+    pub auto_login: bool,
+    /// The keychain item holding the agent token. Its address only, never its
+    /// value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token: Option<KeychainItem>,
+}
+
+/// One generic password in the login keychain.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct KeychainItem {
+    /// The item's service, as `security -s` spells it.
+    pub service: String,
+    /// The item's account, as `security -a` spells it.
+    pub account: String,
 }
 
 /// The write identity for Proton Pass: a second agent token, editor role.

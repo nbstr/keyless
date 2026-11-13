@@ -164,6 +164,7 @@
 //! `tests/session_coordinate.rs` fails the suite when a published file writes a
 //! command line the variable is absent from.
 
+mod auto_login;
 mod commands;
 mod discover;
 mod environment;
@@ -181,6 +182,7 @@ mod token;
 #[cfg(test)]
 mod tests;
 
+pub use auto_login::AutoLogin;
 pub(crate) use commands::flag_value;
 pub use environment::ENCRYPTION_KEY_VAR;
 pub use environment::KEY_PROVIDER_VAR;

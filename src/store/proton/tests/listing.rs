@@ -163,6 +163,7 @@ fn a_listing_cached_under_one_generation_is_not_reused_under_the_next() {
         items: Arc::new(Vec::new()),
         at: Instant::now(),
         generation: Some(a.clone()),
+        logins: 0,
     });
 
     let pass_a = store.enter().expect("a pass over A");

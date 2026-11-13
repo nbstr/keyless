@@ -12,7 +12,7 @@ use std::io;
 use std::path::PathBuf;
 
 /// A store failed to answer. Never carries a secret value.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum StoreError {
     /// The backend could not be reached at all — binary missing, daemon down,
     /// no network. The distinction from [`StoreError::Backend`] matters to

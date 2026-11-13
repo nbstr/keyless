@@ -30,6 +30,29 @@ impl Store for ProtonStore {
             return Ok(None);
         };
 
+        let logins = self.logins_so_far();
+        let read = self.read(name, &address);
+        if read.is_err() && self.logged_in_again(logins)? {
+            return self.read(name, &address);
+        }
+        read
+    }
+
+    /// [`ProtonStore::check_session`], once more when auto-login brought the
+    /// session back: `doctor` reports what the next `run` would meet.
+    fn health(&self) -> Result<(), StoreError> {
+        let logins = self.logins_so_far();
+        let checked = self.check_session();
+        if checked.is_err() && self.logged_in_again(logins)? {
+            return self.check_session();
+        }
+        checked
+    }
+}
+
+impl ProtonStore {
+    /// One lookup of `name` at `address`, through the session as it stands.
+    fn read(&self, name: &str, address: &Address) -> Result<Option<Secret>, StoreError> {
         // One pass spans every child this lookup may spawn — the listing
         // inside `reference_for`, the probe below, and a session-health
         // `info` should the probe fail — so a retirement waits for at most
@@ -38,7 +61,7 @@ impl Store for ProtonStore {
         let pass = self.enter()?;
 
         // Resolved every time, never stored: a share id belongs to one session.
-        let reference = match address.as_ref() {
+        let reference = match address {
             Address::Reference(reference) => reference.clone(),
             Address::Named(address) => self.reference_for(&pass, name, address)?,
             Address::Unusable(detail) => return Err(self.backend(detail.clone())),
@@ -133,7 +156,7 @@ impl Store for ProtonStore {
     /// can use, so every Proton name in the config will degrade. Saying so is
     /// `doctor`'s whole job, and it stays inside `doctor`'s contract: a problem
     /// here degrades a run, it never blocks one. Nothing in `run` consults this.
-    fn health(&self) -> Result<(), StoreError> {
+    fn check_session(&self) -> Result<(), StoreError> {
         // Local facts first, so the message names the closest cause. Both are
         // preconditions of the round trip below: with no session directory there
         // is no identity to ask as, and with no binary there is nothing to ask.

@@ -183,6 +183,11 @@ pub(super) fn register_local_backends(
         stores.push(Box::new(onepassword::OnePasswordStore::from_config(config)));
     }
     if config.stores.proton.enabled {
+        // Somebody asked for auto-login and will not get it: said on every run,
+        // because the session it would have saved ends on a clock either way.
+        if let Err(problem) = proton::AutoLogin::from_config(config) {
+            warnings.push(problem);
+        }
         stores.push(Box::new(proton::ProtonStore::from_config(
             config,
             invocation.reason.clone(),

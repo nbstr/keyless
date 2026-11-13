@@ -7,6 +7,7 @@ use std::time::Duration;
 use crate::config::Config;
 use crate::store::proton_session::Generations;
 
+use super::auto_login::AutoLogin;
 use super::environment::KeyProvider;
 use super::listing::{VaultSlot, bounded_listing_ttl};
 use super::reason::Reason;
@@ -26,6 +27,9 @@ pub struct ProtonStore {
     /// The daemon's own login, or `None` on a session, which inherits one.
     /// See [`AgentToken`].
     pub(super) credentials: Option<AgentToken>,
+    /// How a session gets back in once Proton has ended it, or `None` to
+    /// leave that to a person. See [`AutoLogin`].
+    pub(super) auto_login: Option<AutoLogin>,
     /// Whom to spawn the vendor as. See [`ProtonStore::with_run_as`].
     pub(super) run_as: Option<(u32, u32)>,
     pub(super) timeout: Duration,
@@ -113,6 +117,9 @@ impl ProtonStore {
         )
         .with_timeout(settings.timeout_ms)
         .with_listing_ttl(settings.listing_ttl_ms)
+        // A config asking for something unusable runs without it; the
+        // registry is what warns, once, with the reason.
+        .with_auto_login(AutoLogin::from_config(config).ok().flatten())
     }
 
     /// Construct from the parts, with no session config anywhere behind it.
@@ -135,6 +142,7 @@ impl ProtonStore {
             session_dir: None,
             key_provider: None,
             credentials: None,
+            auto_login: None,
             run_as: None,
             timeout: crate::config::bounded_timeout(crate::config::DEFAULT_TIMEOUT_MS),
             reason,

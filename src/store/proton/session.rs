@@ -177,7 +177,7 @@ impl ProtonStore {
     /// session refused" would turn a loaded machine into a verdict that keeps
     /// a revoked credential alive — see [`ProtonStore::session_is_at_fault`]
     /// for which way the two wrong answers cost.
-    fn info_probe_answers(&self, dir: &Path) -> Option<bool> {
+    pub(super) fn info_probe_answers(&self, dir: &Path) -> Option<bool> {
         match capture(
             self.info_probe_command(dir, std::env::vars_os()),
             self.timeout.min(SESSION_PROBE_CEILING),

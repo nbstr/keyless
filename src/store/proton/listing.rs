@@ -131,6 +131,11 @@ pub(super) struct Listed {
     /// past its TTL, so it is refetched the same way rather than handed out as
     /// though the vault behind it had not changed.
     pub(super) generation: Option<GenerationName>,
+    /// The session side's counterpart: how many sessions auto-login had put
+    /// in place when this was fetched. A share id belongs to the session that
+    /// listed it, so a listing from before the latest login is stale. Always
+    /// zero without auto-login.
+    pub(super) logins: u64,
 }
 
 /// The longest a listing may be reused, whatever the config asks for.
@@ -235,6 +240,7 @@ impl ProtonStore {
         if let Some(cached) = slot.as_ref()
             && cached.at.elapsed() < reusable_for
             && cached.generation == generation
+            && cached.logins == self.logins_so_far()
         {
             return Ok(Arc::clone(&cached.items));
         }
@@ -243,6 +249,9 @@ impl ProtonStore {
             items: Arc::clone(&fetched),
             at: Instant::now(),
             generation,
+            // Read after the fetch: one that succeeded ran against the
+            // session in place now.
+            logins: self.logins_so_far(),
         });
         Ok(fetched)
     }
