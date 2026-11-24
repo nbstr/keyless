@@ -86,26 +86,50 @@ impl AutoLogin {
         self.logins.load(Ordering::SeqCst)
     }
 
-    /// Log `session_dir` in again, unless somebody did while this caller waited.
+    /// Log `session_dir` in again, unless somebody did while this caller
+    /// waited, and say whether the session is back.
+    ///
+    /// `ended` is the caller's own finding, made before the lock so that
+    /// readers failing together do not ask the vendor one after another. What
+    /// that finding cannot settle is decided here, under the lock. A login
+    /// writes its session BEFORE it is counted — it is counted once `info` has
+    /// confirmed it — and a reader that asked inside that moment found the
+    /// session answering, so it took its own failure, met on the ended
+    /// session, for the name's. Taking the lock waits that login out, and the
+    /// count then says the session was replaced.
     fn log_in_again(
         &self,
         store: &ProtonStore,
         session_dir: &Path,
         logins_before: u64,
-    ) -> Result<(), StoreError> {
+        ended: bool,
+    ) -> Result<bool, StoreError> {
         let _this_process = self
             .in_flight
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
         if self.logins() != logins_before {
-            return Ok(());
+            return Ok(true);
+        }
+        if !ended {
+            return Ok(false);
         }
         if let Some(error) = self.gave_up.get() {
             return Err(error.clone());
         }
         self.log_in(store, session_dir).inspect_err(|error| {
             self.gave_up.get_or_init(|| error.clone());
-        })
+        })?;
+        Ok(true)
+    }
+
+    /// Return once no login is running in this process.
+    fn after_a_login_in_flight(&self) {
+        drop(
+            self.in_flight
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner),
+        );
     }
 
     fn log_in(&self, store: &ProtonStore, session_dir: &Path) -> Result<(), StoreError> {
@@ -318,8 +342,9 @@ impl ProtonStore {
     /// one more try.
     ///
     /// `true` when this call logged in again, or a sibling thread did since the
-    /// read began. `false` when auto-login is off, or the session still
-    /// answers — then the failure was about the name.
+    /// read began — including one still checking its login when this read
+    /// asked, see [`AutoLogin::log_in_again`]. `false` when auto-login is off,
+    /// or the session still answers — then the failure was about the name.
     pub(super) fn logged_in_again(&self, logins_before: u64) -> Result<bool, StoreError> {
         let Some(auto_login) = &self.auto_login else {
             return Ok(false);
@@ -327,13 +352,19 @@ impl ProtonStore {
         let Ok(dir) = self.session_dir() else {
             return Ok(false);
         };
-        if auto_login.logins() == logins_before {
-            if !dir.is_dir() || !self.session_ended(dir) {
-                return Ok(false);
-            }
-            auto_login.log_in_again(self, dir, logins_before)?;
+        if auto_login.logins() != logins_before {
+            return Ok(true);
         }
-        Ok(true)
+        let ended = dir.is_dir() && self.session_ended(dir);
+        auto_login.log_in_again(self, dir, logins_before, ended)
+    }
+
+    /// Wait out a login this process has running, so that what is fetched next
+    /// belongs to the session it puts in place. Free when none is running.
+    pub(super) fn after_any_login_in_flight(&self) {
+        if let Some(auto_login) = &self.auto_login {
+            auto_login.after_a_login_in_flight();
+        }
     }
 
     /// Whether Proton has ended the session at `dir`.

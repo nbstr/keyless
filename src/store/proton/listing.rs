@@ -237,6 +237,11 @@ impl ProtonStore {
         let generation = pass.generation().cloned();
         let slot = Arc::clone(self.cache().entry(vault.to_owned()).or_default());
         let mut slot = slot.lock().unwrap_or_else(PoisonError::into_inner);
+        // A login writes its session before it is counted, and a listing
+        // fetched in between is stamped with the count from before it, so the
+        // next reader fetches another. Waiting the login out first also lets
+        // the check below see the count it ends with.
+        self.after_any_login_in_flight();
         if let Some(cached) = slot.as_ref()
             && cached.at.elapsed() < reusable_for
             && cached.generation == generation

@@ -71,7 +71,13 @@ if ! grep -q '^auth=yes$' "$session" 2>/dev/null; then
   exit 1
 fi
 number=$(sed -n -e 's/^session=//p' "$session")
-if [ "$1" = 'info' ]; then echo 'Personal Access Token: decoy-agent'; exit 0; fi
+if [ "$1" = 'info' ]; then
+  # A slow answer from a live session: keeps open the moment a login has
+  # written its session and is still checking it.
+  if [ -f '{slow_info}' ]; then sleep 0.5; fi
+  echo 'Personal Access Token: decoy-agent'
+  exit 0
+fi
 if [ "$number" = 1 ]; then share=ShAr3; else share=ShAr3L1v3; fi
 if [ "$1" = 'item' ] && [ "$2" = 'list' ]; then
   echo listed >> '{listed}'
@@ -104,6 +110,7 @@ exit 1
         sessions = dir.join("pass-cli.sessions").display(),
         listed = dir.join("pass-cli.listed").display(),
         reopen = dir.join("pass-cli.reopen").display(),
+        slow_info = dir.join("pass-cli.slow-info").display(),
     );
     install_executable(&dir.join("pass-cli-stub"), &body)
 }
@@ -308,12 +315,11 @@ fn a_session_proton_ended_in_place_is_logged_in_again() {
     assert_eq!(calls(&dir, "login").len(), 2);
 }
 
-#[test]
-fn names_that_find_the_session_ended_together_log_in_once() {
-    let dir = ended_session("auto-login-once", Some(AGENT_TOKEN));
-    let registry = built(&config(&dir, true, Some(&token_item()))).registry;
-
-    let resolutions: Vec<Resolution> = std::thread::scope(|scope| {
+/// Eight readers of one name, started together on the session in `dir`, and
+/// what each one ended with.
+fn eight_readers_together(dir: &Path) -> Vec<Resolution> {
+    let registry = built(&config(dir, true, Some(&token_item()))).registry;
+    std::thread::scope(|scope| {
         let readers: Vec<_> = (0..8)
             .map(|_| scope.spawn(|| registry.resolve("DECOY")))
             .collect();
@@ -321,9 +327,12 @@ fn names_that_find_the_session_ended_together_log_in_once() {
             .into_iter()
             .map(|reader| reader.join().expect("a reader panicked"))
             .collect()
-    });
+    })
+}
 
-    for resolution in &resolutions {
+/// Every reader got the value, through one login and one listing.
+fn assert_one_login_served_every_reader(dir: &Path, resolutions: &[Resolution]) {
+    for resolution in resolutions {
         assert_eq!(
             resolved(resolution),
             Some(PROTON_DECOY),
@@ -331,10 +340,39 @@ fn names_that_find_the_session_ended_together_log_in_once() {
             resolution.reason()
         );
     }
-    assert_eq!(calls(&dir, "login").len(), 1);
+    assert_eq!(calls(dir, "login").len(), 1);
     // One listing for the new session, reused by every retry: measured in a
     // real run of 33 names, clearing it per retry cost one listing per name.
     assert_eq!(recorded_lines(&dir.join("pass-cli.listed")).len(), 1);
+}
+
+#[test]
+fn names_that_find_the_session_ended_together_log_in_once() {
+    let dir = ended_session("auto-login-once", Some(AGENT_TOKEN));
+
+    let resolutions = eight_readers_together(&dir);
+
+    assert_one_login_served_every_reader(&dir, &resolutions);
+}
+
+/// The same readers, with the moment between a login writing its session and
+/// that login being counted held open for half a second.
+///
+/// The test above used to fail now and then, and both of its failures came
+/// from that moment. A reader whose listing had failed on the ended session
+/// asked whether the session was ended, found it answering, and returned its
+/// failure as the name's own; and a listing fetched in that moment was stamped
+/// as older than the login, so the next reader fetched another. How often
+/// that happened depended on how long the check took, which is load; here it
+/// takes long enough to happen on every run.
+#[test]
+fn a_reader_that_failed_on_the_ended_session_waits_for_the_login_being_checked() {
+    let dir = ended_session("auto-login-checked", Some(AGENT_TOKEN));
+    std::fs::write(dir.join("pass-cli.slow-info"), "").expect("slow the check down");
+
+    let resolutions = eight_readers_together(&dir);
+
+    assert_one_login_served_every_reader(&dir, &resolutions);
 }
 
 fn mode(path: &Path) -> u32 {
