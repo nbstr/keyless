@@ -58,8 +58,11 @@ though one measured on 2026-11-11 still answered 2 h 09 after its login. The
 read that finds it ended deletes `<session_dir>/.session`, and a write still in
 flight can put an empty `session.json` back. From then on every Proton name
 degrades with `This operation requires an authenticated client` until somebody
-logs in again. The daemon renews its own session; a session does nothing
-unless asked:
+logs in again. A login that races such a read can also leave `.session` open
+to group and others, which every later `pass-cli` call refuses with `Session
+directory is accessible by group or others`; `auto_login` takes those bits
+off before and after each login. The daemon renews its own session; a session
+does nothing unless asked:
 
 ```json
 "proton": {

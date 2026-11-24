@@ -9,6 +9,7 @@
 
 mod support;
 
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 use keyless::config::Config;
@@ -28,7 +29,8 @@ const TOKEN_ACCOUNT: &str = "test-agent";
 /// A `pass-cli` stand-in that keeps a session the way the vendor does.
 ///
 /// Every call appends `<verb> <token-in-env|no-token>` to `pass-cli.calls`,
-/// never the token itself. `login` checks the token, writes a `session.json`
+/// never the token itself. Every verb, `login` included, refuses a `.session`
+/// group or others can enter, as 2.7.0 does. `login` checks the token, writes a `session.json`
 /// that holds a login, and bumps the session number. Any other verb refuses
 /// with `there is no session` when the file is missing OR holds no login,
 /// which is what a real expiry left behind on 2026-11-11. `item list` answers
@@ -41,6 +43,11 @@ root="${{PROTON_PASS_SESSION_DIR-}}"
 session="$root/.session/session.json"
 token="${{PROTON_PASS_PERSONAL_ACCESS_TOKEN:+token-in-env}}"
 printf '%s %s\n' "$1" "${{token:-no-token}}" >> '{calls}'
+if [ -d "$root/.session" ] && [ "$(ls -ld "$root/.session" | cut -c5-10)" != '------' ]; then
+  echo 'Error: Error getting base dir' >&2
+  echo "Caused by: Session directory is accessible by group or others: $root/.session" >&2
+  exit 1
+fi
 if [ "$1" = 'login' ]; then
   printf '%s\n' "$@" > '{login_argv}'
   if [ "${{PROTON_PASS_PERSONAL_ACCESS_TOKEN-}}" != '{AGENT_TOKEN}' ]; then
@@ -49,7 +56,11 @@ if [ "$1" = 'login' ]; then
   fi
   number=$(( $(cat '{sessions}' 2>/dev/null || echo 0) + 1 ))
   echo "$number" > '{sessions}'
-  mkdir -p "$root/.session" && printf 'session=%s\nauth=yes\n' "$number" > "$session"
+  if [ -f '{reopen}' ]; then
+    # A read still running deleted `.session`; the login writes it back open.
+    rm -rf "$root/.session" && mkdir -m 755 "$root/.session"
+  fi
+  mkdir -p -m 700 "$root/.session" && printf 'session=%s\nauth=yes\n' "$number" > "$session"
   exit 0
 fi
 if ! grep -q '^auth=yes$' "$session" 2>/dev/null; then
@@ -92,6 +103,7 @@ exit 1
         login_argv = dir.join("pass-cli.login.argv").display(),
         sessions = dir.join("pass-cli.sessions").display(),
         listed = dir.join("pass-cli.listed").display(),
+        reopen = dir.join("pass-cli.reopen").display(),
     );
     install_executable(&dir.join("pass-cli-stub"), &body)
 }
@@ -323,6 +335,57 @@ fn names_that_find_the_session_ended_together_log_in_once() {
     // One listing for the new session, reused by every retry: measured in a
     // real run of 33 names, clearing it per retry cost one listing per name.
     assert_eq!(recorded_lines(&dir.join("pass-cli.listed")).len(), 1);
+}
+
+fn mode(path: &Path) -> u32 {
+    std::fs::metadata(path)
+        .expect("stat the session store")
+        .permissions()
+        .mode()
+        & 0o7777
+}
+
+#[test]
+fn a_session_store_left_open_is_shut_before_the_login() {
+    let dir = ended_session("auto-login-open-store", Some(AGENT_TOKEN));
+    // What a real session met on 2026-11-24: `.session` open to group and
+    // others, and every verb refusing it, the login as well.
+    let store = session_dir(&dir).join(".session");
+    std::fs::create_dir(&store).expect("create the session store");
+    std::fs::set_permissions(&store, std::fs::Permissions::from_mode(0o755))
+        .expect("open the session store");
+    let registry = built(&config(&dir, true, Some(&token_item()))).registry;
+
+    let resolution = registry.resolve("DECOY");
+
+    assert_eq!(
+        resolved(&resolution),
+        Some(PROTON_DECOY),
+        "{}",
+        resolution.reason()
+    );
+    assert_eq!(mode(&store), 0o700);
+}
+
+#[test]
+fn a_session_store_the_login_writes_back_open_is_shut_after_it() {
+    let dir = ended_session("auto-login-reopened", Some(AGENT_TOKEN));
+    // The same day, later: a read still running deletes `.session` while the
+    // login writes, and the login's files land in a directory made open. The
+    // login succeeds; the `info` that checks it is refused.
+    std::fs::write(dir.join("pass-cli.reopen"), "").expect("arm the stand-in");
+    let registry = built(&config(&dir, true, Some(&token_item()))).registry;
+
+    let resolution = registry.resolve("DECOY");
+
+    assert_eq!(
+        resolved(&resolution),
+        Some(PROTON_DECOY),
+        "{}",
+        resolution.reason()
+    );
+    assert_eq!(calls(&dir, "login").len(), 1);
+    assert_eq!(mode(&session_dir(&dir).join(".session")), 0o700);
 }
 
 #[test]

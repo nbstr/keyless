@@ -13,7 +13,7 @@ use crate::store::keychain::KeychainStore;
 
 use super::STORE_ID;
 use super::environment::remove_ambient_references;
-use super::session_dir::{session_file_present, shell_word};
+use super::session_dir::{SESSION_SUBDIR, session_file_present, shell_word};
 use super::store::ProtonStore;
 use super::token::{TOKEN_VAR, refused_the_token};
 
@@ -110,6 +110,9 @@ impl AutoLogin {
 
     fn log_in(&self, store: &ProtonStore, session_dir: &Path) -> Result<(), StoreError> {
         let _every_process = lock_directory(store, session_dir)?;
+        // Before the check below: an open store refuses `info` too, so a
+        // session another process just logged in would read as ended.
+        shut_session_store(store, session_dir)?;
         // Another process logged in while this one waited for the lock.
         if !store.session_ended(session_dir) {
             self.logins.fetch_add(1, Ordering::SeqCst);
@@ -119,11 +122,19 @@ impl AutoLogin {
         let token = [(TOKEN_VAR.to_owned(), self.read_token()?)];
         let captured = capture(store.login_command(session_dir, &token), store.timeout)
             .map_err(|error| store.unreachable(&error))?;
+        shut_session_store(store, session_dir)?;
         // The exit status alone is not the proof: a login that left no live
         // session would leave the retry failing exactly as the first read did.
         if captured.status.success() && !store.session_ended(session_dir) {
             self.logins.fetch_add(1, Ordering::SeqCst);
             return Ok(());
+        }
+        if captured.status.success() {
+            return Err(store.unavailable(format!(
+                "Proton ended this session, and the login reported success but left a session \
+                 at {} that is still refused",
+                session_dir.display()
+            )));
         }
 
         let said = summarise(&captured.stderr);
@@ -233,6 +244,59 @@ fn lock_directory(store: &ProtonStore, dir: &Path) -> Result<File, StoreError> {
         ))
     })?;
     Ok(handle)
+}
+
+/// Take group and others off `<dir>/.session`, which every `pass-cli` verb
+/// refuses otherwise, `login` included: `Session directory is accessible by
+/// group or others`.
+///
+/// `pass-cli` 2.7.0 makes the directory 0700 itself, from `info` and from
+/// `login` alike (measured 2026-11-24). What leaves it open is the race this
+/// login runs in: a read still running finds the session ended and deletes
+/// `.session`, and the login then writes its files back into a directory made
+/// at the process umask. Seen twice that day on a dev session of 31 names —
+/// once refusing the login outright, once letting it succeed and refusing the
+/// `info` that checks it — and each time every name degraded until a `chmod`
+/// by hand. The daemon re-asserts its own directory before each login for the
+/// same reason (`ensure_session_dir`).
+///
+/// Only bits are taken away, and only from a real directory: a symlink is left
+/// for the vendor to refuse, never followed.
+#[cfg(unix)]
+fn shut_session_store(store: &ProtonStore, dir: &Path) -> Result<(), StoreError> {
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+
+    let session_store = dir.join(SESSION_SUBDIR);
+    let meta = match fs::symlink_metadata(&session_store) {
+        Ok(meta) if meta.is_dir() => meta,
+        Ok(_) => return Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(store.unavailable(format!(
+                "cannot examine {} to log in again: {error}",
+                session_store.display()
+            )));
+        }
+    };
+    let mode = meta.permissions().mode() & 0o7777;
+    if mode & 0o077 == 0 {
+        return Ok(());
+    }
+    fs::set_permissions(&session_store, fs::Permissions::from_mode(mode & !0o077)).map_err(
+        |error| {
+            store.unavailable(format!(
+                "{} is open to group or others, which `pass-cli` refuses, and cannot be shut: \
+                 {error}",
+                session_store.display()
+            ))
+        },
+    )
+}
+
+#[cfg(not(unix))]
+fn shut_session_store(_store: &ProtonStore, _dir: &Path) -> Result<(), StoreError> {
+    Ok(())
 }
 
 impl ProtonStore {
