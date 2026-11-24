@@ -146,6 +146,14 @@ fn resolve_all(
             .collect();
     }
 
+    // Once, before the threads: a backend that has to repair what every lookup
+    // depends on does it while no lookup is running. See `Store::prepare`.
+    let names: Vec<&str> = bindings
+        .iter()
+        .map(|binding| binding.name.as_str())
+        .collect();
+    registry.prepare(&names);
+
     let mut slots: Vec<Option<Resolution>> = bindings.iter().map(|_| None).collect();
     thread::scope(|scope| {
         let mut running = Vec::new();

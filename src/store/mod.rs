@@ -97,6 +97,15 @@ pub trait Store: Send + Sync {
     /// Cheap reachability check that reads no secret.
     fn health(&self) -> Result<(), StoreError>;
 
+    /// Get ready for a run about to ask for `names` all at once, before any of
+    /// them is asked for.
+    ///
+    /// Nothing by default. It reports nothing either: whatever goes wrong here,
+    /// each lookup meets again and reports for itself, so this call alone never
+    /// degrades or refuses a run. The Proton adapter logs an ended session back
+    /// in here, while no lookup is running.
+    fn prepare(&self, _names: &[&str]) {}
+
     /// An operational notice this backend wants surfaced on stderr once, from
     /// its most recent lookup — never a secret, and never tied to the name
     /// that was asked for. `None` for every backend but [`daemon::DaemonStore`],

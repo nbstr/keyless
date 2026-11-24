@@ -13,7 +13,8 @@ use crate::store::keychain::KeychainStore;
 
 use super::STORE_ID;
 use super::environment::remove_ambient_references;
-use super::session_dir::{session_file_present, shell_word};
+use super::routing::Address;
+use super::session_dir::{SESSION_SUBDIR, session_file_present, shell_word};
 use super::store::ProtonStore;
 use super::token::{TOKEN_VAR, refused_the_token};
 
@@ -86,30 +87,57 @@ impl AutoLogin {
         self.logins.load(Ordering::SeqCst)
     }
 
-    /// Log `session_dir` in again, unless somebody did while this caller waited.
+    /// Log `session_dir` in again, unless somebody did while this caller
+    /// waited, and say whether the session is back.
+    ///
+    /// `ended` is the caller's own finding, made before the lock so that
+    /// readers failing together do not ask the vendor one after another. What
+    /// that finding cannot settle is decided here, under the lock. A login
+    /// writes its session BEFORE it is counted — it is counted once `info` has
+    /// confirmed it — and a reader that asked inside that moment found the
+    /// session answering, so it took its own failure, met on the ended
+    /// session, for the name's. Taking the lock waits that login out, and the
+    /// count then says the session was replaced.
     fn log_in_again(
         &self,
         store: &ProtonStore,
         session_dir: &Path,
         logins_before: u64,
-    ) -> Result<(), StoreError> {
+        ended: bool,
+    ) -> Result<bool, StoreError> {
         let _this_process = self
             .in_flight
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
         if self.logins() != logins_before {
-            return Ok(());
+            return Ok(true);
+        }
+        if !ended {
+            return Ok(false);
         }
         if let Some(error) = self.gave_up.get() {
             return Err(error.clone());
         }
         self.log_in(store, session_dir).inspect_err(|error| {
             self.gave_up.get_or_init(|| error.clone());
-        })
+        })?;
+        Ok(true)
+    }
+
+    /// Return once no login is running in this process.
+    fn after_a_login_in_flight(&self) {
+        drop(
+            self.in_flight
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner),
+        );
     }
 
     fn log_in(&self, store: &ProtonStore, session_dir: &Path) -> Result<(), StoreError> {
         let _every_process = lock_directory(store, session_dir)?;
+        // Before the check below: an open store refuses `info` too, so a
+        // session another process just logged in would read as ended.
+        shut_session_store(store, session_dir)?;
         // Another process logged in while this one waited for the lock.
         if !store.session_ended(session_dir) {
             self.logins.fetch_add(1, Ordering::SeqCst);
@@ -119,11 +147,19 @@ impl AutoLogin {
         let token = [(TOKEN_VAR.to_owned(), self.read_token()?)];
         let captured = capture(store.login_command(session_dir, &token), store.timeout)
             .map_err(|error| store.unreachable(&error))?;
+        shut_session_store(store, session_dir)?;
         // The exit status alone is not the proof: a login that left no live
         // session would leave the retry failing exactly as the first read did.
         if captured.status.success() && !store.session_ended(session_dir) {
             self.logins.fetch_add(1, Ordering::SeqCst);
             return Ok(());
+        }
+        if captured.status.success() {
+            return Err(store.unavailable(format!(
+                "Proton ended this session, and the login reported success but left a session \
+                 at {} that is still refused",
+                session_dir.display()
+            )));
         }
 
         let said = summarise(&captured.stderr);
@@ -235,6 +271,59 @@ fn lock_directory(store: &ProtonStore, dir: &Path) -> Result<File, StoreError> {
     Ok(handle)
 }
 
+/// Take group and others off `<dir>/.session`, which every `pass-cli` verb
+/// refuses otherwise, `login` included: `Session directory is accessible by
+/// group or others`.
+///
+/// `pass-cli` 2.7.0 makes the directory 0700 itself, from `info` and from
+/// `login` alike (measured 2026-11-24). What leaves it open is the race this
+/// login runs in: a read still running finds the session ended and deletes
+/// `.session`, and the login then writes its files back into a directory made
+/// at the process umask. Seen twice that day on a dev session of 31 names —
+/// once refusing the login outright, once letting it succeed and refusing the
+/// `info` that checks it — and each time every name degraded until a `chmod`
+/// by hand. The daemon re-asserts its own directory before each login for the
+/// same reason (`ensure_session_dir`).
+///
+/// Only bits are taken away, and only from a real directory: a symlink is left
+/// for the vendor to refuse, never followed.
+#[cfg(unix)]
+fn shut_session_store(store: &ProtonStore, dir: &Path) -> Result<(), StoreError> {
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+
+    let session_store = dir.join(SESSION_SUBDIR);
+    let meta = match fs::symlink_metadata(&session_store) {
+        Ok(meta) if meta.is_dir() => meta,
+        Ok(_) => return Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(store.unavailable(format!(
+                "cannot examine {} to log in again: {error}",
+                session_store.display()
+            )));
+        }
+    };
+    let mode = meta.permissions().mode() & 0o7777;
+    if mode & 0o077 == 0 {
+        return Ok(());
+    }
+    fs::set_permissions(&session_store, fs::Permissions::from_mode(mode & !0o077)).map_err(
+        |error| {
+            store.unavailable(format!(
+                "{} is open to group or others, which `pass-cli` refuses, and cannot be shut: \
+                 {error}",
+                session_store.display()
+            ))
+        },
+    )
+}
+
+#[cfg(not(unix))]
+fn shut_session_store(_store: &ProtonStore, _dir: &Path) -> Result<(), StoreError> {
+    Ok(())
+}
+
 impl ProtonStore {
     /// Turn on [`AutoLogin`]; `None` leaves an ended session for a person to
     /// log in again.
@@ -254,8 +343,9 @@ impl ProtonStore {
     /// one more try.
     ///
     /// `true` when this call logged in again, or a sibling thread did since the
-    /// read began. `false` when auto-login is off, or the session still
-    /// answers — then the failure was about the name.
+    /// read began — including one still checking its login when this read
+    /// asked, see [`AutoLogin::log_in_again`]. `false` when auto-login is off,
+    /// or the session still answers — then the failure was about the name.
     pub(super) fn logged_in_again(&self, logins_before: u64) -> Result<bool, StoreError> {
         let Some(auto_login) = &self.auto_login else {
             return Ok(false);
@@ -263,13 +353,67 @@ impl ProtonStore {
         let Ok(dir) = self.session_dir() else {
             return Ok(false);
         };
-        if auto_login.logins() == logins_before {
-            if !dir.is_dir() || !self.session_ended(dir) {
-                return Ok(false);
-            }
-            auto_login.log_in_again(self, dir, logins_before)?;
+        if auto_login.logins() != logins_before {
+            return Ok(true);
         }
-        Ok(true)
+        let ended = dir.is_dir() && self.session_ended(dir);
+        auto_login.log_in_again(self, dir, logins_before, ended)
+    }
+
+    /// Wait out a login this process has running, so that what is fetched next
+    /// belongs to the session it puts in place. Free when none is running.
+    pub(super) fn after_any_login_in_flight(&self) {
+        if let Some(auto_login) = &self.auto_login {
+            auto_login.after_a_login_in_flight();
+        }
+    }
+
+    /// Before `keyless run` asks for every name at once: find out whether
+    /// Proton ended the session and, if it did, log in while no read is running.
+    ///
+    /// # Why before, and not only after a read has failed
+    ///
+    /// A run resolves its names on one thread each. With the session ended,
+    /// the vault listing every named lookup waits on fails and leaves its slot
+    /// empty, so the next waiting thread runs a listing of its own — each one a
+    /// read that finds the session ended and deletes `.session`, queued one
+    /// after another WHILE the first thread logs in. On 2026-11-24 that left a
+    /// dev session of 31 names twice with `.session` open under a login that
+    /// had succeeded. Logged in here, before the threads exist, the login has
+    /// nothing to race; the retry in `resolve` stays for a session that ends
+    /// during the run itself.
+    ///
+    /// # What it costs
+    ///
+    /// Nothing more on a live session with a named address: the listing fetched
+    /// here is the one every lookup fetches first, and they reuse it. One
+    /// `pass-cli info` when every name is a pinned reference. Nothing without
+    /// `auto_login`. A listing that got no answer logs nobody in — ADR-0001
+    /// refuses a retry on silence — so on silence the run waits that one
+    /// listing's deadline before its lookups meet the silence themselves.
+    pub(super) fn log_in_before_the_burst(&self, names: &[&str]) {
+        if self.auto_login.is_none() {
+            return;
+        }
+        let logins = self.logins_so_far();
+        let first_named = names
+            .iter()
+            .find_map(|name| match self.routing.route(name)?.as_ref() {
+                Address::Named(address) => Some((*name, address.vault.clone())),
+                _ => None,
+            });
+        if let Some((name, vault)) = first_named {
+            match self
+                .enter()
+                .and_then(|pass| self.cached_items(&pass, &vault, name))
+            {
+                Ok(_) | Err(StoreError::Unavailable { .. }) => return,
+                Err(_) => {}
+            }
+        }
+        // Whatever this concludes, each lookup meets it again: a failed login
+        // is kept and answers every later name of the run.
+        let _ = self.logged_in_again(logins);
     }
 
     /// Whether Proton has ended the session at `dir`.

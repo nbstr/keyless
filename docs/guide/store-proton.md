@@ -58,8 +58,11 @@ though one measured on 2026-11-11 still answered 2 h 09 after its login. The
 read that finds it ended deletes `<session_dir>/.session`, and a write still in
 flight can put an empty `session.json` back. From then on every Proton name
 degrades with `This operation requires an authenticated client` until somebody
-logs in again. The daemon renews its own session; a session does nothing
-unless asked:
+logs in again. A login that races such a read can also leave `.session` open
+to group and others, which every later `pass-cli` call refuses with `Session
+directory is accessible by group or others`; `auto_login` takes those bits
+off before and after each login. The daemon renews its own session; a session
+does nothing unless asked:
 
 ```json
 "proton": {
@@ -73,7 +76,11 @@ unless asked:
 ```
 
 With that, the lookup that finds the session ended reads the agent token out
-of that login-keychain item, logs the session in again, and retries once. The
+of that login-keychain item, logs the session in again, and retries once. A
+`keyless run` of several names asks first, once, before any of them is read:
+the vault listing every named lookup needs, so a live session pays nothing
+more, and a login there and then if the session has ended, while no read is
+running that could delete `.session` under it. The
 config names the item, never the token; the token goes into the environment of
 that one login and nowhere else. Store it once — `security` prompts for it, so
 it stays out of your shell history:

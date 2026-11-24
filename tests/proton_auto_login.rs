@@ -9,8 +9,12 @@
 
 mod support;
 
+use std::ffi::OsString;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
+use keyless::State;
+use keyless::cmd::run::{Binding, RunRequest, TtyPolicy, run};
 use keyless::config::Config;
 use keyless::store::proton::Reason;
 use keyless::store::{self, Built, Invocation, Resolution};
@@ -28,10 +32,13 @@ const TOKEN_ACCOUNT: &str = "test-agent";
 /// A `pass-cli` stand-in that keeps a session the way the vendor does.
 ///
 /// Every call appends `<verb> <token-in-env|no-token>` to `pass-cli.calls`,
-/// never the token itself. `login` checks the token, writes a `session.json`
+/// never the token itself. Every verb, `login` included, refuses a `.session`
+/// group or others can enter, as 2.7.0 does. `login` checks the token, writes a `session.json`
 /// that holds a login, and bumps the session number. Any other verb refuses
 /// with `there is no session` when the file is missing OR holds no login,
-/// which is what a real expiry left behind on 2026-11-11. `item list` answers
+/// which is what a real expiry left behind on 2026-11-11. A login that wrote
+/// its session appends `login-done`, so a call landing between `login` and
+/// `login-done` ran during it. `item list` answers
 /// with a share id that changes after the first session, and `run` refuses a
 /// reference minted under another session.
 fn stub_vendor(dir: &Path) -> PathBuf {
@@ -41,6 +48,11 @@ root="${{PROTON_PASS_SESSION_DIR-}}"
 session="$root/.session/session.json"
 token="${{PROTON_PASS_PERSONAL_ACCESS_TOKEN:+token-in-env}}"
 printf '%s %s\n' "$1" "${{token:-no-token}}" >> '{calls}'
+if [ -d "$root/.session" ] && [ "$(ls -ld "$root/.session" | cut -c5-10)" != '------' ]; then
+  echo 'Error: Error getting base dir' >&2
+  echo "Caused by: Session directory is accessible by group or others: $root/.session" >&2
+  exit 1
+fi
 if [ "$1" = 'login' ]; then
   printf '%s\n' "$@" > '{login_argv}'
   if [ "${{PROTON_PASS_PERSONAL_ACCESS_TOKEN-}}" != '{AGENT_TOKEN}' ]; then
@@ -49,7 +61,14 @@ if [ "$1" = 'login' ]; then
   fi
   number=$(( $(cat '{sessions}' 2>/dev/null || echo 0) + 1 ))
   echo "$number" > '{sessions}'
-  mkdir -p "$root/.session" && printf 'session=%s\nauth=yes\n' "$number" > "$session"
+  # A login that takes as long as a real one, so a read queued behind it shows.
+  if [ -f '{slow_login}' ]; then sleep 0.5; fi
+  if [ -f '{reopen}' ]; then
+    # A read still running deleted `.session`; the login writes it back open.
+    rm -rf "$root/.session" && mkdir -m 755 "$root/.session"
+  fi
+  mkdir -p -m 700 "$root/.session" && printf 'session=%s\nauth=yes\n' "$number" > "$session"
+  echo 'login-done' >> '{calls}'
   exit 0
 fi
 if ! grep -q '^auth=yes$' "$session" 2>/dev/null; then
@@ -60,7 +79,13 @@ if ! grep -q '^auth=yes$' "$session" 2>/dev/null; then
   exit 1
 fi
 number=$(sed -n -e 's/^session=//p' "$session")
-if [ "$1" = 'info' ]; then echo 'Personal Access Token: decoy-agent'; exit 0; fi
+if [ "$1" = 'info' ]; then
+  # A slow answer from a live session: keeps open the moment a login has
+  # written its session and is still checking it.
+  if [ -f '{slow_info}' ]; then sleep 0.5; fi
+  echo 'Personal Access Token: decoy-agent'
+  exit 0
+fi
 if [ "$number" = 1 ]; then share=ShAr3; else share=ShAr3L1v3; fi
 if [ "$1" = 'item' ] && [ "$2" = 'list' ]; then
   echo listed >> '{listed}'
@@ -92,6 +117,9 @@ exit 1
         login_argv = dir.join("pass-cli.login.argv").display(),
         sessions = dir.join("pass-cli.sessions").display(),
         listed = dir.join("pass-cli.listed").display(),
+        reopen = dir.join("pass-cli.reopen").display(),
+        slow_login = dir.join("pass-cli.slow-login").display(),
+        slow_info = dir.join("pass-cli.slow-info").display(),
     );
     install_executable(&dir.join("pass-cli-stub"), &body)
 }
@@ -199,7 +227,7 @@ fn an_ended_session_is_logged_in_again_and_the_name_resolves() {
     assert!(
         recorded_lines(&dir.join("pass-cli.calls"))
             .iter()
-            .filter(|line| !line.starts_with("login "))
+            .filter(|line| !line.starts_with("login ") && *line != "login-done")
             .all(|line| line.ends_with(" no-token")),
         "only the login may carry the token"
     );
@@ -296,12 +324,11 @@ fn a_session_proton_ended_in_place_is_logged_in_again() {
     assert_eq!(calls(&dir, "login").len(), 2);
 }
 
-#[test]
-fn names_that_find_the_session_ended_together_log_in_once() {
-    let dir = ended_session("auto-login-once", Some(AGENT_TOKEN));
-    let registry = built(&config(&dir, true, Some(&token_item()))).registry;
-
-    let resolutions: Vec<Resolution> = std::thread::scope(|scope| {
+/// Eight readers of one name, started together on the session in `dir`, and
+/// what each one ended with.
+fn eight_readers_together(dir: &Path) -> Vec<Resolution> {
+    let registry = built(&config(dir, true, Some(&token_item()))).registry;
+    std::thread::scope(|scope| {
         let readers: Vec<_> = (0..8)
             .map(|_| scope.spawn(|| registry.resolve("DECOY")))
             .collect();
@@ -309,9 +336,12 @@ fn names_that_find_the_session_ended_together_log_in_once() {
             .into_iter()
             .map(|reader| reader.join().expect("a reader panicked"))
             .collect()
-    });
+    })
+}
 
-    for resolution in &resolutions {
+/// Every reader got the value, through one login and one listing.
+fn assert_one_login_served_every_reader(dir: &Path, resolutions: &[Resolution]) {
+    for resolution in resolutions {
         assert_eq!(
             resolved(resolution),
             Some(PROTON_DECOY),
@@ -319,10 +349,178 @@ fn names_that_find_the_session_ended_together_log_in_once() {
             resolution.reason()
         );
     }
-    assert_eq!(calls(&dir, "login").len(), 1);
+    assert_eq!(calls(dir, "login").len(), 1);
     // One listing for the new session, reused by every retry: measured in a
     // real run of 33 names, clearing it per retry cost one listing per name.
     assert_eq!(recorded_lines(&dir.join("pass-cli.listed")).len(), 1);
+}
+
+#[test]
+fn names_that_find_the_session_ended_together_log_in_once() {
+    let dir = ended_session("auto-login-once", Some(AGENT_TOKEN));
+
+    let resolutions = eight_readers_together(&dir);
+
+    assert_one_login_served_every_reader(&dir, &resolutions);
+}
+
+/// The same readers, with the moment between a login writing its session and
+/// that login being counted held open for half a second.
+///
+/// The test above used to fail now and then, and both of its failures came
+/// from that moment. A reader whose listing had failed on the ended session
+/// asked whether the session was ended, found it answering, and returned its
+/// failure as the name's own; and a listing fetched in that moment was stamped
+/// as older than the login, so the next reader fetched another. How often
+/// that happened depended on how long the check took, which is load; here it
+/// takes long enough to happen on every run.
+#[test]
+fn a_reader_that_failed_on_the_ended_session_waits_for_the_login_being_checked() {
+    let dir = ended_session("auto-login-checked", Some(AGENT_TOKEN));
+    std::fs::write(dir.join("pass-cli.slow-info"), "").expect("slow the check down");
+
+    let resolutions = eight_readers_together(&dir);
+
+    assert_one_login_served_every_reader(&dir, &resolutions);
+}
+
+fn mode(path: &Path) -> u32 {
+    std::fs::metadata(path)
+        .expect("stat the session store")
+        .permissions()
+        .mode()
+        & 0o7777
+}
+
+#[test]
+fn a_session_store_left_open_is_shut_before_the_login() {
+    let dir = ended_session("auto-login-open-store", Some(AGENT_TOKEN));
+    // What a real session met on 2026-11-24: `.session` open to group and
+    // others, and every verb refusing it, the login as well.
+    let store = session_dir(&dir).join(".session");
+    std::fs::create_dir(&store).expect("create the session store");
+    std::fs::set_permissions(&store, std::fs::Permissions::from_mode(0o755))
+        .expect("open the session store");
+    let registry = built(&config(&dir, true, Some(&token_item()))).registry;
+
+    let resolution = registry.resolve("DECOY");
+
+    assert_eq!(
+        resolved(&resolution),
+        Some(PROTON_DECOY),
+        "{}",
+        resolution.reason()
+    );
+    assert_eq!(mode(&store), 0o700);
+}
+
+#[test]
+fn a_session_store_the_login_writes_back_open_is_shut_after_it() {
+    let dir = ended_session("auto-login-reopened", Some(AGENT_TOKEN));
+    // The same day, later: a read still running deletes `.session` while the
+    // login writes, and the login's files land in a directory made open. The
+    // login succeeds; the `info` that checks it is refused.
+    std::fs::write(dir.join("pass-cli.reopen"), "").expect("arm the stand-in");
+    let registry = built(&config(&dir, true, Some(&token_item()))).registry;
+
+    let resolution = registry.resolve("DECOY");
+
+    assert_eq!(
+        resolved(&resolution),
+        Some(PROTON_DECOY),
+        "{}",
+        resolution.reason()
+    );
+    assert_eq!(calls(&dir, "login").len(), 1);
+    assert_eq!(mode(&session_dir(&dir).join(".session")), 0o700);
+}
+
+/// Five names of one run, all addressing the decoy item.
+const BURST: [&str; 5] = ["DECOY", "DECOY_B", "DECOY_C", "DECOY_D", "DECOY_E"];
+
+/// The auto-login config, with every name of [`BURST`] declared.
+fn burst_config(dir: &Path) -> Config {
+    let mut json: serde_json::Value =
+        serde_json::from_str(&config(dir, true, Some(&token_item()))).expect("valid json");
+    let decoy = json["secrets"]["DECOY"].clone();
+    for name in BURST {
+        json["secrets"][name] = decoy.clone();
+    }
+    serde_json::from_value(json).expect("valid config")
+}
+
+/// `keyless run -s` for every name of [`BURST`], through the library exactly
+/// as the binary runs it: the names resolve concurrently, one thread each.
+fn run_burst(dir: &Path) -> (State, String) {
+    let config = burst_config(dir);
+    let bindings: Vec<Binding> = BURST
+        .iter()
+        .map(|name| Binding::declared(name, &config).expect("a declared name"))
+        .collect();
+    let registry = store::build(&config, &Invocation::default()).registry;
+    let argv = [OsString::from("/usr/bin/true")];
+    let mut notes: Vec<u8> = Vec::new();
+    let outcome = run(
+        RunRequest {
+            bindings: &bindings,
+            unusable: &[],
+            argv: &argv,
+            registry: &registry,
+            audit: None,
+            warnings: &[],
+            tty: TtyPolicy::Pipes,
+        },
+        &mut notes,
+    )
+    .expect("the command exists, so the run must reach it");
+    (outcome.state, String::from_utf8_lossy(&notes).into_owned())
+}
+
+#[test]
+fn a_run_logs_in_before_its_names_read_so_no_read_runs_during_the_login() {
+    let dir = ended_session("auto-login-before-the-burst", Some(AGENT_TOKEN));
+    // Without the login up front, the listing each waiting name retries after
+    // the first one failed runs inside this half-second: the race that left
+    // `.session` open on 2026-11-24.
+    std::fs::write(dir.join("pass-cli.slow-login"), "").expect("slow the login down");
+
+    let (state, notes) = run_burst(&dir);
+
+    assert_eq!(state, State::Injected, "{notes}");
+    let recorded = recorded_lines(&dir.join("pass-cli.calls"));
+    let login = recorded
+        .iter()
+        .position(|line| line.starts_with("login "))
+        .expect("a login");
+    assert_eq!(
+        recorded.get(login + 1).map(String::as_str),
+        Some("login-done"),
+        "nothing may run during the login: {recorded:?}"
+    );
+    assert_eq!(calls(&dir, "login").len(), 1);
+}
+
+#[test]
+fn a_live_session_costs_a_run_no_vendor_call_more() {
+    let dir = ended_session("auto-login-live-burst", Some(AGENT_TOKEN));
+    let store = session_dir(&dir).join(".session");
+    std::fs::create_dir(&store).expect("create the session store");
+    std::fs::set_permissions(&store, std::fs::Permissions::from_mode(0o700))
+        .expect("shut the session store");
+    std::fs::write(store.join("session.json"), "session=1\nauth=yes\n").expect("a live session");
+
+    let (state, notes) = run_burst(&dir);
+
+    assert_eq!(state, State::Injected, "{notes}");
+    // The listing done before the names read is the one they all read from.
+    assert_eq!(
+        calls(&dir, "item").len(),
+        1,
+        "one listing for the whole run"
+    );
+    assert_eq!(calls(&dir, "run").len(), BURST.len());
+    assert!(calls(&dir, "info").is_empty(), "no session check on top");
+    assert!(calls(&dir, "login").is_empty(), "nobody logged in");
 }
 
 #[test]
