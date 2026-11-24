@@ -9,9 +9,12 @@
 
 mod support;
 
+use std::ffi::OsString;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
+use keyless::State;
+use keyless::cmd::run::{Binding, RunRequest, TtyPolicy, run};
 use keyless::config::Config;
 use keyless::store::proton::Reason;
 use keyless::store::{self, Built, Invocation, Resolution};
@@ -33,7 +36,9 @@ const TOKEN_ACCOUNT: &str = "test-agent";
 /// group or others can enter, as 2.7.0 does. `login` checks the token, writes a `session.json`
 /// that holds a login, and bumps the session number. Any other verb refuses
 /// with `there is no session` when the file is missing OR holds no login,
-/// which is what a real expiry left behind on 2026-11-11. `item list` answers
+/// which is what a real expiry left behind on 2026-11-11. A login that wrote
+/// its session appends `login-done`, so a call landing between `login` and
+/// `login-done` ran during it. `item list` answers
 /// with a share id that changes after the first session, and `run` refuses a
 /// reference minted under another session.
 fn stub_vendor(dir: &Path) -> PathBuf {
@@ -56,11 +61,14 @@ if [ "$1" = 'login' ]; then
   fi
   number=$(( $(cat '{sessions}' 2>/dev/null || echo 0) + 1 ))
   echo "$number" > '{sessions}'
+  # A login that takes as long as a real one, so a read queued behind it shows.
+  if [ -f '{slow_login}' ]; then sleep 0.5; fi
   if [ -f '{reopen}' ]; then
     # A read still running deleted `.session`; the login writes it back open.
     rm -rf "$root/.session" && mkdir -m 755 "$root/.session"
   fi
   mkdir -p -m 700 "$root/.session" && printf 'session=%s\nauth=yes\n' "$number" > "$session"
+  echo 'login-done' >> '{calls}'
   exit 0
 fi
 if ! grep -q '^auth=yes$' "$session" 2>/dev/null; then
@@ -110,6 +118,7 @@ exit 1
         sessions = dir.join("pass-cli.sessions").display(),
         listed = dir.join("pass-cli.listed").display(),
         reopen = dir.join("pass-cli.reopen").display(),
+        slow_login = dir.join("pass-cli.slow-login").display(),
         slow_info = dir.join("pass-cli.slow-info").display(),
     );
     install_executable(&dir.join("pass-cli-stub"), &body)
@@ -218,7 +227,7 @@ fn an_ended_session_is_logged_in_again_and_the_name_resolves() {
     assert!(
         recorded_lines(&dir.join("pass-cli.calls"))
             .iter()
-            .filter(|line| !line.starts_with("login "))
+            .filter(|line| !line.starts_with("login ") && *line != "login-done")
             .all(|line| line.ends_with(" no-token")),
         "only the login may carry the token"
     );
@@ -424,6 +433,94 @@ fn a_session_store_the_login_writes_back_open_is_shut_after_it() {
     );
     assert_eq!(calls(&dir, "login").len(), 1);
     assert_eq!(mode(&session_dir(&dir).join(".session")), 0o700);
+}
+
+/// Five names of one run, all addressing the decoy item.
+const BURST: [&str; 5] = ["DECOY", "DECOY_B", "DECOY_C", "DECOY_D", "DECOY_E"];
+
+/// The auto-login config, with every name of [`BURST`] declared.
+fn burst_config(dir: &Path) -> Config {
+    let mut json: serde_json::Value =
+        serde_json::from_str(&config(dir, true, Some(&token_item()))).expect("valid json");
+    let decoy = json["secrets"]["DECOY"].clone();
+    for name in BURST {
+        json["secrets"][name] = decoy.clone();
+    }
+    serde_json::from_value(json).expect("valid config")
+}
+
+/// `keyless run -s` for every name of [`BURST`], through the library exactly
+/// as the binary runs it: the names resolve concurrently, one thread each.
+fn run_burst(dir: &Path) -> (State, String) {
+    let config = burst_config(dir);
+    let bindings: Vec<Binding> = BURST
+        .iter()
+        .map(|name| Binding::declared(name, &config).expect("a declared name"))
+        .collect();
+    let registry = store::build(&config, &Invocation::default()).registry;
+    let argv = [OsString::from("/usr/bin/true")];
+    let mut notes: Vec<u8> = Vec::new();
+    let outcome = run(
+        RunRequest {
+            bindings: &bindings,
+            unusable: &[],
+            argv: &argv,
+            registry: &registry,
+            audit: None,
+            warnings: &[],
+            tty: TtyPolicy::Pipes,
+        },
+        &mut notes,
+    )
+    .expect("the command exists, so the run must reach it");
+    (outcome.state, String::from_utf8_lossy(&notes).into_owned())
+}
+
+#[test]
+fn a_run_logs_in_before_its_names_read_so_no_read_runs_during_the_login() {
+    let dir = ended_session("auto-login-before-the-burst", Some(AGENT_TOKEN));
+    // Without the login up front, the listing each waiting name retries after
+    // the first one failed runs inside this half-second: the race that left
+    // `.session` open on 2026-11-24.
+    std::fs::write(dir.join("pass-cli.slow-login"), "").expect("slow the login down");
+
+    let (state, notes) = run_burst(&dir);
+
+    assert_eq!(state, State::Injected, "{notes}");
+    let recorded = recorded_lines(&dir.join("pass-cli.calls"));
+    let login = recorded
+        .iter()
+        .position(|line| line.starts_with("login "))
+        .expect("a login");
+    assert_eq!(
+        recorded.get(login + 1).map(String::as_str),
+        Some("login-done"),
+        "nothing may run during the login: {recorded:?}"
+    );
+    assert_eq!(calls(&dir, "login").len(), 1);
+}
+
+#[test]
+fn a_live_session_costs_a_run_no_vendor_call_more() {
+    let dir = ended_session("auto-login-live-burst", Some(AGENT_TOKEN));
+    let store = session_dir(&dir).join(".session");
+    std::fs::create_dir(&store).expect("create the session store");
+    std::fs::set_permissions(&store, std::fs::Permissions::from_mode(0o700))
+        .expect("shut the session store");
+    std::fs::write(store.join("session.json"), "session=1\nauth=yes\n").expect("a live session");
+
+    let (state, notes) = run_burst(&dir);
+
+    assert_eq!(state, State::Injected, "{notes}");
+    // The listing done before the names read is the one they all read from.
+    assert_eq!(
+        calls(&dir, "item").len(),
+        1,
+        "one listing for the whole run"
+    );
+    assert_eq!(calls(&dir, "run").len(), BURST.len());
+    assert!(calls(&dir, "info").is_empty(), "no session check on top");
+    assert!(calls(&dir, "login").is_empty(), "nobody logged in");
 }
 
 #[test]

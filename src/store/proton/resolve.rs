@@ -48,6 +48,11 @@ impl Store for ProtonStore {
         }
         checked
     }
+
+    /// [`ProtonStore::log_in_before_the_burst`].
+    fn prepare(&self, names: &[&str]) {
+        self.log_in_before_the_burst(names);
+    }
 }
 
 impl ProtonStore {

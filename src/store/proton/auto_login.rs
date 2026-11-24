@@ -13,6 +13,7 @@ use crate::store::keychain::KeychainStore;
 
 use super::STORE_ID;
 use super::environment::remove_ambient_references;
+use super::routing::Address;
 use super::session_dir::{SESSION_SUBDIR, session_file_present, shell_word};
 use super::store::ProtonStore;
 use super::token::{TOKEN_VAR, refused_the_token};
@@ -365,6 +366,54 @@ impl ProtonStore {
         if let Some(auto_login) = &self.auto_login {
             auto_login.after_a_login_in_flight();
         }
+    }
+
+    /// Before `keyless run` asks for every name at once: find out whether
+    /// Proton ended the session and, if it did, log in while no read is running.
+    ///
+    /// # Why before, and not only after a read has failed
+    ///
+    /// A run resolves its names on one thread each. With the session ended,
+    /// the vault listing every named lookup waits on fails and leaves its slot
+    /// empty, so the next waiting thread runs a listing of its own — each one a
+    /// read that finds the session ended and deletes `.session`, queued one
+    /// after another WHILE the first thread logs in. On 2026-11-24 that left a
+    /// dev session of 31 names twice with `.session` open under a login that
+    /// had succeeded. Logged in here, before the threads exist, the login has
+    /// nothing to race; the retry in `resolve` stays for a session that ends
+    /// during the run itself.
+    ///
+    /// # What it costs
+    ///
+    /// Nothing more on a live session with a named address: the listing fetched
+    /// here is the one every lookup fetches first, and they reuse it. One
+    /// `pass-cli info` when every name is a pinned reference. Nothing without
+    /// `auto_login`. A listing that got no answer logs nobody in — ADR-0001
+    /// refuses a retry on silence — so on silence the run waits that one
+    /// listing's deadline before its lookups meet the silence themselves.
+    pub(super) fn log_in_before_the_burst(&self, names: &[&str]) {
+        if self.auto_login.is_none() {
+            return;
+        }
+        let logins = self.logins_so_far();
+        let first_named = names
+            .iter()
+            .find_map(|name| match self.routing.route(name)?.as_ref() {
+                Address::Named(address) => Some((*name, address.vault.clone())),
+                _ => None,
+            });
+        if let Some((name, vault)) = first_named {
+            match self
+                .enter()
+                .and_then(|pass| self.cached_items(&pass, &vault, name))
+            {
+                Ok(_) | Err(StoreError::Unavailable { .. }) => return,
+                Err(_) => {}
+            }
+        }
+        // Whatever this concludes, each lookup meets it again: a failed login
+        // is kept and answers every later name of the run.
+        let _ = self.logged_in_again(logins);
     }
 
     /// Whether Proton has ended the session at `dir`.

@@ -76,7 +76,11 @@ does nothing unless asked:
 ```
 
 With that, the lookup that finds the session ended reads the agent token out
-of that login-keychain item, logs the session in again, and retries once. The
+of that login-keychain item, logs the session in again, and retries once. A
+`keyless run` of several names asks first, once, before any of them is read:
+the vault listing every named lookup needs, so a live session pays nothing
+more, and a login there and then if the session has ended, while no read is
+running that could delete `.session` under it. The
 config names the item, never the token; the token goes into the environment of
 that one login and nowhere else. Store it once — `security` prompts for it, so
 it stays out of your shell history:
