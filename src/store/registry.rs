@@ -132,6 +132,25 @@ impl Registry {
         &self.stores
     }
 
+    /// Let each backend get ready, once, for the names of a run that is about to
+    /// ask for all of them at once. See [`Store::prepare`].
+    ///
+    /// A backend hears only the names a lookup would ask it for, by the same
+    /// choice [`Registry::asks`] makes; a name that would ask several backends
+    /// or none prepares nobody.
+    pub fn prepare(&self, names: &[&str]) {
+        for store in &self.stores {
+            let routed: Vec<&str> = names
+                .iter()
+                .copied()
+                .filter(|name| self.asks(name) == Some(store.id()))
+                .collect();
+            if !routed.is_empty() {
+                store.prepare(&routed);
+            }
+        }
+    }
+
     /// Ask for `name`, under the configured policy.
     ///
     /// An empty name is refused whatever the backends say: it can only come

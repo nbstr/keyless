@@ -7,6 +7,7 @@ mod daemon_suppression;
 mod declared;
 mod explicit;
 mod ordered;
+mod prepare;
 
 struct Fixed {
     id: &'static str,
