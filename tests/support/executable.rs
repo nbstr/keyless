@@ -14,7 +14,12 @@ use std::process::Command;
 /// bytes on purpose — that is what several of them are testing — and a scratch
 /// path can carry a space. Interpolating either into a shell string makes the
 /// fixture a test of the quoting rather than of the code.
-const WRITE: &str = r#"printf '%s' "$1" > "$2" && chmod 755 "$2""#;
+///
+/// `WRITE` executes the file once, holding an inert body, before it writes the
+/// real one over it in place — see "Why the file is executed before it holds
+/// its body" on [`install_executable`].
+const WRITE: &str =
+    r#"printf '#!/bin/sh\n:\n' > "$2" && chmod 755 "$2" && "$2" && printf '%s' "$1" > "$2""#;
 const COPY: &str = r#"cp -- "$1" "$2" && chmod 755 "$2""#;
 
 /// Create `path` as an executable holding `body`, and hand back `path`.
@@ -47,6 +52,30 @@ const COPY: &str = r#"cp -- "$1" "$2" && chmod 755 "$2""#;
 /// writing a stub and then reaching it through a spawned child, sixty-four
 /// thousand execs per arm: the write-then-`chmod` shape is refused on a
 /// fraction of a percent of them, and this one on none of them.
+///
+/// # Why the file is executed before it holds its body
+///
+/// On macOS the FIRST exec of a newly created file is held while the system
+/// assesses it, and concurrent assessments are answered one at a time.
+/// The verdict sticks to the file, not to its bytes: a second exec, or an exec
+/// after the file was rewritten in place, does not pay it again. Measured
+/// 2026-11-26 on the Mac this suite gates on: a fresh `#!/bin/sh` file's first
+/// exec took 222–358 ms and its second 5 ms; five fresh files first-exec'd at
+/// once finished at 246, 466, 686, 905 and 1 092 ms — a staircase, not
+/// contention; the same fresh file read by `/bin/sh` without being exec'd took
+/// 5 ms.
+///
+/// A stub's first exec is almost always INSIDE a window the case is timing — a
+/// daemon's `timeout_ms`, a bounded wait for the vendor's first write — so that
+/// staircase landed on the code under test. `daemon_proton_silent_window`,
+/// whose store gets 1 s, had its first, answering read declared silent in two
+/// or three of four cases on every parallel run.
+///
+/// So the assessment is paid here, on a body that does nothing, and the real
+/// body is written over it afterwards: the same file, so the verdict carries,
+/// and through the same `>` so no writable descriptor is ever created in this
+/// process. Measured the same way, five parallel installs then cost the
+/// staircase themselves, and each stub's first real exec took 5 ms.
 pub fn install_executable(path: &Path, body: &str) -> PathBuf {
     run(WRITE, body.as_ref(), path);
     path.to_path_buf()
