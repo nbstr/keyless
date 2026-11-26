@@ -39,7 +39,7 @@ use keyless::ipc::peer::{PeerError, code_hash_of_file, identify};
 use keyless::ipc::protocol::Request;
 
 use support::{
-    DECOY_VALUE, daemon_config, example_binary, install_executable_copy, own_identity,
+    DECOY_VALUE, PATIENCE, daemon_config, example_binary, install_executable_copy, own_identity,
     policy_allowing_self, scratch, short_socket_path, start_daemon, write_secrets,
 };
 
@@ -600,9 +600,24 @@ fn callers_that_leave_moments_after_connecting_are_still_served() {
         "{} of {COUNT} peers never reached the daemon: {connect_failures:?}",
         connect_failures.len()
     );
-    // Past the daemon's own read timeout, so a connection still being served
-    // has had every chance to finish before the log is read.
-    std::thread::sleep(Duration::from_millis(200));
+    // Every connection the daemon serves or refuses leaves exactly one row, so
+    // the log holding COUNT rows is the event that says every connection has
+    // been decided. It is waited FOR rather than slept past: dropping `running`
+    // joins the accept loop and not the connections it handed off, so a
+    // connection still being decided when the log is read is missing from it,
+    // and a fixed pause only guesses how long deciding twenty takes. Twenty
+    // peers spawned at once on a loaded machine have been measured leaving 12
+    // and 17 rows after a 200 ms pause. `PATIENCE` bounds a failure only — the
+    // assertions below report a caller that never got a row at all.
+    let deadline = std::time::Instant::now() + PATIENCE;
+    while std::fs::read_to_string(&config.audit)
+        .map(|raw| raw.lines().count())
+        .unwrap_or(0)
+        < COUNT
+        && std::time::Instant::now() < deadline
+    {
+        std::thread::sleep(Duration::from_millis(50));
+    }
     drop(running);
 
     let raw = std::fs::read_to_string(&config.audit).expect("read the audit log");
