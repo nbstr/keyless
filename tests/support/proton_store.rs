@@ -2,7 +2,7 @@ use std::path::Path;
 use std::path::PathBuf;
 
 use super::install_executable;
-use super::proton_session::{VendorStore, vendor_store_trace_path};
+use super::proton_session::{Persist, VendorStore, vendor_store_trace_path};
 
 /// Write a `pass-cli` stand-in that models the vendor's store semantics and
 /// hands everything else to `inner`.
@@ -325,7 +325,7 @@ fi
 # SDK crate is not in the vendor's public repository, so `schedule_persist`'s
 # own source was not read.
 if is_revoked "$sid"; then
-  (
+  persist() (
     sleep {persist_key_delay}
     # local_key_path() canonicalizes the base directory, so a write arriving
     # after the directory is gone ERRORS rather than minting a key into a
@@ -336,7 +336,8 @@ if is_revoked "$sid"; then
     [ -d "$base" ] || exit 0
     printf 'session=%s\nkey=%s\nauth=yes\nextra=no\n' "$sid" "$persisted" \
       > "$session.tmp" 2>/dev/null && mv "$session.tmp" "$session" 2>/dev/null
-  ) &
+  )
+  {persist_then}
   remove_local_data > /dev/null 2>&1
   # The background write is bounded by the process that scheduled it: the
   # vendor's runtime goes down with the command, so a write that has not landed
@@ -371,6 +372,12 @@ exec '{inner}' "$@"
         rmdir_window = behaviour.rmdir_window.as_secs_f64(),
         persist_key_delay = behaviour.persist_key_delay.as_secs_f64(),
         persist_write_delay = behaviour.persist_write_delay.as_secs_f64(),
+        // `persist &` and the `wait` below are the vendor's unordered pair;
+        // a bare `persist` runs it to completion before the cleanup's listing.
+        persist_then = match behaviour.persist {
+            Persist::BeforeCleanup => "persist",
+            Persist::Concurrent => "persist &",
+        },
     );
 
     install_executable(&dir.join("pass-cli-store-stub"), &body)

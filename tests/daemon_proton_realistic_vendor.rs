@@ -165,6 +165,7 @@ fn no_read_meets_a_session_store_a_renewal_left_undecryptable() {
             persist_key_delay: Duration::ZERO,
             persist_write_delay: Duration::from_millis(600),
             login_delay: Duration::ZERO,
+            persist: support::proton_session::Persist::Concurrent,
         },
     );
     // `key_provider: fs`, because the key that gets minted, deleted and

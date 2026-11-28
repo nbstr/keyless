@@ -579,6 +579,11 @@ def run():
                "keyless run -s GITHUB_TOKEN -- sh -c '", v.message)
     s.check("KL-ASSIGN never echoes the value",
             DECOY["github_pat"] in v.message, False)
+    # Inside that `sh -c`, `cmd "$NAME"` hands the value to cmd's argv, which `ps`
+    # shows to every process; the remedy has to say how the command READS it instead.
+    s.check_in("KL-ASSIGN teaches the inner command to read the variable",
+               "--variable %GITHUB_TOKEN --expand-header", v.message)
+    s.check_in("KL-ASSIGN names argv as where an argument leaks", "argv", v.message)
 
     # ── KL-WRITE: rewrite, never refuse ─────────────────────────────────────
     for label, literal in (("github", DECOY["github_pat"]), ("aws", DECOY["aws_key"]),
@@ -807,6 +812,12 @@ def run():
         if kind != "silent":
             s.check_in("KL-HEREDOC owns that verdict (%s)" % why,
                        "[KL-HEREDOC]", v.message)
+
+    # The stdin remedy prescribes `sh -c`; it must also keep the value out of the
+    # inner command's argv, or it teaches the leak it was written to prevent.
+    v = drive(bash("node <<'EOF'\nconst k = \"%s\";\nEOF" % DECOY["aws_key"], cwd=root))
+    s.check_in("KL-HEREDOC stdin remedy keeps the value out of argv",
+               "--variable %NAME --expand-header", v.message)
 
     # A heredoc body must reach the check WHOLE. Truncating it at the first line
     # would keep every row above green while missing a literal further down.

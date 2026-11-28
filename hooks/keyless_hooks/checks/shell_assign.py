@@ -240,8 +240,14 @@ def _message(names, shapes):
         "by the CALLING shell, where the name is unset, and `-- cmd '$%s'` arrives "
         "as a literal because keyless does not expand its arguments. Only the "
         "inner shell expands from the environment.\n\n"
+        "Inside it, let the command READ the variable rather than receive it: "
+        "`curl --variable %%%s --expand-header 'Authorization: Bearer {{%s}}'`, "
+        "libpq's PG* variables, or `printf '%%s' \"$%s\" | cmd --password-stdin`. "
+        "`cmd \"$%s\"` puts the value in that process's argv, which `ps` shows "
+        "to every process on the machine.\n\n"
         "`keyless ls` names what it can resolve. If this value is not a "
         "credential — a fixture, a public identifier, a test vector — spell it so "
         "it is not credential-shaped. An operator can disable this pack for a "
         "session with KEYLESS_HOOKS_DISABLE=1 in the settings file's `env` block."
-        % (CHECK, ", ".join(names[:4]), ", ".join(sorted(shapes)), var, var, var))
+        % (CHECK, ", ".join(names[:4]), ", ".join(sorted(shapes)), var, var, var,
+           var, var, var, var))

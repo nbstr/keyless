@@ -220,7 +220,12 @@ def _stdin_message(shapes):
         "environment instead:\n\n"
         "    keyless run -s <NAME> -- sh -c '<the command you were going to run>'\n\n"
         "Keep the body inside `sh -c` and SINGLE-QUOTE it: only the inner shell "
-        "expands from the environment."
+        "expands from the environment.\n\n"
+        "Inside it, let the command READ the variable rather than receive it: "
+        "`curl --variable %%NAME --expand-header 'Authorization: Bearer {{NAME}}'`, "
+        "libpq's PG* variables, or `printf '%%s' \"$NAME\" | cmd --password-stdin`. "
+        "`cmd \"$NAME\"` puts the value in that process's argv, which `ps` shows "
+        "to every process on the machine."
         % (CHECK, ", ".join(shapes)))
 
 

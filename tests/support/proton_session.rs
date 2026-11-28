@@ -79,7 +79,8 @@ pub struct VendorStore {
     /// A read whose session the account revoked does two things and they are
     /// not ordered with respect to each other: the SDK's callback deletes the
     /// store, and the store schedules its own `session.json` write on a
-    /// background task. This is when that task starts.
+    /// background task. This is when that task starts; [`Persist`] says
+    /// whether it starts beside the cleanup or ahead of it.
     pub persist_key_delay: std::time::Duration,
 
     /// How long that write takes between resolving the key and the rename
@@ -91,16 +92,43 @@ pub struct VendorStore {
     /// disk under a key no surviving `local.key` holds. That state is terminal
     /// — the next child mints a fresh key and cannot decrypt it.
     pub persist_write_delay: std::time::Duration,
+
+    /// Whether that write runs BESIDE the callback's cleanup or finishes before
+    /// it starts.
+    pub persist: Persist,
+}
+
+/// How the invalidation-time `session.json` write is ordered against the
+/// callback's cleanup.
+///
+/// The vendor does not order them, so both are real. What a fixture must not
+/// do is leave the choice to the scheduler: with both spans at zero, which one
+/// wins is decided by however the machine runs two shells at once, and a case
+/// that needs the store GONE then fails whenever the write's rename lands
+/// between the cleanup's unlinks and its `rmdir`. A delay on the write does not
+/// order them either — it makes the race unlikely rather than impossible.
+#[derive(Clone, Copy)]
+pub enum Persist {
+    /// The write lands, and then the cleanup deletes it with everything else.
+    /// One process, one after the other: the store is gone afterwards on every
+    /// run, which is the interleaving a case about the DELETION wants.
+    BeforeCleanup,
+    /// The write runs on a background task while the cleanup runs, and the two
+    /// delays above decide which lands first — the interleaving that leaves a
+    /// `session.json` under a key no surviving `local.key` holds.
+    Concurrent,
 }
 
 impl VendorStore {
-    /// A vendor with no windows: every span above is instant.
+    /// A vendor with no windows: every span above is instant, and nothing
+    /// overlaps.
     pub const INSTANT: VendorStore = VendorStore {
         login_delay: std::time::Duration::ZERO,
         logout_delay: std::time::Duration::ZERO,
         rmdir_window: std::time::Duration::ZERO,
         persist_key_delay: std::time::Duration::ZERO,
         persist_write_delay: std::time::Duration::ZERO,
+        persist: Persist::BeforeCleanup,
     };
 }
 

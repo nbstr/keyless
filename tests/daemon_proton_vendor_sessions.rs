@@ -3,8 +3,6 @@
 mod daemon_proton_support;
 mod support;
 
-use std::time::Duration;
-
 use daemon_proton_support::vendor_store::{Keying, run_vendor, said, store_stub, vendor_scope};
 use daemon_proton_support::{ENCRYPTION_KEY_DECOY, VAULT};
 use support::backend::Backend;
@@ -74,18 +72,12 @@ fn a_read_whose_session_the_account_revoked_deletes_the_whole_store_on_its_way_o
     // so they are one case.
     let dir = scratch("vendor-store-destructive-reads");
     // The callback's cleanup is not the only thing an invalidated read does:
-    // the store schedules its own `session.json` write, and with both instant
-    // the two race — which is the vendor, and is the subject of the
-    // concurrent-child case rather than of this one. Starting the write after
-    // the cleanup has finished takes it out of contention, so what this case
-    // observes is the cleanup alone.
-    let vendor = store_stub(
-        &dir,
-        &support::proton_session::VendorStore {
-            persist_key_delay: Duration::from_millis(300),
-            ..support::proton_session::VendorStore::INSTANT
-        },
-    );
+    // the store schedules its own `session.json` write, and the two racing is
+    // the subject of the concurrent-child case rather than of this one.
+    // `INSTANT` lands the write before the cleanup starts, so the cleanup
+    // deletes it with everything else and what this case observes is the
+    // cleanup alone.
+    let vendor = store_stub(&dir, &support::proton_session::VendorStore::INSTANT);
 
     let revoked = vendor_scope(&dir, "revoked");
     run_vendor(&vendor, &revoked, &Keying::Fs, &["login"]);
